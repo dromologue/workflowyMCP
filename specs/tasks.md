@@ -155,6 +155,7 @@
   - ADR-002: Hierarchical insertion
   - ADR-003: Smart insert workflow
   - ADR-004: Cache invalidation
+  - ADR-005: Bottom-default insertion order
 
 ---
 
@@ -205,3 +206,9 @@
   - Hierarchical insertion
   - Smart insert workflow
   - README documentation
+
+- [x] **T-024**: Fix insertion order (content appearing reversed)
+  - Default to "bottom" position for correct order
+  - "top" only applies to first top-level node
+  - Hierarchical content maintains parent-child relationships
+  - ADR-005 documented

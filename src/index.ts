@@ -164,6 +164,9 @@ async function insertHierarchicalContent(
   // Index 0 = root parent, Index 1 = first level children, etc.
   const parentStack: string[] = [rootParentId];
 
+  // Track if we've inserted the first top-level node (for "top" positioning)
+  let firstTopLevelInserted = false;
+
   for (const line of parsedLines) {
     // Determine the parent for this node
     // If indent is 0, parent is rootParentId
@@ -171,14 +174,21 @@ async function insertHierarchicalContent(
     const parentIndex = Math.min(line.indent, parentStack.length - 1);
     const parentId = parentStack[parentIndex];
 
+    // Position logic:
+    // - Default to "bottom" to preserve content order
+    // - If "top" requested: only first top-level node goes to top,
+    //   all subsequent nodes use "bottom" to maintain order
+    let nodePosition: "top" | "bottom" = "bottom";
+    if (position === "top" && line.indent === 0 && !firstTopLevelInserted) {
+      nodePosition = "top";
+      firstTopLevelInserted = true;
+    }
+
     const body: Record<string, unknown> = {
       name: line.text,
       parent_id: parentId,
+      position: nodePosition,
     };
-    // Only apply position to top-level nodes
-    if (position && line.indent === 0) {
-      body.position = position;
-    }
 
     const result = (await workflowyRequest("/nodes", "POST", body)) as CreatedNode;
     createdNodes.push(result);

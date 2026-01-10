@@ -118,6 +118,19 @@ src/
 - (-) Performance penalty for write-heavy workflows
 - (-) Could be more granular (future optimization)
 
+### ADR-005: Bottom-Default Insertion Order
+
+**Context**: Workflowy's "top" position inserts each node above the previous, reversing multi-node content order.
+
+**Decision**: Default to "bottom" position for all insertions. When "top" is explicitly requested, only the first top-level node is placed at top; subsequent nodes use "bottom" to preserve order.
+
+**Consequences**:
+- (+) Content appears in correct order (as written)
+- (+) Hierarchical content maintains parent-child relationships
+- (+) "top" still places content block at top of parent
+- (-) Multiple top-level nodes with "top" won't all be at very top
+- (-) Slight semantic change from raw API behavior
+
 ## Error Handling Strategy
 
 ```typescript

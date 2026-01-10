@@ -57,8 +57,13 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 | Hierarchical insert | Parse indented content into nested structure |
 | Smart insert | Search-and-insert workflow with selection |
 | Markdown support | Headers, todos, code blocks, quotes |
+| Order preservation | Content appears in same order as provided |
 
-**Success criteria**: Claude-generated content appears in Workflowy with correct structure.
+**Position behavior**:
+- `bottom` (default): Content appended after existing children, order preserved
+- `top`: First node placed at top, subsequent nodes follow in order
+
+**Success criteria**: Claude-generated content appears in Workflowy with correct structure and order.
 
 ### 4. Content Modification
 
