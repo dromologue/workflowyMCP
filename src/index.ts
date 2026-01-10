@@ -115,6 +115,84 @@ function formatNodesForSelection(nodes: NodeWithPath[]): string {
   return `Found ${nodes.length} matching node(s):\n\n${lines.join("\n\n")}`;
 }
 
+// Parse indented content into hierarchical structure
+interface ParsedLine {
+  text: string;
+  indent: number;
+}
+
+function parseIndentedContent(content: string): ParsedLine[] {
+  const lines = content.split("\n");
+  const parsed: ParsedLine[] = [];
+
+  for (const line of lines) {
+    // Skip empty lines
+    if (!line.trim()) continue;
+
+    // Count leading whitespace (tabs = 2 spaces equivalent)
+    const match = line.match(/^(\s*)/);
+    const whitespace = match ? match[1] : "";
+    // Convert tabs to 2-space equivalents for consistent indent calculation
+    const normalizedWhitespace = whitespace.replace(/\t/g, "  ");
+    const indent = Math.floor(normalizedWhitespace.length / 2);
+
+    parsed.push({
+      text: line.trim(),
+      indent,
+    });
+  }
+
+  return parsed;
+}
+
+// Insert hierarchical content respecting indentation
+interface CreatedNode {
+  id: string;
+  name: string;
+  [key: string]: unknown;
+}
+
+async function insertHierarchicalContent(
+  rootParentId: string,
+  content: string,
+  position?: "top" | "bottom"
+): Promise<CreatedNode[]> {
+  const parsedLines = parseIndentedContent(content);
+  const createdNodes: CreatedNode[] = [];
+
+  // Stack to track parent IDs at each indent level
+  // Index 0 = root parent, Index 1 = first level children, etc.
+  const parentStack: string[] = [rootParentId];
+
+  for (const line of parsedLines) {
+    // Determine the parent for this node
+    // If indent is 0, parent is rootParentId
+    // If indent is N, parent is the node at level N-1
+    const parentIndex = Math.min(line.indent, parentStack.length - 1);
+    const parentId = parentStack[parentIndex];
+
+    const body: Record<string, unknown> = {
+      name: line.text,
+      parent_id: parentId,
+    };
+    // Only apply position to top-level nodes
+    if (position && line.indent === 0) {
+      body.position = position;
+    }
+
+    const result = (await workflowyRequest("/nodes", "POST", body)) as CreatedNode;
+    createdNodes.push(result);
+
+    // Update the parent stack for subsequent nodes
+    // Set this node as the parent at indent level + 1
+    parentStack[line.indent + 1] = result.id;
+    // Trim the stack to remove any deeper levels (they're now invalid)
+    parentStack.length = line.indent + 2;
+  }
+
+  return createdNodes;
+}
+
 // Tool schemas
 const searchNodesSchema = z.object({
   query: z.string().describe("Text to search for in node names and notes"),
@@ -661,22 +739,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { parent_id, content, position } =
           insertContentSchema.parse(args);
 
-        // Split content by double newlines to create separate nodes
-        const lines = content.split(/\n\n+/);
-        const createdNodes: unknown[] = [];
-
-        for (const line of lines) {
-          if (line.trim()) {
-            const body: Record<string, unknown> = {
-              name: line.trim(),
-              parent_id,
-            };
-            if (position) body.position = position;
-
-            const result = await workflowyRequest("/nodes", "POST", body);
-            createdNodes.push(result);
-          }
-        }
+        // Insert content respecting indentation hierarchy
+        const createdNodes = await insertHierarchicalContent(
+          parent_id,
+          content,
+          position
+        );
 
         invalidateCache();
         return {
@@ -686,7 +754,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(
                 {
                   success: true,
-                  message: `Inserted ${createdNodes.length} node(s)`,
+                  message: `Inserted ${createdNodes.length} node(s) with hierarchy preserved`,
                   nodes: createdNodes,
                 },
                 null,
@@ -763,21 +831,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           const targetNode = nodesWithPaths[selection - 1];
-          const lines = content.split(/\n\n+/);
-          const createdNodes: unknown[] = [];
-
-          for (const line of lines) {
-            if (line.trim()) {
-              const body: Record<string, unknown> = {
-                name: line.trim(),
-                parent_id: targetNode.id,
-              };
-              if (position) body.position = position;
-
-              const result = await workflowyRequest("/nodes", "POST", body);
-              createdNodes.push(result);
-            }
-          }
+          const createdNodes = await insertHierarchicalContent(
+            targetNode.id,
+            content,
+            position
+          );
 
           invalidateCache();
           return {
@@ -787,7 +845,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 text: JSON.stringify(
                   {
                     success: true,
-                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}" with hierarchy preserved`,
                     target_path: targetNode.path,
                     nodes: createdNodes,
                   },
@@ -802,21 +860,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // If only one match, insert directly
         if (matches.length === 1) {
           const targetNode = nodesWithPaths[0];
-          const lines = content.split(/\n\n+/);
-          const createdNodes: unknown[] = [];
-
-          for (const line of lines) {
-            if (line.trim()) {
-              const body: Record<string, unknown> = {
-                name: line.trim(),
-                parent_id: targetNode.id,
-              };
-              if (position) body.position = position;
-
-              const result = await workflowyRequest("/nodes", "POST", body);
-              createdNodes.push(result);
-            }
-          }
+          const createdNodes = await insertHierarchicalContent(
+            targetNode.id,
+            content,
+            position
+          );
 
           invalidateCache();
           return {
@@ -826,7 +874,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 text: JSON.stringify(
                   {
                     success: true,
-                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}" with hierarchy preserved`,
                     target_path: targetNode.path,
                     nodes: createdNodes,
                   },
