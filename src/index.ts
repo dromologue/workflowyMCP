@@ -66,10 +66,53 @@ interface WorkflowyNode {
   parent_id?: string;
 }
 
-interface WorkflowyTarget {
-  id: string;
-  name: string;
-  type: string;
+interface NodeWithPath extends WorkflowyNode {
+  path: string;
+  depth: number;
+}
+
+// Helper function to build node paths for better identification
+function buildNodePaths(nodes: WorkflowyNode[]): NodeWithPath[] {
+  const nodeMap = new Map<string, WorkflowyNode>();
+  nodes.forEach((node) => nodeMap.set(node.id, node));
+
+  function getPath(node: WorkflowyNode, depth: number = 0): { path: string; depth: number } {
+    const parts: string[] = [];
+    let current: WorkflowyNode | undefined = node;
+    let currentDepth = 0;
+
+    while (current) {
+      const displayName = current.name?.substring(0, 40) || "(untitled)";
+      parts.unshift(displayName);
+      currentDepth++;
+      if (current.parent_id) {
+        current = nodeMap.get(current.parent_id);
+      } else {
+        break;
+      }
+    }
+
+    return { path: parts.join(" > "), depth: currentDepth };
+  }
+
+  return nodes.map((node) => {
+    const { path, depth } = getPath(node);
+    return { ...node, path, depth };
+  });
+}
+
+// Format nodes for display with numbered options
+function formatNodesForSelection(nodes: NodeWithPath[]): string {
+  if (nodes.length === 0) {
+    return "No matching nodes found.";
+  }
+
+  const lines = nodes.map((node, index) => {
+    const note = node.note ? ` [note: ${node.note.substring(0, 50)}...]` : "";
+    return `[${index + 1}] ${node.path}${note}\n    ID: ${node.id}`;
+  });
+
+  return `Found ${nodes.length} matching node(s):\n\n${lines.join("\n\n")}`;
 }
 
 // Tool schemas
@@ -141,6 +184,44 @@ const insertContentSchema = z.object({
     .describe("Position relative to siblings (default: top)"),
 });
 
+const findInsertTargetsSchema = z.object({
+  query: z.string().describe("Search text to find potential target nodes"),
+});
+
+const smartInsertSchema = z.object({
+  search_query: z
+    .string()
+    .describe("Search text to find the target node for insertion"),
+  content: z.string().describe("The content to insert"),
+  selection: z
+    .number()
+    .optional()
+    .describe("If multiple matches found, the number (1-based) of the node to use"),
+  position: z
+    .enum(["top", "bottom"])
+    .optional()
+    .describe("Position relative to siblings (default: top)"),
+});
+
+// Cache for nodes to avoid repeated API calls
+let cachedNodes: WorkflowyNode[] | null = null;
+let cacheTimestamp: number = 0;
+const CACHE_TTL = 30000; // 30 seconds
+
+async function getCachedNodes(): Promise<WorkflowyNode[]> {
+  const now = Date.now();
+  if (!cachedNodes || now - cacheTimestamp > CACHE_TTL) {
+    cachedNodes = (await workflowyRequest("/nodes-export")) as WorkflowyNode[];
+    cacheTimestamp = now;
+  }
+  return cachedNodes;
+}
+
+function invalidateCache() {
+  cachedNodes = null;
+  cacheTimestamp = 0;
+}
+
 // Initialize MCP server
 const server = new Server(
   { name: "workflowy-mcp-server", version: "1.0.0" },
@@ -154,7 +235,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "search_nodes",
         description:
-          "Search for nodes in Workflowy by text. Returns all nodes matching the query in their name or note.",
+          "Search for nodes in Workflowy by text. Returns all nodes matching the query in their name or note, with full paths for identification.",
         inputSchema: {
           type: "object",
           properties: {
@@ -190,8 +271,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             parent_id: {
               type: "string",
-              description:
-                "Parent node ID. Omit to get root-level nodes",
+              description: "Parent node ID. Omit to get root-level nodes",
             },
           },
         },
@@ -227,8 +307,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "update_node",
-        description:
-          "Update an existing node's name and/or note.",
+        description: "Update an existing node's name and/or note.",
         inputSchema: {
           type: "object",
           properties: {
@@ -316,14 +395,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "insert_content",
         description:
-          "Insert Claude's generated content into a specified Workflowy node. Creates a new child node with the content.",
+          "Insert content into a Workflowy node by ID. Use find_insert_targets first to locate the node ID.",
         inputSchema: {
           type: "object",
           properties: {
             parent_id: {
               type: "string",
-              description:
-                "The ID of the parent node to insert content under",
+              description: "The ID of the parent node to insert content under",
             },
             content: {
               type: "string",
@@ -336,6 +414,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["parent_id", "content"],
+        },
+      },
+      {
+        name: "find_insert_targets",
+        description:
+          "Search for potential target nodes to insert content into. Returns a numbered list with full paths and IDs. Use this before insert_content to find the right node.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search text to find potential target nodes",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "smart_insert",
+        description:
+          "Search for a node and insert content. If one match is found, inserts immediately. If multiple matches, returns numbered options - call again with selection number to complete insertion.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            search_query: {
+              type: "string",
+              description: "Search text to find the target node for insertion",
+            },
+            content: {
+              type: "string",
+              description: "The content to insert",
+            },
+            selection: {
+              type: "number",
+              description:
+                "If multiple matches were found, the number (1-based) of the node to use",
+            },
+            position: {
+              type: "string",
+              enum: ["top", "bottom"],
+              description: "Position relative to siblings (default: top)",
+            },
+          },
+          required: ["search_query", "content"],
         },
       },
       {
@@ -368,16 +490,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "search_nodes": {
         const { query } = searchNodesSchema.parse(args);
-        // Export all nodes and search locally
-        const allNodes = (await workflowyRequest(
-          "/nodes-export"
-        )) as WorkflowyNode[];
+        const allNodes = await getCachedNodes();
         const queryLower = query.toLowerCase();
         const matches = allNodes.filter(
           (node) =>
             node.name?.toLowerCase().includes(queryLower) ||
             node.note?.toLowerCase().includes(queryLower)
         );
+        const nodesWithPaths = buildNodePaths(matches);
+
         return {
           content: [
             {
@@ -386,7 +507,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   query,
                   total_matches: matches.length,
-                  nodes: matches,
+                  nodes: nodesWithPaths.map((n) => ({
+                    id: n.id,
+                    name: n.name,
+                    note: n.note,
+                    path: n.path,
+                    depth: n.depth,
+                  })),
                 },
                 null,
                 2
@@ -424,26 +551,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (position) body.position = position;
 
         const result = await workflowyRequest("/nodes", "POST", body);
+        invalidateCache();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { success: true, node: result },
-                null,
-                2
-              ),
+              text: JSON.stringify({ success: true, node: result }, null, 2),
             },
           ],
         };
       }
 
       case "update_node": {
-        const {
-          node_id,
-          name: nodeName,
-          note,
-        } = updateNodeSchema.parse(args);
+        const { node_id, name: nodeName, note } = updateNodeSchema.parse(args);
         const body: Record<string, unknown> = {};
         if (nodeName !== undefined) body.name = nodeName;
         if (note !== undefined) body.note = note;
@@ -453,15 +573,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           "POST",
           body
         );
+        invalidateCache();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { success: true, node: result },
-                null,
-                2
-              ),
+              text: JSON.stringify({ success: true, node: result }, null, 2),
             },
           ],
         };
@@ -470,6 +587,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "delete_node": {
         const { node_id } = deleteNodeSchema.parse(args);
         await workflowyRequest(`/nodes/${node_id}`, "DELETE");
+        invalidateCache();
         return {
           content: [
             {
@@ -494,15 +612,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           "POST",
           body
         );
+        invalidateCache();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { success: true, node: result },
-                null,
-                2
-              ),
+              text: JSON.stringify({ success: true, node: result }, null, 2),
             },
           ],
         };
@@ -514,15 +629,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `/nodes/${node_id}/complete`,
           "POST"
         );
+        invalidateCache();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { success: true, node: result },
-                null,
-                2
-              ),
+              text: JSON.stringify({ success: true, node: result }, null, 2),
             },
           ],
         };
@@ -534,15 +646,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `/nodes/${node_id}/uncomplete`,
           "POST"
         );
+        invalidateCache();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { success: true, node: result },
-                null,
-                2
-              ),
+              text: JSON.stringify({ success: true, node: result }, null, 2),
             },
           ],
         };
@@ -553,7 +662,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           insertContentSchema.parse(args);
 
         // Split content by double newlines to create separate nodes
-        // Single newlines within content are preserved
         const lines = content.split(/\n\n+/);
         const createdNodes: unknown[] = [];
 
@@ -570,6 +678,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        invalidateCache();
         return {
           content: [
             {
@@ -583,6 +692,162 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 null,
                 2
               ),
+            },
+          ],
+        };
+      }
+
+      case "find_insert_targets": {
+        const { query } = findInsertTargetsSchema.parse(args);
+        const allNodes = await getCachedNodes();
+        const queryLower = query.toLowerCase();
+
+        const matches = allNodes.filter(
+          (node) =>
+            node.name?.toLowerCase().includes(queryLower) ||
+            node.note?.toLowerCase().includes(queryLower)
+        );
+
+        const nodesWithPaths = buildNodePaths(matches);
+        const formatted = formatNodesForSelection(nodesWithPaths);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                formatted +
+                "\n\n---\nTo insert content, use insert_content with the ID of your chosen node, or use smart_insert with the selection number.",
+            },
+          ],
+        };
+      }
+
+      case "smart_insert": {
+        const { search_query, content, selection, position } =
+          smartInsertSchema.parse(args);
+        const allNodes = await getCachedNodes();
+        const queryLower = search_query.toLowerCase();
+
+        const matches = allNodes.filter(
+          (node) =>
+            node.name?.toLowerCase().includes(queryLower) ||
+            node.note?.toLowerCase().includes(queryLower)
+        );
+
+        if (matches.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No nodes found matching "${search_query}". Try a different search term or use get_children to browse the node structure.`,
+              },
+            ],
+          };
+        }
+
+        const nodesWithPaths = buildNodePaths(matches);
+
+        // If selection provided, use that node
+        if (selection !== undefined) {
+          if (selection < 1 || selection > matches.length) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Invalid selection ${selection}. Please choose a number between 1 and ${matches.length}.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          const targetNode = nodesWithPaths[selection - 1];
+          const lines = content.split(/\n\n+/);
+          const createdNodes: unknown[] = [];
+
+          for (const line of lines) {
+            if (line.trim()) {
+              const body: Record<string, unknown> = {
+                name: line.trim(),
+                parent_id: targetNode.id,
+              };
+              if (position) body.position = position;
+
+              const result = await workflowyRequest("/nodes", "POST", body);
+              createdNodes.push(result);
+            }
+          }
+
+          invalidateCache();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: true,
+                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+                    target_path: targetNode.path,
+                    nodes: createdNodes,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // If only one match, insert directly
+        if (matches.length === 1) {
+          const targetNode = nodesWithPaths[0];
+          const lines = content.split(/\n\n+/);
+          const createdNodes: unknown[] = [];
+
+          for (const line of lines) {
+            if (line.trim()) {
+              const body: Record<string, unknown> = {
+                name: line.trim(),
+                parent_id: targetNode.id,
+              };
+              if (position) body.position = position;
+
+              const result = await workflowyRequest("/nodes", "POST", body);
+              createdNodes.push(result);
+            }
+          }
+
+          invalidateCache();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: true,
+                    message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+                    target_path: targetNode.path,
+                    nodes: createdNodes,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Multiple matches - return options for user to select
+        const formatted = formatNodesForSelection(nodesWithPaths);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Multiple nodes match "${search_query}". Please select one:\n\n` +
+                formatted +
+                `\n\n---\nCall smart_insert again with the same search_query and content, plus selection: <number> to insert into your chosen node.`,
             },
           ],
         };
