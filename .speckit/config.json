@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "project": "workflowy-mcp-server",
+  "specsDir": "specs",
+  "constitution": "specs/constitution.md",
+  "specification": "specs/specification.md",
+  "implementationPlan": "specs/implementation-plan.md",
+  "tasks": "specs/tasks.md",
+  "agents": ["claude"],
+  "created": "2026-01-10",
+  "lastUpdated": "2026-01-10"
+}

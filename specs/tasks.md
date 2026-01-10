@@ -1,0 +1,207 @@
+# Tasks
+
+> Actionable work items derived from the specification and implementation plan.
+
+## Status Legend
+
+- [ ] Not started
+- [~] In progress
+- [x] Complete
+
+---
+
+## Phase 1: Foundation Compliance
+
+*Align current implementation with constitution requirements.*
+
+### Code Quality
+
+- [ ] **T-001**: Enable strict TypeScript mode
+  - Add `"strict": true` to tsconfig.json (already present)
+  - Audit for `any` types and eliminate
+  - Add explicit return types to all functions
+
+- [ ] **T-002**: Add JSDoc documentation
+  - Document all exported functions
+  - Document all tool schemas
+  - Document configuration options
+
+### Security Hardening
+
+- [ ] **T-003**: Implement secure logging
+  - Create sanitization utility for logs
+  - Ensure no API keys in any log output
+  - Ensure no user content in error messages
+
+- [ ] **T-004**: Add audit logging for destructive operations
+  - Log delete operations to stderr (no content, just node ID + timestamp)
+  - Log move operations
+
+### Error Handling
+
+- [ ] **T-005**: Implement retry logic with exponential backoff
+  - Create retry utility with configurable attempts
+  - Handle 429 (rate limit) with backoff
+  - Handle 5xx errors with retry
+  - Surface 4xx errors immediately
+
+- [ ] **T-006**: Improve error messages
+  - Map API errors to user-friendly messages
+  - Include suggested actions in error responses
+  - Never expose raw API errors to users
+
+---
+
+## Phase 2: Testing Infrastructure
+
+*Establish comprehensive test coverage per constitution.*
+
+### Setup
+
+- [ ] **T-007**: Configure test framework
+  - Add Jest or Vitest
+  - Configure TypeScript support
+  - Add coverage reporting
+
+### Unit Tests
+
+- [ ] **T-008**: Test indentation parser
+  - Spaces (2, 4 per level)
+  - Tabs
+  - Mixed indentation
+  - Empty lines
+  - Deep nesting (10+ levels)
+
+- [ ] **T-009**: Test path builder
+  - Root nodes
+  - Deeply nested nodes
+  - Nodes with long names (truncation)
+  - Missing parent references
+
+- [ ] **T-010**: Test cache utility
+  - TTL expiration
+  - Manual invalidation
+  - Concurrent access
+
+### Integration Tests
+
+- [ ] **T-011**: Test API client with mocks
+  - Successful responses
+  - Error responses (401, 404, 429, 500)
+  - Network failures
+  - Timeout handling
+
+- [ ] **T-012**: Test tool handlers end-to-end
+  - search_nodes
+  - smart_insert (single match, multiple matches, selection)
+  - insert_content (flat, hierarchical)
+  - CRUD operations
+
+---
+
+## Phase 3: Refactoring
+
+*Restructure code per implementation plan.*
+
+### Module Extraction
+
+- [ ] **T-013**: Extract API client module
+  - Move to `src/api/client.ts`
+  - Add types to `src/api/types.ts`
+  - Implement retry logic in `src/api/retry.ts`
+
+- [ ] **T-014**: Extract tool modules
+  - `src/tools/search.ts`
+  - `src/tools/navigation.ts`
+  - `src/tools/creation.ts`
+  - `src/tools/modification.ts`
+
+- [ ] **T-015**: Extract utility modules
+  - `src/utils/cache.ts`
+  - `src/utils/hierarchy.ts`
+  - `src/utils/paths.ts`
+
+### Configuration
+
+- [ ] **T-016**: Implement configurable settings
+  - Cache TTL (env: `WORKFLOWY_CACHE_TTL`)
+  - Retry attempts (env: `WORKFLOWY_RETRY_ATTEMPTS`)
+  - Rate limit behavior (env: `WORKFLOWY_RATE_LIMIT_MODE`)
+
+---
+
+## Phase 4: Documentation
+
+*Developer-focused documentation per constitution.*
+
+### Code Documentation
+
+- [x] **T-017**: README with setup instructions
+- [ ] **T-018**: Add CONTRIBUTING.md
+  - Development setup
+  - Code style guide
+  - PR process
+  - Testing requirements
+
+- [ ] **T-019**: Add CHANGELOG.md
+  - Document all releases
+  - Breaking changes highlighted
+  - Migration notes
+
+### Architecture Documentation
+
+- [ ] **T-020**: Document ADRs in specs/
+  - ADR-001: Local search strategy
+  - ADR-002: Hierarchical insertion
+  - ADR-003: Smart insert workflow
+  - ADR-004: Cache invalidation
+
+---
+
+## Phase 5: Reliability
+
+*Production-readiness improvements.*
+
+### Resilience
+
+- [ ] **T-021**: Implement graceful degradation
+  - Handle API unavailable state
+  - Return cached data with staleness warning
+  - Queue writes for retry (optional)
+
+- [ ] **T-022**: Add startup health check
+  - Verify API connectivity
+  - Validate credentials
+  - Warn on configuration issues
+
+### Observability
+
+- [ ] **T-023**: Add structured logging
+  - Log levels (error, warn, info, debug)
+  - Consistent format
+  - Timestamps
+
+---
+
+## Backlog
+
+*Future considerations, not committed.*
+
+- [ ] **B-001**: Batch operations for bulk updates
+- [ ] **B-002**: Template system for common patterns
+- [ ] **B-003**: Offline queue for unreachable API
+- [ ] **B-004**: Conflict detection for concurrent edits
+- [ ] **B-005**: Support for Workflowy mirrors/live copies
+
+---
+
+## Completed
+
+*Reference for done work.*
+
+- [x] **T-000**: Initial implementation
+  - Basic MCP server structure
+  - All core tools implemented
+  - Hierarchical insertion
+  - Smart insert workflow
+  - README documentation
