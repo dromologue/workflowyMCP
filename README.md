@@ -83,20 +83,63 @@ Quit and reopen Claude Desktop to load the MCP server.
 
 ## Available Tools
 
+### Search & Navigation
+
 | Tool | Description |
 |------|-------------|
-| `search_nodes` | Search for nodes by text in names and notes |
+| `search_nodes` | Search for nodes by text in names and notes. Returns full paths for easy identification. |
 | `get_node` | Retrieve a specific node by its ID |
 | `get_children` | List child nodes of a parent (or root-level nodes) |
+| `find_insert_targets` | Search for potential target nodes with numbered list for selection |
+| `list_targets` | List available shortcuts (inbox, user-defined) |
+| `export_all` | Export all nodes (rate limited: 1 request/minute) |
+
+### Content Management
+
+| Tool | Description |
+|------|-------------|
 | `create_node` | Create a new node with optional markdown formatting |
 | `update_node` | Edit a node's name and/or note |
 | `delete_node` | Permanently delete a node |
 | `move_node` | Move a node to a new parent location |
 | `complete_node` | Mark a node as completed |
 | `uncomplete_node` | Mark a node as incomplete |
-| `insert_content` | Insert Claude's generated content into a node |
-| `list_targets` | List available shortcuts (inbox, user-defined) |
-| `export_all` | Export all nodes (rate limited: 1 request/minute) |
+
+### Smart Insertion
+
+| Tool | Description |
+|------|-------------|
+| `smart_insert` | Search for a node and insert content with interactive selection |
+| `insert_content` | Insert content directly into a node by ID |
+
+## Smart Insert Workflow
+
+The `smart_insert` tool provides an interactive workflow for inserting content:
+
+1. **Single match**: If your search finds exactly one node, content is inserted immediately
+2. **Multiple matches**: Returns a numbered list with full paths for disambiguation
+3. **Selection**: Call again with the `selection` parameter to complete insertion
+
+Example interaction:
+```
+User: "Insert my meeting notes into the Projects node"
+
+Claude uses smart_insert with search_query="Projects"
+
+Response (multiple matches):
+[1] Work > Projects
+    ID: abc123
+[2] Personal > Side Projects
+    ID: def456
+[3] Archive > Old Projects
+    ID: ghi789
+
+User: "Use option 1"
+
+Claude uses smart_insert with selection=1
+
+Response: Inserted 3 node(s) into "Projects"
+```
 
 ## Usage Examples
 
@@ -105,17 +148,22 @@ Once configured, you can interact with Workflowy through Claude Desktop:
 **Search your outline:**
 > "Search my Workflowy for meeting notes"
 
+**Smart content insertion (recommended):**
+> "Summarize this article and add it to my Research node"
+
+Claude will search for "Research", show you matching nodes if there are multiple, and let you pick the right one.
+
 **Create new nodes:**
 > "Create a new node in my inbox called 'Weekly Review' with a note about tasks to review"
-
-**Insert AI-generated content:**
-> "Summarize this article and insert it into node [id]"
 
 **Manage tasks:**
 > "Mark the 'Send report' task as complete"
 
 **Navigate your outline:**
 > "Show me all the children of my Projects node"
+
+**Find where to insert:**
+> "Find nodes where I could add my book notes"
 
 ## Markdown Formatting
 
