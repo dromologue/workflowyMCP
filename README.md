@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server that integrates [Workflowy](https://workflowy.com) with Claude Desktop, enabling AI-powered management of your Workflowy outlines.
 
+> **Note**: This project also serves as a reference implementation of [GitHub's SpecKit](https://github.com/github/spec-kit) for spec-driven development. See [Spec-Driven Development](#spec-driven-development) below.
+
 ## Features
 
 - **Search** nodes by text across your entire Workflowy outline
@@ -223,6 +225,104 @@ This server uses the [Workflowy REST API](https://workflowy.com/api-reference/).
 - `DELETE /api/v1/nodes/:id` - Delete node
 - `GET /api/v1/nodes-export` - Export all nodes
 
+## Spec-Driven Development
+
+This project uses [GitHub's SpecKit](https://github.com/github/spec-kit) as a reference implementation of spec-driven development (SDD). SpecKit provides a structured methodology for building software with AI assistants by defining specifications upfront.
+
+### What is SpecKit?
+
+SpecKit transforms how we build software by putting specifications first. Instead of jumping straight into code, you:
+
+1. **Define** what you want (constitution, specification)
+2. **Plan** how to build it (implementation plan)
+3. **Track** what needs doing (tasks)
+4. **Implement** with AI assistance
+
+The specs become a "single source of truth" that AI coding assistants reference throughout development.
+
+### Spec Structure
+
+```
+specs/
+├── constitution.md        # Non-negotiable principles
+├── specification.md       # What the tool does
+├── implementation-plan.md # Technical approach & ADRs
+└── tasks.md              # Actionable work items
+```
+
+#### `constitution.md` - The Rules
+
+Defines non-negotiable principles that guide all decisions:
+
+- **Mission**: Core value proposition ("AI-native outlining")
+- **Quality standards**: TypeScript strictness, test coverage
+- **Security posture**: How credentials and data are handled
+- **Compatibility**: Versioning and breaking change policy
+- **Design philosophy**: Smart workflows vs atomic operations
+
+Example principle from this project:
+> "Paranoid Security: API keys and credentials never logged, even at debug level"
+
+#### `specification.md` - The What
+
+Documents what the tool does without prescribing how:
+
+- **User personas**: Who uses this and why
+- **Core capabilities**: Features organized by goal
+- **User flows**: Step-by-step interaction patterns
+- **Constraints**: API limits, scope boundaries
+- **Success criteria**: How to know if it's working
+
+#### `implementation-plan.md` - The How
+
+Technical decisions and architecture:
+
+- **Architecture diagrams**: System component layout
+- **Technology stack**: Runtime, language, dependencies
+- **Module structure**: Code organization
+- **ADRs**: Architecture Decision Records documenting key choices
+- **Error handling**: Strategy for failures
+- **Testing approach**: What and how to test
+
+Example ADR from this project:
+> **ADR-005: Bottom-Default Insertion Order**
+> Context: Workflowy's "top" position reverses multi-node content.
+> Decision: Default to "bottom", apply "top" only to first node.
+
+#### `tasks.md` - The Work
+
+Actionable items derived from the spec:
+
+- **Phased approach**: Foundation → Testing → Refactoring → Docs → Reliability
+- **Task states**: `[ ]` pending, `[~]` in progress, `[x]` complete
+- **Backlog**: Future considerations not yet committed
+- **Completed**: Reference for done work
+
+### Benefits of This Approach
+
+1. **Living documentation**: Specs evolve with the code
+2. **AI context**: Assistants reference specs for consistent decisions
+3. **Onboarding**: New contributors understand design rationale
+4. **Traceability**: Link tasks → specs → implementation
+
+### Using SpecKit with Claude
+
+When working with Claude on this project:
+
+```
+"Before implementing, check specs/constitution.md for project principles"
+"Reference specs/implementation-plan.md for the ADR on caching"
+"Update specs/tasks.md to mark T-005 as complete"
+```
+
+The specs act as persistent memory across conversations.
+
+### Learn More
+
+- [SpecKit Repository](https://github.com/github/spec-kit)
+- [Spec-Driven Development Guide](https://github.com/github/spec-kit/blob/main/spec-driven.md)
+- [This project's specs](./specs/)
+
 ## License
 
 MIT
@@ -231,7 +331,12 @@ MIT
 
 Contributions are welcome! Please open an issue or submit a pull request.
 
+Before contributing, review:
+- `specs/constitution.md` for project principles
+- `specs/tasks.md` for open work items
+
 ## Acknowledgments
 
 - [Anthropic](https://anthropic.com) for Claude and the MCP protocol
 - [Workflowy](https://workflowy.com) for the outliner and API
+- [GitHub](https://github.com) for SpecKit and the spec-driven methodology
