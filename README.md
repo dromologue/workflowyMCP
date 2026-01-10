@@ -104,8 +104,15 @@ Quit and reopen Claude Desktop to load the MCP server.
 | `update_node` | Edit a node's name and/or note |
 | `delete_node` | Permanently delete a node |
 | `move_node` | Move a node to a new parent location |
-| `complete_node` | Mark a node as completed |
-| `uncomplete_node` | Mark a node as incomplete |
+
+### Todo Management
+
+| Tool | Description |
+|------|-------------|
+| `create_todo` | Create a checkbox todo item with optional initial completion state |
+| `list_todos` | List all todos with filtering by status, parent, and search text |
+| `complete_node` | Mark a todo (or any node) as completed |
+| `uncomplete_node` | Mark a todo (or any node) as incomplete |
 
 ### Smart Insertion
 
@@ -158,8 +165,17 @@ Claude will search for "Research", show you matching nodes if there are multiple
 **Create new nodes:**
 > "Create a new node in my inbox called 'Weekly Review' with a note about tasks to review"
 
-**Manage tasks:**
+**Create todos:**
+> "Add a todo to my inbox: Review Q4 budget proposal"
+
+**List pending tasks:**
+> "Show me all my incomplete todos"
+
+**Complete a task:**
 > "Mark the 'Send report' task as complete"
+
+**Filter todos by location:**
+> "List all todos under my Work Projects node"
 
 **Navigate your outline:**
 > "Show me all the children of my Projects node"

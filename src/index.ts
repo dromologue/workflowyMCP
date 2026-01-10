@@ -261,6 +261,40 @@ const uncompleteNodeSchema = z.object({
   node_id: z.string().describe("The ID of the node to mark as incomplete"),
 });
 
+const createTodoSchema = z.object({
+  name: z.string().describe("The text content of the todo item"),
+  note: z.string().optional().describe("Optional note for the todo"),
+  parent_id: z
+    .string()
+    .optional()
+    .describe(
+      'Parent node ID, target key (e.g., "inbox"), or omit for root level'
+    ),
+  completed: z
+    .boolean()
+    .optional()
+    .describe("Whether the todo starts as completed (default: false)"),
+  position: z
+    .enum(["top", "bottom"])
+    .optional()
+    .describe("Position relative to siblings (default: bottom)"),
+});
+
+const listTodosSchema = z.object({
+  parent_id: z
+    .string()
+    .optional()
+    .describe("Filter to todos under a specific parent node"),
+  status: z
+    .enum(["all", "pending", "completed"])
+    .optional()
+    .describe("Filter by completion status (default: all)"),
+  query: z
+    .string()
+    .optional()
+    .describe("Optional text to search for within todos"),
+});
+
 const insertContentSchema = z.object({
   parent_id: z
     .string()
@@ -478,6 +512,63 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["node_id"],
+        },
+      },
+      {
+        name: "create_todo",
+        description:
+          "Create a new todo item in Workflowy. Todo items have a checkbox and can be marked complete/incomplete.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "The text content of the todo item",
+            },
+            note: {
+              type: "string",
+              description: "Optional note for the todo",
+            },
+            parent_id: {
+              type: "string",
+              description:
+                'Parent node ID, target key (e.g., "inbox"), or omit for root level',
+            },
+            completed: {
+              type: "boolean",
+              description:
+                "Whether the todo starts as completed (default: false)",
+            },
+            position: {
+              type: "string",
+              enum: ["top", "bottom"],
+              description: "Position relative to siblings (default: bottom)",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "list_todos",
+        description:
+          "List all todo items in Workflowy. Can filter by parent, completion status, and search text.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            parent_id: {
+              type: "string",
+              description: "Filter to todos under a specific parent node",
+            },
+            status: {
+              type: "string",
+              enum: ["all", "pending", "completed"],
+              description: "Filter by completion status (default: all)",
+            },
+            query: {
+              type: "string",
+              description: "Optional text to search for within todos",
+            },
+          },
         },
       },
       {
@@ -740,6 +831,136 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: JSON.stringify({ success: true, node: result }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "create_todo": {
+        const { name: todoName, note, parent_id, completed, position } =
+          createTodoSchema.parse(args);
+
+        // Create todo using markdown syntax: - [ ] for uncompleted, - [x] for completed
+        const todoPrefix = completed ? "- [x] " : "- [ ] ";
+        const body: Record<string, unknown> = {
+          name: todoPrefix + todoName,
+        };
+        if (note) body.note = note;
+        if (parent_id) body.parent_id = parent_id;
+        body.position = position || "bottom";
+
+        const result = (await workflowyRequest("/nodes", "POST", body)) as CreatedNode;
+
+        // If marked as completed, also call the complete endpoint
+        if (completed) {
+          await workflowyRequest(`/nodes/${result.id}/complete`, "POST");
+        }
+
+        invalidateCache();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: `Created todo: "${todoName}"${completed ? " (completed)" : ""}`,
+                  todo: result,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "list_todos": {
+        const { parent_id, status, query } = listTodosSchema.parse(args);
+        const allNodes = await getCachedNodes();
+
+        // Filter for todo items (those with layoutMode "todo" or using checkbox syntax)
+        let todos = allNodes.filter((node) => {
+          // Check for todo layoutMode or checkbox markdown syntax
+          const isTodo =
+            node.layoutMode === "todo" ||
+            node.name?.startsWith("- [ ] ") ||
+            node.name?.startsWith("- [x] ");
+          return isTodo;
+        });
+
+        // Filter by parent if specified
+        if (parent_id) {
+          // Get all descendant IDs of the parent
+          const descendantIds = new Set<string>();
+          const findDescendants = (pid: string) => {
+            allNodes.forEach((n) => {
+              if (n.parent_id === pid) {
+                descendantIds.add(n.id);
+                findDescendants(n.id);
+              }
+            });
+          };
+          descendantIds.add(parent_id);
+          findDescendants(parent_id);
+          todos = todos.filter((t) => t.parent_id && descendantIds.has(t.parent_id));
+        }
+
+        // Filter by completion status
+        if (status && status !== "all") {
+          todos = todos.filter((t) => {
+            const isCompleted =
+              t.completedAt !== undefined ||
+              t.name?.startsWith("- [x] ");
+            return status === "completed" ? isCompleted : !isCompleted;
+          });
+        }
+
+        // Filter by query if specified
+        if (query) {
+          const queryLower = query.toLowerCase();
+          todos = todos.filter(
+            (t) =>
+              t.name?.toLowerCase().includes(queryLower) ||
+              t.note?.toLowerCase().includes(queryLower)
+          );
+        }
+
+        // Build paths for better identification
+        const todosWithPaths = buildNodePaths(todos);
+
+        // Format output
+        const formattedTodos = todosWithPaths.map((t) => {
+          const isCompleted =
+            t.completedAt !== undefined || t.name?.startsWith("- [x] ");
+          // Clean up the name for display (remove checkbox syntax)
+          const cleanName = t.name
+            ?.replace(/^- \[[ x]\] /, "")
+            .trim();
+          return {
+            id: t.id,
+            name: cleanName,
+            note: t.note,
+            completed: isCompleted,
+            path: t.path,
+            completedAt: t.completedAt,
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  total: formattedTodos.length,
+                  pending: formattedTodos.filter((t) => !t.completed).length,
+                  completed: formattedTodos.filter((t) => t.completed).length,
+                  todos: formattedTodos,
+                },
+                null,
+                2
+              ),
             },
           ],
         };

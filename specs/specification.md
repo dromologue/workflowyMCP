@@ -65,7 +65,28 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 
 **Success criteria**: Claude-generated content appears in Workflowy with correct structure and order.
 
-### 4. Content Modification
+### 4. Todo Management
+
+**Goal**: Create and manage task lists within Workflowy.
+
+| Feature | Description |
+|---------|-------------|
+| Create todo | Create a checkbox item with optional initial completion state |
+| List todos | Retrieve all todos with filtering by status, parent, search |
+| Complete/Uncomplete | Toggle completion status of any node |
+
+**Todo identification**:
+- Nodes with `layoutMode: "todo"`
+- Nodes using markdown checkbox syntax (`- [ ]` or `- [x]`)
+
+**Filtering options**:
+- `status`: "all", "pending", or "completed"
+- `parent_id`: Scope to todos under a specific node
+- `query`: Text search within todo names/notes
+
+**Success criteria**: Full task management workflow without leaving Claude.
+
+### 5. Content Modification
 
 **Goal**: Update existing nodes.
 

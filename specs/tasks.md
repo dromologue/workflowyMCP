@@ -212,3 +212,9 @@
   - "top" only applies to first top-level node
   - Hierarchical content maintains parent-child relationships
   - ADR-005 documented
+
+- [x] **T-025**: Add todo management tools
+  - `create_todo`: Create checkbox items with completion state
+  - `list_todos`: Filter by status, parent, search query
+  - Works with existing `complete_node`/`uncomplete_node`
+  - Detects todos by layoutMode or markdown checkbox syntax
