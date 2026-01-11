@@ -120,7 +120,7 @@ Quit and reopen Claude Desktop to load the MCP server.
 |------|-------------|
 | `find_related` | Find nodes related to a given node based on keyword analysis |
 | `create_links` | Create internal links from a node to related content in the knowledge base |
-| `generate_concept_map` | Generate a visual concept map with configurable search scope and insert directly into Workflowy via Dropbox |
+| `generate_concept_map` | Generate a visual concept map PNG/JPEG with configurable search scope (saved to Downloads) |
 
 ### Smart Insertion
 
@@ -233,67 +233,6 @@ When creating nodes, you can use markdown formatting:
 ### Rate limiting
 
 The `export_all` tool is rate limited to 1 request per minute by Workflowy's API. Use `search_nodes` for frequent queries instead.
-
-## Dropbox Configuration (Optional)
-
-To insert concept map images directly into Workflowy, configure Dropbox for image hosting. This is a one-time setup.
-
-### Step 1: Create a Dropbox App
-
-1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Click **Create app** → Choose **Scoped access** → Choose **Full Dropbox**
-3. Name it anything (e.g., "Workflowy Concept Maps") → Click **Create app**
-4. On the app page, copy your **App key** and **App secret**
-
-### Step 2: Set Permissions
-
-1. Go to the **Permissions** tab
-2. Check: `files.content.write` and `sharing.write`
-3. Click **Submit**
-
-### Step 3: Get Your Authorization Code
-
-Open this URL in your browser (replace `YOUR_APP_KEY` with your actual app key):
-
-```
-https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
-```
-
-Click **Allow**. Dropbox will show you a **code** - copy it.
-
-### Step 4: Exchange Code for Refresh Token
-
-Run this command in Terminal (replace the THREE placeholders):
-
-```bash
-curl -X POST https://api.dropbox.com/oauth2/token \
-  -d code=PASTE_YOUR_CODE_HERE \
-  -d grant_type=authorization_code \
-  -d client_id=YOUR_APP_KEY \
-  -d client_secret=YOUR_APP_SECRET
-```
-
-You'll get a JSON response. Find the `"refresh_token"` value - it looks like:
-```
-"refresh_token": "xxxxxxxxxxxxAAAAAAAAAxxxxxxxxxxxxxxxxxxxxxxx"
-```
-
-### Step 5: Add to .env
-
-Add these three lines to your `.env` file:
-
-```bash
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=paste-the-refresh-token-from-step-4
-```
-
-### Step 6: Test
-
-Restart Claude Desktop and try:
-> "Create a concept map for my Research node and insert it there"
-
-Concept map images will be stored in `/workflowy/conceptMaps/` in your Dropbox.
 
 ## Concept Map Scope Options
 

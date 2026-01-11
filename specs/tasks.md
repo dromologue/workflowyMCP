@@ -255,3 +255,10 @@
   - Filter nodes before keyword matching
   - Default scope: all (entire Workflowy)
   - Scope included in response and inserted node note
+
+- [x] **T-031**: Simplify concept map to local-only
+  - Remove Dropbox integration (external dependency overhead)
+  - Increase resolution to 2400px width, 300 DPI
+  - Add defensive checks for scope filtering (Array.isArray, depth limits)
+  - Fix allNodes.find error (API returns {nodes:[]} not array)
+  - Simplified output: saves directly to ~/Downloads/

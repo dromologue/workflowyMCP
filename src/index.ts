@@ -20,166 +20,9 @@ dotenv.config({ path: path.join(__dirname, "..", ".env") });
 const WORKFLOWY_API_KEY = process.env.WORKFLOWY_API_KEY;
 const WORKFLOWY_BASE_URL = "https://workflowy.com/api/v1";
 
-// Dropbox configuration
-const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
-const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
-const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
-
 if (!WORKFLOWY_API_KEY) {
   console.error("Error: WORKFLOWY_API_KEY environment variable is not set");
   process.exit(1);
-}
-
-// Dropbox API integration
-interface DropboxTokenResponse {
-  access_token: string;
-  token_type: string;
-  expires_in: number;
-}
-
-interface DropboxUploadResponse {
-  id: string;
-  name: string;
-  path_display: string;
-}
-
-interface DropboxShareResponse {
-  url: string;
-}
-
-// Cache for Dropbox access token
-let dropboxAccessToken: string | null = null;
-let dropboxTokenExpiry: number = 0;
-
-async function getDropboxAccessToken(): Promise<string | null> {
-  if (!DROPBOX_APP_KEY || !DROPBOX_APP_SECRET || !DROPBOX_REFRESH_TOKEN) {
-    return null;
-  }
-
-  // Return cached token if still valid (with 5 min buffer)
-  if (dropboxAccessToken && Date.now() < dropboxTokenExpiry - 300000) {
-    return dropboxAccessToken;
-  }
-
-  try {
-    const response = await fetch("https://api.dropbox.com/oauth2/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: DROPBOX_REFRESH_TOKEN,
-        client_id: DROPBOX_APP_KEY,
-        client_secret: DROPBOX_APP_SECRET,
-      }),
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const data = await response.json() as DropboxTokenResponse;
-    dropboxAccessToken = data.access_token;
-    dropboxTokenExpiry = Date.now() + (data.expires_in * 1000);
-    return dropboxAccessToken;
-  } catch {
-    return null;
-  }
-}
-
-async function uploadToDropbox(
-  imageBuffer: Buffer,
-  filename: string
-): Promise<{ success: boolean; url?: string; error?: string }> {
-  const accessToken = await getDropboxAccessToken();
-
-  if (!accessToken) {
-    return {
-      success: false,
-      error: "Dropbox not configured. See README for setup instructions.",
-    };
-  }
-
-  try {
-    // Upload file to Dropbox
-    const uploadPath = `/workflowy/conceptMaps/${filename}`;
-
-    const uploadResponse = await fetch("https://content.dropboxapi.com/2/files/upload", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/octet-stream",
-        "Dropbox-API-Arg": JSON.stringify({
-          path: uploadPath,
-          mode: "overwrite",
-          autorename: true,
-        }),
-      },
-      body: new Uint8Array(imageBuffer),
-    });
-
-    if (!uploadResponse.ok) {
-      const errorText = await uploadResponse.text();
-      return { success: false, error: `Upload failed: ${errorText}` };
-    }
-
-    const uploadResult = await uploadResponse.json() as DropboxUploadResponse;
-
-    // Create shareable link
-    const shareResponse = await fetch("https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        path: uploadResult.path_display,
-        settings: {
-          requested_visibility: "public",
-        },
-      }),
-    });
-
-    let shareUrl: string;
-
-    if (shareResponse.ok) {
-      const shareResult = await shareResponse.json() as DropboxShareResponse;
-      // Convert share URL to direct link (dl=1 instead of dl=0)
-      shareUrl = shareResult.url.replace("www.dropbox.com", "dl.dropboxusercontent.com").replace("?dl=0", "");
-    } else {
-      // Link might already exist, try to get existing link
-      const listResponse = await fetch("https://api.dropboxapi.com/2/sharing/list_shared_links", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          path: uploadResult.path_display,
-          direct_only: true,
-        }),
-      });
-
-      if (!listResponse.ok) {
-        return { success: false, error: "Failed to create shareable link" };
-      }
-
-      const listResult = await listResponse.json() as { links: DropboxShareResponse[] };
-      if (listResult.links && listResult.links.length > 0) {
-        shareUrl = listResult.links[0].url.replace("www.dropbox.com", "dl.dropboxusercontent.com").replace("?dl=0", "");
-      } else {
-        return { success: false, error: "Failed to get shareable link" };
-      }
-    }
-
-    return { success: true, url: shareUrl };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
 }
 
 // Workflowy API helper functions
@@ -413,6 +256,11 @@ function filterNodesByScope(
   allNodes: WorkflowyNode[],
   scope: ConceptMapScope
 ): WorkflowyNode[] {
+  // Defensive check: ensure allNodes is an array
+  if (!Array.isArray(allNodes)) {
+    return [];
+  }
+
   switch (scope) {
     case "this_node":
       // Only the source node itself (no related nodes possible)
@@ -421,11 +269,13 @@ function filterNodesByScope(
     case "children": {
       // Source node and all its descendants
       const childIds = new Set<string>();
-      const findChildren = (parentId: string) => {
+      const findChildren = (parentId: string, depth: number = 0) => {
+        // Prevent infinite recursion
+        if (depth > 100) return;
         for (const node of allNodes) {
-          if (node.parent_id === parentId) {
+          if (node.parent_id === parentId && !childIds.has(node.id)) {
             childIds.add(node.id);
-            findChildren(node.id);
+            findChildren(node.id, depth + 1);
           }
         }
       };
@@ -450,10 +300,12 @@ function filterNodesByScope(
       // Walk up the parent chain
       const ancestorIds = new Set<string>();
       let currentId = sourceNode.parent_id;
-      while (currentId) {
+      let depth = 0;
+      while (currentId && depth < 100) {
         ancestorIds.add(currentId);
         const parent = allNodes.find((n) => n.id === currentId);
         currentId = parent?.parent_id;
+        depth++;
       }
       return allNodes.filter((n) => ancestorIds.has(n.id));
     }
@@ -669,15 +521,15 @@ async function generateConceptMapImage(
     // Render to SVG
     const svg = graphviz.dot(dot, "svg");
 
-    // Convert SVG to PNG/JPEG using sharp
-    const imageBuffer = await sharp(Buffer.from(svg))
-      .resize(1200, null, {
+    // Convert SVG to PNG/JPEG using sharp at high resolution
+    const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
+      .resize(2400, null, {
         fit: "inside",
         withoutEnlargement: false,
       })
       .flatten({ background: "#ffffff" })
       [format]({
-        quality: format === "jpeg" ? 90 : undefined,
+        quality: format === "jpeg" ? 95 : undefined,
       })
       .toBuffer();
 
@@ -869,23 +721,15 @@ const generateConceptMapSchema = z.object({
   scope: z
     .enum(["this_node", "children", "siblings", "ancestors", "all"])
     .optional()
-    .describe("Search scope: 'this_node' (only this node), 'children' (node and its children), 'siblings' (node and its peers), 'ancestors' (node and its parent chain), 'all' (entire Workflowy). Default: 'all'"),
+    .describe("Search scope: 'children' (descendants only), 'siblings' (peer nodes), 'ancestors' (parent chain), 'all' (entire Workflowy). Default: 'all'"),
   max_related: z
     .number()
     .optional()
-    .describe("Maximum number of related nodes to include in the map (default: 10)"),
-  insert_into: z
-    .string()
-    .optional()
-    .describe("Parent node ID to insert the concept map image into. Uploads to Dropbox and creates a node with the image. Requires Dropbox configuration."),
-  save_locally: z
-    .boolean()
-    .optional()
-    .describe("Also save the image locally (default: true if insert_into not provided, false otherwise)"),
+    .describe("Maximum number of related nodes to include in the map (default: 15)"),
   output_path: z
     .string()
     .optional()
-    .describe("Local output file path when saving locally. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
+    .describe("Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
   format: z
     .enum(["png", "jpeg"])
     .optional()
@@ -1235,7 +1079,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "generate_concept_map",
         description:
-          "Generate a visual concept map showing conceptual links between a node and related content. Searches within a specified scope and can insert directly into Workflowy via Dropbox.",
+          "Generate a visual concept map showing conceptual links between a node and related content. Saves a high-resolution PNG/JPEG to Downloads that can be dragged into Workflowy.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1245,29 +1089,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             scope: {
               type: "string",
-              enum: ["this_node", "children", "siblings", "ancestors", "all"],
+              enum: ["children", "siblings", "ancestors", "all"],
               description:
-                "Search scope: 'this_node' (only this node), 'children' (node's descendants), 'siblings' (peer nodes), 'ancestors' (parent chain), 'all' (entire Workflowy). Default: 'all'",
+                "Search scope: 'children' (descendants), 'siblings' (peer nodes), 'ancestors' (parent chain), 'all' (entire Workflowy). Default: 'all'",
             },
             max_related: {
               type: "number",
               description:
-                "Maximum number of related nodes to include in the map (default: 10)",
-            },
-            insert_into: {
-              type: "string",
-              description:
-                "Parent node ID to insert the concept map into. Uploads to Dropbox and creates a node with the image. Requires Dropbox configuration.",
-            },
-            save_locally: {
-              type: "boolean",
-              description:
-                "Also save the image locally (default: true if insert_into not provided)",
+                "Maximum number of related nodes to include (default: 15)",
             },
             output_path: {
               type: "string",
               description:
-                "Local output file path when saving locally. Defaults to ~/Downloads/concept-map-{timestamp}.png",
+                "Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png",
             },
             format: {
               type: "string",
@@ -1869,9 +1703,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "generate_concept_map": {
-        const { node_id, scope, max_related, insert_into, save_locally, output_path, format, title } =
+        const { node_id, scope, max_related, output_path, format, title } =
           generateConceptMapSchema.parse(args);
         const allNodes = await getCachedNodes();
+
+        // Defensive check
+        if (!Array.isArray(allNodes) || allNodes.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: Could not retrieve nodes from Workflowy",
+              },
+            ],
+            isError: true,
+          };
+        }
 
         // Find the source node
         const sourceNode = allNodes.find((n) => n.id === node_id);
@@ -1894,8 +1741,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Find related nodes within the scoped set
         const { keywords, relatedNodes } = await findRelatedNodes(
           sourceNode,
-          scopedNodes,
-          max_related || 10
+          scopedNodes.length > 0 ? scopedNodes : allNodes.filter(n => n.id !== sourceNode.id),
+          max_related || 15
         );
 
         if (relatedNodes.length === 0) {
@@ -1906,8 +1753,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 text: JSON.stringify(
                   {
                     success: false,
-                    message: "No related nodes found. Cannot generate concept map for a node with no connections.",
+                    message: "No related nodes found. The node may not have enough content to find conceptual links.",
                     keywords_extracted: keywords,
+                    scope_used: searchScope,
+                    nodes_in_scope: scopedNodes.length,
                   },
                   null,
                   2
@@ -1949,112 +1798,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Response data to build
-        const responseData: Record<string, unknown> = {
-          success: true,
-          format: imageFormat,
-          scope: searchScope,
-          center_node: {
-            id: sourceNode.id,
-            name: sourceNode.name,
-          },
-          keywords_used: keywords,
-          related_nodes_count: relatedNodes.length,
-          related_nodes: relatedNodes.map((n) => ({
-            id: n.id,
-            name: n.name,
-            relevance: n.relevanceScore,
-          })),
-        };
+        // Save to file
+        const timestamp = Date.now();
+        const defaultPath = path.join(
+          process.env.HOME || "/tmp",
+          "Downloads",
+          `concept-map-${timestamp}.${imageFormat}`
+        );
+        const finalPath = output_path || defaultPath;
 
-        // Determine if we should save locally
-        const shouldSaveLocally = save_locally ?? !insert_into;
-
-        if (shouldSaveLocally) {
-          const timestamp = Date.now();
-          const defaultPath = path.join(
-            process.env.HOME || "/tmp",
-            "Downloads",
-            `concept-map-${timestamp}.${imageFormat}`
-          );
-          const finalPath = output_path || defaultPath;
-
-          // Ensure directory exists
-          const dir = path.dirname(finalPath);
-          if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-          }
-
-          fs.writeFileSync(finalPath, result.buffer);
-          responseData.local_path = finalPath;
+        // Ensure directory exists
+        const dir = path.dirname(finalPath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
         }
 
-        // If insert_into is provided, upload to Dropbox and create node in Workflowy
-        if (insert_into) {
-          const timestamp = Date.now();
-          const filename = `concept-map-${sourceNode.id}-${timestamp}.${imageFormat}`;
-          const uploadResult = await uploadToDropbox(result.buffer, filename);
-
-          if (!uploadResult.success) {
-            // If upload fails but we saved locally, report partial success
-            if (shouldSaveLocally) {
-              responseData.message = `Concept map saved locally. Dropbox upload failed: ${uploadResult.error}`;
-              responseData.upload_error = uploadResult.error;
-            } else {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify(
-                      {
-                        success: false,
-                        message: `Failed to upload image: ${uploadResult.error}`,
-                        hint: "Configure Dropbox in your .env file. See README for setup instructions.",
-                      },
-                      null,
-                      2
-                    ),
-                  },
-                ],
-                isError: true,
-              };
-            }
-          } else {
-            // Create a node in Workflowy with the image
-            const imageUrl = uploadResult.url!;
-            const nodeName = `📊 ${mapTitle}`;
-            const nodeNote = `![${mapTitle}](${imageUrl})\n\nScope: ${searchScope}\nRelated nodes: ${relatedNodes.map(n => n.name).join(", ")}`;
-
-            const createdNode = await workflowyRequest("/nodes", "POST", {
-              name: nodeName,
-              note: nodeNote,
-              parent_id: insert_into,
-              position: "top",
-            }) as { id: string; name: string };
-
-            invalidateCache();
-
-            responseData.message = "Concept map generated and inserted into Workflowy";
-            responseData.image_url = imageUrl;
-            responseData.dropbox_path = `/workflowy/conceptMaps/${filename}`;
-            responseData.workflowy_node = {
-              id: createdNode.id,
-              name: nodeName,
-              parent_id: insert_into,
-            };
-          }
-        } else {
-          responseData.message = "Concept map generated successfully";
-          if (!DROPBOX_REFRESH_TOKEN) {
-            responseData.hint = "To insert directly into Workflowy, configure Dropbox in your .env file and use the insert_into parameter. See README for setup instructions.";
-          }
-        }
+        fs.writeFileSync(finalPath, result.buffer);
 
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(responseData, null, 2),
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: "Concept map generated successfully",
+                  file_path: finalPath,
+                  format: imageFormat,
+                  scope: searchScope,
+                  center_node: {
+                    id: sourceNode.id,
+                    name: sourceNode.name,
+                  },
+                  keywords_used: keywords,
+                  related_nodes_count: relatedNodes.length,
+                  related_nodes: relatedNodes.map((n) => ({
+                    id: n.id,
+                    name: n.name,
+                    relevance: n.relevanceScore,
+                    matched_keywords: n.matchedKeywords,
+                  })),
+                  tip: "Drag and drop the image file into Workflowy to insert it.",
+                },
+                null,
+                2
+              ),
             },
           ],
         };
