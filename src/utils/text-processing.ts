@@ -50,13 +50,25 @@ export function formatNodesForSelection(nodes: NodeWithPath[]): string {
 
 /**
  * Escape special characters for Graphviz DOT format
+ * Handles Unicode characters (accents, umlauts) safely
  */
 export function escapeForDot(str: string): string {
-  return str
+  // First escape special characters that DOT requires
+  let escaped = str
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/\n/g, "\\n")
-    .substring(0, 40); // Truncate for readability
+    .replace(/\r/g, "")
+    .replace(/[<>{}|]/g, ""); // Remove DOT special chars that could break parsing
+
+  // Truncate to 40 characters using Array.from to respect Unicode boundaries
+  // This prevents breaking multi-byte characters (é, ü, ö, etc.)
+  const chars = Array.from(escaped);
+  if (chars.length > 40) {
+    escaped = chars.slice(0, 37).join("") + "...";
+  }
+
+  return escaped;
 }
 
 /**
@@ -65,4 +77,46 @@ export function escapeForDot(str: string): string {
 export function generateWorkflowyLink(nodeId: string, nodeName: string): string {
   const cleanName = (nodeName || "Untitled").substring(0, 50);
   return `[${cleanName}](https://workflowy.com/#/${nodeId})`;
+}
+
+/**
+ * Concept map configuration constants
+ */
+export const CONCEPT_MAP_LIMITS = {
+  MIN_CONCEPTS: 2,
+  MAX_CONCEPTS: 35,
+  MAX_LABEL_LENGTH: 40,
+  IMAGE_SIZE: 2000,  // Square dimensions (2000x2000)
+} as const;
+
+/**
+ * Validate concept map input parameters
+ * Returns null if valid, or an error object if invalid
+ */
+export function validateConceptMapInput(concepts: string[] | undefined): {
+  valid: false;
+  error: string;
+  tip: string;
+  provided?: number;
+  maximum?: number;
+} | { valid: true } {
+  if (!concepts || concepts.length < CONCEPT_MAP_LIMITS.MIN_CONCEPTS) {
+    return {
+      valid: false,
+      error: `Please provide at least ${CONCEPT_MAP_LIMITS.MIN_CONCEPTS} concepts. Concepts become the nodes in the map, connected based on relationships found in your content.`,
+      tip: "Example: concepts: ['phenomenology', 'pragmatism', 'experience', 'being'] - the core concept will be at the center, with others arranged hierarchically.",
+    };
+  }
+
+  if (concepts.length > CONCEPT_MAP_LIMITS.MAX_CONCEPTS) {
+    return {
+      valid: false,
+      error: `Too many concepts: ${concepts.length} provided, maximum is ${CONCEPT_MAP_LIMITS.MAX_CONCEPTS}. Large graphs become unreadable and may fail to render.`,
+      tip: "Split into multiple focused concept maps, or select the most important concepts. Consider grouping related concepts under broader themes.",
+      provided: concepts.length,
+      maximum: CONCEPT_MAP_LIMITS.MAX_CONCEPTS,
+    };
+  }
+
+  return { valid: true };
 }

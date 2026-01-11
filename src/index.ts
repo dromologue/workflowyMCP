@@ -39,6 +39,8 @@ import {
   formatNodesForSelection,
   escapeForDot,
   generateWorkflowyLink,
+  validateConceptMapInput,
+  CONCEPT_MAP_LIMITS,
 } from "./utils/text-processing.js";
 import {
   extractKeywords,
@@ -264,10 +266,13 @@ function generateHierarchicalConceptMap(
 ): string {
   const lines: string[] = [
     "digraph ConceptMap {",
+    '  charset="UTF-8";',  // Ensure proper handling of accented characters
     '  rankdir=TB;',
-    '  splines=ortho;',
-    '  nodesep=0.8;',
-    '  ranksep=1.0;',
+    '  splines=polyline;',  // More compact than ortho
+    '  nodesep=0.6;',
+    '  ranksep=0.8;',
+    '  ratio="compress";',  // Compress to more square aspect ratio
+    '  size="12,12";',      // Target square dimensions
     '  bgcolor="white";',
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
@@ -376,7 +381,10 @@ function generateDotGraph(
 ): string {
   const lines: string[] = [
     "digraph ConceptMap {",
+    '  charset="UTF-8";',  // Ensure proper handling of accented characters
     '  rankdir=LR;',
+    '  ratio="compress";',  // Compress to more square aspect ratio
+    '  size="12,12";',      // Target square dimensions
     '  bgcolor="white";',
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
@@ -441,8 +449,8 @@ async function generateConceptMapImage(
     const svg = graphviz.dot(dotGraph, "svg");
 
     const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-      .resize(2400, null, {
-        fit: "inside",
+      .resize(2000, 2000, {
+        fit: "inside",        // Fit within square bounds
         withoutEnlargement: false,
       })
       .flatten({ background: "#ffffff" })
@@ -473,8 +481,8 @@ async function generateHierarchicalConceptMapImage(
     const svg = graphviz.dot(dotGraph, "svg");
 
     const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-      .resize(2400, null, {
-        fit: "inside",
+      .resize(2000, 2000, {
+        fit: "inside",        // Fit within square bounds
         withoutEnlargement: false,
       })
       .flatten({ background: "#ffffff" })
@@ -1182,15 +1190,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      // Concepts are required - they become the nodes in the concept map
-      if (!concepts || concepts.length < 2) {
+      // Validate concepts input (min/max limits)
+      const validation = validateConceptMapInput(concepts);
+      if (!validation.valid) {
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
               success: false,
-              message: "Please provide at least 2 concepts. Concepts become the nodes in the map, connected based on relationships found in your content.",
-              tip: "Example: concepts: ['phenomenology', 'pragmatism', 'experience', 'being'] - the core concept will be at the center, with others arranged hierarchically.",
+              message: validation.error,
+              tip: validation.tip,
+              ...(validation.provided !== undefined && { provided: validation.provided }),
+              ...(validation.maximum !== undefined && { maximum: validation.maximum }),
             }, null, 2),
           }],
         };

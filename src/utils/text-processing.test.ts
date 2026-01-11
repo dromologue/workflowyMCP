@@ -4,6 +4,8 @@ import {
   formatNodesForSelection,
   escapeForDot,
   generateWorkflowyLink,
+  validateConceptMapInput,
+  CONCEPT_MAP_LIMITS,
 } from "./text-processing.js";
 import type { NodeWithPath } from "../types/index.js";
 
@@ -118,6 +120,26 @@ describe("escapeForDot", () => {
     const longString = "a".repeat(50);
     expect(escapeForDot(longString).length).toBe(40);
   });
+
+  it("preserves Unicode characters (accents, umlauts)", () => {
+    expect(escapeForDot("Détournement")).toBe("Détournement");
+    expect(escapeForDot("Übermensch")).toBe("Übermensch");
+    expect(escapeForDot("phénoménologie")).toBe("phénoménologie");
+  });
+
+  it("safely truncates strings with Unicode characters", () => {
+    // 45 characters with accents - should truncate to 37 + "..."
+    const unicodeString = "é".repeat(45);
+    const result = escapeForDot(unicodeString);
+    expect(result.length).toBe(40);
+    expect(result.endsWith("...")).toBe(true);
+    // Should not have broken characters
+    expect(result).not.toContain("\uFFFD"); // replacement character
+  });
+
+  it("removes DOT special characters", () => {
+    expect(escapeForDot("test<>{}|value")).toBe("testvalue");
+  });
 });
 
 describe("generateWorkflowyLink", () => {
@@ -135,5 +157,89 @@ describe("generateWorkflowyLink", () => {
     const longName = "a".repeat(60);
     const link = generateWorkflowyLink("id", longName);
     expect(link).toContain("[" + "a".repeat(50) + "]");
+  });
+});
+
+describe("CONCEPT_MAP_LIMITS", () => {
+  it("has correct minimum concepts", () => {
+    expect(CONCEPT_MAP_LIMITS.MIN_CONCEPTS).toBe(2);
+  });
+
+  it("has correct maximum concepts", () => {
+    expect(CONCEPT_MAP_LIMITS.MAX_CONCEPTS).toBe(35);
+  });
+
+  it("has correct max label length", () => {
+    expect(CONCEPT_MAP_LIMITS.MAX_LABEL_LENGTH).toBe(40);
+  });
+
+  it("has square image dimensions", () => {
+    expect(CONCEPT_MAP_LIMITS.IMAGE_SIZE).toBe(2000);
+  });
+});
+
+describe("validateConceptMapInput", () => {
+  it("returns valid for array with 2+ concepts", () => {
+    const result = validateConceptMapInput(["concept1", "concept2"]);
+    expect(result.valid).toBe(true);
+  });
+
+  it("returns valid for array at max limit", () => {
+    const concepts = Array.from({ length: 35 }, (_, i) => `concept${i}`);
+    const result = validateConceptMapInput(concepts);
+    expect(result.valid).toBe(true);
+  });
+
+  it("returns error for undefined concepts", () => {
+    const result = validateConceptMapInput(undefined);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toContain("at least 2 concepts");
+    }
+  });
+
+  it("returns error for empty array", () => {
+    const result = validateConceptMapInput([]);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toContain("at least 2 concepts");
+    }
+  });
+
+  it("returns error for single concept", () => {
+    const result = validateConceptMapInput(["only-one"]);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toContain("at least 2 concepts");
+    }
+  });
+
+  it("returns error for too many concepts", () => {
+    const concepts = Array.from({ length: 70 }, (_, i) => `concept${i}`);
+    const result = validateConceptMapInput(concepts);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toContain("Too many concepts");
+      expect(result.provided).toBe(70);
+      expect(result.maximum).toBe(35);
+    }
+  });
+
+  it("returns error at exactly max + 1", () => {
+    const concepts = Array.from({ length: 36 }, (_, i) => `concept${i}`);
+    const result = validateConceptMapInput(concepts);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.provided).toBe(36);
+    }
+  });
+
+  it("includes helpful tip in error", () => {
+    const result = validateConceptMapInput([]);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.tip).toBeDefined();
+      expect(result.tip.length).toBeGreaterThan(0);
+    }
   });
 });

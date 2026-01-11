@@ -128,10 +128,14 @@ Follows academic concept mapping principles (Cornell University guidelines):
 **Parameters**:
 - `node_id`: Parent node whose children will be analyzed
 - `core_concept`: The central concept (defaults to parent node name)
-- `concepts`: List of concepts/terms to map (required, minimum 2)
+- `concepts`: List of concepts/terms to map (required, minimum 2, maximum 35)
 - `scope`: Search scope for content analysis (default: children)
 - `format`: PNG (default) or JPEG
 - `title`: Custom title for the map
+
+**Limits**:
+- Maximum 35 concepts per map (prevents oversized graphs that fail to render)
+- For larger concept sets, split into multiple focused maps by theme/category
 
 **Visual encoding**:
 - **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
@@ -147,7 +151,8 @@ Follows academic concept mapping principles (Cornell University guidelines):
 - Evaluative: supports, opposes, extends, critiques
 
 **Output**:
-- High resolution (2400px, 300 DPI) for modern displays
+- Square aspect ratio (2000x2000 max, 300 DPI) for balanced visual layout
+- Unicode support for accented characters (French, German, etc.)
 - Auto-insert into source node via Dropbox image hosting
 - Fallback: save locally to `~/Downloads/` if Dropbox not configured
 
