@@ -247,12 +247,18 @@ npm run concept-map -- \
   --auto
 ```
 
-### Claude API Setup (Optional)
+### Claude API Setup (for --auto)
 
-For `--auto` concept extraction, add to `.env`:
+The `--auto` flag uses Claude to intelligently extract concepts from your content. To enable it:
+
+1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
+2. Click **Create Key**
+3. Name it (e.g., "concept-map-cli")
+4. Copy the key (starts with `sk-ant-...`)
+5. Add to your `.env` file:
 
 ```bash
-ANTHROPIC_API_KEY=your-api-key
+ANTHROPIC_API_KEY=sk-ant-your-key-here
 ```
 
 Without the API key, `--auto` is skipped and only manual concepts are used.
