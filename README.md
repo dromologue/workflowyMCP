@@ -196,6 +196,21 @@ Add the `refresh_token` from the response to your `.env`.
 
 Generate concept maps directly from the command line without Claude Desktop. The CLI can optionally use the Claude API to automatically extract relevant concepts from your content.
 
+### First-Time Setup
+
+On first run, the CLI will prompt for credentials if not configured:
+
+```bash
+npm run concept-map -- --setup
+```
+
+This interactive wizard configures:
+- **Workflowy credentials** (required) - email and API key
+- **Anthropic API key** (optional) - enables `--auto` concept extraction
+- **Dropbox** (optional) - for MCP server image hosting
+
+Credentials are saved to `.env` in the project directory.
+
 ### Basic Usage
 
 ```bash
@@ -214,6 +229,7 @@ npm run concept-map -- --node-id abc123 --core "Theme" --concepts "a,b,c"
 
 | Option | Description |
 |--------|-------------|
+| `--setup` | Run interactive credential setup |
 | `-n, --node-id <id>` | Workflowy node ID to analyze |
 | `-s, --search <query>` | Search for node by name |
 | `-c, --core <concept>` | Core concept at map center |

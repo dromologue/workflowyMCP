@@ -7,6 +7,7 @@
  *   npx tsx src/cli/concept-map.ts --node-id <id> --core "Event" --concepts "Being,Truth,Subject"
  *   npx tsx src/cli/concept-map.ts --node-id <id> --core "Event" --auto  # Claude extracts concepts
  *   npx tsx src/cli/concept-map.ts --search "Conceptual Foundations" --core "Event" --auto
+ *   npx tsx src/cli/concept-map.ts --setup  # Interactive credential setup
  */
 
 import "dotenv/config";
@@ -18,6 +19,7 @@ import { writeFileSync } from "fs";
 import { join } from "path";
 import { workflowyRequest } from "../api/workflowy.js";
 import { escapeForDot } from "../utils/text-processing.js";
+import { ensureCredentials, runSetup } from "./setup.js";
 
 interface WorkflowyNode {
   id: string;
@@ -46,6 +48,7 @@ program
   .option("-o, --output <filename>", "Output filename (default: concept-map-<timestamp>.png)")
   .option("-f, --format <type>", "Output format: png or jpeg", "png")
   .option("--no-claude", "Skip Claude analysis, use provided concepts only")
+  .option("--setup", "Run interactive credential setup")
   .parse(process.argv);
 
 const options = program.opts();
@@ -185,6 +188,19 @@ function generateDotGraph(
 }
 
 async function main() {
+  // Handle --setup flag
+  if (options.setup) {
+    await runSetup();
+    return;
+  }
+
+  // Ensure credentials are configured (prompts if missing)
+  const hasCredentials = await ensureCredentials();
+  if (!hasCredentials) {
+    console.error("\nRun with --setup to configure credentials");
+    process.exit(1);
+  }
+
   // Validate inputs
   if (!options.nodeId && !options.search) {
     console.error("Error: Must provide either --node-id or --search");
