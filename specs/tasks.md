@@ -218,3 +218,10 @@
   - `list_todos`: Filter by status, parent, search query
   - Works with existing `complete_node`/`uncomplete_node`
   - Detects todos by layoutMode or markdown checkbox syntax
+
+- [x] **T-026**: Add knowledge linking tools
+  - `find_related`: Extract keywords, find related nodes by relevance score
+  - `create_links`: Generate internal Workflowy links to related content
+  - Keyword extraction with stop word filtering
+  - Link placement options: child node or note appendage
+  - Auto-discovery of connections based on content analysis

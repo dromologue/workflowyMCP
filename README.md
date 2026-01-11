@@ -114,6 +114,13 @@ Quit and reopen Claude Desktop to load the MCP server.
 | `complete_node` | Mark a todo (or any node) as completed |
 | `uncomplete_node` | Mark a todo (or any node) as incomplete |
 
+### Knowledge Linking
+
+| Tool | Description |
+|------|-------------|
+| `find_related` | Find nodes related to a given node based on keyword analysis |
+| `create_links` | Create internal links from a node to related content in the knowledge base |
+
 ### Smart Insertion
 
 | Tool | Description |
@@ -176,6 +183,12 @@ Claude will search for "Research", show you matching nodes if there are multiple
 
 **Filter todos by location:**
 > "List all todos under my Work Projects node"
+
+**Find related content:**
+> "Find nodes related to this article about machine learning"
+
+**Auto-link knowledge:**
+> "Create links from this node to related content in my knowledge base"
 
 **Navigate your outline:**
 > "Show me all the children of my Projects node"

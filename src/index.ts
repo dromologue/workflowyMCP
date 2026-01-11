@@ -145,6 +145,163 @@ function parseIndentedContent(content: string): ParsedLine[] {
   return parsed;
 }
 
+// Common stop words to filter out when extracting keywords
+const STOP_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of",
+  "with", "by", "from", "as", "is", "was", "are", "were", "been", "be", "have",
+  "has", "had", "do", "does", "did", "will", "would", "could", "should", "may",
+  "might", "must", "can", "this", "that", "these", "those", "i", "you", "he",
+  "she", "it", "we", "they", "what", "which", "who", "whom", "when", "where",
+  "why", "how", "all", "each", "every", "both", "few", "more", "most", "other",
+  "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than",
+  "too", "very", "just", "also", "now", "here", "there", "then", "once",
+  "if", "about", "into", "through", "during", "before", "after", "above",
+  "below", "between", "under", "again", "further", "any", "your", "my", "our",
+  "their", "its", "his", "her", "up", "down", "out", "off", "over", "under",
+  "get", "got", "make", "made", "take", "took", "see", "saw", "know", "knew",
+  "think", "thought", "come", "came", "go", "went", "want", "need", "use",
+  "used", "like", "new", "first", "last", "long", "great", "little", "own",
+  "good", "bad", "right", "left", "being", "thing", "things", "way", "ways",
+  "work", "well", "even", "back", "still", "while", "since", "much", "many"
+]);
+
+// Extract significant keywords from text
+function extractKeywords(text: string): string[] {
+  if (!text) return [];
+
+  // Normalize text: lowercase, remove special chars except hyphens in words
+  const normalized = text
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Split into words
+  const words = normalized.split(" ");
+
+  // Filter and score keywords
+  const keywords: string[] = [];
+  const seen = new Set<string>();
+
+  for (const word of words) {
+    // Skip short words, stop words, and duplicates
+    if (word.length < 3) continue;
+    if (STOP_WORDS.has(word)) continue;
+    if (seen.has(word)) continue;
+
+    // Skip pure numbers
+    if (/^\d+$/.test(word)) continue;
+
+    seen.add(word);
+    keywords.push(word);
+  }
+
+  return keywords;
+}
+
+// Calculate relevance score between a node and keywords
+function calculateRelevance(
+  node: WorkflowyNode,
+  keywords: string[],
+  sourceNodeId: string
+): number {
+  // Don't match the source node itself
+  if (node.id === sourceNodeId) return 0;
+
+  const nodeText = `${node.name || ""} ${node.note || ""}`.toLowerCase();
+  let score = 0;
+
+  for (const keyword of keywords) {
+    // Count occurrences of keyword in node text
+    const regex = new RegExp(`\\b${keyword}\\b`, "gi");
+    const matches = nodeText.match(regex);
+    if (matches) {
+      // Boost score for title matches vs note matches
+      const titleMatches = (node.name || "").toLowerCase().match(regex);
+      score += matches.length;
+      if (titleMatches) {
+        score += titleMatches.length * 2; // Title matches worth 3x total
+      }
+    }
+  }
+
+  return score;
+}
+
+// Generate Workflowy internal link
+function generateWorkflowyLink(nodeId: string, nodeName: string): string {
+  // Workflowy internal links format: [text](https://workflowy.com/#/nodeid)
+  const cleanName = (nodeName || "Untitled").substring(0, 50);
+  return `[${cleanName}](https://workflowy.com/#/${nodeId})`;
+}
+
+interface RelatedNode {
+  id: string;
+  name: string;
+  note?: string;
+  path: string;
+  relevanceScore: number;
+  matchedKeywords: string[];
+  link: string;
+}
+
+// Find nodes related to a source node based on keyword matching
+async function findRelatedNodes(
+  sourceNode: WorkflowyNode,
+  allNodes: WorkflowyNode[],
+  maxResults: number = 10
+): Promise<{ keywords: string[]; relatedNodes: RelatedNode[] }> {
+  // Extract keywords from source node
+  const sourceText = `${sourceNode.name || ""} ${sourceNode.note || ""}`;
+  const keywords = extractKeywords(sourceText);
+
+  if (keywords.length === 0) {
+    return { keywords: [], relatedNodes: [] };
+  }
+
+  // Score all nodes
+  const scoredNodes: Array<{
+    node: WorkflowyNode;
+    score: number;
+    matchedKeywords: string[];
+  }> = [];
+
+  for (const node of allNodes) {
+    const score = calculateRelevance(node, keywords, sourceNode.id);
+    if (score > 0) {
+      // Find which keywords matched
+      const nodeText = `${node.name || ""} ${node.note || ""}`.toLowerCase();
+      const matchedKeywords = keywords.filter((kw) =>
+        new RegExp(`\\b${kw}\\b`, "i").test(nodeText)
+      );
+      scoredNodes.push({ node, score, matchedKeywords });
+    }
+  }
+
+  // Sort by score descending
+  scoredNodes.sort((a, b) => b.score - a.score);
+
+  // Take top results
+  const topNodes = scoredNodes.slice(0, maxResults);
+
+  // Build paths for context
+  const nodesWithPaths = buildNodePaths(topNodes.map((n) => n.node));
+  const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+  // Format results
+  const relatedNodes: RelatedNode[] = topNodes.map((n) => ({
+    id: n.node.id,
+    name: n.node.name || "",
+    note: n.node.note,
+    path: pathMap.get(n.node.id) || n.node.name || "",
+    relevanceScore: n.score,
+    matchedKeywords: n.matchedKeywords,
+    link: generateWorkflowyLink(n.node.id, n.node.name || ""),
+  }));
+
+  return { keywords, relatedNodes };
+}
+
 // Insert hierarchical content respecting indentation
 interface CreatedNode {
   id: string;
@@ -293,6 +450,30 @@ const listTodosSchema = z.object({
     .string()
     .optional()
     .describe("Optional text to search for within todos"),
+});
+
+const findRelatedSchema = z.object({
+  node_id: z.string().describe("The ID of the node to find related content for"),
+  max_results: z
+    .number()
+    .optional()
+    .describe("Maximum number of related nodes to return (default: 10)"),
+});
+
+const createLinksSchema = z.object({
+  node_id: z.string().describe("The ID of the node to add links to"),
+  link_node_ids: z
+    .array(z.string())
+    .optional()
+    .describe("Specific node IDs to link to. If omitted, auto-discovers related nodes."),
+  max_links: z
+    .number()
+    .optional()
+    .describe("Maximum number of auto-discovered links to create (default: 5)"),
+  position: z
+    .enum(["note", "child"])
+    .optional()
+    .describe("Where to place links: 'note' appends to node note, 'child' creates a 'Related' child node (default: child)"),
 });
 
 const insertContentSchema = z.object({
@@ -569,6 +750,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Optional text to search for within todos",
             },
           },
+        },
+      },
+      {
+        name: "find_related",
+        description:
+          "Find nodes related to a given node based on keyword analysis. Extracts significant keywords from the source node and finds matching content across the knowledge base.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type: "string",
+              description: "The ID of the node to find related content for",
+            },
+            max_results: {
+              type: "number",
+              description:
+                "Maximum number of related nodes to return (default: 10)",
+            },
+          },
+          required: ["node_id"],
+        },
+      },
+      {
+        name: "create_links",
+        description:
+          "Create internal links from a node to related nodes in the knowledge base. Can auto-discover related nodes or link to specific node IDs.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type: "string",
+              description: "The ID of the node to add links to",
+            },
+            link_node_ids: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Specific node IDs to link to. If omitted, auto-discovers related nodes.",
+            },
+            max_links: {
+              type: "number",
+              description:
+                "Maximum number of auto-discovered links to create (default: 5)",
+            },
+            position: {
+              type: "string",
+              enum: ["note", "child"],
+              description:
+                "Where to place links: 'note' appends to node note, 'child' creates a 'Related' child node (default: child)",
+            },
+          },
+          required: ["node_id"],
         },
       },
       {
@@ -957,6 +1190,197 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   pending: formattedTodos.filter((t) => !t.completed).length,
                   completed: formattedTodos.filter((t) => t.completed).length,
                   todos: formattedTodos,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "find_related": {
+        const { node_id, max_results } = findRelatedSchema.parse(args);
+        const allNodes = await getCachedNodes();
+
+        // Find the source node
+        const sourceNode = allNodes.find((n) => n.id === node_id);
+        if (!sourceNode) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Node with ID "${node_id}" not found`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Find related nodes
+        const { keywords, relatedNodes } = await findRelatedNodes(
+          sourceNode,
+          allNodes,
+          max_results || 10
+        );
+
+        if (relatedNodes.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    source_node: {
+                      id: sourceNode.id,
+                      name: sourceNode.name,
+                    },
+                    keywords_extracted: keywords,
+                    message: "No related nodes found. Try a node with more content.",
+                    related_nodes: [],
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  source_node: {
+                    id: sourceNode.id,
+                    name: sourceNode.name,
+                  },
+                  keywords_extracted: keywords,
+                  related_count: relatedNodes.length,
+                  related_nodes: relatedNodes,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "create_links": {
+        const { node_id, link_node_ids, max_links, position } =
+          createLinksSchema.parse(args);
+        const allNodes = await getCachedNodes();
+
+        // Find the source node
+        const sourceNode = allNodes.find((n) => n.id === node_id);
+        if (!sourceNode) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Node with ID "${node_id}" not found`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        let nodesToLink: RelatedNode[] = [];
+
+        if (link_node_ids && link_node_ids.length > 0) {
+          // Use specified node IDs
+          const nodesWithPaths = buildNodePaths(allNodes);
+          const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+          for (const linkId of link_node_ids) {
+            const node = allNodes.find((n) => n.id === linkId);
+            if (node) {
+              nodesToLink.push({
+                id: node.id,
+                name: node.name || "",
+                note: node.note,
+                path: pathMap.get(node.id) || node.name || "",
+                relevanceScore: 0,
+                matchedKeywords: [],
+                link: generateWorkflowyLink(node.id, node.name || ""),
+              });
+            }
+          }
+        } else {
+          // Auto-discover related nodes
+          const { relatedNodes } = await findRelatedNodes(
+            sourceNode,
+            allNodes,
+            max_links || 5
+          );
+          nodesToLink = relatedNodes;
+        }
+
+        if (nodesToLink.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    message: "No nodes to link. Node may lack sufficient content for keyword extraction.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Generate the links content
+        const linksContent = nodesToLink
+          .map((n) => `• ${n.link}`)
+          .join("\n");
+
+        const linkPosition = position || "child";
+
+        if (linkPosition === "note") {
+          // Append links to the node's note
+          const existingNote = sourceNode.note || "";
+          const separator = existingNote ? "\n\n---\n**Related:**\n" : "**Related:**\n";
+          const newNote = existingNote + separator + linksContent;
+
+          await workflowyRequest(`/nodes/${node_id}`, "POST", { note: newNote });
+        } else {
+          // Create a "Related" child node with links
+          const relatedNodeContent = `**Related**\n${linksContent}`;
+          await workflowyRequest("/nodes", "POST", {
+            name: "🔗 Related",
+            note: linksContent,
+            parent_id: node_id,
+            position: "bottom",
+          });
+        }
+
+        invalidateCache();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: `Created ${nodesToLink.length} link(s) ${linkPosition === "note" ? "in note" : "as child node"}`,
+                  source_node: {
+                    id: sourceNode.id,
+                    name: sourceNode.name,
+                  },
+                  linked_nodes: nodesToLink.map((n) => ({
+                    id: n.id,
+                    name: n.name,
+                    path: n.path,
+                    link: n.link,
+                  })),
                 },
                 null,
                 2

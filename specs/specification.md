@@ -86,7 +86,30 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 
 **Success criteria**: Full task management workflow without leaving Claude.
 
-### 5. Content Modification
+### 5. Knowledge Linking
+
+**Goal**: Discover and create connections between related content.
+
+| Feature | Description |
+|---------|-------------|
+| Find related | Analyze node content, extract keywords, find matching nodes |
+| Create links | Generate Workflowy internal links to related nodes |
+| Auto-discovery | Automatically find relevant connections based on content |
+
+**Keyword extraction**:
+- Filters common stop words
+- Prioritizes significant terms (3+ characters)
+- Scores matches by title vs note occurrence
+
+**Link placement options**:
+- `child`: Creates a "🔗 Related" child node with links (default)
+- `note`: Appends links to the node's existing note
+
+**Link format**: `[Node Title](https://workflowy.com/#/nodeId)`
+
+**Success criteria**: Surface relevant connections user might not have noticed.
+
+### 6. Content Modification
 
 **Goal**: Update existing nodes.
 
