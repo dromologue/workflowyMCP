@@ -267,12 +267,12 @@ function generateHierarchicalConceptMap(
   const lines: string[] = [
     "digraph ConceptMap {",
     '  charset="UTF-8";',  // Ensure proper handling of accented characters
-    '  rankdir=TB;',
-    '  splines=polyline;',  // More compact than ortho
-    '  nodesep=0.6;',
-    '  ranksep=0.8;',
-    '  ratio="compress";',  // Compress to more square aspect ratio
-    '  size="12,12";',      // Target square dimensions
+    '  layout=neato;',     // Force-directed layout for better space usage
+    '  overlap=false;',    // Prevent node overlap
+    '  splines=true;',     // Curved edges
+    '  sep="+20";',        // Minimum separation between nodes
+    '  ratio=1;',          // Force 1:1 square aspect ratio
+    '  size="14,14!";',    // Force exact square dimensions (! = force)
     '  bgcolor="white";',
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
@@ -284,10 +284,10 @@ function generateHierarchicalConceptMap(
     "",
   ];
 
-  // Core concept - largest, distinctive color
+  // Core concept - largest, distinctive color, pinned at center
   lines.push("  // Core concept (center)");
   lines.push(
-    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=16, penwidth=3, width=2.5];`
+    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=16, penwidth=3, width=2.5, pos="7,7!", pin=true];`
   );
   lines.push("");
 
@@ -358,17 +358,6 @@ function generateHierarchicalConceptMap(
     }
   });
 
-  // Add rank constraints for hierarchy
-  lines.push("");
-  lines.push("  // Hierarchy constraints");
-  lines.push(`  { rank=min; "${coreNode.id}"; }`);
-  if (level1.length > 0) {
-    lines.push(`  { rank=same; ${level1.map(n => `"${n.id}"`).join("; ")}; }`);
-  }
-  if (level2.length > 0) {
-    lines.push(`  { rank=max; ${level2.map(n => `"${n.id}"`).join("; ")}; }`);
-  }
-
   lines.push("}");
   return lines.join("\n");
 }
@@ -382,9 +371,12 @@ function generateDotGraph(
   const lines: string[] = [
     "digraph ConceptMap {",
     '  charset="UTF-8";',  // Ensure proper handling of accented characters
-    '  rankdir=LR;',
-    '  ratio="compress";',  // Compress to more square aspect ratio
-    '  size="12,12";',      // Target square dimensions
+    '  layout=neato;',     // Force-directed layout for better space usage
+    '  overlap=false;',    // Prevent node overlap
+    '  splines=true;',     // Curved edges
+    '  sep="+20";',        // Minimum separation between nodes
+    '  ratio=1;',          // Force 1:1 square aspect ratio
+    '  size="14,14!";',    // Force exact square dimensions (! = force)
     '  bgcolor="white";',
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
@@ -394,8 +386,8 @@ function generateDotGraph(
     "  // Node styling",
     '  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=12];',
     "",
-    "  // Center node",
-    `  "${centerNode.id}" [label="${escapeForDot(centerNode.label)}", fillcolor="#4A90D9", fontcolor="white", penwidth=2];`,
+    "  // Center node (pinned at center)",
+    `  "${centerNode.id}" [label="${escapeForDot(centerNode.label)}", fillcolor="#4A90D9", fontcolor="white", penwidth=2, pos="7,7!", pin=true];`,
     "",
     "  // Related nodes",
   ];
