@@ -20,9 +20,158 @@ dotenv.config({ path: path.join(__dirname, "..", ".env") });
 const WORKFLOWY_API_KEY = process.env.WORKFLOWY_API_KEY;
 const WORKFLOWY_BASE_URL = "https://workflowy.com/api/v1";
 
+// Dropbox configuration for image hosting
+const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
+const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
+const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
+
 if (!WORKFLOWY_API_KEY) {
   console.error("Error: WORKFLOWY_API_KEY environment variable is not set");
   process.exit(1);
+}
+
+// Dropbox API types
+interface DropboxTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+}
+
+// Cache for Dropbox access token
+let dropboxAccessToken: string | null = null;
+let dropboxTokenExpiry: number = 0;
+
+async function getDropboxAccessToken(): Promise<string | null> {
+  if (!DROPBOX_APP_KEY || !DROPBOX_APP_SECRET || !DROPBOX_REFRESH_TOKEN) {
+    return null;
+  }
+
+  // Return cached token if still valid (with 5 min buffer)
+  if (dropboxAccessToken && Date.now() < dropboxTokenExpiry - 300000) {
+    return dropboxAccessToken;
+  }
+
+  try {
+    const response = await fetch("https://api.dropbox.com/oauth2/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: DROPBOX_REFRESH_TOKEN,
+        client_id: DROPBOX_APP_KEY,
+        client_secret: DROPBOX_APP_SECRET,
+      }),
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = (await response.json()) as DropboxTokenResponse;
+    dropboxAccessToken = data.access_token;
+    dropboxTokenExpiry = Date.now() + data.expires_in * 1000;
+    return dropboxAccessToken;
+  } catch {
+    return null;
+  }
+}
+
+async function uploadToDropbox(
+  imageBuffer: Buffer,
+  filename: string
+): Promise<{ success: boolean; url?: string; error?: string }> {
+  const accessToken = await getDropboxAccessToken();
+
+  if (!accessToken) {
+    return {
+      success: false,
+      error: "Dropbox not configured. Set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN in .env",
+    };
+  }
+
+  try {
+    const uploadPath = `/workflowy/conceptMaps/${filename}`;
+
+    // Upload file to Dropbox
+    const uploadResponse = await fetch(
+      "https://content.dropboxapi.com/2/files/upload",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/octet-stream",
+          "Dropbox-API-Arg": JSON.stringify({
+            path: uploadPath,
+            mode: "overwrite",
+            autorename: false,
+          }),
+        },
+        body: new Uint8Array(imageBuffer),
+      }
+    );
+
+    if (!uploadResponse.ok) {
+      const errorText = await uploadResponse.text();
+      return { success: false, error: `Dropbox upload failed: ${errorText}` };
+    }
+
+    // Create a shared link
+    const shareResponse = await fetch(
+      "https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          path: uploadPath,
+          settings: { requested_visibility: "public" },
+        }),
+      }
+    );
+
+    let shareUrl: string;
+
+    if (shareResponse.ok) {
+      const shareData = (await shareResponse.json()) as { url: string };
+      shareUrl = shareData.url.replace("dl=0", "raw=1");
+    } else {
+      // Link might already exist, try to get it
+      const getResponse = await fetch(
+        "https://api.dropboxapi.com/2/sharing/list_shared_links",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ path: uploadPath, direct_only: true }),
+        }
+      );
+
+      if (!getResponse.ok) {
+        return { success: false, error: "Failed to get shareable link" };
+      }
+
+      const linksData = (await getResponse.json()) as {
+        links: Array<{ url: string }>;
+      };
+      if (linksData.links.length === 0) {
+        return { success: false, error: "No shareable link found" };
+      }
+      shareUrl = linksData.links[0].url.replace("dl=0", "raw=1");
+    }
+
+    return { success: true, url: shareUrl };
+  } catch (err) {
+    return {
+      success: false,
+      error: `Dropbox error: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 // Workflowy API helper functions
@@ -1798,54 +1947,121 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Save to file
+        // Generate filename
         const timestamp = Date.now();
-        const defaultPath = path.join(
-          process.env.HOME || "/tmp",
-          "Downloads",
-          `concept-map-${timestamp}.${imageFormat}`
-        );
-        const finalPath = output_path || defaultPath;
+        const filename = `concept-map-${timestamp}.${imageFormat}`;
 
-        // Ensure directory exists
-        const dir = path.dirname(finalPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
+        // Try to upload to Dropbox and insert into Workflowy
+        const uploadResult = await uploadToDropbox(result.buffer, filename);
 
-        fs.writeFileSync(finalPath, result.buffer);
+        if (uploadResult.success && uploadResult.url) {
+          // Create a child node in the source node with the image
+          const imageMarkdown = `![Concept Map](${uploadResult.url})`;
+          const nodeNote = `Scope: ${searchScope} | Keywords: ${keywords.slice(0, 5).join(", ")}${keywords.length > 5 ? "..." : ""} | ${relatedNodes.length} related nodes`;
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
+          try {
+            await workflowyRequest("/nodes", "POST", {
+              parent_id: sourceNode.id,
+              name: `📊 ${mapTitle}`,
+              note: `${imageMarkdown}\n\n${nodeNote}`,
+              priority: 0, // Insert at top
+            });
+            invalidateCache();
+
+            return {
+              content: [
                 {
-                  success: true,
-                  message: "Concept map generated successfully",
-                  file_path: finalPath,
-                  format: imageFormat,
-                  scope: searchScope,
-                  center_node: {
-                    id: sourceNode.id,
-                    name: sourceNode.name,
-                  },
-                  keywords_used: keywords,
-                  related_nodes_count: relatedNodes.length,
-                  related_nodes: relatedNodes.map((n) => ({
-                    id: n.id,
-                    name: n.name,
-                    relevance: n.relevanceScore,
-                    matched_keywords: n.matchedKeywords,
-                  })),
-                  tip: "Drag and drop the image file into Workflowy to insert it.",
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      success: true,
+                      message: "Concept map created and inserted into Workflowy",
+                      inserted_into: {
+                        id: sourceNode.id,
+                        name: sourceNode.name,
+                      },
+                      image_url: uploadResult.url,
+                      format: imageFormat,
+                      scope: searchScope,
+                      keywords_used: keywords,
+                      related_nodes_count: relatedNodes.length,
+                      related_nodes: relatedNodes.map((n) => ({
+                        id: n.id,
+                        name: n.name,
+                        relevance: n.relevanceScore,
+                        matched_keywords: n.matchedKeywords,
+                      })),
+                    },
+                    null,
+                    2
+                  ),
                 },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+              ],
+            };
+          } catch (insertError) {
+            // Upload succeeded but insert failed - still return success with URL
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      success: true,
+                      message: "Concept map uploaded but failed to insert into Workflowy",
+                      image_url: uploadResult.url,
+                      insert_error: insertError instanceof Error ? insertError.message : String(insertError),
+                      tip: "You can manually add this image URL to your Workflowy node.",
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        } else {
+          // Dropbox upload failed - save locally as fallback
+          const defaultPath = path.join(
+            process.env.HOME || "/tmp",
+            "Downloads",
+            filename
+          );
+          const finalPath = output_path || defaultPath;
+
+          const dir = path.dirname(finalPath);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+
+          fs.writeFileSync(finalPath, result.buffer);
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: true,
+                    message: "Concept map saved locally (Dropbox not configured)",
+                    file_path: finalPath,
+                    dropbox_error: uploadResult.error,
+                    format: imageFormat,
+                    scope: searchScope,
+                    center_node: {
+                      id: sourceNode.id,
+                      name: sourceNode.name,
+                    },
+                    keywords_used: keywords,
+                    related_nodes_count: relatedNodes.length,
+                    tip: "Configure Dropbox to auto-insert concept maps into Workflowy. See README.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
       }
 
       case "insert_content": {

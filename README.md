@@ -120,7 +120,7 @@ Quit and reopen Claude Desktop to load the MCP server.
 |------|-------------|
 | `find_related` | Find nodes related to a given node based on keyword analysis |
 | `create_links` | Create internal links from a node to related content in the knowledge base |
-| `generate_concept_map` | Generate a visual concept map PNG/JPEG with configurable search scope (saved to Downloads) |
+| `generate_concept_map` | Generate a visual concept map and insert into the source node (requires Dropbox config) |
 
 ### Smart Insertion
 
@@ -233,6 +233,50 @@ When creating nodes, you can use markdown formatting:
 ### Rate limiting
 
 The `export_all` tool is rate limited to 1 request per minute by Workflowy's API. Use `search_nodes` for frequent queries instead.
+
+## Dropbox Configuration (Optional)
+
+To auto-insert concept map images into Workflowy, configure Dropbox for image hosting.
+
+### Step 1: Create a Dropbox App
+
+1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
+2. Click **Create app** → **Scoped access** → **Full Dropbox** → Name it → **Create app**
+3. Copy your **App key** and **App secret**
+
+### Step 2: Set Permissions
+
+1. Go to the **Permissions** tab
+2. Check: `files.content.write` and `sharing.write`
+3. Click **Submit**
+
+### Step 3: Get Refresh Token
+
+Open this URL (replace `YOUR_APP_KEY`):
+```
+https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
+```
+
+Click **Allow** and copy the code. Then run:
+```bash
+curl -X POST https://api.dropbox.com/oauth2/token \
+  -d code=YOUR_CODE \
+  -d grant_type=authorization_code \
+  -d client_id=YOUR_APP_KEY \
+  -d client_secret=YOUR_APP_SECRET
+```
+
+Copy the `refresh_token` from the response.
+
+### Step 4: Add to .env
+
+```bash
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=your-refresh-token
+```
+
+Images will be stored in `/workflowy/conceptMaps/` in your Dropbox and auto-inserted into the source node.
 
 ## Concept Map Scope Options
 

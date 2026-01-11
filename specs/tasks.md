@@ -256,9 +256,13 @@
   - Default scope: all (entire Workflowy)
   - Scope included in response and inserted node note
 
-- [x] **T-031**: Simplify concept map to local-only
-  - Remove Dropbox integration (external dependency overhead)
+- [x] **T-031**: Improve concept map reliability
   - Increase resolution to 2400px width, 300 DPI
   - Add defensive checks for scope filtering (Array.isArray, depth limits)
   - Fix allNodes.find error (API returns {nodes:[]} not array)
-  - Simplified output: saves directly to ~/Downloads/
+
+- [x] **T-032**: Auto-insert concept maps into Workflowy
+  - Re-enable Dropbox integration for image hosting
+  - Auto-create child node in source node with concept map image
+  - Node includes markdown image, scope info, and keywords
+  - Fallback to local ~/Downloads/ if Dropbox not configured
