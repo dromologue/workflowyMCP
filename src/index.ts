@@ -138,10 +138,20 @@ function filterNodesByScope(
 async function findRelatedNodes(
   sourceNode: WorkflowyNode,
   allNodes: WorkflowyNode[],
-  maxResults: number = 10
+  maxResults: number = 10,
+  customKeywords?: string[]
 ): Promise<{ keywords: string[]; relatedNodes: RelatedNode[] }> {
-  const sourceText = `${sourceNode.name || ""} ${sourceNode.note || ""}`;
-  const keywords = extractKeywords(sourceText);
+  // Use custom keywords if provided, otherwise extract from node content
+  let keywords: string[];
+  if (customKeywords && customKeywords.length > 0) {
+    // Normalize custom keywords (lowercase, filter empty)
+    keywords = customKeywords
+      .map(k => k.toLowerCase().trim())
+      .filter(k => k.length > 0);
+  } else {
+    const sourceText = `${sourceNode.name || ""} ${sourceNode.note || ""}`;
+    keywords = extractKeywords(sourceText);
+  }
 
   if (keywords.length === 0) {
     return { keywords: [], relatedNodes: [] };
@@ -394,6 +404,7 @@ const generateConceptMapSchema = z.object({
   output_path: z.string().optional().describe("Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
   format: z.enum(["png", "jpeg"]).optional().describe("Image format (default: png)"),
   title: z.string().optional().describe("Title for the concept map (defaults to node name)"),
+  keywords: z.array(z.string()).optional().describe("Custom keywords to use for finding related nodes (overrides automatic extraction)"),
 });
 
 const insertContentSchema = z.object({
@@ -596,6 +607,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             output_path: { type: "string", description: "Output file path" },
             format: { type: "string", enum: ["png", "jpeg"], description: "Image format" },
             title: { type: "string", description: "Title for the concept map" },
+            keywords: { type: "array", items: { type: "string" }, description: "Custom keywords to use for finding related nodes (overrides automatic extraction)" },
           },
           required: ["node_id"],
         },
@@ -943,7 +955,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "generate_concept_map": {
-      const { node_id, scope, max_related, output_path, format, title } =
+      const { node_id, scope, max_related, output_path, format, title, keywords: customKeywords } =
         generateConceptMapSchema.parse(args);
       const allNodes = await getCachedNodes();
 
@@ -968,7 +980,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { keywords, relatedNodes } = await findRelatedNodes(
         sourceNode,
         scopedNodes.length > 0 ? scopedNodes : allNodes.filter((n) => n.id !== sourceNode.id),
-        max_related || 15
+        max_related || 15,
+        customKeywords
       );
 
       if (relatedNodes.length === 0) {

@@ -246,51 +246,91 @@ The `export_all` tool is rate limited to 1 request per minute by Workflowy's API
 
 ## Dropbox Configuration (Optional)
 
-To auto-insert concept map images into Workflowy, configure Dropbox for image hosting.
+To auto-insert concept map images into Workflowy, configure Dropbox for image hosting. Without Dropbox, concept maps are saved locally to `~/Downloads/`.
 
 ### Step 1: Create a Dropbox App
 
 1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Click **Create app** → **Scoped access** → **Full Dropbox** → Name it → **Create app**
-3. Copy your **App key** and **App secret**
+2. Click **Create app**
+3. Choose **Scoped access**
+4. Choose **Full Dropbox** (or App folder if you prefer isolation)
+5. Name your app (e.g., "workflowy-concept-maps")
+6. Click **Create app**
+7. Copy your **App key** and **App secret** from the Settings tab
 
-### Step 2: Set Permissions
+### Step 2: Set Required Permissions
 
-1. Go to the **Permissions** tab
-2. Check: `files.content.write` and `sharing.write`
-3. Click **Submit**
+**Important**: Both permissions are required for concept maps to work.
 
-### Step 3: Get Refresh Token
+1. Go to the **Permissions** tab in your app settings
+2. Under **Files and folders**, check:
+   - `files.content.write` - Required to upload images
+3. Under **Sharing**, check:
+   - `sharing.write` - Required to create shareable links
+4. Click **Submit** to save changes
 
-Open this URL (replace `YOUR_APP_KEY`):
+### Step 3: Generate Authorization Code
+
+After setting permissions, you must authorize the app with the new scopes.
+
+Open this URL in your browser (replace `YOUR_APP_KEY`):
 ```
 https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
 ```
 
-Click **Allow** and copy the code. Then run:
+1. Log in to Dropbox if prompted
+2. Click **Allow** to grant permissions
+3. Copy the authorization code shown
+
+### Step 4: Exchange Code for Refresh Token
+
+Run this command (replace placeholders):
 ```bash
 curl -X POST https://api.dropbox.com/oauth2/token \
-  -d code=YOUR_CODE \
+  -d code=YOUR_AUTHORIZATION_CODE \
   -d grant_type=authorization_code \
   -d client_id=YOUR_APP_KEY \
   -d client_secret=YOUR_APP_SECRET
 ```
 
-Copy the `refresh_token` from the response.
+The response will include a `refresh_token` - copy this value.
 
-### Step 4: Add to .env
+### Step 5: Add Credentials to .env
 
+Add these lines to your `.env` file:
 ```bash
 DROPBOX_APP_KEY=your-app-key
 DROPBOX_APP_SECRET=your-app-secret
 DROPBOX_REFRESH_TOKEN=your-refresh-token
 ```
 
-Images will be stored in `/workflowy/conceptMaps/` in your Dropbox and auto-inserted into the source node.
+### How It Works
 
-## Concept Map Scope Options
+When you generate a concept map:
+1. The image is uploaded to `/workflowy/conceptMaps/` in your Dropbox
+2. A shareable link is created automatically
+3. A new child node is added to the source node with the embedded image
 
-The `generate_concept_map` tool supports different search scopes:
+### Troubleshooting Dropbox
+
+**"Your app is not permitted to access this endpoint"**
+- You're missing the `sharing.write` permission
+- Go to Permissions tab → enable `sharing.write` → Submit
+- Re-authorize and generate a new refresh token (Step 3-4)
+
+**"Failed to get shareable link"**
+- Same as above - missing `sharing.write` scope
+- Permissions changes require re-authorization
+
+**Images upload but aren't inserted into Workflowy**
+- Check the response for the Dropbox URL
+- You can manually add the URL to any Workflowy node
+
+## Concept Map Options
+
+The `generate_concept_map` tool supports different search scopes and custom keywords.
+
+### Scope Options
 
 | Scope | Description |
 |-------|-------------|
@@ -302,6 +342,22 @@ The `generate_concept_map` tool supports different search scopes:
 
 Example:
 > "Create a concept map for my Project node, only searching its children"
+
+### Custom Keywords
+
+By default, keywords are automatically extracted from the node's content. You can override this with custom keywords to find specific relationships:
+
+```
+keywords: ["machine learning", "neural networks", "deep learning"]
+```
+
+Example:
+> "Create a concept map for this node using the keywords: strategy, planning, execution"
+
+This is useful when:
+- The node content is sparse but you know what concepts to explore
+- You want to find connections around specific themes
+- You're exploring relationships not directly mentioned in the node
 
 ## Development
 
