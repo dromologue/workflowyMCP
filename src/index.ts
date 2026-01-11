@@ -934,7 +934,15 @@ const CACHE_TTL = 30000; // 30 seconds
 async function getCachedNodes(): Promise<WorkflowyNode[]> {
   const now = Date.now();
   if (!cachedNodes || now - cacheTimestamp > CACHE_TTL) {
-    cachedNodes = (await workflowyRequest("/nodes-export")) as WorkflowyNode[];
+    const response = await workflowyRequest("/nodes-export");
+    // API returns { nodes: [...] } not an array directly
+    if (response && typeof response === "object" && "nodes" in response) {
+      cachedNodes = (response as { nodes: WorkflowyNode[] }).nodes;
+    } else if (Array.isArray(response)) {
+      cachedNodes = response as WorkflowyNode[];
+    } else {
+      cachedNodes = [];
+    }
     cacheTimestamp = now;
   }
   return cachedNodes;
