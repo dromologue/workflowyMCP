@@ -17,8 +17,8 @@ import { Graphviz } from "@hpcc-js/wasm-graphviz";
 import sharp from "sharp";
 import { writeFileSync } from "fs";
 import { join } from "path";
-import { workflowyRequest } from "../api/workflowy.js";
-import { escapeForDot } from "../utils/text-processing.js";
+import { workflowyRequest } from "../shared/api/workflowy.js";
+import { escapeForDot } from "../shared/utils/text-processing.js";
 import { ensureCredentials, runSetup } from "./setup.js";
 
 interface WorkflowyNode {

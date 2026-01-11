@@ -1,16 +1,22 @@
 {
   "name": "workflowy-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server for Workflowy integration with Claude Desktop",
+  "description": "Concept mapping tool with CLI and MCP server for Workflowy + Claude",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+
+    "mcp:start": "node dist/index.js",
+    "mcp:dev": "tsc && node dist/index.js",
+
+    "cli": "npx tsx src/cli/concept-map.ts",
+    "cli:setup": "npx tsx src/cli/concept-map.ts --setup",
+
+    "start": "node dist/index.js",
     "concept-map": "npx tsx src/cli/concept-map.ts"
   },
   "keywords": [

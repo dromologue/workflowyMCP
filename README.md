@@ -327,13 +327,66 @@ The server includes full Workflowy management to support your knowledge work:
 - Check Claude's response for the Dropbox URL
 - Manually add to any node if needed
 
+## Architecture
+
+The project is organized into three distinct layers:
+
+```
+src/
+├── cli/                    # Command-line interface
+│   ├── concept-map.ts      # CLI entry point
+│   └── setup.ts            # Interactive credential wizard
+│
+├── mcp/                    # MCP server for Claude Desktop
+│   └── server.ts           # Tool handlers & server setup
+│
+├── shared/                 # Shared modules (used by both)
+│   ├── api/
+│   │   ├── workflowy.ts    # Workflowy REST client
+│   │   ├── dropbox.ts      # Dropbox image hosting
+│   │   └── retry.ts        # Exponential backoff logic
+│   ├── utils/
+│   │   ├── text-processing.ts   # DOT escaping, parsing
+│   │   ├── keyword-extraction.ts # Relevance scoring
+│   │   ├── cache.ts        # Node caching (30s TTL)
+│   │   └── node-paths.ts   # Breadcrumb path building
+│   ├── config/
+│   │   └── environment.ts  # Env vars & validation
+│   └── types/
+│       └── index.ts        # TypeScript interfaces
+│
+└── index.ts                # Entry point (re-exports MCP server)
+```
+
+### Module Responsibilities
+
+| Layer | Purpose | Entry Point |
+|-------|---------|-------------|
+| **CLI** | Standalone concept mapping | `npm run cli` |
+| **MCP** | Claude Desktop integration | `npm run mcp:start` |
+| **Shared** | Common functionality | Imported by both |
+
 ## Development
 
 ```bash
-npm run build        # Compile TypeScript
-npm test             # Run test suite (61 tests)
-npm start            # Run the MCP server
-npm run concept-map  # Run CLI tool (see CLI Tool section)
+# Build
+npm run build           # Compile TypeScript
+
+# Test
+npm test                # Run 61 tests
+npm run test:coverage   # With coverage report
+
+# MCP Server
+npm run mcp:start       # Start MCP server
+npm run mcp:dev         # Build + start
+
+# CLI Tool
+npm run cli             # Run concept map CLI
+npm run cli:setup       # Interactive setup wizard
+
+# Aliases (backward compatible)
+npm start               # Same as mcp:start
+npm run concept-map     # Same as cli
 ```
 
 ## License
