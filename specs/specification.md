@@ -113,13 +113,21 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 - Edge labels show matching keywords between nodes
 - Edge width indicates relevance strength
 - Output formats: PNG (default), JPEG
-- Direct insertion into Workflowy via imgbb image hosting
+- Configurable search scope (children, siblings, ancestors, all)
+- Direct insertion into Workflowy via Dropbox image hosting
 - Fallback: save locally to `~/Downloads/concept-map-{timestamp}.png`
 - Optimized for readability with clear node labels and colors
 
-**Image hosting** (optional):
-- Requires `IMGBB_API_KEY` environment variable
-- Free API key from https://api.imgbb.com/
+**Search scopes**:
+- `all`: Search entire Workflowy knowledge base
+- `children`: Search only descendants of the center node
+- `siblings`: Search only peer nodes (same parent)
+- `ancestors`: Search only the parent chain
+
+**Image hosting** (Dropbox):
+- Requires Dropbox OAuth configuration (app key, secret, refresh token)
+- Images stored in `/concept-maps/` folder
+- Shareable links generated automatically
 - When configured, concept maps can be inserted directly into Workflowy nodes
 
 **Success criteria**: Surface relevant connections user might not have noticed.

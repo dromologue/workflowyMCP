@@ -49,10 +49,6 @@ Create a `.env` file in the project root:
 ```bash
 WORKFLOWY_USERNAME=your-email@example.com
 WORKFLOWY_API_KEY=your-api-key-here
-
-# Optional: Enable direct image insertion into Workflowy
-# Get a free API key at https://api.imgbb.com/
-IMGBB_API_KEY=your-imgbb-api-key-here
 ```
 
 ### 5. Build the Server
@@ -124,7 +120,7 @@ Quit and reopen Claude Desktop to load the MCP server.
 |------|-------------|
 | `find_related` | Find nodes related to a given node based on keyword analysis |
 | `create_links` | Create internal links from a node to related content in the knowledge base |
-| `generate_concept_map` | Generate a visual concept map and optionally insert it directly into Workflowy (requires IMGBB_API_KEY) |
+| `generate_concept_map` | Generate a visual concept map with configurable search scope and insert directly into Workflowy via Dropbox |
 
 ### Smart Insertion
 
@@ -237,6 +233,85 @@ When creating nodes, you can use markdown formatting:
 ### Rate limiting
 
 The `export_all` tool is rate limited to 1 request per minute by Workflowy's API. Use `search_nodes` for frequent queries instead.
+
+## Dropbox Configuration (Optional)
+
+To enable direct insertion of concept map images into Workflowy, you need to configure Dropbox for image hosting. This is a one-time setup.
+
+### 1. Create a Dropbox App
+
+1. Go to the [Dropbox App Console](https://www.dropbox.com/developers/apps)
+2. Click "Create app"
+3. Choose "Scoped access"
+4. Choose "Full Dropbox" access
+5. Name your app (e.g., "Workflowy Concept Maps")
+6. Click "Create app"
+
+### 2. Configure App Permissions
+
+On your app's settings page:
+1. Go to the "Permissions" tab
+2. Enable these permissions:
+   - `files.content.write` - to upload images
+   - `sharing.write` - to create shareable links
+3. Click "Submit" to save
+
+### 3. Get Your Refresh Token
+
+Dropbox uses OAuth 2.0 with short-lived access tokens. You need a refresh token for long-term access.
+
+**Step 1:** Build the authorization URL (replace `YOUR_APP_KEY` with your app key):
+
+```
+https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
+```
+
+**Step 2:** Visit this URL in your browser and authorize the app. You'll receive an authorization code.
+
+**Step 3:** Exchange the code for tokens. Run this command (replace placeholders):
+
+```bash
+curl https://api.dropbox.com/oauth2/token \
+  -d code=YOUR_AUTHORIZATION_CODE \
+  -d grant_type=authorization_code \
+  -d client_id=YOUR_APP_KEY \
+  -d client_secret=YOUR_APP_SECRET
+```
+
+The response will include a `refresh_token`. Copy this value.
+
+### 4. Add Credentials to .env
+
+Add these lines to your `.env` file:
+
+```bash
+# Dropbox configuration for concept map image storage
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=your-refresh-token
+```
+
+### 5. Verify Setup
+
+Restart Claude Desktop and test with:
+> "Create a concept map for my Research node and insert it there"
+
+Concept map images will be stored in `/Apps/your-app-name/concept-maps/` in your Dropbox.
+
+## Concept Map Scope Options
+
+The `generate_concept_map` tool supports different search scopes:
+
+| Scope | Description |
+|-------|-------------|
+| `all` | Search entire Workflowy (default) |
+| `children` | Search only descendants of the node |
+| `siblings` | Search only peer nodes (same parent) |
+| `ancestors` | Search only parent chain |
+| `this_node` | No related nodes (visualization only) |
+
+Example:
+> "Create a concept map for my Project node, only searching its children"
 
 ## Development
 

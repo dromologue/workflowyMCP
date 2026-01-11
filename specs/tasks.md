@@ -242,3 +242,16 @@
   - Markdown image syntax for inline display
   - Fallback to local save if no API key configured
   - Optional `save_locally` parameter for local backup
+
+- [x] **T-029**: Switch to Dropbox for image hosting
+  - Replace imgbb with Dropbox API integration
+  - OAuth 2.0 with refresh token for long-lived access
+  - Automatic access token refresh with caching
+  - Images stored in `/concept-maps/` folder
+  - Shareable links generated automatically
+
+- [x] **T-030**: Add search scope to concept map
+  - `scope` parameter: this_node, children, siblings, ancestors, all
+  - Filter nodes before keyword matching
+  - Default scope: all (entire Workflowy)
+  - Scope included in response and inserted node note
