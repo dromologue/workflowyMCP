@@ -50,23 +50,33 @@
 
 ```
 src/
-├── index.ts              # Entry point, server setup
+├── index.ts              # Entry point (minimal)
+├── config/
+│   └── environment.ts    # Environment variables, constants
 ├── api/
-│   ├── client.ts         # Workflowy API wrapper
-│   ├── types.ts          # API response types
-│   └── retry.ts          # Retry logic with backoff
-├── tools/
-│   ├── search.ts         # search_nodes, find_insert_targets
-│   ├── navigation.ts     # get_node, get_children, list_targets
-│   ├── creation.ts       # create_node, insert_content, smart_insert
-│   ├── modification.ts   # update_node, move_node, delete_node
-│   └── completion.ts     # complete_node, uncomplete_node
+│   ├── workflowy.ts      # Workflowy API client with retry
+│   ├── dropbox.ts        # Dropbox OAuth + image upload
+│   └── retry.ts          # Retry logic with exponential backoff
+├── types/
+│   └── index.ts          # All TypeScript interfaces
 ├── utils/
 │   ├── cache.ts          # Node caching with TTL
-│   ├── hierarchy.ts      # Indentation parsing
-│   └── paths.ts          # Breadcrumb path building
-└── config/
-    └── env.ts            # Environment variable handling
+│   ├── node-paths.ts     # Breadcrumb path building
+│   ├── text-processing.ts # Indentation parsing, formatting
+│   └── keyword-extraction.ts # Keywords, relevance scoring
+├── schemas/
+│   └── index.ts          # Zod validation schemas
+├── tools/
+│   ├── search.ts         # search_nodes, find_insert_targets
+│   ├── navigation.ts     # get_node, get_children, list_targets, export_all
+│   ├── creation.ts       # create_node, insert_content, smart_insert
+│   ├── modification.ts   # update_node, move_node, delete_node
+│   ├── todos.ts          # create_todo, list_todos
+│   ├── completion.ts     # complete_node, uncomplete_node
+│   ├── knowledge.ts      # find_related, create_links
+│   └── concept-map.ts    # generate_concept_map
+└── handlers/
+    └── index.ts          # Tool handler dispatch
 ```
 
 ## Key Design Decisions
@@ -130,6 +140,69 @@ src/
 - (+) "top" still places content block at top of parent
 - (-) Multiple top-level nodes with "top" won't all be at very top
 - (-) Slight semantic change from raw API behavior
+
+### ADR-006: Knowledge Linking via Keyword Extraction
+
+**Context**: Users want to discover connections between related content in their Workflowy outline.
+
+**Decision**: Extract keywords from node content, filter stop words, score matches by title vs note occurrence, rank by relevance.
+
+**Algorithm**:
+1. Extract keywords: lowercase, remove punctuation, filter words < 3 chars
+2. Filter 100+ English stop words (the, and, is, etc.)
+3. Score matches: +1 per occurrence, +2 bonus for title matches
+4. Rank by total score, return top N results
+
+**Consequences**:
+- (+) Simple, predictable matching behavior
+- (+) Title matches weighted higher (more intentional)
+- (+) No external NLP dependencies
+- (-) English-centric stop word list
+- (-) No semantic understanding (only keyword matching)
+
+### ADR-007: Concept Map Generation
+
+**Context**: Visual representation of node relationships aids understanding of knowledge structure.
+
+**Decision**: Generate Graphviz DOT format, render via @hpcc-js/wasm-graphviz, convert to PNG/JPEG via Sharp, host on Dropbox for Workflowy embedding.
+
+**Architecture**:
+```
+Node Content → Keyword Extraction → Related Node Scoring
+                                          ↓
+DOT Graph ← Edge/Node Building ← Top N Results
+    ↓
+SVG (Graphviz WASM) → PNG/JPEG (Sharp @ 2400px, 300 DPI)
+    ↓
+Dropbox Upload → Shareable URL → Workflowy Node Insert
+```
+
+**Consequences**:
+- (+) No native dependencies (WASM-based)
+- (+) High-quality output suitable for embedding
+- (+) Optional Dropbox hosting with local fallback
+- (-) Requires Dropbox OAuth setup for auto-insert
+- (-) Large dependencies (Sharp, Graphviz WASM)
+
+### ADR-008: Retry Logic with Exponential Backoff
+
+**Context**: Transient API failures should be retried automatically.
+
+**Decision**: Implement retry wrapper with configurable attempts, exponential backoff, and jitter.
+
+**Configuration**:
+- Max attempts: 3
+- Base delay: 1000ms
+- Max delay: 10000ms
+- Retryable: 429, 500, 502, 503, 504
+- Non-retryable: 4xx (except 429)
+
+**Consequences**:
+- (+) Transparent retry for transient failures
+- (+) Rate limit (429) handled gracefully
+- (+) Jitter prevents thundering herd
+- (-) Increased latency on failures
+- (-) May mask persistent issues if not logged
 
 ## Error Handling Strategy
 

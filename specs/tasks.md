@@ -39,7 +39,7 @@
 
 ### Error Handling
 
-- [ ] **T-005**: Implement retry logic with exponential backoff
+- [x] **T-005**: Implement retry logic with exponential backoff
   - Create retry utility with configurable attempts
   - Handle 429 (rate limit) with backoff
   - Handle 5xx errors with retry
@@ -58,10 +58,10 @@
 
 ### Setup
 
-- [ ] **T-007**: Configure test framework
-  - Add Jest or Vitest
-  - Configure TypeScript support
-  - Add coverage reporting
+- [x] **T-007**: Configure test framework
+  - Add Vitest with TypeScript support
+  - Configure coverage reporting (v8)
+  - Add test scripts: test, test:watch, test:coverage
 
 ### Unit Tests
 
