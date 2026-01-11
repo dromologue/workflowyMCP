@@ -234,3 +234,11 @@
   - Edge labels show matching keywords
   - Edge width indicates connection strength
   - Optimized for readability with clear colors and labels
+
+- [x] **T-028**: Add direct image insertion into Workflowy
+  - Integrate imgbb API for image hosting
+  - `insert_into` parameter to specify target node
+  - Automatic upload and node creation with image URL
+  - Markdown image syntax for inline display
+  - Fallback to local save if no API key configured
+  - Optional `save_locally` parameter for local backup

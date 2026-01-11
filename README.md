@@ -49,6 +49,10 @@ Create a `.env` file in the project root:
 ```bash
 WORKFLOWY_USERNAME=your-email@example.com
 WORKFLOWY_API_KEY=your-api-key-here
+
+# Optional: Enable direct image insertion into Workflowy
+# Get a free API key at https://api.imgbb.com/
+IMGBB_API_KEY=your-imgbb-api-key-here
 ```
 
 ### 5. Build the Server
@@ -120,7 +124,7 @@ Quit and reopen Claude Desktop to load the MCP server.
 |------|-------------|
 | `find_related` | Find nodes related to a given node based on keyword analysis |
 | `create_links` | Create internal links from a node to related content in the knowledge base |
-| `generate_concept_map` | Generate a visual PNG/JPEG concept map of node relationships |
+| `generate_concept_map` | Generate a visual concept map and optionally insert it directly into Workflowy (requires IMGBB_API_KEY) |
 
 ### Smart Insertion
 
@@ -192,7 +196,7 @@ Claude will search for "Research", show you matching nodes if there are multiple
 > "Create links from this node to related content in my knowledge base"
 
 **Generate visual concept map:**
-> "Create a concept map showing how this project connects to other nodes"
+> "Create a concept map showing how this project connects to other nodes and add it to my Research node"
 
 **Navigate your outline:**
 > "Show me all the children of my Projects node"

@@ -19,10 +19,55 @@ dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
 const WORKFLOWY_API_KEY = process.env.WORKFLOWY_API_KEY;
 const WORKFLOWY_BASE_URL = "https://workflowy.com/api/v1";
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY;
 
 if (!WORKFLOWY_API_KEY) {
   console.error("Error: WORKFLOWY_API_KEY environment variable is not set");
   process.exit(1);
+}
+
+// Image hosting upload function (imgbb)
+interface ImgbbResponse {
+  success: boolean;
+  data?: {
+    url: string;
+    display_url: string;
+    delete_url: string;
+  };
+  error?: {
+    message: string;
+  };
+}
+
+async function uploadToImgbb(imageBuffer: Buffer, name?: string): Promise<{ success: boolean; url?: string; error?: string }> {
+  if (!IMGBB_API_KEY) {
+    return { success: false, error: "IMGBB_API_KEY not configured. Add it to your .env file to enable direct image insertion." };
+  }
+
+  try {
+    const base64Image = imageBuffer.toString("base64");
+    const formData = new FormData();
+    formData.append("key", IMGBB_API_KEY);
+    formData.append("image", base64Image);
+    if (name) {
+      formData.append("name", name);
+    }
+
+    const response = await fetch("https://api.imgbb.com/1/upload", {
+      method: "POST",
+      body: formData,
+    });
+
+    const result = await response.json() as ImgbbResponse;
+
+    if (result.success && result.data) {
+      return { success: true, url: result.data.display_url };
+    } else {
+      return { success: false, error: result.error?.message || "Unknown upload error" };
+    }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 // Workflowy API helper functions
@@ -439,10 +484,9 @@ function generateDotGraph(
 async function generateConceptMapImage(
   centerNode: { id: string; name: string },
   relatedNodes: RelatedNode[],
-  outputPath: string,
   title: string,
   format: "png" | "jpeg" = "png"
-): Promise<{ success: boolean; path: string; error?: string }> {
+): Promise<{ success: boolean; buffer?: Buffer; error?: string }> {
   try {
     // Generate DOT graph
     const dot = generateDotGraph(centerNode, relatedNodes, title);
@@ -465,14 +509,10 @@ async function generateConceptMapImage(
       })
       .toBuffer();
 
-    // Write to file
-    fs.writeFileSync(outputPath, imageBuffer);
-
-    return { success: true, path: outputPath };
+    return { success: true, buffer: imageBuffer };
   } catch (error) {
     return {
       success: false,
-      path: outputPath,
       error: error instanceof Error ? error.message : String(error),
     };
   }
@@ -658,10 +698,18 @@ const generateConceptMapSchema = z.object({
     .number()
     .optional()
     .describe("Maximum number of related nodes to include (default: 8)"),
+  insert_into: z
+    .string()
+    .optional()
+    .describe("Parent node ID to insert the concept map image into. If provided, uploads to imgbb and creates a node with the image. Requires IMGBB_API_KEY."),
+  save_locally: z
+    .boolean()
+    .optional()
+    .describe("Also save the image locally (default: true if insert_into not provided, false otherwise)"),
   output_path: z
     .string()
     .optional()
-    .describe("Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
+    .describe("Local output file path when saving locally. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
   format: z
     .enum(["png", "jpeg"])
     .optional()
@@ -1003,7 +1051,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "generate_concept_map",
         description:
-          "Generate a visual concept map showing a node and its related content. Creates a PNG or JPEG image optimized for readability that can be inserted into Workflowy.",
+          "Generate a visual concept map showing a node and its related content. Creates a PNG or JPEG image and can insert it directly into Workflowy (requires IMGBB_API_KEY for image hosting).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1016,10 +1064,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Maximum number of related nodes to include (default: 8)",
             },
+            insert_into: {
+              type: "string",
+              description:
+                "Parent node ID to insert the concept map into. Uploads to imgbb and creates a node with the image. Requires IMGBB_API_KEY.",
+            },
+            save_locally: {
+              type: "boolean",
+              description:
+                "Also save the image locally (default: true if insert_into not provided)",
+            },
             output_path: {
               type: "string",
               description:
-                "Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png",
+                "Local output file path when saving locally. Defaults to ~/Downloads/concept-map-{timestamp}.png",
             },
             format: {
               type: "string",
@@ -1621,7 +1679,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "generate_concept_map": {
-        const { node_id, max_related, output_path, format, title } =
+        const { node_id, max_related, insert_into, save_locally, output_path, format, title } =
           generateConceptMapSchema.parse(args);
         const allNodes = await getCachedNodes();
 
@@ -1665,35 +1723,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Determine output path
-        const imageFormat = format || "png";
-        const timestamp = Date.now();
-        const defaultPath = path.join(
-          process.env.HOME || "/tmp",
-          "Downloads",
-          `concept-map-${timestamp}.${imageFormat}`
-        );
-        const finalPath = output_path || defaultPath;
-
-        // Ensure directory exists
-        const dir = path.dirname(finalPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-
         // Generate the map title
+        const imageFormat = format || "png";
         const mapTitle = title || `Concept Map: ${sourceNode.name || "Node"}`;
 
         // Generate the image
         const result = await generateConceptMapImage(
           { id: sourceNode.id, name: sourceNode.name || "" },
           relatedNodes,
-          finalPath,
           mapTitle,
           imageFormat
         );
 
-        if (!result.success) {
+        if (!result.success || !result.buffer) {
           return {
             content: [
               {
@@ -1713,32 +1755,111 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        // Response data to build
+        const responseData: Record<string, unknown> = {
+          success: true,
+          format: imageFormat,
+          center_node: {
+            id: sourceNode.id,
+            name: sourceNode.name,
+          },
+          keywords_used: keywords,
+          related_nodes_count: relatedNodes.length,
+          related_nodes: relatedNodes.map((n) => ({
+            id: n.id,
+            name: n.name,
+            relevance: n.relevanceScore,
+          })),
+        };
+
+        // Determine if we should save locally
+        const shouldSaveLocally = save_locally ?? !insert_into;
+
+        if (shouldSaveLocally) {
+          const timestamp = Date.now();
+          const defaultPath = path.join(
+            process.env.HOME || "/tmp",
+            "Downloads",
+            `concept-map-${timestamp}.${imageFormat}`
+          );
+          const finalPath = output_path || defaultPath;
+
+          // Ensure directory exists
+          const dir = path.dirname(finalPath);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+
+          fs.writeFileSync(finalPath, result.buffer);
+          responseData.local_path = finalPath;
+        }
+
+        // If insert_into is provided, upload to imgbb and create node in Workflowy
+        if (insert_into) {
+          const uploadResult = await uploadToImgbb(
+            result.buffer,
+            `concept-map-${sourceNode.id}`
+          );
+
+          if (!uploadResult.success) {
+            // If upload fails but we saved locally, report partial success
+            if (shouldSaveLocally) {
+              responseData.message = `Concept map saved locally. Image upload failed: ${uploadResult.error}`;
+              responseData.upload_error = uploadResult.error;
+            } else {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      {
+                        success: false,
+                        message: `Failed to upload image: ${uploadResult.error}`,
+                        hint: "Add IMGBB_API_KEY to your .env file. Get a free key at https://api.imgbb.com/",
+                      },
+                      null,
+                      2
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+          } else {
+            // Create a node in Workflowy with the image
+            const imageUrl = uploadResult.url!;
+            const nodeName = `📊 ${mapTitle}`;
+            const nodeNote = `![${mapTitle}](${imageUrl})\n\nRelated nodes: ${relatedNodes.map(n => n.name).join(", ")}`;
+
+            const createdNode = await workflowyRequest("/nodes", "POST", {
+              name: nodeName,
+              note: nodeNote,
+              parent_id: insert_into,
+              position: "top",
+            }) as { id: string; name: string };
+
+            invalidateCache();
+
+            responseData.message = "Concept map generated and inserted into Workflowy";
+            responseData.image_url = imageUrl;
+            responseData.workflowy_node = {
+              id: createdNode.id,
+              name: nodeName,
+              parent_id: insert_into,
+            };
+          }
+        } else {
+          responseData.message = "Concept map generated successfully";
+          if (!IMGBB_API_KEY) {
+            responseData.hint = "To insert directly into Workflowy, add IMGBB_API_KEY to your .env file and use the insert_into parameter. Get a free key at https://api.imgbb.com/";
+          }
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  success: true,
-                  message: `Concept map generated successfully`,
-                  image_path: result.path,
-                  format: imageFormat,
-                  center_node: {
-                    id: sourceNode.id,
-                    name: sourceNode.name,
-                  },
-                  keywords_used: keywords,
-                  related_nodes_count: relatedNodes.length,
-                  related_nodes: relatedNodes.map((n) => ({
-                    id: n.id,
-                    name: n.name,
-                    relevance: n.relevanceScore,
-                  })),
-                  instructions: "To insert into Workflowy: Upload the image to a hosting service and add it to a note using ![Concept Map](image_url)",
-                },
-                null,
-                2
-              ),
+              text: JSON.stringify(responseData, null, 2),
             },
           ],
         };
