@@ -95,10 +95,13 @@ Create `.env` in the project root:
 WORKFLOWY_USERNAME=your-email@example.com
 WORKFLOWY_API_KEY=your-api-key
 
-# Required for concept maps - Dropbox
+# Required for concept maps via MCP - Dropbox
 DROPBOX_APP_KEY=your-app-key
 DROPBOX_APP_SECRET=your-app-secret
 DROPBOX_REFRESH_TOKEN=your-refresh-token
+
+# Optional - for CLI auto concept extraction
+ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
 
 Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
@@ -189,6 +192,83 @@ Add the `refresh_token` from the response to your `.env`.
 | `format` | `png` (default) or `jpeg` |
 | `title` | Custom title for the map |
 
+## CLI Tool
+
+Generate concept maps directly from the command line without Claude Desktop. The CLI can optionally use the Claude API to automatically extract relevant concepts from your content.
+
+### Basic Usage
+
+```bash
+# With manual concepts
+npm run concept-map -- --search "My Notes" --core "Main Topic" \
+  --concepts "concept1,concept2,concept3"
+
+# With Claude auto-extraction
+npm run concept-map -- --search "Philosophy" --core "Event" --auto
+
+# By node ID
+npm run concept-map -- --node-id abc123 --core "Theme" --concepts "a,b,c"
+```
+
+### CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `-n, --node-id <id>` | Workflowy node ID to analyze |
+| `-s, --search <query>` | Search for node by name |
+| `-c, --core <concept>` | Core concept at map center |
+| `-C, --concepts <list>` | Comma-separated concept list |
+| `-a, --auto` | Use Claude to extract concepts |
+| `-o, --output <file>` | Output filename |
+| `-f, --format <type>` | `png` (default) or `jpeg` |
+| `--no-claude` | Skip Claude, use provided concepts only |
+
+### Examples
+
+```bash
+# Map philosophical concepts under "Conceptual Foundations"
+npm run concept-map -- \
+  --search "Conceptual Foundations" \
+  --core "Event" \
+  --concepts "Being,Truth,Subject,Fidelity,Situation,Spectacle,Ereignis" \
+  --output event-map.png
+
+# Let Claude identify concepts automatically
+npm run concept-map -- \
+  --search "Research Notes" \
+  --core "Machine Learning" \
+  --auto
+
+# Combine manual + auto concepts
+npm run concept-map -- \
+  --node-id 696f787e-0670-43ba-f37b-613d14d4490f \
+  --core "Phenomenology" \
+  --concepts "Husserl,Heidegger,Merleau-Ponty" \
+  --auto
+```
+
+### Claude API Setup (Optional)
+
+For `--auto` concept extraction, add to `.env`:
+
+```bash
+ANTHROPIC_API_KEY=your-api-key
+```
+
+Without the API key, `--auto` is skipped and only manual concepts are used.
+
+### Output
+
+The CLI saves images to the current directory:
+
+```
+✅ Concept map saved to: /path/to/current/dir/concept-map-event-1234567890.png
+   Size: 451.0 KB
+   Concepts mapped: 12
+   Major: Being, Situation, Spectacle, Truth, Difference, Subject
+   Detail: Rupture, Fidelity, Will to Power, Ereignis
+```
+
 ## Additional Tools
 
 The server includes full Workflowy management to support your knowledge work:
@@ -228,9 +308,10 @@ The server includes full Workflowy management to support your knowledge work:
 ## Development
 
 ```bash
-npm run build    # Compile TypeScript
-npm test         # Run test suite (61 tests)
-npm start        # Run the server
+npm run build        # Compile TypeScript
+npm test             # Run test suite (61 tests)
+npm start            # Run the MCP server
+npm run concept-map  # Run CLI tool (see CLI Tool section)
 ```
 
 ## License
