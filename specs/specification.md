@@ -109,19 +109,51 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 **Link format**: `[Node Title](https://workflowy.com/#/nodeId)`
 
 **Concept map generation**:
-- Center node displayed with related nodes arranged around it
-- Edge labels show matching keywords between nodes
-- Edge width indicates relevance strength
-- Output formats: PNG (default), JPEG
-- Configurable search scope (children, siblings, ancestors, all)
+
+Follows academic concept mapping principles (Cornell University guidelines):
+
+1. **Core concept at center**: The main topic/theme is placed prominently at the top
+2. **Hierarchical arrangement**: Concepts arranged in levels (major → detail)
+3. **Labeled relationships**: Connections show *how* concepts relate (not just that they do)
+4. **Visual encoding**: Node size = frequency, edge color = relationship type
+
+**Creating a concept map** (based on Cornell/academic best practices):
+1. Identify the core concept - the central theme being mapped
+2. List concepts/terms to map - these become nodes in the visualization
+3. Analyze content to find relationships - tool scans Workflowy children for co-occurrence
+4. Extract relationship labels - phrases like "influences", "contrasts with", "includes" from context
+5. Organize hierarchically - concepts found in shallower Workflowy nodes become "major concepts", deeper ones become "details"
+6. Generate visual map - Graphviz renders the hierarchical network
+
+**Parameters**:
+- `node_id`: Parent node whose children will be analyzed
+- `core_concept`: The central concept (defaults to parent node name)
+- `concepts`: List of concepts/terms to map (required, minimum 2)
+- `scope`: Search scope for content analysis (default: children)
+- `format`: PNG (default) or JPEG
+- `title`: Custom title for the map
+
+**Visual encoding**:
+- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
+- **Node size**: Larger = concept appears in more nodes
+- **Edge labels**: Relationship type extracted from content context
+- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
+
+**Relationship extraction**: The tool scans content for relationship words:
+- Causal: leads to, causes, results in
+- Hierarchical: includes, is part of, contains
+- Comparative: contrasts with, similar to, differs from
+- Dependency: requires, enables, prevents
+- Evaluative: supports, opposes, extends, critiques
+
+**Output**:
 - High resolution (2400px, 300 DPI) for modern displays
-- Optimized for readability with clear node labels and colors
 - Auto-insert into source node via Dropbox image hosting
 - Fallback: save locally to `~/Downloads/` if Dropbox not configured
 
 **Search scopes**:
-- `all`: Search entire Workflowy knowledge base (default)
-- `children`: Search only descendants of the center node
+- `children`: Search only descendants of the parent node (default)
+- `all`: Search entire Workflowy knowledge base
 - `siblings`: Search only peer nodes (same parent)
 - `ancestors`: Search only the parent chain
 
@@ -185,13 +217,24 @@ User: "Mark my weekly review tasks as complete"
 ### Flow 4: Visualize Knowledge Connections
 
 ```
-User: "Create a concept map showing how this project connects to other nodes"
+User: "Create a concept map of my philosophy notes showing how Heidegger, Dewey,
+       phenomenology, and pragmatism relate"
 
-1. get_node retrieves the target node content
-2. generate_concept_map analyzes keywords and finds related nodes
-3. Graphviz renders the relationship graph
-4. PNG/JPEG saved to Downloads folder
-5. User can insert image into Workflowy or share
+1. User provides the parent node and list of concepts
+2. generate_concept_map scans all children for concept occurrences
+3. Tool extracts relationship labels from context (e.g., "Heidegger critiques pragmatism")
+4. Concepts organized hierarchically based on Workflowy depth:
+   - Major concepts (found in shallower notes)
+   - Detail concepts (found in deeper nested notes)
+5. Graphviz renders hierarchical network with labeled edges
+6. PNG auto-inserted into Workflowy (or saved to Downloads)
+
+Example output structure:
+- Core: "Philosophy Notes" (center)
+- Major: "Heidegger", "Dewey" (connected to core with "includes")
+- Details: "phenomenology", "pragmatism" (connected with "influences", "contrasts with")
+- Cross-links: "Heidegger" → "phenomenology" ("develops"),
+              "phenomenology" ↔ "pragmatism" ("contrasts with")
 ```
 
 ## Constraints
