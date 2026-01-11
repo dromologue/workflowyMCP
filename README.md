@@ -236,64 +236,61 @@ The `export_all` tool is rate limited to 1 request per minute by Workflowy's API
 
 ## Dropbox Configuration (Optional)
 
-To enable direct insertion of concept map images into Workflowy, you need to configure Dropbox for image hosting. This is a one-time setup.
+To insert concept map images directly into Workflowy, configure Dropbox for image hosting. This is a one-time setup.
 
-### 1. Create a Dropbox App
+### Step 1: Create a Dropbox App
 
-1. Go to the [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Click "Create app"
-3. Choose "Scoped access"
-4. Choose "Full Dropbox" access
-5. Name your app (e.g., "Workflowy Concept Maps")
-6. Click "Create app"
+1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
+2. Click **Create app** → Choose **Scoped access** → Choose **Full Dropbox**
+3. Name it anything (e.g., "Workflowy Concept Maps") → Click **Create app**
+4. On the app page, copy your **App key** and **App secret**
 
-### 2. Configure App Permissions
+### Step 2: Set Permissions
 
-On your app's settings page:
-1. Go to the "Permissions" tab
-2. Enable these permissions:
-   - `files.content.write` - to upload images
-   - `sharing.write` - to create shareable links
-3. Click "Submit" to save
+1. Go to the **Permissions** tab
+2. Check: `files.content.write` and `sharing.write`
+3. Click **Submit**
 
-### 3. Get Your Refresh Token
+### Step 3: Get Your Authorization Code
 
-Dropbox uses OAuth 2.0 with short-lived access tokens. You need a refresh token for long-term access.
-
-**Step 1:** Build the authorization URL (replace `YOUR_APP_KEY` with your app key):
+Open this URL in your browser (replace `YOUR_APP_KEY` with your actual app key):
 
 ```
 https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
 ```
 
-**Step 2:** Visit this URL in your browser and authorize the app. You'll receive an authorization code.
+Click **Allow**. Dropbox will show you a **code** - copy it.
 
-**Step 3:** Exchange the code for tokens. Run this command (replace placeholders):
+### Step 4: Exchange Code for Refresh Token
+
+Run this command in Terminal (replace the THREE placeholders):
 
 ```bash
-curl https://api.dropbox.com/oauth2/token \
-  -d code=YOUR_AUTHORIZATION_CODE \
+curl -X POST https://api.dropbox.com/oauth2/token \
+  -d code=PASTE_YOUR_CODE_HERE \
   -d grant_type=authorization_code \
   -d client_id=YOUR_APP_KEY \
   -d client_secret=YOUR_APP_SECRET
 ```
 
-The response will include a `refresh_token`. Copy this value.
-
-### 4. Add Credentials to .env
-
-Add these lines to your `.env` file:
-
-```bash
-# Dropbox configuration for concept map image storage
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=your-refresh-token
+You'll get a JSON response. Find the `"refresh_token"` value - it looks like:
+```
+"refresh_token": "xxxxxxxxxxxxAAAAAAAAAxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-### 5. Verify Setup
+### Step 5: Add to .env
 
-Restart Claude Desktop and test with:
+Add these three lines to your `.env` file:
+
+```bash
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=paste-the-refresh-token-from-step-4
+```
+
+### Step 6: Test
+
+Restart Claude Desktop and try:
 > "Create a concept map for my Research node and insert it there"
 
 Concept map images will be stored in `/Apps/your-app-name/concept-maps/` in your Dropbox.
