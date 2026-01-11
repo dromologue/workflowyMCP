@@ -120,6 +120,7 @@ Quit and reopen Claude Desktop to load the MCP server.
 |------|-------------|
 | `find_related` | Find nodes related to a given node based on keyword analysis |
 | `create_links` | Create internal links from a node to related content in the knowledge base |
+| `generate_concept_map` | Generate a visual PNG/JPEG concept map of node relationships |
 
 ### Smart Insertion
 
@@ -189,6 +190,9 @@ Claude will search for "Research", show you matching nodes if there are multiple
 
 **Auto-link knowledge:**
 > "Create links from this node to related content in my knowledge base"
+
+**Generate visual concept map:**
+> "Create a concept map showing how this project connects to other nodes"
 
 **Navigate your outline:**
 > "Show me all the children of my Projects node"

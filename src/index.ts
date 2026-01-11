@@ -7,7 +7,10 @@ import {
 import { z } from "zod";
 import * as dotenv from "dotenv";
 import * as path from "path";
+import * as fs from "fs";
 import { fileURLToPath } from "url";
+import { Graphviz } from "@hpcc-js/wasm-graphviz";
+import sharp from "sharp";
 
 // Load environment variables from .env file in the project directory
 const __filename = fileURLToPath(import.meta.url);
@@ -302,6 +305,179 @@ async function findRelatedNodes(
   return { keywords, relatedNodes };
 }
 
+// Concept map generation
+interface ConceptMapNode {
+  id: string;
+  label: string;
+  isCenter: boolean;
+}
+
+interface ConceptMapEdge {
+  from: string;
+  to: string;
+  keywords: string[];
+  weight: number;
+}
+
+// Escape special characters for DOT format
+function escapeForDot(str: string): string {
+  return str
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .substring(0, 40); // Truncate for readability
+}
+
+// Generate DOT format graph for Graphviz
+function generateDotGraph(
+  centerNode: { id: string; name: string },
+  relatedNodes: RelatedNode[],
+  title: string
+): string {
+  const nodes: ConceptMapNode[] = [
+    { id: centerNode.id, label: centerNode.name || "Center", isCenter: true },
+  ];
+
+  const edges: ConceptMapEdge[] = [];
+
+  for (const related of relatedNodes) {
+    nodes.push({
+      id: related.id,
+      label: related.name || "Untitled",
+      isCenter: false,
+    });
+    edges.push({
+      from: centerNode.id,
+      to: related.id,
+      keywords: related.matchedKeywords,
+      weight: related.relevanceScore,
+    });
+  }
+
+  // Build DOT format
+  let dot = `digraph ConceptMap {
+    // Graph settings for readability
+    graph [
+      rankdir=TB
+      bgcolor="#ffffff"
+      fontname="Arial"
+      fontsize=14
+      pad=0.5
+      nodesep=0.8
+      ranksep=1.0
+      label="${escapeForDot(title)}"
+      labelloc=t
+      labeljust=c
+      fontcolor="#333333"
+    ];
+
+    // Default node settings
+    node [
+      shape=box
+      style="rounded,filled"
+      fontname="Arial"
+      fontsize=11
+      margin=0.2
+      width=0
+      height=0
+    ];
+
+    // Default edge settings
+    edge [
+      fontname="Arial"
+      fontsize=9
+      color="#666666"
+      fontcolor="#888888"
+    ];
+
+`;
+
+  // Add nodes
+  for (const node of nodes) {
+    const escapedLabel = escapeForDot(node.label);
+    if (node.isCenter) {
+      // Center node - larger, different color
+      dot += `    "${node.id}" [
+      label="${escapedLabel}"
+      fillcolor="#4A90D9"
+      fontcolor="#ffffff"
+      fontsize=13
+      penwidth=2
+    ];\n`;
+    } else {
+      // Related nodes - lighter color
+      dot += `    "${node.id}" [
+      label="${escapedLabel}"
+      fillcolor="#E8F4FD"
+      fontcolor="#333333"
+      penwidth=1
+    ];\n`;
+    }
+  }
+
+  dot += "\n";
+
+  // Add edges with keyword labels
+  for (const edge of edges) {
+    const keywordLabel =
+      edge.keywords.length > 0
+        ? edge.keywords.slice(0, 3).join(", ")
+        : "";
+    const penWidth = Math.min(1 + edge.weight * 0.3, 4);
+    dot += `    "${edge.from}" -> "${edge.to}" [
+      label="${escapeForDot(keywordLabel)}"
+      penwidth=${penWidth.toFixed(1)}
+    ];\n`;
+  }
+
+  dot += "}\n";
+
+  return dot;
+}
+
+// Generate concept map image
+async function generateConceptMapImage(
+  centerNode: { id: string; name: string },
+  relatedNodes: RelatedNode[],
+  outputPath: string,
+  title: string,
+  format: "png" | "jpeg" = "png"
+): Promise<{ success: boolean; path: string; error?: string }> {
+  try {
+    // Generate DOT graph
+    const dot = generateDotGraph(centerNode, relatedNodes, title);
+
+    // Initialize Graphviz WASM
+    const graphviz = await Graphviz.load();
+
+    // Render to SVG
+    const svg = graphviz.dot(dot, "svg");
+
+    // Convert SVG to PNG/JPEG using sharp
+    const imageBuffer = await sharp(Buffer.from(svg))
+      .resize(1200, null, {
+        fit: "inside",
+        withoutEnlargement: false,
+      })
+      .flatten({ background: "#ffffff" })
+      [format]({
+        quality: format === "jpeg" ? 90 : undefined,
+      })
+      .toBuffer();
+
+    // Write to file
+    fs.writeFileSync(outputPath, imageBuffer);
+
+    return { success: true, path: outputPath };
+  } catch (error) {
+    return {
+      success: false,
+      path: outputPath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 // Insert hierarchical content respecting indentation
 interface CreatedNode {
   id: string;
@@ -474,6 +650,26 @@ const createLinksSchema = z.object({
     .enum(["note", "child"])
     .optional()
     .describe("Where to place links: 'note' appends to node note, 'child' creates a 'Related' child node (default: child)"),
+});
+
+const generateConceptMapSchema = z.object({
+  node_id: z.string().describe("The ID of the center node for the concept map"),
+  max_related: z
+    .number()
+    .optional()
+    .describe("Maximum number of related nodes to include (default: 8)"),
+  output_path: z
+    .string()
+    .optional()
+    .describe("Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
+  format: z
+    .enum(["png", "jpeg"])
+    .optional()
+    .describe("Image format (default: png)"),
+  title: z
+    .string()
+    .optional()
+    .describe("Title for the concept map (defaults to node name)"),
 });
 
 const insertContentSchema = z.object({
@@ -799,6 +995,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["note", "child"],
               description:
                 "Where to place links: 'note' appends to node note, 'child' creates a 'Related' child node (default: child)",
+            },
+          },
+          required: ["node_id"],
+        },
+      },
+      {
+        name: "generate_concept_map",
+        description:
+          "Generate a visual concept map showing a node and its related content. Creates a PNG or JPEG image optimized for readability that can be inserted into Workflowy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type: "string",
+              description: "The ID of the center node for the concept map",
+            },
+            max_related: {
+              type: "number",
+              description:
+                "Maximum number of related nodes to include (default: 8)",
+            },
+            output_path: {
+              type: "string",
+              description:
+                "Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png",
+            },
+            format: {
+              type: "string",
+              enum: ["png", "jpeg"],
+              description: "Image format (default: png)",
+            },
+            title: {
+              type: "string",
+              description: "Title for the concept map (defaults to node name)",
             },
           },
           required: ["node_id"],
@@ -1381,6 +1611,130 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     path: n.path,
                     link: n.link,
                   })),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "generate_concept_map": {
+        const { node_id, max_related, output_path, format, title } =
+          generateConceptMapSchema.parse(args);
+        const allNodes = await getCachedNodes();
+
+        // Find the source node
+        const sourceNode = allNodes.find((n) => n.id === node_id);
+        if (!sourceNode) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Node with ID "${node_id}" not found`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Find related nodes
+        const { keywords, relatedNodes } = await findRelatedNodes(
+          sourceNode,
+          allNodes,
+          max_related || 8
+        );
+
+        if (relatedNodes.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    message: "No related nodes found. Cannot generate concept map for a node with no connections.",
+                    keywords_extracted: keywords,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Determine output path
+        const imageFormat = format || "png";
+        const timestamp = Date.now();
+        const defaultPath = path.join(
+          process.env.HOME || "/tmp",
+          "Downloads",
+          `concept-map-${timestamp}.${imageFormat}`
+        );
+        const finalPath = output_path || defaultPath;
+
+        // Ensure directory exists
+        const dir = path.dirname(finalPath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        // Generate the map title
+        const mapTitle = title || `Concept Map: ${sourceNode.name || "Node"}`;
+
+        // Generate the image
+        const result = await generateConceptMapImage(
+          { id: sourceNode.id, name: sourceNode.name || "" },
+          relatedNodes,
+          finalPath,
+          mapTitle,
+          imageFormat
+        );
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    message: "Failed to generate concept map image",
+                    error: result.error,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: `Concept map generated successfully`,
+                  image_path: result.path,
+                  format: imageFormat,
+                  center_node: {
+                    id: sourceNode.id,
+                    name: sourceNode.name,
+                  },
+                  keywords_used: keywords,
+                  related_nodes_count: relatedNodes.length,
+                  related_nodes: relatedNodes.map((n) => ({
+                    id: n.id,
+                    name: n.name,
+                    relevance: n.relevanceScore,
+                  })),
+                  instructions: "To insert into Workflowy: Upload the image to a hosting service and add it to a note using ![Concept Map](image_url)",
                 },
                 null,
                 2

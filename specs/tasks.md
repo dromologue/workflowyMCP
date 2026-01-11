@@ -225,3 +225,12 @@
   - Keyword extraction with stop word filtering
   - Link placement options: child node or note appendage
   - Auto-discovery of connections based on content analysis
+
+- [x] **T-027**: Add visual concept map generation
+  - `generate_concept_map`: Create PNG/JPEG graph of node relationships
+  - Graphviz WASM for graph rendering (no native dependencies)
+  - Sharp for SVG to PNG/JPEG conversion
+  - Center node with related nodes arranged by relevance
+  - Edge labels show matching keywords
+  - Edge width indicates connection strength
+  - Optimized for readability with clear colors and labels

@@ -95,6 +95,7 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 | Find related | Analyze node content, extract keywords, find matching nodes |
 | Create links | Generate Workflowy internal links to related nodes |
 | Auto-discovery | Automatically find relevant connections based on content |
+| Concept map | Generate visual PNG/JPEG graph of node relationships |
 
 **Keyword extraction**:
 - Filters common stop words
@@ -106,6 +107,14 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 - `note`: Appends links to the node's existing note
 
 **Link format**: `[Node Title](https://workflowy.com/#/nodeId)`
+
+**Concept map generation**:
+- Center node displayed with related nodes arranged around it
+- Edge labels show matching keywords between nodes
+- Edge width indicates relevance strength
+- Output formats: PNG (default), JPEG
+- Default output: `~/Downloads/concept-map-{timestamp}.png`
+- Optimized for readability with clear node labels and colors
 
 **Success criteria**: Surface relevant connections user might not have noticed.
 
@@ -156,6 +165,18 @@ User: "Mark my weekly review tasks as complete"
 2. get_children to list tasks
 3. complete_node for each task
 4. Confirmation of completed items
+```
+
+### Flow 4: Visualize Knowledge Connections
+
+```
+User: "Create a concept map showing how this project connects to other nodes"
+
+1. get_node retrieves the target node content
+2. generate_concept_map analyzes keywords and finds related nodes
+3. Graphviz renders the relationship graph
+4. PNG/JPEG saved to Downloads folder
+5. User can insert image into Workflowy or share
 ```
 
 ## Constraints
