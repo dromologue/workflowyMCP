@@ -247,7 +247,7 @@
   - Replace imgbb with Dropbox API integration
   - OAuth 2.0 with refresh token for long-lived access
   - Automatic access token refresh with caching
-  - Images stored in `/concept-maps/` folder
+  - Images stored in `/workflowy/conceptMaps/` folder
   - Shareable links generated automatically
 
 - [x] **T-030**: Add search scope to concept map

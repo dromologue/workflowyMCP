@@ -126,7 +126,7 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 
 **Image hosting** (Dropbox):
 - Requires Dropbox OAuth configuration (app key, secret, refresh token)
-- Images stored in `/concept-maps/` folder
+- Images stored in `/workflowy/conceptMaps/` folder
 - Shareable links generated automatically
 - When configured, concept maps can be inserted directly into Workflowy nodes
 

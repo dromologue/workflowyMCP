@@ -103,7 +103,7 @@ async function uploadToDropbox(
 
   try {
     // Upload file to Dropbox
-    const uploadPath = `/concept-maps/${filename}`;
+    const uploadPath = `/workflowy/conceptMaps/${filename}`;
 
     const uploadResponse = await fetch("https://content.dropboxapi.com/2/files/upload", {
       method: "POST",
@@ -2028,7 +2028,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             responseData.message = "Concept map generated and inserted into Workflowy";
             responseData.image_url = imageUrl;
-            responseData.dropbox_path = `/concept-maps/${filename}`;
+            responseData.dropbox_path = `/workflowy/conceptMaps/${filename}`;
             responseData.workflowy_node = {
               id: createdNode.id,
               name: nodeName,

@@ -293,7 +293,7 @@ DROPBOX_REFRESH_TOKEN=paste-the-refresh-token-from-step-4
 Restart Claude Desktop and try:
 > "Create a concept map for my Research node and insert it there"
 
-Concept map images will be stored in `/Apps/your-app-name/concept-maps/` in your Dropbox.
+Concept map images will be stored in `/workflowy/conceptMaps/` in your Dropbox.
 
 ## Concept Map Scope Options
 
