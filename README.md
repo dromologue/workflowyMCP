@@ -1,80 +1,107 @@
-# Workflowy MCP Server
+# Concept Mapping with Claude, Workflowy & Dropbox
 
-A Model Context Protocol (MCP) server that integrates [Workflowy](https://workflowy.com) with Claude Desktop, enabling AI-powered management of your Workflowy outlines.
+A visual concept mapping tool that connects Claude's AI with your Workflowy knowledge base. Generate hierarchical concept maps that reveal relationships between ideas in your notes, automatically hosted via Dropbox and embedded in your outline.
 
-## Features
+## What It Does
 
-### Core Operations
-- **Search** nodes by text across your entire outline
-- **Navigate** and retrieve nodes and their children
-- **Create** new nodes with markdown formatting
-- **Edit** existing node names and notes
-- **Delete** nodes permanently
-- **Move** nodes to new locations
+**Turn your notes into visual knowledge maps.**
 
-### Knowledge Management
-- **Todo Management** - Create, list, and complete checkbox items
-- **Find Related** - Discover connections between nodes using keyword analysis
-- **Create Links** - Auto-generate internal links to related content
+You provide a list of concepts (philosophers, theories, themes, project components) and a Workflowy node to analyze. The tool:
 
-### Visual Concept Maps
-Generate visual relationship graphs that show how your ideas connect:
-- **Automatic keyword extraction** from node content
-- **Relevance scoring** to find the most related nodes
-- **Configurable scope** - search children, siblings, ancestors, or entire outline
-- **High-resolution output** (2400px, 300 DPI)
-- **Auto-insert into Workflowy** via Dropbox integration (or save locally)
+1. Scans your Workflowy content for where those concepts appear
+2. Extracts relationship labels from context ("influences", "contrasts with", "extends")
+3. Organizes concepts hierarchically based on document structure
+4. Generates a visual graph with labeled connections
+5. Uploads to Dropbox and embeds the image in your Workflowy
 
-## Prerequisites
+## Example
 
-- [Node.js](https://nodejs.org/) v18 or later
+```
+You: "Create a concept map of my philosophy notes showing how
+      Heidegger, Dewey, phenomenology, and pragmatism relate"
+
+Claude: Analyzes your notes, finds that:
+        - Heidegger appears in 12 nodes, develops phenomenology
+        - Dewey appears in 8 nodes, central to pragmatism
+        - "phenomenology contrasts with pragmatism" found in context
+
+        → Generates hierarchical map with labeled relationships
+        → Uploads to Dropbox, embeds in your Philosophy node
+```
+
+## The Stack
+
+| Component | Role |
+|-----------|------|
+| **Claude** | AI that understands your request, orchestrates the analysis, interprets results |
+| **Workflowy** | Your knowledge base - the source content being mapped |
+| **Dropbox** | Image hosting - makes concept maps viewable in Workflowy |
+| **Graphviz** | Graph rendering engine (runs locally via WASM) |
+
+## Concept Map Features
+
+### Academic-Style Mapping
+
+Follows Cornell University concept mapping guidelines:
+
+- **Core concept** at center (your main theme)
+- **Hierarchical levels** - major concepts vs. detail concepts based on document depth
+- **Labeled relationships** - shows *how* concepts connect, not just that they do
+- **Visual encoding** - node size = frequency, edge color = relationship type
+
+### Relationship Detection
+
+Automatically extracts relationship types from your content:
+
+| Type | Examples |
+|------|----------|
+| Causal | leads to, causes, results in |
+| Hierarchical | includes, is part of, contains |
+| Comparative | contrasts with, similar to, differs from |
+| Dependency | requires, enables, prevents |
+| Evaluative | supports, opposes, extends, critiques |
+
+### Output
+
+- Square aspect ratio (2000x2000 max) for balanced visual layout
+- 300 DPI for high-resolution display
+- Unicode support (French accents, German umlauts, etc.)
+- Maximum 35 concepts per map (split larger sets into themed groups)
+
+## Quick Start
+
+### Prerequisites
+
+- Node.js v18+
 - [Claude Desktop](https://claude.ai/download)
-- A Workflowy account with an API key
+- Workflowy account with [API key](https://workflowy.com/api-key)
+- Dropbox account (for image hosting)
 
-## Installation
-
-### 1. Clone the Repository
+### Installation
 
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git
 cd workflowyMCP
-```
-
-### 2. Install Dependencies
-
-```bash
 npm install
-```
-
-### 3. Get Your Workflowy API Key
-
-1. Log in to [Workflowy](https://workflowy.com)
-2. Visit [https://workflowy.com/api-key](https://workflowy.com/api-key)
-3. Generate and copy your API key
-
-### 4. Configure Environment
-
-Create a `.env` file in the project root:
-
-```bash
-WORKFLOWY_USERNAME=your-email@example.com
-WORKFLOWY_API_KEY=your-api-key-here
-```
-
-### 5. Build the Server
-
-```bash
 npm run build
 ```
 
-### 6. Configure Claude Desktop
+### Configuration
 
-Open your Claude Desktop configuration file:
+Create `.env` in the project root:
 
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+```bash
+# Required - Workflowy
+WORKFLOWY_USERNAME=your-email@example.com
+WORKFLOWY_API_KEY=your-api-key
 
-Add the Workflowy server to your configuration:
+# Required for concept maps - Dropbox
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=your-refresh-token
+```
+
+Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
@@ -87,311 +114,132 @@ Add the Workflowy server to your configuration:
 }
 ```
 
-Replace `/absolute/path/to/workflowyMCP` with the actual path where you cloned the repository.
+Restart Claude Desktop.
 
-### 7. Restart Claude Desktop
+## Dropbox Setup
 
-Quit and reopen Claude Desktop to load the MCP server.
+Concept maps require Dropbox for image hosting. Without it, images save to `~/Downloads/` instead.
 
-## Available Tools
-
-### Search & Navigation
-
-| Tool | Description |
-|------|-------------|
-| `search_nodes` | Search for nodes by text in names and notes. Returns full paths for easy identification. |
-| `get_node` | Retrieve a specific node by its ID |
-| `get_children` | List child nodes of a parent (or root-level nodes) |
-| `find_insert_targets` | Search for potential target nodes with numbered list for selection |
-| `list_targets` | List available shortcuts (inbox, user-defined) |
-| `export_all` | Export all nodes (rate limited: 1 request/minute) |
-
-### Content Management
-
-| Tool | Description |
-|------|-------------|
-| `create_node` | Create a new node with optional markdown formatting |
-| `update_node` | Edit a node's name and/or note |
-| `delete_node` | Permanently delete a node |
-| `move_node` | Move a node to a new parent location |
-
-### Todo Management
-
-| Tool | Description |
-|------|-------------|
-| `create_todo` | Create a checkbox todo item with optional initial completion state |
-| `list_todos` | List all todos with filtering by status, parent, and search text |
-| `complete_node` | Mark a todo (or any node) as completed |
-| `uncomplete_node` | Mark a todo (or any node) as incomplete |
-
-### Knowledge Linking
-
-| Tool | Description |
-|------|-------------|
-| `find_related` | Find nodes related to a given node based on keyword analysis |
-| `create_links` | Create internal links from a node to related content in the knowledge base |
-| `generate_concept_map` | Generate a visual concept map and insert into the source node (requires Dropbox config) |
-
-### Smart Insertion
-
-| Tool | Description |
-|------|-------------|
-| `smart_insert` | Search for a node and insert content with interactive selection |
-| `insert_content` | Insert content directly into a node by ID |
-
-## Smart Insert Workflow
-
-The `smart_insert` tool provides an interactive workflow for inserting content:
-
-1. **Single match**: If your search finds exactly one node, content is inserted immediately
-2. **Multiple matches**: Returns a numbered list with full paths for disambiguation
-3. **Selection**: Call again with the `selection` parameter to complete insertion
-
-Example interaction:
-```
-User: "Insert my meeting notes into the Projects node"
-
-Claude uses smart_insert with search_query="Projects"
-
-Response (multiple matches):
-[1] Work > Projects
-    ID: abc123
-[2] Personal > Side Projects
-    ID: def456
-[3] Archive > Old Projects
-    ID: ghi789
-
-User: "Use option 1"
-
-Claude uses smart_insert with selection=1
-
-Response: Inserted 3 node(s) into "Projects"
-```
-
-## Usage Examples
-
-Once configured, you can interact with Workflowy through Claude Desktop:
-
-**Search your outline:**
-> "Search my Workflowy for meeting notes"
-
-**Smart content insertion (recommended):**
-> "Summarize this article and add it to my Research node"
-
-Claude will search for "Research", show you matching nodes if there are multiple, and let you pick the right one.
-
-**Create new nodes:**
-> "Create a new node in my inbox called 'Weekly Review' with a note about tasks to review"
-
-**Create todos:**
-> "Add a todo to my inbox: Review Q4 budget proposal"
-
-**List pending tasks:**
-> "Show me all my incomplete todos"
-
-**Complete a task:**
-> "Mark the 'Send report' task as complete"
-
-**Filter todos by location:**
-> "List all todos under my Work Projects node"
-
-**Find related content:**
-> "Find nodes related to this article about machine learning"
-
-**Auto-link knowledge:**
-> "Create links from this node to related content in my knowledge base"
-
-**Generate visual concept map:**
-> "Create a concept map showing how this project connects to other nodes and add it to my Research node"
-
-**Navigate your outline:**
-> "Show me all the children of my Projects node"
-
-**Find where to insert:**
-> "Find nodes where I could add my book notes"
-
-## Markdown Formatting
-
-When creating nodes, you can use markdown formatting:
-
-- `# Header` → H1 heading
-- `## Header` → H2 heading
-- `### Header` → H3 heading
-- `- [ ] Task` → Uncompleted todo
-- `- [x] Task` → Completed todo
-- `` ```code``` `` → Code block
-- `> Quote` → Quote block
-- `**bold**` → Bold text
-- `*italic*` → Italic text
-- `[text](url)` → Hyperlink
-
-## Troubleshooting
-
-### Server not appearing in Claude Desktop
-
-1. Verify the path in `claude_desktop_config.json` is correct and absolute
-2. Ensure the project is built (`npm run build`)
-3. Check that Node.js is in your PATH
-4. Restart Claude Desktop completely
-
-### Authentication errors
-
-1. Verify your API key at [https://workflowy.com/api-key](https://workflowy.com/api-key)
-2. Check that `.env` file exists and contains correct credentials
-3. Ensure there are no extra spaces in the `.env` file
-
-### Rate limiting
-
-The `export_all` tool is rate limited to 1 request per minute by Workflowy's API. Use `search_nodes` for frequent queries instead.
-
-## Dropbox Configuration (Optional)
-
-To auto-insert concept map images into Workflowy, configure Dropbox for image hosting. Without Dropbox, concept maps are saved locally to `~/Downloads/`.
-
-### Step 1: Create a Dropbox App
+### 1. Create Dropbox App
 
 1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Click **Create app**
-3. Choose **Scoped access**
-4. Choose **Full Dropbox** (or App folder if you prefer isolation)
-5. Name your app (e.g., "workflowy-concept-maps")
-6. Click **Create app**
-7. Copy your **App key** and **App secret** from the Settings tab
+2. Create app → Scoped access → Full Dropbox
+3. Name it (e.g., "workflowy-concept-maps")
+4. Copy **App key** and **App secret**
 
-### Step 2: Set Required Permissions
+### 2. Set Permissions
 
-**Important**: Both permissions are required for concept maps to work.
+In the Permissions tab, enable:
+- `files.content.write` (upload images)
+- `sharing.write` (create shareable links)
 
-1. Go to the **Permissions** tab in your app settings
-2. Under **Files and folders**, check:
-   - `files.content.write` - Required to upload images
-3. Under **Sharing**, check:
-   - `sharing.write` - Required to create shareable links
-4. Click **Submit** to save changes
+Click **Submit**.
 
-### Step 3: Generate Authorization Code
+### 3. Authorize
 
-After setting permissions, you must authorize the app with the new scopes.
-
-Open this URL in your browser (replace `YOUR_APP_KEY`):
+Open in browser (replace YOUR_APP_KEY):
 ```
 https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
 ```
 
-1. Log in to Dropbox if prompted
-2. Click **Allow** to grant permissions
-3. Copy the authorization code shown
+Copy the authorization code.
 
-### Step 4: Exchange Code for Refresh Token
+### 4. Get Refresh Token
 
-Run this command (replace placeholders):
 ```bash
 curl -X POST https://api.dropbox.com/oauth2/token \
-  -d code=YOUR_AUTHORIZATION_CODE \
+  -d code=YOUR_CODE \
   -d grant_type=authorization_code \
   -d client_id=YOUR_APP_KEY \
   -d client_secret=YOUR_APP_SECRET
 ```
 
-The response will include a `refresh_token` - copy this value.
+Add the `refresh_token` from the response to your `.env`.
 
-### Step 5: Add Credentials to .env
+## Using Concept Maps
 
-Add these lines to your `.env` file:
-```bash
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=your-refresh-token
-```
-
-### How It Works
-
-When you generate a concept map:
-1. The image is uploaded to `/workflowy/conceptMaps/` in your Dropbox
-2. A shareable link is created automatically
-3. A new child node is added to the source node with the embedded image
-
-### Troubleshooting Dropbox
-
-**"Your app is not permitted to access this endpoint"**
-- You're missing the `sharing.write` permission
-- Go to Permissions tab → enable `sharing.write` → Submit
-- Re-authorize and generate a new refresh token (Step 3-4)
-
-**"Failed to get shareable link"**
-- Same as above - missing `sharing.write` scope
-- Permissions changes require re-authorization
-
-**Images upload but aren't inserted into Workflowy**
-- Check the response for the Dropbox URL
-- You can manually add the URL to any Workflowy node
-
-## Concept Map Options
-
-The `generate_concept_map` tool supports different search scopes and custom keywords.
-
-### Scope Options
-
-| Scope | Description |
-|-------|-------------|
-| `all` | Search entire Workflowy (default) |
-| `children` | Search only descendants of the node |
-| `siblings` | Search only peer nodes (same parent) |
-| `ancestors` | Search only parent chain |
-| `this_node` | No related nodes (visualization only) |
-
-Example:
-> "Create a concept map for my Project node, only searching its children"
-
-### Custom Keywords
-
-By default, keywords are automatically extracted from the node's content. You can override this with custom keywords to find specific relationships:
+### Basic Usage
 
 ```
-keywords: ["machine learning", "neural networks", "deep learning"]
+"Create a concept map of my Research node using these concepts:
+ machine learning, neural networks, backpropagation, gradient descent"
 ```
 
-Example:
-> "Create a concept map for this node using the keywords: strategy, planning, execution"
+### With Scope Control
 
-This is useful when:
-- The node content is sparse but you know what concepts to explore
-- You want to find connections around specific themes
-- You're exploring relationships not directly mentioned in the node
+| Scope | What it searches |
+|-------|------------------|
+| `children` | Only descendants of the node (default) |
+| `all` | Entire Workflowy |
+| `siblings` | Peer nodes only |
+| `ancestors` | Parent chain only |
+
+```
+"Create a concept map for my Project node, only searching its children"
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `node_id` | Parent node to analyze |
+| `concepts` | List of terms to map (2-35 required) |
+| `core_concept` | Central theme (defaults to node name) |
+| `scope` | Search scope for analysis |
+| `format` | `png` (default) or `jpeg` |
+| `title` | Custom title for the map |
+
+## Additional Tools
+
+The server includes full Workflowy management to support your knowledge work:
+
+### Search & Navigation
+- `search_nodes` - Find nodes by text
+- `get_node` / `get_children` - Navigate structure
+- `export_all` - Full outline export
+
+### Content Management
+- `create_node` / `update_node` / `delete_node` / `move_node`
+- `smart_insert` - Search-and-insert workflow
+- Markdown formatting support
+
+### Todo Management
+- `create_todo` / `list_todos` / `complete_node` / `uncomplete_node`
+
+### Knowledge Linking
+- `find_related` - Discover connections via keyword analysis
+- `create_links` - Auto-generate internal links
+
+## Troubleshooting
+
+### Concept map fails silently
+- Check concept count (max 35)
+- Verify Dropbox permissions include `sharing.write`
+- Re-authorize if you changed permissions
+
+### "Not permitted to access this endpoint"
+- Missing `sharing.write` permission
+- Must re-authorize after adding permissions
+
+### Images upload but don't appear in Workflowy
+- Check Claude's response for the Dropbox URL
+- Manually add to any node if needed
 
 ## Development
 
 ```bash
-# Build the project
-npm run build
-
-# Run directly (after building)
-npm start
-
-# Build and run
-npm run dev
+npm run build    # Compile TypeScript
+npm test         # Run test suite (61 tests)
+npm start        # Run the server
 ```
-
-## API Reference
-
-This server uses the [Workflowy REST API](https://workflowy.com/api-reference/). Key endpoints:
-
-- `POST /api/v1/nodes` - Create node
-- `POST /api/v1/nodes/:id` - Update node
-- `GET /api/v1/nodes/:id` - Get node
-- `GET /api/v1/nodes` - List children
-- `DELETE /api/v1/nodes/:id` - Delete node
-- `GET /api/v1/nodes-export` - Export all nodes
 
 ## License
 
 MIT
 
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
-
 ## Acknowledgments
 
-- [Anthropic](https://anthropic.com) for Claude and the MCP protocol
-- [Workflowy](https://workflowy.com) for the outliner and API
+- [Anthropic](https://anthropic.com) - Claude and MCP protocol
+- [Workflowy](https://workflowy.com) - Outliner and API
+- [Dropbox](https://dropbox.com) - Image hosting
+- [Graphviz](https://graphviz.org) - Graph visualization
