@@ -80,6 +80,39 @@ export function generateWorkflowyLink(nodeId: string, nodeName: string): string 
 }
 
 /**
+ * Extract Workflowy node IDs from internal links in text
+ * Matches markdown links like [text](https://workflowy.com/#/node-id)
+ * Also matches plain Workflowy URLs
+ */
+export function extractWorkflowyLinks(text: string): string[] {
+  const nodeIds: string[] = [];
+
+  // Match markdown links: [text](https://workflowy.com/#/node-id)
+  // Node IDs can contain lowercase hex chars, numbers, and dashes
+  const markdownRegex = /\[([^\]]*)\]\(https:\/\/workflowy\.com\/#\/([a-z0-9-]+)\)/gi;
+  let match;
+  while ((match = markdownRegex.exec(text)) !== null) {
+    const nodeId = match[2];
+    if (nodeId && !nodeIds.includes(nodeId)) {
+      nodeIds.push(nodeId);
+    }
+  }
+
+  // Also match plain URLs: https://workflowy.com/#/node-id
+  // Use negative lookbehind to avoid matching URLs already captured by markdown pattern
+  // Match URL not preceded by '(' (which would be part of markdown link)
+  const plainUrlRegex = /(?<!\()https:\/\/workflowy\.com\/#\/([a-z0-9-]+)/gi;
+  while ((match = plainUrlRegex.exec(text)) !== null) {
+    const nodeId = match[1];
+    if (nodeId && !nodeIds.includes(nodeId)) {
+      nodeIds.push(nodeId);
+    }
+  }
+
+  return nodeIds;
+}
+
+/**
  * Concept map configuration constants
  */
 export const CONCEPT_MAP_LIMITS = {

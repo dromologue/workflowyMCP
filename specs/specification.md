@@ -95,7 +95,8 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 | Find related | Analyze node content, extract keywords, find matching nodes |
 | Create links | Generate Workflowy internal links to related nodes |
 | Auto-discovery | Automatically find relevant connections based on content |
-| Concept map | Generate visual PNG/JPEG graph of node relationships |
+| Concept map (legacy) | Generate visual graph using keyword matching |
+| **LLM-powered concept map** | Multi-tool workflow for semantic concept discovery |
 
 **Keyword extraction**:
 - Filters common stop words
@@ -108,22 +109,114 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 
 **Link format**: `[Node Title](https://workflowy.com/#/nodeId)`
 
-**Concept map generation**:
+---
 
-Follows academic concept mapping principles (Cornell University guidelines):
+#### LLM-Powered Concept Mapping (Recommended)
 
-1. **Core concept at center**: The main topic/theme is placed prominently at the top
-2. **Hierarchical arrangement**: Concepts arranged in levels (major → detail)
-3. **Labeled relationships**: Connections show *how* concepts relate (not just that they do)
-4. **Visual encoding**: Node size = frequency, edge color = relationship type
+The LLM-powered approach uses Claude's semantic understanding to discover meaningful conceptual relationships, rather than mechanical keyword matching.
 
-**Creating a concept map** (based on Cornell/academic best practices):
-1. Identify the core concept - the central theme being mapped
-2. List concepts/terms to map - these become nodes in the visualization
-3. Analyze content to find relationships - tool scans Workflowy children for co-occurrence
-4. Extract relationship labels - phrases like "influences", "contrasts with", "includes" from context
-5. Organize hierarchically - concepts found in shallower Workflowy nodes become "major concepts", deeper ones become "details"
-6. Generate visual map - Graphviz renders the hierarchical network
+**Two-tool workflow**:
+
+1. **`get_node_content_for_analysis`**: Extracts subtree content formatted for LLM analysis
+2. **`render_concept_map`**: Renders Claude's discovered concepts and relationships
+
+**Why this approach**:
+- Claude reads and **understands** the content semantically
+- Claude **discovers** concepts through reasoning, not keyword matching
+- Claude identifies **meaningful relationships** from context
+- Relationship labels reflect actual semantic connections ("critiques", "extends", "enables")
+
+**Tool 1: `get_node_content_for_analysis`**
+
+Extracts content from a Workflowy subtree, including linked content.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `node_id` | string | required | Root node to analyze |
+| `depth` | number | unlimited | Maximum depth to traverse |
+| `include_notes` | boolean | true | Include node notes |
+| `max_nodes` | number | 500 | Maximum nodes to return |
+| `follow_links` | boolean | true | Follow internal Workflowy links |
+| `format` | "structured" \| "outline" | "structured" | Output format |
+
+**Link following**: Automatically parses Workflowy internal links (`[text](https://workflowy.com/#/node-id)`) and includes linked content from outside the immediate hierarchy. This enables discovery of cross-references and connections.
+
+**Output (structured format)**:
+```json
+{
+  "root": { "id": "...", "name": "Topic", "note": "..." },
+  "total_nodes": 47,
+  "total_chars": 23456,
+  "truncated": false,
+  "linked_nodes_included": 5,
+  "content": [
+    {
+      "depth": 0,
+      "id": "node1",
+      "name": "Child Topic",
+      "note": "Detailed notes...",
+      "path": "Topic > Child Topic",
+      "links_to": ["node5", "node8"]
+    }
+  ],
+  "linked_content": [
+    {
+      "depth": -1,
+      "id": "node5",
+      "name": "Referenced Topic",
+      "note": "Content from linked node...",
+      "path": "Other Section > Referenced Topic"
+    }
+  ]
+}
+```
+
+**Tool 2: `render_concept_map`**
+
+Renders a visual concept map from Claude's semantic analysis.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | yes | Map title |
+| `core_concept` | object | yes | Central concept (`{label, description?}`) |
+| `concepts` | array | yes | Discovered concepts (2-35) |
+| `relationships` | array | yes | Relationships between concepts |
+| `output` | object | no | Format, insertion target, output path |
+
+**Concept structure**:
+```json
+{
+  "id": "truth-procedure",
+  "label": "Truth Procedure",
+  "level": "major",  // or "detail"
+  "importance": 8,   // 1-10, affects node size
+  "description": "Optional description"
+}
+```
+
+**Relationship structure**:
+```json
+{
+  "from": "core",  // or concept id
+  "to": "truth-procedure",
+  "type": "produces",  // semantic relationship
+  "strength": 9,   // 1-10, affects edge weight
+  "evidence": "Brief quote showing relationship"
+}
+```
+
+**Common relationship types**:
+- `produces`, `enables`, `requires` (causal/dependency)
+- `critiques`, `extends`, `develops` (evaluative)
+- `contrasts with`, `differs from` (comparative)
+- `includes`, `examples of`, `type of` (hierarchical)
+- `influences`, `relates to` (general)
+
+---
+
+#### Legacy Concept Map (Keyword-Based)
+
+The original `generate_concept_map` tool uses keyword matching. It requires the user to provide concepts upfront and finds relationships through co-occurrence and pattern matching.
 
 **Parameters**:
 - `node_id`: Parent node whose children will be analyzed
@@ -137,30 +230,20 @@ Follows academic concept mapping principles (Cornell University guidelines):
 - Maximum 35 concepts per map (prevents oversized graphs that fail to render)
 - For larger concept sets, split into multiple focused maps by theme/category
 
-**Visual encoding**:
-- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
-- **Node size**: Larger = concept appears in more nodes
-- **Edge labels**: Relationship type extracted from content context
-- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
+---
 
-**Relationship extraction**: The tool scans content for relationship words:
-- Causal: leads to, causes, results in
-- Hierarchical: includes, is part of, contains
-- Comparative: contrasts with, similar to, differs from
-- Dependency: requires, enables, prevents
-- Evaluative: supports, opposes, extends, critiques
+#### Visual Encoding (Both Approaches)
+
+- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
+- **Node size**: Larger = more important/frequent
+- **Edge labels**: Relationship type
+- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
 
 **Output**:
 - Square aspect ratio (2000x2000 max, 300 DPI) for balanced visual layout
 - Unicode support for accented characters (French, German, etc.)
 - Auto-insert into source node via Dropbox image hosting
 - Fallback: save locally to `~/Downloads/` if Dropbox not configured
-
-**Search scopes**:
-- `children`: Search only descendants of the parent node (default)
-- `all`: Search entire Workflowy knowledge base
-- `siblings`: Search only peer nodes (same parent)
-- `ancestors`: Search only the parent chain
 
 **Image hosting** (Dropbox):
 - Requires Dropbox OAuth configuration (app key, secret, refresh token)
@@ -219,7 +302,48 @@ User: "Mark my weekly review tasks as complete"
 4. Confirmation of completed items
 ```
 
-### Flow 4: Visualize Knowledge Connections
+### Flow 4: Visualize Knowledge Connections (LLM-Powered)
+
+```
+User: "Create a concept map of my Badiou philosophy notes"
+
+1. Claude calls get_node_content_for_analysis to retrieve subtree content
+   - All child nodes with names, notes, paths returned
+   - Internal Workflowy links are followed to include connected content
+
+2. Claude reads and semantically analyzes the content:
+   - Discovers key concepts: Event, Truth, Subject, Fidelity, Situation
+   - Identifies relationships from context:
+     * "Event produces Truth" (found in: "The Event ruptures the situation...")
+     * "Subject constituted by Fidelity" (found in: "...the Subject emerges through...")
+     * "Badiou critiques Deleuze" (found in: "...Badiou's critique of immanence...")
+
+3. Claude calls render_concept_map with discovered analysis:
+   {
+     "title": "Badiou's Event Philosophy",
+     "core_concept": { "label": "Event" },
+     "concepts": [
+       { "id": "truth", "label": "Truth", "level": "major", "importance": 9 },
+       { "id": "subject", "label": "Subject", "level": "major", "importance": 8 },
+       { "id": "fidelity", "label": "Fidelity", "level": "detail", "importance": 6 }
+     ],
+     "relationships": [
+       { "from": "core", "to": "truth", "type": "produces", "strength": 9 },
+       { "from": "subject", "to": "fidelity", "type": "constituted by", "strength": 8 }
+     ],
+     "output": { "insert_into_workflowy": "abc123" }
+   }
+
+4. Tool renders Graphviz visualization and uploads to Dropbox
+5. Concept map inserted as child node with image and summary
+
+Key difference from legacy approach:
+- Claude DISCOVERS concepts through understanding, not keyword matching
+- Relationships are semantically meaningful, not pattern-matched
+- No need to provide concepts upfront - Claude finds them
+```
+
+### Flow 4b: Visualize Knowledge Connections (Legacy Keyword-Based)
 
 ```
 User: "Create a concept map of my philosophy notes showing how Heidegger, Dewey,
