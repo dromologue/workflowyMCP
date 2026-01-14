@@ -271,39 +271,13 @@ function formatRelationType(type: string): string {
 }
 
 /**
- * Wrap text to fit within a maximum width (for edge labels)
+ * Build edge label - just use the description as a short sentence.
+ * No truncation, no wrapping - the description should be written as a complete thought.
  */
-function wrapText(text: string, maxWidth: number): string {
-  const words = text.split(" ");
-  const lines: string[] = [];
-  let currentLine = "";
-
-  for (const word of words) {
-    if (currentLine.length + word.length + 1 <= maxWidth) {
-      currentLine += (currentLine ? " " : "") + word;
-    } else {
-      if (currentLine) lines.push(currentLine);
-      currentLine = word;
-    }
-  }
-  if (currentLine) lines.push(currentLine);
-
-  return lines.join("\\n");
-}
-
-/**
- * Build a rich edge label from type and description
- */
-function buildEdgeLabel(type: string, description: string): string {
-  const formattedType = formatRelationType(type);
-  // Allow longer descriptions for better context
-  const maxDescLen = 60;
-  const truncatedDesc = description.length > maxDescLen
-    ? description.substring(0, maxDescLen - 3) + "..."
-    : description;
-
-  // Wrap with more width for larger output
-  return wrapText(`${formattedType}: ${truncatedDesc}`, 35);
+function buildEdgeLabel(_type: string, description: string): string {
+  // Use the description directly - it should already be a short, complete sentence
+  // The relationship type is conveyed through edge color and style
+  return description;
 }
 
 /**
@@ -393,7 +367,7 @@ function generateHierarchicalConceptMap(
     '  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.3,0.15"];',
     "",
     "  // Global edge styling - larger labels for readability",
-    '  edge [fontname="Helvetica", fontsize=11, labelfloat=false, decorate=true, labeldistance=2];',
+    '  edge [fontname="Helvetica", fontsize=14, labelfloat=false, decorate=true, labeldistance=2];',
     "",
   ];
 
@@ -459,7 +433,7 @@ function generateHierarchicalConceptMap(
     // Build edge attributes
     const attrs: string[] = [
       `label="${escapeForDot(label)}"`,
-      `fontsize=12`,
+      `fontsize=14`,
       `penwidth=${penwidth}`,
       `color="${color}"`,
       `fontcolor="${color}"`,

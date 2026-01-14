@@ -51,24 +51,15 @@ export function formatNodesForSelection(nodes: NodeWithPath[]): string {
 /**
  * Escape special characters for Graphviz DOT format
  * Handles Unicode characters (accents, umlauts) safely
+ * Does NOT truncate - callers should handle length if needed
  */
 export function escapeForDot(str: string): string {
-  // First escape special characters that DOT requires
-  let escaped = str
+  return str
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
     .replace(/\r/g, "")
     .replace(/[<>{}|]/g, ""); // Remove DOT special chars that could break parsing
-
-  // Truncate to 40 characters using Array.from to respect Unicode boundaries
-  // This prevents breaking multi-byte characters (é, ü, ö, etc.)
-  const chars = Array.from(escaped);
-  if (chars.length > 40) {
-    escaped = chars.slice(0, 37).join("") + "...";
-  }
-
-  return escaped;
+  // Note: actual newlines (\n) are kept as-is - Graphviz handles them in labels
 }
 
 /**

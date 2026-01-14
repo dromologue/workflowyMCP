@@ -123,14 +123,10 @@ function wrapText(text: string, maxWidth: number): string {
   return lines.join("\\n");
 }
 
-function buildEdgeLabel(type: string, description: string): string {
-  const formattedType = formatRelationType(type);
-  const maxDescLen = 50;
-  const truncatedDesc = description.length > maxDescLen
-    ? description.substring(0, maxDescLen - 3) + "..."
-    : description;
-
-  return wrapText(`${formattedType}: ${truncatedDesc}`, 30);
+function buildEdgeLabel(_type: string, description: string): string {
+  // Use the description directly - it should already be a short, complete sentence
+  // The relationship type is conveyed through edge color and style
+  return description;
 }
 
 function getEdgeColor(type: string): string {
@@ -211,7 +207,7 @@ function generateConceptMapDot(
     `  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.3,0.15", fontsize=${fontSize}];`,
     "",
     "  // Global edge styling - larger labels for readability",
-    `  edge [fontname="Helvetica", fontsize=${fontSize * 0.7}, labelfloat=false, decorate=true, labeldistance=2];`,
+    `  edge [fontname="Helvetica", fontsize=${fontSize}, labelfloat=false, decorate=true, labeldistance=2];`,
     "",
   ];
 
@@ -272,7 +268,7 @@ function generateConceptMapDot(
 
     const attrs: string[] = [
       `label="${escapeForDot(label)}"`,
-      `fontsize=${fontSize * 0.75}`,
+      `fontsize=${fontSize}`,
       `penwidth=${penwidth}`,
       `color="${color}"`,
       `fontcolor="${color}"`,
@@ -462,7 +458,7 @@ program
   .option("-w, --width <pixels>", "Output width in pixels", "4000")
   .option("-h, --height <pixels>", "Output height in pixels", "3000")
   .option("-d, --dpi <number>", "DPI for rendering", "300")
-  .option("--font-size <number>", "Base font size", "14")
+  .option("--font-size <number>", "Base font size", "18")
   .option("--example", "Output example JSON to stdout")
   .option("--dot", "Output DOT graph source instead of image")
   .option("--svg", "Output SVG instead of rasterized image")
