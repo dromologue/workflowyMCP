@@ -113,13 +113,15 @@ describe("escapeForDot", () => {
     expect(escapeForDot('say "hello"')).toBe('say \\"hello\\"');
   });
 
-  it("escapes newlines", () => {
-    expect(escapeForDot("line1\nline2")).toBe("line1\\nline2");
+  it("preserves newlines for Graphviz label line breaks", () => {
+    // Graphviz can handle newlines in labels - we keep them as-is
+    expect(escapeForDot("line1\nline2")).toBe("line1\nline2");
   });
 
-  it("truncates long strings to 40 chars", () => {
+  it("does not truncate - callers handle length if needed", () => {
     const longString = "a".repeat(50);
-    expect(escapeForDot(longString).length).toBe(40);
+    // escapeForDot no longer truncates - full description is preserved
+    expect(escapeForDot(longString).length).toBe(50);
   });
 
   it("preserves Unicode characters (accents, umlauts)", () => {
@@ -128,12 +130,11 @@ describe("escapeForDot", () => {
     expect(escapeForDot("phénoménologie")).toBe("phénoménologie");
   });
 
-  it("safely truncates strings with Unicode characters", () => {
-    // 45 characters with accents - should truncate to 37 + "..."
+  it("preserves long Unicode strings without truncation", () => {
+    // 45 characters with accents - preserved in full
     const unicodeString = "é".repeat(45);
     const result = escapeForDot(unicodeString);
-    expect(result.length).toBe(40);
-    expect(result.endsWith("...")).toBe(true);
+    expect(result.length).toBe(45);
     // Should not have broken characters
     expect(result).not.toContain("\uFFFD"); // replacement character
   });

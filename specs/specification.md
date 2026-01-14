@@ -247,7 +247,7 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 
 - **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
 - **Node size**: Larger = more important/frequent
-- **Edge labels**: Relationship type + description (truncated for readability)
+- **Edge labels**: Full description as a complete sentence (positioned externally to avoid overlap)
 - **Edge colors by category**:
   - Blue = causal (causes, enables, prevents, triggers, influences)
   - Green = structural (contains, part_of, instance_of, derives_from, extends)
@@ -256,7 +256,8 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
   - Teal = comparative (similar_to, contrasts_with, generalizes, specializes)
   - Gray = other (related_to)
 - **Edge styles**: Dashed = contradictory/contrastive, Dotted = temporal, Bold = strong causal
-- **Layout**: SFDP algorithm with polyline splines for clean edge routing and no crossings
+- **Layout**: SFDP algorithm with curved splines and external labels (xlabel) for clear label placement
+- **Spacing**: High repulsive force and separation to utilize whitespace for labels
 
 **Output**:
 - High resolution (4000x3000, 300 DPI) for zooming and detail viewing
@@ -302,7 +303,7 @@ npx tsx src/cli/render-concept-map.ts --input concepts.json --svg --output map.s
 | `--width` | 4000 | Output width in pixels |
 | `--height` | 3000 | Output height in pixels |
 | `--dpi` | 300 | Rendering DPI |
-| `--font-size` | 14 | Base font size |
+| `--font-size` | 18 | Base font size |
 | `--svg` | false | Output SVG instead of raster |
 | `--dot` | false | Output DOT source for debugging |
 | `--example` | - | Print example JSON to stdout |
