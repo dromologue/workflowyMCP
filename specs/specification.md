@@ -256,10 +256,10 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
   - Teal = comparative (similar_to, contrasts_with, generalizes, specializes)
   - Gray = other (related_to)
 - **Edge styles**: Dashed = contradictory/contrastive, Dotted = temporal, Bold = strong causal
-- **Layout**: FDP algorithm with orthogonal splines to minimize edge crossings
+- **Layout**: SFDP algorithm with polyline splines for clean edge routing and no crossings
 
 **Output**:
-- Square aspect ratio (2000x2000 max, 300 DPI) for balanced visual layout
+- High resolution (4000x3000, 300 DPI) for zooming and detail viewing
 - Unicode support for accented characters (French, German, etc.)
 - Auto-insert into source node via Dropbox image hosting
 - Fallback: save locally to `~/Downloads/` if Dropbox not configured
@@ -271,6 +271,43 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 - Concept maps inserted as child nodes with markdown image syntax
 
 **Success criteria**: Surface relevant connections user might not have noticed.
+
+---
+
+#### CLI Tool: render-concept-map
+
+Standalone command-line tool for rendering concept maps from JSON definitions. Does not require Workflowy - useful for programmatic generation or manual concept definition.
+
+**Usage**:
+```bash
+# Generate example JSON
+npx tsx src/cli/render-concept-map.ts --example > concepts.json
+
+# Render from JSON
+npx tsx src/cli/render-concept-map.ts --input concepts.json --output map.png
+
+# High-resolution output
+npx tsx src/cli/render-concept-map.ts --input concepts.json --width 4000 --height 3000 --output map.png
+
+# SVG output (for PDF conversion)
+npx tsx src/cli/render-concept-map.ts --input concepts.json --svg --output map.svg
+```
+
+**Options**:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--input` | stdin | JSON file path or `-` for stdin |
+| `--output` | auto | Output file path |
+| `--format` | png | `png`, `jpeg`, or `pdf` |
+| `--width` | 4000 | Output width in pixels |
+| `--height` | 3000 | Output height in pixels |
+| `--dpi` | 300 | Rendering DPI |
+| `--font-size` | 14 | Base font size |
+| `--svg` | false | Output SVG instead of raster |
+| `--dot` | false | Output DOT source for debugging |
+| `--example` | - | Print example JSON to stdout |
+
+---
 
 ### 6. Content Modification
 

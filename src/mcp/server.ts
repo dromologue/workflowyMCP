@@ -296,14 +296,14 @@ function wrapText(text: string, maxWidth: number): string {
  */
 function buildEdgeLabel(type: string, description: string): string {
   const formattedType = formatRelationType(type);
-  // Truncate description if too long
-  const maxDescLen = 40;
+  // Allow longer descriptions for better context
+  const maxDescLen = 60;
   const truncatedDesc = description.length > maxDescLen
     ? description.substring(0, maxDescLen - 3) + "..."
     : description;
 
-  // Wrap the combined label for readability
-  return wrapText(`${formattedType}: ${truncatedDesc}`, 25);
+  // Wrap with more width for larger output
+  return wrapText(`${formattedType}: ${truncatedDesc}`, 35);
 }
 
 /**
@@ -366,41 +366,41 @@ function generateHierarchicalConceptMap(
   const lines: string[] = [
     "digraph ConceptMap {",
     '  charset="UTF-8";',
-    // Use fdp layout - better at avoiding edge crossings than neato
-    '  layout=fdp;',
-    // Prevent node overlap with extra padding
+    // Use sfdp layout - scales well and produces cleaner results
+    '  layout=sfdp;',
+    // Prevent node overlap with scaling
     '  overlap=prism;',
-    '  overlap_scaling=2;',
-    // Use orthogonal splines to reduce crossings and improve readability
-    '  splines=ortho;',
-    // Increase separation between nodes
-    '  sep="+50,50";',
-    '  K=2;', // Ideal edge length (fdp-specific)
-    '  repulsiveforce=1.5;', // Push nodes apart more
-    // Graph dimensions
-    '  ratio=auto;',
-    '  size="16,12";',
+    '  overlap_scaling=4;',
+    // Use polyline splines - cleaner than ortho for complex graphs
+    '  splines=polyline;',
+    // Increase separation significantly
+    '  sep="+80,80";',
+    '  K=3;',
+    '  repulsiveforce=2.0;',
+    // Large graph dimensions for high-res output
+    '  size="40,30";',
+    '  ratio=fill;',
     '  bgcolor="white";',
-    '  pad="0.5";',
-    '  margin="0.5";',
+    '  pad="1.0";',
+    '  margin="1.0";',
     // Title
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
-    '  fontsize=24;',
-    '  fontname="Arial Bold";',
+    '  fontsize=28;',
+    '  fontname="Helvetica Bold";',
     "",
     "  // Global node styling",
-    '  node [shape=box, style="rounded,filled", fontname="Arial", margin="0.2,0.1"];',
+    '  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.3,0.15"];',
     "",
-    "  // Global edge styling",
-    '  edge [fontname="Arial", fontsize=8, labelfloat=false, decorate=true];',
+    "  // Global edge styling - larger labels for readability",
+    '  edge [fontname="Helvetica", fontsize=11, labelfloat=false, decorate=true, labeldistance=2];',
     "",
   ];
 
   // Core concept - largest, distinctive color
   lines.push("  // Core concept (center)");
   lines.push(
-    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=18, penwidth=3, width=3, height=1];`
+    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=20, penwidth=4, width=4, height=1.2];`
   );
   lines.push("");
 
@@ -411,12 +411,12 @@ function generateHierarchicalConceptMap(
   // Level 1 - Major concepts
   if (level1.length > 0) {
     lines.push("  // Major concepts");
-    const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c", "#c0392b", "#2c3e50"];
+    const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c", "#c0392b", "#2c3e50", "#7d3c98"];
     level1.forEach((node, index) => {
       const color = majorColors[index % majorColors.length];
-      const width = Math.max(2.0, Math.min(2.0 + node.occurrences * 0.1, 2.8));
+      const width = Math.max(2.5, Math.min(2.5 + node.occurrences * 0.15, 3.5));
       lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=14, width=${width}, height=0.8];`
+        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=16, width=${width}, height=1];`
       );
     });
     lines.push("");
@@ -425,12 +425,12 @@ function generateHierarchicalConceptMap(
   // Level 2 - Detail concepts
   if (level2.length > 0) {
     lines.push("  // Detail concepts");
-    const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4", "#f1948a", "#85929e"];
+    const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4", "#f1948a", "#85929e", "#aed6f1"];
     level2.forEach((node, index) => {
       const color = detailColors[index % detailColors.length];
-      const width = Math.max(1.5, Math.min(1.5 + node.occurrences * 0.08, 2.2));
+      const width = Math.max(2.0, Math.min(2.0 + node.occurrences * 0.1, 2.8));
       lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=11, width=${width}, height=0.6];`
+        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=14, width=${width}, height=0.8];`
       );
     });
     lines.push("");
@@ -448,22 +448,23 @@ function generateHierarchicalConceptMap(
     if (addedEdges.has(edgeKey)) return;
     addedEdges.add(edgeKey);
 
-    // Scale weight from 0-1 to reasonable penwidth (1-4)
-    const penwidth = Math.max(1, Math.min(1 + edge.weight * 3, 4));
+    // Scale weight from 0-1 to reasonable penwidth (1.5-5)
+    const penwidth = Math.max(1.5, Math.min(1.5 + edge.weight * 4, 5));
     const color = getEdgeColor(edge.type);
     const style = getEdgeStyle(edge.type);
 
-    // Build the enriched label
+    // Build the enriched label with more space
     const label = buildEdgeLabel(edge.type, edge.description);
 
     // Build edge attributes
     const attrs: string[] = [
       `label="${escapeForDot(label)}"`,
-      `fontsize=9`,
+      `fontsize=12`,
       `penwidth=${penwidth}`,
       `color="${color}"`,
       `fontcolor="${color}"`,
       `style="${style}"`,
+      `len=3`, // Preferred edge length for sfdp
     ];
 
     // Handle bidirectional edges
@@ -597,9 +598,10 @@ async function generateHierarchicalConceptMapImage(
     const dotGraph = generateHierarchicalConceptMap(coreNode, conceptNodes, edges, title);
     const svg = graphviz.dot(dotGraph, "svg");
 
+    // Generate larger image for better readability when zoomed
     const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-      .resize(2000, 2000, {
-        fit: "inside",        // Fit within square bounds
+      .resize(4000, 3000, {
+        fit: "inside",
         withoutEnlargement: false,
       })
       .flatten({ background: "#ffffff" })

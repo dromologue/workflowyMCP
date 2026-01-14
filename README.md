@@ -192,103 +192,111 @@ Add the `refresh_token` from the response to your `.env`.
 | `format` | `png` (default) or `jpeg` |
 | `title` | Custom title for the map |
 
-## CLI Tool
+## CLI Tool: render-concept-map
 
-Generate concept maps directly from the command line without Claude Desktop. The CLI can optionally use the Claude API to automatically extract relevant concepts from your content.
-
-### First-Time Setup
-
-On first run, the CLI will prompt for credentials if not configured:
-
-```bash
-npm run concept-map -- --setup
-```
-
-This interactive wizard configures:
-- **Workflowy credentials** (required) - email and API key
-- **Anthropic API key** (optional) - enables `--auto` concept extraction
-- **Dropbox** (optional) - for MCP server image hosting
-
-Credentials are saved to `.env` in the project directory.
+Generate concept maps from JSON definitions. This standalone tool renders concept maps without requiring Workflowy - perfect for programmatic generation or manual concept definition.
 
 ### Basic Usage
 
 ```bash
-# With manual concepts
-npm run concept-map -- --search "My Notes" --core "Main Topic" \
-  --concepts "concept1,concept2,concept3"
+# Generate example JSON
+npx tsx src/cli/render-concept-map.ts --example > concepts.json
 
-# With Claude auto-extraction
-npm run concept-map -- --search "Philosophy" --core "Event" --auto
+# Render from JSON file
+npx tsx src/cli/render-concept-map.ts --input concepts.json --output map.png
 
-# By node ID
-npm run concept-map -- --node-id abc123 --core "Theme" --concepts "a,b,c"
+# Pipe JSON from stdin
+cat concepts.json | npx tsx src/cli/render-concept-map.ts --output map.png
+
+# Output SVG instead of PNG (for PDF conversion)
+npx tsx src/cli/render-concept-map.ts --input concepts.json --svg --output map.svg
+
+# Output raw DOT graph for debugging
+npx tsx src/cli/render-concept-map.ts --input concepts.json --dot
 ```
 
 ### CLI Options
 
 | Option | Description |
 |--------|-------------|
-| `--setup` | Run interactive credential setup |
-| `-n, --node-id <id>` | Workflowy node ID to analyze |
-| `-s, --search <query>` | Search for node by name |
-| `-c, --core <concept>` | Core concept at map center |
-| `-C, --concepts <list>` | Comma-separated concept list |
-| `-a, --auto` | Use Claude to extract concepts |
-| `-o, --output <file>` | Output filename |
-| `-f, --format <type>` | `png` (default) or `jpeg` |
-| `--no-claude` | Skip Claude, use provided concepts only |
+| `-i, --input <file>` | Input JSON file (use `-` for stdin) |
+| `-o, --output <file>` | Output file path |
+| `-f, --format <type>` | `png` (default), `jpeg`, or `pdf` |
+| `-w, --width <pixels>` | Output width (default: 4000) |
+| `-h, --height <pixels>` | Output height (default: 3000) |
+| `-d, --dpi <number>` | DPI for rendering (default: 300) |
+| `--font-size <number>` | Base font size (default: 14) |
+| `--example` | Output example JSON to stdout |
+| `--svg` | Output SVG instead of raster image |
+| `--dot` | Output DOT graph source |
 
-### Examples
+### JSON Format
+
+```json
+{
+  "title": "Map Title",
+  "core_concept": {
+    "label": "Central Concept",
+    "description": "Optional description"
+  },
+  "concepts": [
+    {
+      "id": "concept-id",
+      "label": "Display Label",
+      "level": "major",
+      "importance": 8
+    }
+  ],
+  "relationships": [
+    {
+      "from": "core",
+      "to": "concept-id",
+      "type": "enables",
+      "description": "Explanation of why this relationship exists",
+      "strength": 0.8,
+      "bidirectional": false
+    }
+  ]
+}
+```
+
+### Relationship Types
+
+Relationships use a defined vocabulary organized by category:
+
+| Category | Types | Edge Color |
+|----------|-------|------------|
+| Causal | `causes`, `enables`, `prevents`, `triggers`, `influences` | Blue |
+| Structural | `contains`, `part_of`, `instance_of`, `derives_from`, `extends` | Green |
+| Temporal | `precedes`, `follows`, `co_occurs` | Orange |
+| Logical | `implies`, `contradicts`, `supports`, `refines`, `exemplifies` | Purple |
+| Comparative | `similar_to`, `contrasts_with`, `generalizes`, `specializes` | Teal |
+| Other | `related_to` | Gray |
+
+### Example: Heidegger Concept Map
 
 ```bash
-# Map philosophical concepts under "Conceptual Foundations"
-npm run concept-map -- \
-  --search "Conceptual Foundations" \
-  --core "Event" \
-  --concepts "Being,Truth,Subject,Fidelity,Situation,Spectacle,Ereignis" \
-  --output event-map.png
+# Generate the example
+npx tsx src/cli/render-concept-map.ts --example > heidegger.json
 
-# Let Claude identify concepts automatically
-npm run concept-map -- \
-  --search "Research Notes" \
-  --core "Machine Learning" \
-  --auto
-
-# Combine manual + auto concepts
-npm run concept-map -- \
-  --node-id 696f787e-0670-43ba-f37b-613d14d4490f \
-  --core "Phenomenology" \
-  --concepts "Husserl,Heidegger,Merleau-Ponty" \
-  --auto
+# Render at high resolution
+npx tsx src/cli/render-concept-map.ts \
+  --input heidegger.json \
+  --output heidegger.png \
+  --width 4000 \
+  --height 3000
 ```
 
-### Claude API Setup (for --auto)
-
-The `--auto` flag uses Claude to intelligently extract concepts from your content. To enable it:
-
-1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
-2. Click **Create Key**
-3. Name it (e.g., "concept-map-cli")
-4. Copy the key (starts with `sk-ant-...`)
-5. Add to your `.env` file:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-your-key-here
+Output:
 ```
+Rendering: Heidegger's Fundamental Ontology
+  Core: Being (Sein)
+  Concepts: 9
+  Relationships: 11
 
-Without the API key, `--auto` is skipped and only manual concepts are used.
-
-### Output
-
-The CLI saves images to the current directory:
-
-```
-✅ Concept map saved to: /path/to/current/dir/concept-map-event-1234567890.png
-   Size: 451.0 KB
-   Concepts mapped: 12
-   Major: Being, Situation, Spectacle, Truth, Difference, Subject
-   Detail: Rupture, Fidelity, Will to Power, Ereignis
+Concept map saved to: heidegger.png
+  Size: 301.0 KB
+  Dimensions: 4000x3000 @ 300 DPI
 ```
 
 ## Additional Tools
@@ -334,7 +342,7 @@ The project is organized into three distinct layers:
 ```
 src/
 ├── cli/                    # Command-line interface
-│   ├── concept-map.ts      # CLI entry point
+│   ├── render-concept-map.ts  # Standalone concept map renderer
 │   └── setup.ts            # Interactive credential wizard
 │
 ├── mcp/                    # MCP server for Claude Desktop
@@ -346,14 +354,14 @@ src/
 │   │   ├── dropbox.ts      # Dropbox image hosting
 │   │   └── retry.ts        # Exponential backoff logic
 │   ├── utils/
-│   │   ├── text-processing.ts   # DOT escaping, parsing
+│   │   ├── text-processing.ts   # DOT escaping, parsing, link extraction
 │   │   ├── keyword-extraction.ts # Relevance scoring
 │   │   ├── cache.ts        # Node caching (30s TTL)
 │   │   └── node-paths.ts   # Breadcrumb path building
 │   ├── config/
 │   │   └── environment.ts  # Env vars & validation
 │   └── types/
-│       └── index.ts        # TypeScript interfaces
+│       └── index.ts        # TypeScript interfaces (including RelationshipType)
 │
 └── index.ts                # Entry point (re-exports MCP server)
 ```
@@ -362,7 +370,7 @@ src/
 
 | Layer | Purpose | Entry Point |
 |-------|---------|-------------|
-| **CLI** | Standalone concept mapping | `npm run cli` |
+| **CLI** | Standalone concept map rendering | `npx tsx src/cli/render-concept-map.ts` |
 | **MCP** | Claude Desktop integration | `npm run mcp:start` |
 | **Shared** | Common functionality | Imported by both |
 
@@ -373,7 +381,7 @@ src/
 npm run build           # Compile TypeScript
 
 # Test
-npm test                # Run 61 tests
+npm test                # Run 96 tests
 npm run test:coverage   # With coverage report
 
 # MCP Server
@@ -381,12 +389,11 @@ npm run mcp:start       # Start MCP server
 npm run mcp:dev         # Build + start
 
 # CLI Tool
-npm run cli             # Run concept map CLI
-npm run cli:setup       # Interactive setup wizard
+npx tsx src/cli/render-concept-map.ts --example  # Generate example JSON
+npx tsx src/cli/render-concept-map.ts --input concepts.json --output map.png
 
-# Aliases (backward compatible)
+# Aliases
 npm start               # Same as mcp:start
-npm run concept-map     # Same as cli
 ```
 
 ## License
