@@ -121,13 +121,67 @@ export interface ConceptInput {
   description?: string;
 }
 
+/**
+ * Relationship types for concept mapping.
+ * These provide a structured vocabulary for describing conceptual relationships.
+ */
+export type RelationshipType =
+  // Causal relationships
+  | "causes"
+  | "enables"
+  | "prevents"
+  | "triggers"
+  | "influences"
+  // Structural relationships
+  | "contains"
+  | "part_of"
+  | "instance_of"
+  | "derives_from"
+  | "extends"
+  // Temporal relationships
+  | "precedes"
+  | "follows"
+  | "co_occurs"
+  // Logical relationships
+  | "implies"
+  | "contradicts"
+  | "supports"
+  | "refines"
+  | "exemplifies"
+  // Comparative relationships
+  | "similar_to"
+  | "contrasts_with"
+  | "generalizes"
+  | "specializes"
+  // Other
+  | "related_to";
+
 /** Relationship input for render_concept_map */
 export interface RelationshipInput {
   from: string;
   to: string;
-  type: string;
-  strength?: number;
+  /** The type of relationship from the defined vocabulary */
+  type: RelationshipType;
+  /**
+   * A natural language description explaining WHY this relationship exists.
+   * This should be a concise sentence providing context-specific meaning.
+   * Example: "Feedback loops enable system stability by correcting deviations"
+   */
+  description: string;
+  /**
+   * Optional quote or paraphrase from the source content that evidences this relationship
+   */
   evidence?: string;
+  /**
+   * Strength of the relationship (0.0 to 1.0).
+   * Higher values indicate stronger, more central relationships.
+   */
+  strength?: number;
+  /**
+   * Whether the relationship is bidirectional (mutual influence).
+   * Default is false (unidirectional).
+   */
+  bidirectional?: boolean;
 }
 
 /** Core concept for render_concept_map */

@@ -163,35 +163,90 @@ describe("render_concept_map logic", () => {
   });
 
   describe("relationship type handling", () => {
-    it("handles common relationship types", () => {
-      const validTypes = [
-        "produces",
-        "enables",
-        "requires",
-        "critiques",
-        "contrasts with",
-        "extends",
-        "includes",
-        "examples of",
-        "influences",
-        "relates to",
-      ];
-
-      validTypes.forEach((type) => {
+    it("supports causal relationship types", () => {
+      const causalTypes = ["causes", "enables", "prevents", "triggers", "influences"];
+      causalTypes.forEach((type) => {
         expect(type.length).toBeGreaterThan(0);
       });
     });
 
-    it("handles relationships with strength values", () => {
+    it("supports structural relationship types", () => {
+      const structuralTypes = ["contains", "part_of", "instance_of", "derives_from", "extends"];
+      structuralTypes.forEach((type) => {
+        expect(type.length).toBeGreaterThan(0);
+      });
+    });
+
+    it("supports temporal relationship types", () => {
+      const temporalTypes = ["precedes", "follows", "co_occurs"];
+      temporalTypes.forEach((type) => {
+        expect(type.length).toBeGreaterThan(0);
+      });
+    });
+
+    it("supports logical relationship types", () => {
+      const logicalTypes = ["implies", "contradicts", "supports", "refines", "exemplifies"];
+      logicalTypes.forEach((type) => {
+        expect(type.length).toBeGreaterThan(0);
+      });
+    });
+
+    it("supports comparative relationship types", () => {
+      const comparativeTypes = ["similar_to", "contrasts_with", "generalizes", "specializes"];
+      comparativeTypes.forEach((type) => {
+        expect(type.length).toBeGreaterThan(0);
+      });
+    });
+
+    it("requires description field for relationships", () => {
       const relationship = {
         from: "concept-a",
         to: "concept-b",
-        type: "produces",
-        strength: 8,
+        type: "enables",
+        description: "Concept A enables Concept B by providing necessary foundation",
+        strength: 0.8,
       };
 
-      expect(relationship.strength).toBeGreaterThanOrEqual(1);
-      expect(relationship.strength).toBeLessThanOrEqual(10);
+      expect(relationship.description).toBeDefined();
+      expect(relationship.description.length).toBeGreaterThan(0);
+    });
+
+    it("handles relationships with strength values (0.0-1.0)", () => {
+      const relationship = {
+        from: "concept-a",
+        to: "concept-b",
+        type: "enables",
+        description: "Enables through causal mechanism",
+        strength: 0.8,
+      };
+
+      expect(relationship.strength).toBeGreaterThanOrEqual(0);
+      expect(relationship.strength).toBeLessThanOrEqual(1);
+    });
+
+    it("handles bidirectional relationships", () => {
+      const relationship = {
+        from: "concept-a",
+        to: "concept-b",
+        type: "similar_to",
+        description: "Both concepts share common properties",
+        bidirectional: true,
+      };
+
+      expect(relationship.bidirectional).toBe(true);
+    });
+
+    it("handles relationships with evidence", () => {
+      const relationship = {
+        from: "concept-a",
+        to: "concept-b",
+        type: "supports",
+        description: "Evidence from the text supports this relationship",
+        evidence: "As stated in the source: 'A directly supports B'",
+      };
+
+      expect(relationship.evidence).toBeDefined();
+      expect(relationship.evidence).toContain("A directly supports B");
     });
   });
 

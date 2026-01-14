@@ -233,9 +233,11 @@ interface ConceptMapNode {
 interface ConceptMapEdge {
   from: string;
   to: string;
-  label: string; // relationship label
-  weight: number; // strength of connection
-  sourceContexts: string[]; // excerpts showing the relationship
+  type: string; // relationship type from vocabulary
+  description: string; // natural language explanation of the relationship
+  weight: number; // strength of connection (0.0-1.0)
+  evidence?: string; // excerpt showing the relationship
+  bidirectional: boolean; // whether the relationship is mutual
 }
 
 function extractRelationshipLabel(text: string, concept1: string, concept2: string): string {
@@ -261,6 +263,100 @@ function extractRelationshipLabel(text: string, concept1: string, concept2: stri
   return "relates to";
 }
 
+/**
+ * Format a relationship type for display (e.g., "part_of" -> "part of")
+ */
+function formatRelationType(type: string): string {
+  return type.replace(/_/g, " ");
+}
+
+/**
+ * Wrap text to fit within a maximum width (for edge labels)
+ */
+function wrapText(text: string, maxWidth: number): string {
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let currentLine = "";
+
+  for (const word of words) {
+    if (currentLine.length + word.length + 1 <= maxWidth) {
+      currentLine += (currentLine ? " " : "") + word;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+
+  return lines.join("\\n");
+}
+
+/**
+ * Build a rich edge label from type and description
+ */
+function buildEdgeLabel(type: string, description: string): string {
+  const formattedType = formatRelationType(type);
+  // Truncate description if too long
+  const maxDescLen = 40;
+  const truncatedDesc = description.length > maxDescLen
+    ? description.substring(0, maxDescLen - 3) + "..."
+    : description;
+
+  // Wrap the combined label for readability
+  return wrapText(`${formattedType}: ${truncatedDesc}`, 25);
+}
+
+/**
+ * Get edge color based on relationship type category
+ */
+function getEdgeColor(type: string): string {
+  // Causal relationships - blue
+  if (["causes", "enables", "prevents", "triggers", "influences"].includes(type)) {
+    return "#2980b9";
+  }
+  // Structural relationships - green
+  if (["contains", "part_of", "instance_of", "derives_from", "extends"].includes(type)) {
+    return "#27ae60";
+  }
+  // Temporal relationships - orange
+  if (["precedes", "follows", "co_occurs"].includes(type)) {
+    return "#e67e22";
+  }
+  // Logical relationships - purple
+  if (["implies", "supports", "refines", "exemplifies"].includes(type)) {
+    return "#8e44ad";
+  }
+  // Contradictory/contrastive - red
+  if (["contradicts", "contrasts_with"].includes(type)) {
+    return "#c0392b";
+  }
+  // Comparative relationships - teal
+  if (["similar_to", "generalizes", "specializes"].includes(type)) {
+    return "#16a085";
+  }
+  // Default - gray
+  return "#566573";
+}
+
+/**
+ * Get edge style based on relationship type
+ */
+function getEdgeStyle(type: string): string {
+  // Contradictory relationships are dashed
+  if (["contradicts", "contrasts_with", "prevents"].includes(type)) {
+    return "dashed";
+  }
+  // Temporal relationships are dotted
+  if (["precedes", "follows", "co_occurs"].includes(type)) {
+    return "dotted";
+  }
+  // Strong causal/logical relationships are bold
+  if (["causes", "implies", "derives_from"].includes(type)) {
+    return "bold";
+  }
+  return "solid";
+}
+
 function generateHierarchicalConceptMap(
   coreNode: ConceptMapNode,
   conceptNodes: ConceptMapNode[],
@@ -269,96 +365,122 @@ function generateHierarchicalConceptMap(
 ): string {
   const lines: string[] = [
     "digraph ConceptMap {",
-    '  charset="UTF-8";',  // Ensure proper handling of accented characters
-    '  layout=neato;',     // Force-directed layout for better space usage
-    '  overlap=false;',    // Prevent node overlap
-    '  splines=true;',     // Curved edges
-    '  sep="+20";',        // Minimum separation between nodes
-    '  ratio=1;',          // Force 1:1 square aspect ratio
-    '  size="14,14!";',    // Force exact square dimensions (! = force)
+    '  charset="UTF-8";',
+    // Use fdp layout - better at avoiding edge crossings than neato
+    '  layout=fdp;',
+    // Prevent node overlap with extra padding
+    '  overlap=prism;',
+    '  overlap_scaling=2;',
+    // Use orthogonal splines to reduce crossings and improve readability
+    '  splines=ortho;',
+    // Increase separation between nodes
+    '  sep="+50,50";',
+    '  K=2;', // Ideal edge length (fdp-specific)
+    '  repulsiveforce=1.5;', // Push nodes apart more
+    // Graph dimensions
+    '  ratio=auto;',
+    '  size="16,12";',
     '  bgcolor="white";',
+    '  pad="0.5";',
+    '  margin="0.5";',
+    // Title
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
-    '  fontsize=28;',
+    '  fontsize=24;',
     '  fontname="Arial Bold";',
     "",
-    "  // Node styling",
-    '  node [shape=box, style="rounded,filled", fontname="Arial"];',
+    "  // Global node styling",
+    '  node [shape=box, style="rounded,filled", fontname="Arial", margin="0.2,0.1"];',
+    "",
+    "  // Global edge styling",
+    '  edge [fontname="Arial", fontsize=8, labelfloat=false, decorate=true];',
     "",
   ];
 
-  // Core concept - largest, distinctive color, pinned at center
+  // Core concept - largest, distinctive color
   lines.push("  // Core concept (center)");
   lines.push(
-    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=16, penwidth=3, width=2.5, pos="7,7!", pin=true];`
+    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=18, penwidth=3, width=3, height=1];`
   );
   lines.push("");
 
-  // Group concepts by level for ranking
+  // Group concepts by level
   const level1 = conceptNodes.filter(n => n.level === 1);
   const level2 = conceptNodes.filter(n => n.level === 2);
 
-  // Level 1 - Major concepts (medium size, warm colors)
+  // Level 1 - Major concepts
   if (level1.length > 0) {
     lines.push("  // Major concepts");
-    const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c"];
+    const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c", "#c0392b", "#2c3e50"];
     level1.forEach((node, index) => {
       const color = majorColors[index % majorColors.length];
-      const width = Math.max(1.5, Math.min(1.5 + node.occurrences * 0.1, 2.2));
+      const width = Math.max(2.0, Math.min(2.0 + node.occurrences * 0.1, 2.8));
       lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=13, width=${width}];`
+        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=14, width=${width}, height=0.8];`
       );
     });
     lines.push("");
   }
 
-  // Level 2 - Detail concepts (smaller, lighter colors)
+  // Level 2 - Detail concepts
   if (level2.length > 0) {
     lines.push("  // Detail concepts");
-    const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4"];
+    const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4", "#f1948a", "#85929e"];
     level2.forEach((node, index) => {
       const color = detailColors[index % detailColors.length];
-      const width = Math.max(1.0, Math.min(1.0 + node.occurrences * 0.08, 1.8));
+      const width = Math.max(1.5, Math.min(1.5 + node.occurrences * 0.08, 2.2));
       lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=11, width=${width}];`
+        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=11, width=${width}, height=0.6];`
       );
     });
     lines.push("");
   }
 
-  // Edges with relationship labels
-  lines.push("  // Relationships (labeled connections)");
+  // Edges with enriched relationship labels
+  lines.push("  // Relationships with semantic labels");
   const addedEdges = new Set<string>();
 
   edges.forEach((edge) => {
-    const edgeKey = [edge.from, edge.to].sort().join("|||");
+    // For bidirectional, use sorted key; for directional, use ordered key
+    const edgeKey = edge.bidirectional
+      ? [edge.from, edge.to].sort().join("|||")
+      : `${edge.from}|||${edge.to}`;
     if (addedEdges.has(edgeKey)) return;
     addedEdges.add(edgeKey);
 
-    const penwidth = Math.min(1 + edge.weight * 0.3, 3);
-    const label = edge.label !== "relates to" ? edge.label : "";
+    // Scale weight from 0-1 to reasonable penwidth (1-4)
+    const penwidth = Math.max(1, Math.min(1 + edge.weight * 3, 4));
+    const color = getEdgeColor(edge.type);
+    const style = getEdgeStyle(edge.type);
 
-    // Use different edge styles based on relationship type
-    let edgeStyle = "";
-    if (edge.label.includes("contrasts") || edge.label.includes("opposes")) {
-      edgeStyle = ', style="dashed", color="#c0392b"';
-    } else if (edge.label.includes("supports") || edge.label.includes("extends")) {
-      edgeStyle = ', color="#27ae60"';
-    } else if (edge.label.includes("requires") || edge.label.includes("depends")) {
-      edgeStyle = ', color="#8e44ad"';
-    } else {
-      edgeStyle = ', color="#566573"';
+    // Build the enriched label
+    const label = buildEdgeLabel(edge.type, edge.description);
+
+    // Build edge attributes
+    const attrs: string[] = [
+      `label="${escapeForDot(label)}"`,
+      `fontsize=9`,
+      `penwidth=${penwidth}`,
+      `color="${color}"`,
+      `fontcolor="${color}"`,
+      `style="${style}"`,
+    ];
+
+    // Handle bidirectional edges
+    if (edge.bidirectional) {
+      attrs.push(`dir=both`);
+      attrs.push(`arrowhead=normal`);
+      attrs.push(`arrowtail=normal`);
     }
 
-    if (label) {
-      lines.push(
-        `  "${edge.from}" -> "${edge.to}" [label="${escapeForDot(label)}", fontsize=9, penwidth=${penwidth}${edgeStyle}];`
-      );
-    } else {
-      lines.push(
-        `  "${edge.from}" -> "${edge.to}" [penwidth=${penwidth}${edgeStyle}];`
-      );
+    // Add tooltip with full description and evidence
+    const tooltipParts = [edge.description];
+    if (edge.evidence) {
+      tooltipParts.push(`Evidence: "${edge.evidence}"`);
     }
+    attrs.push(`tooltip="${escapeForDot(tooltipParts.join(" | "))}"`);
+
+    lines.push(`  "${edge.from}" -> "${edge.to}" [${attrs.join(", ")}];`);
   });
 
   lines.push("}");
@@ -661,10 +783,25 @@ const renderConceptMapSchema = z.object({
   relationships: z.array(z.object({
     from: z.string().describe("Source concept ID (or 'core' for the central concept)"),
     to: z.string().describe("Target concept ID"),
-    type: z.string().describe("Relationship type (e.g., 'produces', 'critiques', 'enables', 'contrasts with')"),
-    strength: z.number().optional().describe("Relationship strength 1-10 (affects edge weight, default: 5)"),
-    evidence: z.string().optional().describe("Brief quote or note showing the relationship"),
-  })).describe("Relationships between concepts"),
+    type: z.enum([
+      // Causal
+      "causes", "enables", "prevents", "triggers", "influences",
+      // Structural
+      "contains", "part_of", "instance_of", "derives_from", "extends",
+      // Temporal
+      "precedes", "follows", "co_occurs",
+      // Logical
+      "implies", "contradicts", "supports", "refines", "exemplifies",
+      // Comparative
+      "similar_to", "contrasts_with", "generalizes", "specializes",
+      // Other
+      "related_to"
+    ]).describe("Relationship type from the defined vocabulary"),
+    description: z.string().describe("A concise sentence explaining WHY this relationship exists in this context. Example: 'Feedback loops enable system stability by correcting deviations'"),
+    evidence: z.string().optional().describe("Brief quote or paraphrase from source content evidencing this relationship"),
+    strength: z.number().optional().describe("Relationship strength 0.0-1.0 (affects edge weight, default: 0.5)"),
+    bidirectional: z.boolean().optional().describe("Whether the relationship is mutual/bidirectional (default: false)"),
+  })).describe("Relationships between concepts with semantic descriptions"),
   output: z.object({
     format: z.enum(["png", "jpeg"]).optional().describe("Image format (default: png)"),
     insert_into_workflowy: z.string().optional().describe("Node ID to insert the concept map into"),
@@ -933,7 +1070,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "render_concept_map",
-        description: "Render a concept map from your semantic analysis. After analyzing content with get_node_content_for_analysis, use this tool to create a visual concept map. Provide the concepts you discovered and the relationships between them. Common relationship types: 'produces', 'enables', 'requires', 'critiques', 'contrasts with', 'extends', 'includes', 'examples of', 'influences'. The map will be rendered as an image and optionally inserted into Workflowy.",
+        description: `Render a concept map from your semantic analysis. After analyzing content with get_node_content_for_analysis, use this tool to create a visual concept map.
+
+RELATIONSHIP TYPES (grouped by category):
+- Causal: causes, enables, prevents, triggers, influences
+- Structural: contains, part_of, instance_of, derives_from, extends
+- Temporal: precedes, follows, co_occurs
+- Logical: implies, contradicts, supports, refines, exemplifies
+- Comparative: similar_to, contrasts_with, generalizes, specializes
+- Other: related_to
+
+IMPORTANT: Each relationship MUST include:
+1. A 'type' from the vocabulary above
+2. A 'description' explaining WHY this relationship exists (e.g., "Feedback loops enable stability by correcting deviations")
+3. Optionally, 'evidence' quoting the source material
+4. Set 'bidirectional: true' for mutual relationships (e.g., similar_to, contrasts_with)
+
+The edges are color-coded by category and styled by type (dashed for contradictions, dotted for temporal).`,
         inputSchema: {
           type: "object",
           properties: {
@@ -969,13 +1122,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 properties: {
                   from: { type: "string", description: "Source concept ID (or 'core')" },
                   to: { type: "string", description: "Target concept ID" },
-                  type: { type: "string", description: "Relationship type (e.g., 'produces', 'critiques')" },
-                  strength: { type: "number", description: "Strength 1-10 (affects edge weight)" },
-                  evidence: { type: "string", description: "Brief quote showing relationship" },
+                  type: {
+                    type: "string",
+                    enum: ["causes", "enables", "prevents", "triggers", "influences", "contains", "part_of", "instance_of", "derives_from", "extends", "precedes", "follows", "co_occurs", "implies", "contradicts", "supports", "refines", "exemplifies", "similar_to", "contrasts_with", "generalizes", "specializes", "related_to"],
+                    description: "Relationship type from the defined vocabulary",
+                  },
+                  description: { type: "string", description: "REQUIRED: Sentence explaining WHY this relationship exists" },
+                  evidence: { type: "string", description: "Quote or paraphrase from source evidencing the relationship" },
+                  strength: { type: "number", description: "Strength 0.0-1.0 (affects edge weight, default: 0.5)" },
+                  bidirectional: { type: "boolean", description: "Whether relationship is mutual (default: false)" },
                 },
-                required: ["from", "to", "type"],
+                required: ["from", "to", "type", "description"],
               },
-              description: "Relationships between concepts",
+              description: "Relationships between concepts with semantic descriptions",
             },
             output: {
               type: "object",
@@ -1449,9 +1608,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         conceptMapEdges.push({
           from: "core",
           to: node.id,
-          label: node.level === 1 ? "includes" : "details",
-          weight: node.occurrences,
-          sourceContexts: [],
+          type: node.level === 1 ? "contains" : "contains",
+          description: node.level === 1 ? "Major concept within this topic" : "Detail supporting the topic",
+          weight: Math.min(node.occurrences / 10, 1),
+          evidence: undefined,
+          bidirectional: false,
         });
       }
 
@@ -1497,14 +1658,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Convert edge map to array (concept-to-concept edges)
       for (const [key, data] of edgeMap) {
         const [from, to] = key.split("|||");
-        // Use the most common relationship label, or "relates to" if none found
-        const label = data.labels.find(l => l !== "relates to") || data.labels[0] || "relates to";
+        // Use the most common relationship label, or "related_to" if none found
+        const label = data.labels.find(l => l !== "relates to") || data.labels[0] || "related_to";
         conceptMapEdges.push({
           from,
           to,
-          label,
-          weight: data.weight,
-          sourceContexts: data.contexts,
+          type: label === "relates to" ? "related_to" : label,
+          description: data.contexts[0] ? `Co-occurs in: ${data.contexts[0].substring(0, 50)}...` : "Concepts appear together",
+          weight: Math.min(data.weight / 5, 1),
+          evidence: data.contexts[0],
+          bidirectional: true, // Co-occurrence is inherently bidirectional
         });
       }
 
@@ -1585,7 +1748,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 },
                 relationships: conceptConnections.slice(0, 10).map(e => ({
                   between: [e.from, e.to],
-                  relationship: e.label,
+                  relationship: e.type,
+                  description: e.description,
                   strength: e.weight,
                 })),
               }, null, 2),
@@ -2021,13 +2185,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         depth: c.level === "major" ? 1 : 2,
       }));
 
-      // Build edges
+      // Build edges with enriched relationship data
       const conceptMapEdges: ConceptMapEdge[] = relationships.map((r) => ({
         from: r.from,
         to: r.to,
-        label: r.type,
-        weight: r.strength || 5,
-        sourceContexts: r.evidence ? [r.evidence] : [],
+        type: r.type,
+        description: r.description,
+        weight: r.strength ?? 0.5,
+        evidence: r.evidence,
+        bidirectional: r.bidirectional ?? false,
       }));
 
       // Generate the image

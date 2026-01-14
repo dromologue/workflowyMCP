@@ -199,18 +199,29 @@ Renders a visual concept map from Claude's semantic analysis.
 {
   "from": "core",  // or concept id
   "to": "truth-procedure",
-  "type": "produces",  // semantic relationship
-  "strength": 9,   // 1-10, affects edge weight
-  "evidence": "Brief quote showing relationship"
+  "type": "enables",  // from defined vocabulary
+  "description": "Events enable truth procedures by rupturing the existing order",  // REQUIRED
+  "evidence": "Brief quote showing relationship",  // optional
+  "strength": 0.9,   // 0.0-1.0, affects edge weight
+  "bidirectional": false  // true for mutual relationships
 }
 ```
 
-**Common relationship types**:
-- `produces`, `enables`, `requires` (causal/dependency)
-- `critiques`, `extends`, `develops` (evaluative)
-- `contrasts with`, `differs from` (comparative)
-- `includes`, `examples of`, `type of` (hierarchical)
-- `influences`, `relates to` (general)
+**Relationship type vocabulary** (grouped by category):
+
+| Category | Types | Edge Color | Edge Style |
+|----------|-------|------------|------------|
+| Causal | `causes`, `enables`, `prevents`, `triggers`, `influences` | Blue | Bold for `causes` |
+| Structural | `contains`, `part_of`, `instance_of`, `derives_from`, `extends` | Green | Bold for `derives_from` |
+| Temporal | `precedes`, `follows`, `co_occurs` | Orange | Dotted |
+| Logical | `implies`, `contradicts`, `supports`, `refines`, `exemplifies` | Purple | Dashed for `contradicts` |
+| Comparative | `similar_to`, `contrasts_with`, `generalizes`, `specializes` | Teal | Dashed for `contrasts_with` |
+| Other | `related_to` | Gray | Solid |
+
+**Key requirements**:
+- Each relationship MUST include a `description` explaining WHY the relationship exists
+- Use `bidirectional: true` for mutual relationships (e.g., `similar_to`, `contrasts_with`)
+- The edge label shows both the type and a truncated description for context
 
 ---
 
@@ -236,8 +247,16 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 
 - **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
 - **Node size**: Larger = more important/frequent
-- **Edge labels**: Relationship type
-- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
+- **Edge labels**: Relationship type + description (truncated for readability)
+- **Edge colors by category**:
+  - Blue = causal (causes, enables, prevents, triggers, influences)
+  - Green = structural (contains, part_of, instance_of, derives_from, extends)
+  - Orange = temporal (precedes, follows, co_occurs)
+  - Purple = logical (implies, contradicts, supports, refines, exemplifies)
+  - Teal = comparative (similar_to, contrasts_with, generalizes, specializes)
+  - Gray = other (related_to)
+- **Edge styles**: Dashed = contradictory/contrastive, Dotted = temporal, Bold = strong causal
+- **Layout**: FDP algorithm with orthogonal splines to minimize edge crossings
 
 **Output**:
 - Square aspect ratio (2000x2000 max, 300 DPI) for balanced visual layout
@@ -328,8 +347,21 @@ User: "Create a concept map of my Badiou philosophy notes"
        { "id": "fidelity", "label": "Fidelity", "level": "detail", "importance": 6 }
      ],
      "relationships": [
-       { "from": "core", "to": "truth", "type": "produces", "strength": 9 },
-       { "from": "subject", "to": "fidelity", "type": "constituted by", "strength": 8 }
+       {
+         "from": "core", "to": "truth", "type": "enables",
+         "description": "Events enable truth procedures by creating ruptures in the existing order",
+         "strength": 0.9
+       },
+       {
+         "from": "subject", "to": "fidelity", "type": "derives_from",
+         "description": "The subject emerges through fidelity to the event's trace",
+         "strength": 0.8
+       },
+       {
+         "from": "truth", "to": "subject", "type": "enables",
+         "description": "Truth procedures constitute subjects who carry forward the event",
+         "bidirectional": true, "strength": 0.7
+       }
      ],
      "output": { "insert_into_workflowy": "abc123" }
    }
