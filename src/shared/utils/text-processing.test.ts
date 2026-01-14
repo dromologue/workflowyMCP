@@ -4,6 +4,7 @@ import {
   formatNodesForSelection,
   escapeForDot,
   generateWorkflowyLink,
+  extractWorkflowyLinks,
   validateConceptMapInput,
   CONCEPT_MAP_LIMITS,
 } from "./text-processing.js";
@@ -241,5 +242,70 @@ describe("validateConceptMapInput", () => {
       expect(result.tip).toBeDefined();
       expect(result.tip.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("extractWorkflowyLinks", () => {
+  it("extracts node ID from markdown link", () => {
+    const text = "See [Related Topic](https://workflowy.com/#/abc123-def456)";
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["abc123-def456"]);
+  });
+
+  it("extracts multiple links from text", () => {
+    const text = `
+      Check out [Topic A](https://workflowy.com/#/node-aaa) and
+      also [Topic B](https://workflowy.com/#/node-bbb) for more info.
+    `;
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["node-aaa", "node-bbb"]);
+  });
+
+  it("extracts plain Workflowy URLs", () => {
+    const text = "See https://workflowy.com/#/plain-node-id for details";
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["plain-node-id"]);
+  });
+
+  it("handles mixed markdown and plain URLs", () => {
+    const text = `
+      Link: [Named](https://workflowy.com/#/named-id)
+      Also: https://workflowy.com/#/plain-id
+    `;
+    const result = extractWorkflowyLinks(text);
+    expect(result).toContain("named-id");
+    expect(result).toContain("plain-id");
+    expect(result.length).toBe(2);
+  });
+
+  it("returns empty array for text without links", () => {
+    const text = "No Workflowy links here, just regular text.";
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual([]);
+  });
+
+  it("deduplicates repeated links", () => {
+    const text = `
+      First: [Topic](https://workflowy.com/#/same-id)
+      Second: [Topic Again](https://workflowy.com/#/same-id)
+    `;
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["same-id"]);
+  });
+
+  it("handles UUIDs as node IDs", () => {
+    const text = "[Note](https://workflowy.com/#/550e8400-e29b-41d4-a716-446655440000)";
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["550e8400-e29b-41d4-a716-446655440000"]);
+  });
+
+  it("ignores non-Workflowy URLs", () => {
+    const text = `
+      [Google](https://google.com)
+      [Workflowy](https://workflowy.com/#/valid-id)
+      [Other](https://example.com/#/fake-id)
+    `;
+    const result = extractWorkflowyLinks(text);
+    expect(result).toEqual(["valid-id"]);
   });
 });

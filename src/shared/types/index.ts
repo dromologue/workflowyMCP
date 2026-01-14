@@ -81,3 +81,82 @@ export interface DropboxUploadResult {
   url?: string;
   error?: string;
 }
+
+// ============================================================================
+// LLM-Powered Concept Map Types
+// ============================================================================
+
+/** A node formatted for LLM analysis */
+export interface AnalysisContentNode {
+  depth: number;
+  id: string;
+  name: string;
+  note?: string;
+  path: string;
+  /** IDs of nodes this node links to (via Workflowy internal links) */
+  links_to?: string[];
+}
+
+/** Result from get_node_content_for_analysis */
+export interface AnalysisContentResult {
+  root: {
+    id: string;
+    name: string;
+    note?: string;
+  };
+  total_nodes: number;
+  total_chars: number;
+  truncated: boolean;
+  /** Nodes that were linked but outside the initial scope */
+  linked_nodes_included: number;
+  content: AnalysisContentNode[];
+}
+
+/** Concept input for render_concept_map */
+export interface ConceptInput {
+  id: string;
+  label: string;
+  level: "major" | "detail";
+  importance?: number;
+  description?: string;
+}
+
+/** Relationship input for render_concept_map */
+export interface RelationshipInput {
+  from: string;
+  to: string;
+  type: string;
+  strength?: number;
+  evidence?: string;
+}
+
+/** Core concept for render_concept_map */
+export interface CoreConceptInput {
+  label: string;
+  description?: string;
+}
+
+/** Output options for render_concept_map */
+export interface RenderOutputOptions {
+  format?: "png" | "jpeg";
+  insert_into_workflowy?: string;
+  output_path?: string;
+}
+
+/** Result from render_concept_map */
+export interface RenderConceptMapResult {
+  success: boolean;
+  image_url?: string;
+  file_path?: string;
+  inserted_into?: {
+    id: string;
+    name: string;
+  };
+  error?: string;
+  stats?: {
+    concepts_rendered: number;
+    major_concepts: number;
+    detail_concepts: number;
+    relationships_rendered: number;
+  };
+}

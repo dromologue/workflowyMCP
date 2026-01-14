@@ -50,34 +50,39 @@
 
 ```
 src/
-├── index.ts              # Entry point (minimal)
-├── config/
-│   └── environment.ts    # Environment variables, constants
-├── api/
-│   ├── workflowy.ts      # Workflowy API client with retry
-│   ├── dropbox.ts        # Dropbox OAuth + image upload
-│   └── retry.ts          # Retry logic with exponential backoff
-├── types/
-│   └── index.ts          # All TypeScript interfaces
-├── utils/
-│   ├── cache.ts          # Node caching with TTL
-│   ├── node-paths.ts     # Breadcrumb path building
-│   ├── text-processing.ts # Indentation parsing, formatting
-│   └── keyword-extraction.ts # Keywords, relevance scoring
-├── schemas/
-│   └── index.ts          # Zod validation schemas
-├── tools/
-│   ├── search.ts         # search_nodes, find_insert_targets
-│   ├── navigation.ts     # get_node, get_children, list_targets, export_all
-│   ├── creation.ts       # create_node, insert_content, smart_insert
-│   ├── modification.ts   # update_node, move_node, delete_node
-│   ├── todos.ts          # create_todo, list_todos
-│   ├── completion.ts     # complete_node, uncomplete_node
-│   ├── knowledge.ts      # find_related, create_links
-│   └── concept-map.ts    # generate_concept_map
-└── handlers/
-    └── index.ts          # Tool handler dispatch
+├── index.ts              # Entry point (re-exports MCP server)
+├── cli/                  # Command-line interface
+│   ├── concept-map.ts    # Standalone concept map generation
+│   └── setup.ts          # Interactive credential wizard
+├── mcp/
+│   └── server.ts         # MCP server with all tool handlers (~2000 lines)
+└── shared/               # Shared utilities (used by CLI and MCP)
+    ├── api/
+    │   ├── workflowy.ts  # Workflowy API client with retry
+    │   ├── dropbox.ts    # Dropbox OAuth + image upload
+    │   └── retry.ts      # Retry logic with exponential backoff
+    ├── config/
+    │   └── environment.ts # Environment variables, constants
+    ├── types/
+    │   └── index.ts      # All TypeScript interfaces
+    └── utils/
+        ├── cache.ts          # Node caching with TTL
+        ├── node-paths.ts     # Breadcrumb path building
+        ├── text-processing.ts # Parsing, formatting, link extraction
+        └── keyword-extraction.ts # Keywords, relevance scoring
 ```
+
+### MCP Tools (in server.ts)
+
+| Category | Tools |
+|----------|-------|
+| Search & Navigation | search_nodes, get_node, get_children, export_all, list_targets, find_insert_targets |
+| Content Creation | create_node, insert_content, smart_insert |
+| Content Modification | update_node, move_node, delete_node |
+| Todo Management | create_todo, list_todos, complete_node, uncomplete_node |
+| Knowledge Linking | find_related, create_links |
+| Concept Mapping (Legacy) | generate_concept_map |
+| **LLM-Powered Concept Mapping** | **get_node_content_for_analysis, render_concept_map** |
 
 ## Key Design Decisions
 
@@ -160,13 +165,13 @@ src/
 - (-) English-centric stop word list
 - (-) No semantic understanding (only keyword matching)
 
-### ADR-007: Concept Map Generation
+### ADR-007: Concept Map Generation (Legacy)
 
 **Context**: Visual representation of node relationships aids understanding of knowledge structure.
 
 **Decision**: Generate Graphviz DOT format, render via @hpcc-js/wasm-graphviz, convert to PNG/JPEG via Sharp, host on Dropbox for Workflowy embedding.
 
-**Architecture**:
+**Architecture** (keyword-based):
 ```
 Node Content → Keyword Extraction → Related Node Scoring
                                           ↓
@@ -183,6 +188,60 @@ Dropbox Upload → Shareable URL → Workflowy Node Insert
 - (+) Optional Dropbox hosting with local fallback
 - (-) Requires Dropbox OAuth setup for auto-insert
 - (-) Large dependencies (Sharp, Graphviz WASM)
+- (-) Keyword matching lacks semantic understanding
+
+### ADR-009: LLM-Powered Concept Mapping
+
+**Context**: The keyword-based concept map approach (ADR-007) requires users to provide concepts upfront and only finds relationships through co-occurrence patterns. This misses the semantic understanding that Claude can provide.
+
+**Decision**: Implement a two-tool workflow where Claude acts as the semantic analyzer:
+1. `get_node_content_for_analysis` - Extracts subtree content formatted for LLM analysis
+2. `render_concept_map` - Renders Claude's discovered concepts and relationships
+
+**Architecture** (LLM-powered):
+```
+                          Claude Desktop
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ▼                      │                      ▼
+get_node_content_for_analysis  │           render_concept_map
+        │                      │                      │
+        ▼                      │                      │
+┌───────────────────┐          │         ┌───────────────────┐
+│ Workflowy Subtree │          │         │ Claude's Analysis │
+│ + Linked Content  │──────────┼────────▶│ - Concepts        │
+│ (JSON/Outline)    │   Claude │         │ - Relationships   │
+└───────────────────┘  Analyzes│         │ - Hierarchy       │
+                               │         └─────────┬─────────┘
+                               │                   │
+                               │                   ▼
+                               │    ┌────────────────────────┐
+                               │    │ Graphviz DOT → SVG     │
+                               │    │ Sharp → PNG/JPEG       │
+                               │    │ Dropbox → Workflowy    │
+                               │    └────────────────────────┘
+```
+
+**Key Design Decisions**:
+
+1. **Claude as orchestrator**: The MCP server doesn't call Claude API internally. Instead, Claude Desktop coordinates the workflow, calling tools in sequence.
+
+2. **Link following**: `get_node_content_for_analysis` parses Workflowy internal links (`[text](https://workflowy.com/#/node-id)`) and includes linked content to capture cross-references.
+
+3. **Structured output**: Content returned as JSON with depth, path, and link metadata so Claude can understand hierarchy and connections.
+
+4. **Semantic relationships**: Claude discovers relationship types ("produces", "critiques", "enables") through understanding, not regex pattern matching.
+
+**Consequences**:
+- (+) Leverages Claude's semantic understanding for concept discovery
+- (+) No need to provide concepts upfront - Claude finds them
+- (+) Meaningful relationship labels based on actual content meaning
+- (+) Follows links to include cross-referenced content
+- (+) Same high-quality visual output as legacy approach
+- (-) Requires two tool calls instead of one
+- (-) Depends on Claude's analysis quality
+- (-) Cannot be used without an LLM orchestrator
 
 ### ADR-008: Retry Logic with Exponential Backoff
 
