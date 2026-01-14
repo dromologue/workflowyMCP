@@ -180,23 +180,25 @@ function generateConceptMapDot(
   const lines: string[] = [
     "digraph ConceptMap {",
     '  charset="UTF-8";',
-    // Use sfdp for better scaling with larger graphs, circo for radial layout
+    // Use sfdp for better scaling with larger graphs
     '  layout=sfdp;',
-    // Prevent overlap with scaling
+    // Prevent overlap with scaling - higher values push nodes apart more
     '  overlap=prism;',
-    '  overlap_scaling=4;',
-    // Use polyline splines - cleaner than ortho for complex graphs
-    '  splines=polyline;',
-    // Increase separation significantly
-    '  sep="+80,80";',
-    '  K=3;',
-    '  repulsiveforce=2.0;',
+    '  overlap_scaling=6;',
+    // Use curved splines - better label placement than polyline
+    '  splines=curved;',
+    // Increase separation significantly for label space
+    '  sep="+100,100";',
+    '  K=4;',
+    '  repulsiveforce=3.0;',
+    // Force external labels to be shown even if they might overlap
+    '  forcelabels=true;',
     // Much larger graph dimensions
     `  size="${width},${height}";`,
     '  ratio=fill;',
     '  bgcolor="white";',
-    '  pad="1.0";',
-    '  margin="1.0";',
+    '  pad="1.5";',
+    '  margin="1.5";',
     // Title
     `  label="${escapeForDot(title)}";`,
     '  labelloc="t";',
@@ -204,10 +206,10 @@ function generateConceptMapDot(
     '  fontname="Helvetica Bold";',
     "",
     "  // Global node styling",
-    `  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.3,0.15", fontsize=${fontSize}];`,
+    `  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.4,0.2", fontsize=${fontSize}];`,
     "",
-    "  // Global edge styling - larger labels for readability",
-    `  edge [fontname="Helvetica", fontsize=${fontSize}, labelfloat=false, decorate=true, labeldistance=2];`,
+    "  // Global edge styling - use xlabel for external labels that don't overlap edges",
+    `  edge [fontname="Helvetica", fontsize=${fontSize * 0.9}];`,
     "",
   ];
 
@@ -266,14 +268,16 @@ function generateConceptMapDot(
     const style = getEdgeStyle(edge.type);
     const label = buildEdgeLabel(edge.type, edge.description);
 
+    // Use xlabel (external label) to position label away from the edge line
+    // This prevents labels from overlapping with edges and nodes
     const attrs: string[] = [
-      `label="${escapeForDot(label)}"`,
-      `fontsize=${fontSize}`,
+      `xlabel="${escapeForDot(label)}"`,
+      `fontsize=${fontSize * 0.9}`,
       `penwidth=${penwidth}`,
       `color="${color}"`,
       `fontcolor="${color}"`,
       `style="${style}"`,
-      `len=3`, // Preferred edge length for sfdp
+      `len=4`, // Longer edge length for more label space
     ];
 
     if (edge.bidirectional) {
