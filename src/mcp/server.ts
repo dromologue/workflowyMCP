@@ -635,6 +635,12 @@ const smartInsertSchema = z.object({
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
 });
 
+const findNodeSchema = z.object({
+  name: z.string().describe("The exact name of the node to find"),
+  match_mode: z.enum(["exact", "contains", "starts_with"]).optional().describe("How to match the name: 'exact' (default) for exact match, 'contains' for substring match, 'starts_with' for prefix match"),
+  selection: z.number().optional().describe("If multiple matches found, the number (1-based) of the node to use. Returns the selected node's ID ready for use."),
+});
+
 // LLM-Powered Concept Map Schemas
 const getNodeContentForAnalysisSchema = z.object({
   node_id: z.string().describe("The ID of the root node to analyze"),
@@ -896,6 +902,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings" },
           },
           required: ["search_query", "content"],
+        },
+      },
+      {
+        name: "find_node",
+        description: "Fast node lookup by name. Returns the node ID ready for use with other tools. Handles duplicates by presenting options for selection. Use this when you need to find a specific node by its exact name.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The name of the node to find" },
+            match_mode: { type: "string", enum: ["exact", "contains", "starts_with"], description: "How to match: 'exact' (default), 'contains', or 'starts_with'" },
+            selection: { type: "number", description: "If multiple matches, the number (1-based) to select. Returns that node's ID." },
+          },
+          required: ["name"],
         },
       },
       {
@@ -1755,6 +1774,117 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await workflowyRequest("/targets");
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    }
+
+    case "find_node": {
+      const { name: searchName, match_mode, selection } = findNodeSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const mode = match_mode || "exact";
+      const lowerSearchName = searchName.toLowerCase();
+
+      // Filter nodes based on match mode
+      const matchingNodes = allNodes.filter((node) => {
+        const nodeName = node.name?.toLowerCase() || "";
+        switch (mode) {
+          case "exact":
+            return nodeName === lowerSearchName;
+          case "starts_with":
+            return nodeName.startsWith(lowerSearchName);
+          case "contains":
+            return nodeName.includes(lowerSearchName);
+          default:
+            return nodeName === lowerSearchName;
+        }
+      });
+
+      if (matchingNodes.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              found: false,
+              message: `No node found with name "${searchName}" (match mode: ${mode})`,
+              tip: mode === "exact"
+                ? "Try match_mode: 'contains' or 'starts_with' for more flexible matching"
+                : "Check the exact spelling or try a different search term",
+            }, null, 2),
+          }],
+        };
+      }
+
+      const nodesWithPaths = buildNodePaths(matchingNodes);
+
+      // Single match - return directly
+      if (matchingNodes.length === 1) {
+        const node = matchingNodes[0];
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              found: true,
+              node_id: node.id,
+              name: node.name,
+              path: nodesWithPaths[0].path,
+              note: node.note || null,
+              message: "Single match found. Use node_id with other tools.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Multiple matches - check if selection provided
+      if (selection !== undefined) {
+        const index = selection - 1;
+        if (index < 0 || index >= matchingNodes.length) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                found: true,
+                error: `Invalid selection: ${selection}. Choose between 1 and ${matchingNodes.length}.`,
+                matches: matchingNodes.length,
+              }, null, 2),
+            }],
+          };
+        }
+        const selectedNode = matchingNodes[index];
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              found: true,
+              node_id: selectedNode.id,
+              name: selectedNode.name,
+              path: nodesWithPaths[index].path,
+              note: selectedNode.note || null,
+              message: `Selected match ${selection} of ${matchingNodes.length}. Use node_id with other tools.`,
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Multiple matches, no selection - ask user to choose
+      const options = nodesWithPaths.map((node, i) => ({
+        option: i + 1,
+        name: node.name,
+        path: node.path,
+        note_preview: node.note ? node.note.substring(0, 60) + (node.note.length > 60 ? "..." : "") : null,
+        id: node.id,
+      }));
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            found: true,
+            multiple_matches: true,
+            count: matchingNodes.length,
+            message: `Found ${matchingNodes.length} nodes named "${searchName}". Which one do you mean?`,
+            options,
+            usage: `Call find_node again with selection: <number> to get the node_id`,
+          }, null, 2),
+        }],
       };
     }
 

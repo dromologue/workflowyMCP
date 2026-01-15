@@ -296,9 +296,37 @@ The CLI saves images to the current directory:
 The server includes full Workflowy management to support your knowledge work:
 
 ### Search & Navigation
-- `search_nodes` - Find nodes by text
+- `find_node` - Fast node lookup by name with duplicate handling (see below)
+- `search_nodes` - Find nodes by text (substring search)
 - `get_node` / `get_children` - Navigate structure
 - `export_all` - Full outline export
+
+### find_node Tool
+
+Fast node lookup that handles duplicates by presenting options for selection. Returns the node ID ready for use with other tools.
+
+**Parameters:**
+| Parameter | Description |
+|-----------|-------------|
+| `name` | The name of the node to find (required) |
+| `match_mode` | `exact` (default), `contains`, or `starts_with` |
+| `selection` | If multiple matches, the 1-based number to select |
+
+**Usage Examples:**
+```
+"Find the node called 'Project Ideas'"
+→ Returns single match with node_id ready to use
+
+"Find the node called 'Ideas'"
+→ Multiple matches: presents numbered options with paths
+→ "Found 3 nodes named 'Ideas'. Which one do you mean?"
+   1. Work > Project Ideas > Ideas (ID: abc123)
+   2. Personal > Ideas (ID: def456)
+   3. Archive > Old Ideas > Ideas (ID: ghi789)
+
+"Find node 'Ideas', selection 2"
+→ Returns the Personal > Ideas node with its ID
+```
 
 ### Content Management
 - `create_node` / `update_node` / `delete_node` / `move_node`
