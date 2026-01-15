@@ -76,7 +76,7 @@ src/
 
 | Category | Tools |
 |----------|-------|
-| Search & Navigation | search_nodes, get_node, get_children, export_all, list_targets, find_insert_targets |
+| Search & Navigation | **find_node**, search_nodes, get_node, get_children, export_all, list_targets, find_insert_targets |
 | Content Creation | create_node, insert_content, smart_insert |
 | Content Modification | update_node, move_node, delete_node |
 | Todo Management | create_todo, list_todos, complete_node, uncomplete_node |

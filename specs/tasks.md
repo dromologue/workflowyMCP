@@ -266,3 +266,10 @@
   - Auto-create child node in source node with concept map image
   - Node includes markdown image, scope info, and keywords
   - Fallback to local ~/Downloads/ if Dropbox not configured
+
+- [x] **T-033**: Add find_node tool for fast node lookup
+  - Fast node identification by exact name
+  - Support for exact, contains, and starts_with match modes
+  - Duplicate handling with numbered options and selection parameter
+  - Returns node_id ready for use with other tools
+  - Full test coverage (28 unit tests)

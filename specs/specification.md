@@ -28,12 +28,69 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 
 | Feature | Description |
 |---------|-------------|
+| **Fast node lookup** | Find nodes by exact name with duplicate handling |
 | Text search | Search node names and notes by keyword |
 | Path display | Show full breadcrumb path for disambiguation |
 | Target listing | Access Workflowy shortcuts (inbox, starred) |
 | Full export | Retrieve entire outline for comprehensive analysis |
 
 **Success criteria**: User can locate any node in <2 tool calls.
+
+---
+
+#### find_node Tool
+
+Fast node lookup by name that returns the node ID ready for use with other tools. Designed for when Claude needs to quickly identify a specific node.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | The name of the node to find |
+| `match_mode` | "exact" \| "contains" \| "starts_with" | no | How to match (default: "exact") |
+| `selection` | number | no | If multiple matches, the 1-based index to select |
+
+**Match modes**:
+- `exact`: Node name must exactly match (case-insensitive)
+- `contains`: Node name contains the search term
+- `starts_with`: Node name starts with the search term
+
+**Behavior**:
+1. **Single match**: Returns node ID, name, path, and note directly
+2. **Multiple matches**: Returns numbered options with paths for disambiguation
+3. **With selection**: Returns the specific node from the match list
+
+**Response (single match)**:
+```json
+{
+  "found": true,
+  "node_id": "abc123",
+  "name": "Project Ideas",
+  "path": "Work > Projects > Project Ideas",
+  "note": "My project notes...",
+  "message": "Single match found. Use node_id with other tools."
+}
+```
+
+**Response (multiple matches)**:
+```json
+{
+  "found": true,
+  "multiple_matches": true,
+  "count": 3,
+  "message": "Found 3 nodes named 'Ideas'. Which one do you mean?",
+  "options": [
+    {"option": 1, "name": "Ideas", "path": "Work > Ideas", "id": "abc"},
+    {"option": 2, "name": "Ideas", "path": "Personal > Ideas", "id": "def"},
+    {"option": 3, "name": "Ideas", "path": "Archive > Ideas", "id": "ghi"}
+  ],
+  "usage": "Call find_node again with selection: <number> to get the node_id"
+}
+```
+
+**Use case**: When Claude needs to find a node by name to use its ID with other tools (insert_content, get_children, create_links, etc.)
+
+---
 
 ### 2. Navigation & Retrieval
 
