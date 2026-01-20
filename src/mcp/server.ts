@@ -529,12 +529,16 @@ async function generateHierarchicalConceptMapImage(
 // ============================================================================
 
 /**
- * Insert hierarchical content with rate limiting.
- * Uses the request queue for controlled API access.
+ * Insert hierarchical content using a staging node approach.
  *
- * Note: Hierarchical content must be processed sequentially because
- * child nodes depend on parent node IDs. However, the request queue
- * provides rate limiting to avoid overwhelming the API.
+ * To avoid nodes briefly appearing at the wrong location during creation,
+ * this function:
+ * 1. Creates a temporary staging node under the target parent
+ * 2. Creates all hierarchical content inside the staging node
+ * 3. Moves top-level children from staging to the actual parent
+ * 4. Deletes the staging node
+ *
+ * This ensures nodes are never visible at unintended locations during the operation.
  */
 async function insertHierarchicalContent(
   rootParentId: string,
@@ -542,93 +546,114 @@ async function insertHierarchicalContent(
   position?: "top" | "bottom"
 ): Promise<CreatedNode[]> {
   const parsedLines = parseIndentedContent(content);
+  if (parsedLines.length === 0) {
+    return [];
+  }
+
+  // Step 1: Create a temporary staging node under the target parent
+  const stagingNode = (await workflowyRequest("/nodes", "POST", {
+    name: "__staging_temp__",
+    parent_id: rootParentId,
+    position: "bottom", // Always at bottom to minimize visibility
+  })) as CreatedNode;
+
   const createdNodes: CreatedNode[] = [];
-  const parentStack: string[] = [rootParentId];
-  let firstTopLevelInserted = false;
+  const topLevelNodeIds: string[] = []; // Track top-level nodes for moving later
+  const parentStack: string[] = [stagingNode.id]; // Start with staging node as root
 
-  // Process in batches where possible - batch consecutive same-level items with known parents
-  const BATCH_SIZE = 10;
-  let i = 0;
+  try {
+    // Step 2: Create all content inside the staging node
+    const BATCH_SIZE = 10;
+    let i = 0;
 
-  while (i < parsedLines.length) {
-    const currentLine = parsedLines[i];
-    const currentParentIndex = Math.min(currentLine.indent, parentStack.length - 1);
-    const currentParentId = parentStack[currentParentIndex];
+    while (i < parsedLines.length) {
+      const currentLine = parsedLines[i];
+      const currentParentIndex = Math.min(currentLine.indent, parentStack.length - 1);
 
-    // Collect consecutive lines that can share the same parent (same indent level)
-    // Only batch items at the same indent level whose parent is already known
-    const batch: Array<{ line: typeof currentLine; index: number }> = [];
+      // Collect consecutive lines that can share the same parent (same indent level)
+      const batch: Array<{ line: typeof currentLine; index: number }> = [];
 
-    while (i < parsedLines.length && batch.length < BATCH_SIZE) {
-      const line = parsedLines[i];
-      const parentIndex = Math.min(line.indent, parentStack.length - 1);
+      while (i < parsedLines.length && batch.length < BATCH_SIZE) {
+        const line = parsedLines[i];
+        const parentIndex = Math.min(line.indent, parentStack.length - 1);
 
-      // Can only batch if:
-      // 1. Same indent level as batch start (same parent reference)
-      // 2. Parent already exists in parentStack
-      if (line.indent === currentLine.indent && parentIndex < parentStack.length) {
-        batch.push({ line, index: i });
-        i++;
-      } else {
-        // Different indent level or parent not yet created - stop batching
-        break;
-      }
-    }
-
-    if (batch.length === 1) {
-      // Single item - process normally
-      const { line } = batch[0];
-      const parentId = parentStack[Math.min(line.indent, parentStack.length - 1)];
-
-      let nodePosition: "top" | "bottom" = "bottom";
-      if (position === "top" && line.indent === 0 && !firstTopLevelInserted) {
-        nodePosition = "top";
-        firstTopLevelInserted = true;
+        if (line.indent === currentLine.indent && parentIndex < parentStack.length) {
+          batch.push({ line, index: i });
+          i++;
+        } else {
+          break;
+        }
       }
 
-      const result = (await workflowyRequest("/nodes", "POST", {
-        name: line.text,
-        parent_id: parentId,
-        position: nodePosition,
-      })) as CreatedNode;
-
-      createdNodes.push(result);
-      parentStack[line.indent + 1] = result.id;
-      parentStack.length = line.indent + 2;
-    } else {
-      // Multiple items - batch create concurrently
-      const batchPromises = batch.map(({ line }, batchIdx) => {
+      if (batch.length === 1) {
+        const { line } = batch[0];
         const parentId = parentStack[Math.min(line.indent, parentStack.length - 1)];
 
-        let nodePosition: "top" | "bottom" = "bottom";
-        if (position === "top" && line.indent === 0 && !firstTopLevelInserted && batchIdx === 0) {
-          nodePosition = "top";
-        }
-
-        return workflowyRequest("/nodes", "POST", {
+        const result = (await workflowyRequest("/nodes", "POST", {
           name: line.text,
           parent_id: parentId,
-          position: nodePosition,
-        }) as Promise<CreatedNode>;
-      });
+          position: "bottom",
+        })) as CreatedNode;
 
-      if (position === "top" && currentLine.indent === 0 && !firstTopLevelInserted) {
-        firstTopLevelInserted = true;
-      }
-
-      const results = await Promise.all(batchPromises);
-
-      // Process results in order to maintain correct parent stack
-      for (let j = 0; j < results.length; j++) {
-        const result = results[j];
-        const { line } = batch[j];
         createdNodes.push(result);
 
-        // Update parent stack - last item at this level becomes the parent for next deeper level
+        // Track top-level nodes (indent 0) for moving later
+        if (line.indent === 0) {
+          topLevelNodeIds.push(result.id);
+        }
+
         parentStack[line.indent + 1] = result.id;
         parentStack.length = line.indent + 2;
+      } else {
+        const batchPromises = batch.map(({ line }) => {
+          const parentId = parentStack[Math.min(line.indent, parentStack.length - 1)];
+          return workflowyRequest("/nodes", "POST", {
+            name: line.text,
+            parent_id: parentId,
+            position: "bottom",
+          }) as Promise<CreatedNode>;
+        });
+
+        const results = await Promise.all(batchPromises);
+
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j];
+          const { line } = batch[j];
+          createdNodes.push(result);
+
+          // Track top-level nodes for moving later
+          if (line.indent === 0) {
+            topLevelNodeIds.push(result.id);
+          }
+
+          parentStack[line.indent + 1] = result.id;
+          parentStack.length = line.indent + 2;
+        }
       }
     }
+
+    // Step 3: Move top-level nodes from staging to the actual parent
+    // Move in reverse order if position is "top" to maintain correct order
+    const nodesToMove = position === "top" ? [...topLevelNodeIds].reverse() : topLevelNodeIds;
+
+    for (const nodeId of nodesToMove) {
+      await workflowyRequest(`/nodes/${nodeId}`, "POST", {
+        parent_id: rootParentId,
+        position: position || "bottom",
+      });
+    }
+
+    // Step 4: Delete the staging node (should now be empty)
+    await workflowyRequest(`/nodes/${stagingNode.id}`, "DELETE");
+
+  } catch (error) {
+    // Clean up staging node on error
+    try {
+      await workflowyRequest(`/nodes/${stagingNode.id}`, "DELETE");
+    } catch {
+      // Ignore cleanup errors
+    }
+    throw error;
   }
 
   return createdNodes;

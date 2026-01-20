@@ -115,10 +115,22 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 | Smart insert | Search-and-insert workflow with selection |
 | Markdown support | Headers, todos, code blocks, quotes |
 | Order preservation | Content appears in same order as provided |
+| **Staging node pattern** | Prevents nodes from appearing at unintended locations during insertion |
 
 **Position behavior**:
 - `bottom` (default): Content appended after existing children, order preserved
 - `top`: First node placed at top, subsequent nodes follow in order
+
+**Staging node insertion**:
+
+To prevent nodes from briefly appearing at the root or wrong location during multi-node insertions, the `insert_content` and `smart_insert` tools use a staging node pattern:
+
+1. Create a temporary staging node (`__staging_temp__`) under the target parent
+2. Create all hierarchical content inside the staging node
+3. Move top-level children from staging to the actual parent (respecting position)
+4. Delete the staging node
+
+This ensures nodes are never visible at unintended locations during the operation.
 
 **Success criteria**: Claude-generated content appears in Workflowy with correct structure and order.
 

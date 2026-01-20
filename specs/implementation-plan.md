@@ -146,6 +146,39 @@ src/
 - (-) Multiple top-level nodes with "top" won't all be at very top
 - (-) Slight semantic change from raw API behavior
 
+### ADR-010: Staging Node Pattern for Content Insertion
+
+**Context**: When inserting multiple nodes, concurrent API calls could cause nodes to briefly appear at unintended locations (like the Workflowy root) during the operation, before being moved to their correct parents. This creates visual clutter and confuses users.
+
+**Decision**: Use a staging node pattern for hierarchical content insertion:
+1. Create a temporary staging node (`__staging_temp__`) under the target parent
+2. Create all hierarchical content inside the staging node
+3. Move top-level children from staging to the actual parent
+4. Delete the staging node
+
+**Implementation**:
+```
+Target Parent
+    └── __staging_temp__  ← 1. Create staging
+            └── Content A ← 2. Create content here
+            └── Content B
+                └── Child B1
+
+Target Parent             ← 3. Move top-level nodes
+    └── Content A
+    └── Content B
+        └── Child B1
+    (staging deleted)     ← 4. Delete staging
+```
+
+**Consequences**:
+- (+) Nodes never appear at root or wrong location during insertion
+- (+) Clean user experience - content appears atomically in correct location
+- (+) Error recovery - staging node cleanup on failure
+- (+) Works with both "top" and "bottom" position (reverse move order for "top")
+- (-) Additional API calls (1 create + N moves + 1 delete)
+- (-) Slightly increased latency for large insertions
+
 ### ADR-006: Knowledge Linking via Keyword Extraction
 
 **Context**: Users want to discover connections between related content in their Workflowy outline.
