@@ -457,11 +457,108 @@ Example output structure:
 - Logging: No user content or secrets
 - Transport: Local stdio (no network exposure)
 
+### 7. Batch Operations & High-Load Handling
+
+**Goal**: Handle multiple operations efficiently without overwhelming the Workflowy API.
+
+| Feature | Description |
+|---------|-------------|
+| Batch operations | Execute multiple create/update/delete/move operations in a single call |
+| Request queuing | Controlled concurrency with configurable limits |
+| Rate limiting | Proactive token bucket rate limiter to prevent API throttling |
+| Selective cache invalidation | Invalidate only affected nodes instead of full cache |
+
+---
+
+#### batch_operations Tool
+
+Execute multiple operations with controlled concurrency and rate limiting.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `operations` | array | yes | Array of operations to execute |
+| `parallel` | boolean | no | Execute in parallel (default: true) |
+
+**Operation structure**:
+```json
+{
+  "type": "create" | "update" | "delete" | "move" | "complete" | "uncomplete",
+  "params": { /* operation-specific parameters */ }
+}
+```
+
+**Operation params by type**:
+- `create`: `{name, note?, parent_id?, position?}`
+- `update`: `{node_id, name?, note?}`
+- `delete`: `{node_id}`
+- `move`: `{node_id, parent_id, position?}`
+- `complete`/`uncomplete`: `{node_id}`
+
+**Response**:
+```json
+{
+  "success": true,
+  "message": "All 10 operations completed successfully",
+  "total": 10,
+  "succeeded": 10,
+  "failed": 0,
+  "results": [
+    {
+      "index": 0,
+      "operation": { "type": "create", "params": {...} },
+      "status": "fulfilled",
+      "result": { "id": "abc123", "name": "..." }
+    }
+  ],
+  "queue_stats": {
+    "queueLength": 0,
+    "activeRequests": 0,
+    "totalProcessed": 10,
+    "totalFailed": 0
+  }
+}
+```
+
+**Use cases**:
+- Bulk node creation (e.g., importing a list of items)
+- Mass updates (e.g., completing multiple todos)
+- Mixed operations in a single batch
+
+---
+
+#### Configuration
+
+High-load behavior is configured via environment constants:
+
+**Queue Configuration** (`QUEUE_CONFIG`):
+- `maxConcurrency`: Max parallel API requests (default: 3)
+- `batchDelay`: Wait time before processing batch (default: 50ms)
+- `maxBatchSize`: Max operations per batch (default: 20)
+
+**Rate Limiting** (`RATE_LIMIT_CONFIG`):
+- `requestsPerSecond`: Max sustained request rate (default: 5)
+- `burstSize`: Allowed burst capacity (default: 10)
+
+---
+
+#### Performance Characteristics
+
+| Scenario | Without Batching | With Batching |
+|----------|-----------------|---------------|
+| Create 10 nodes | ~2000ms (10 × 200ms) | ~400ms (parallel) |
+| Create 100 nodes | ~20s | ~4s |
+| Mixed 50 operations | Sequential | Parallel with rate limiting |
+
+**Success criteria**: Handle 100+ operations without API rate limit errors.
+
+---
+
 ## Future Considerations
 
 *Not committed, but designed to accommodate:*
 
-- Batch operations for bulk updates
 - Template system for common content patterns
 - Conflict detection for concurrent edits
 - Offline queue for unreachable API
