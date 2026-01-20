@@ -103,45 +103,64 @@ function filterNodesByScope(
     return [];
   }
 
+  // Build indexes once - O(n) instead of O(n²) for repeated lookups
+  const nodeMap = new Map<string, WorkflowyNode>();
+  const childrenMap = new Map<string, WorkflowyNode[]>();
+
+  for (const node of allNodes) {
+    nodeMap.set(node.id, node);
+    const parentId = node.parent_id || "root";
+    if (!childrenMap.has(parentId)) {
+      childrenMap.set(parentId, []);
+    }
+    childrenMap.get(parentId)!.push(node);
+  }
+
   switch (scope) {
     case "this_node":
       return [];
 
     case "children": {
-      const childIds = new Set<string>();
-      const findChildren = (parentId: string, depth: number = 0) => {
+      // Use index for O(children) instead of O(n × depth)
+      const result: WorkflowyNode[] = [];
+      const collectChildren = (parentId: string, depth = 0) => {
         if (depth > 100) return;
-        for (const node of allNodes) {
-          if (node.parent_id === parentId && !childIds.has(node.id)) {
-            childIds.add(node.id);
-            findChildren(node.id, depth + 1);
-          }
+        const children = childrenMap.get(parentId) || [];
+        for (const child of children) {
+          result.push(child);
+          collectChildren(child.id, depth + 1);
         }
       };
-      findChildren(sourceNode.id);
-      return allNodes.filter((n) => childIds.has(n.id));
+      collectChildren(sourceNode.id);
+      return result;
     }
 
     case "siblings": {
       if (!sourceNode.parent_id) {
-        return allNodes.filter((n) => !n.parent_id && n.id !== sourceNode.id);
+        // Root-level siblings from index
+        return (childrenMap.get("root") || []).filter((n) => n.id !== sourceNode.id);
       }
-      return allNodes.filter(
-        (n) => n.parent_id === sourceNode.parent_id && n.id !== sourceNode.id
+      return (childrenMap.get(sourceNode.parent_id) || []).filter(
+        (n) => n.id !== sourceNode.id
       );
     }
 
     case "ancestors": {
-      const ancestorIds = new Set<string>();
+      // Use nodeMap for O(1) parent lookups instead of O(n)
+      const ancestors: WorkflowyNode[] = [];
       let currentId = sourceNode.parent_id;
       let depth = 0;
       while (currentId && depth < 100) {
-        ancestorIds.add(currentId);
-        const parent = allNodes.find((n) => n.id === currentId);
-        currentId = parent?.parent_id;
+        const parent = nodeMap.get(currentId);
+        if (parent) {
+          ancestors.push(parent);
+          currentId = parent.parent_id;
+        } else {
+          break;
+        }
         depth++;
       }
-      return allNodes.filter((n) => ancestorIds.has(n.id));
+      return ancestors;
     }
 
     case "all":
@@ -527,31 +546,89 @@ async function insertHierarchicalContent(
   const parentStack: string[] = [rootParentId];
   let firstTopLevelInserted = false;
 
-  for (const line of parsedLines) {
-    const parentIndex = Math.min(line.indent, parentStack.length - 1);
-    const parentId = parentStack[parentIndex];
+  // Process in batches where possible - batch consecutive same-level items with known parents
+  const BATCH_SIZE = 10;
+  let i = 0;
 
-    let nodePosition: "top" | "bottom" = "bottom";
-    if (position === "top" && line.indent === 0 && !firstTopLevelInserted) {
-      nodePosition = "top";
-      firstTopLevelInserted = true;
+  while (i < parsedLines.length) {
+    const currentLine = parsedLines[i];
+    const currentParentIndex = Math.min(currentLine.indent, parentStack.length - 1);
+    const currentParentId = parentStack[currentParentIndex];
+
+    // Collect consecutive lines that can share the same parent (same indent level)
+    // Only batch items at the same indent level whose parent is already known
+    const batch: Array<{ line: typeof currentLine; index: number }> = [];
+
+    while (i < parsedLines.length && batch.length < BATCH_SIZE) {
+      const line = parsedLines[i];
+      const parentIndex = Math.min(line.indent, parentStack.length - 1);
+
+      // Can only batch if:
+      // 1. Same indent level as batch start (same parent reference)
+      // 2. Parent already exists in parentStack
+      if (line.indent === currentLine.indent && parentIndex < parentStack.length) {
+        batch.push({ line, index: i });
+        i++;
+      } else {
+        // Different indent level or parent not yet created - stop batching
+        break;
+      }
     }
 
-    const body: Record<string, unknown> = {
-      name: line.text,
-      parent_id: parentId,
-      position: nodePosition,
-    };
+    if (batch.length === 1) {
+      // Single item - process normally
+      const { line } = batch[0];
+      const parentId = parentStack[Math.min(line.indent, parentStack.length - 1)];
 
-    // Use request queue for rate limiting
-    const result = (await requestQueue.enqueue({
-      type: "create",
-      params: body,
-    })) as CreatedNode;
-    createdNodes.push(result);
+      let nodePosition: "top" | "bottom" = "bottom";
+      if (position === "top" && line.indent === 0 && !firstTopLevelInserted) {
+        nodePosition = "top";
+        firstTopLevelInserted = true;
+      }
 
-    parentStack[line.indent + 1] = result.id;
-    parentStack.length = line.indent + 2;
+      const result = (await workflowyRequest("/nodes", "POST", {
+        name: line.text,
+        parent_id: parentId,
+        position: nodePosition,
+      })) as CreatedNode;
+
+      createdNodes.push(result);
+      parentStack[line.indent + 1] = result.id;
+      parentStack.length = line.indent + 2;
+    } else {
+      // Multiple items - batch create concurrently
+      const batchPromises = batch.map(({ line }, batchIdx) => {
+        const parentId = parentStack[Math.min(line.indent, parentStack.length - 1)];
+
+        let nodePosition: "top" | "bottom" = "bottom";
+        if (position === "top" && line.indent === 0 && !firstTopLevelInserted && batchIdx === 0) {
+          nodePosition = "top";
+        }
+
+        return workflowyRequest("/nodes", "POST", {
+          name: line.text,
+          parent_id: parentId,
+          position: nodePosition,
+        }) as Promise<CreatedNode>;
+      });
+
+      if (position === "top" && currentLine.indent === 0 && !firstTopLevelInserted) {
+        firstTopLevelInserted = true;
+      }
+
+      const results = await Promise.all(batchPromises);
+
+      // Process results in order to maintain correct parent stack
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        const { line } = batch[j];
+        createdNodes.push(result);
+
+        // Update parent stack - last item at this level becomes the parent for next deeper level
+        parentStack[line.indent + 1] = result.id;
+        parentStack.length = line.indent + 2;
+      }
+    }
   }
 
   return createdNodes;
@@ -1584,7 +1661,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Then, find relationships between concepts based on co-occurrence
+      // Limit nodes analyzed to prevent O(n*c²) explosion with large datasets
+      const MAX_NODES_TO_ANALYZE = 5000;
+      const MAX_EDGES = 1000;
+      let nodesAnalyzed = 0;
+      let edgeLimitReached = false;
+
       for (const node of nodesToAnalyze) {
+        // Early termination if limits reached
+        if (nodesAnalyzed >= MAX_NODES_TO_ANALYZE || edgeLimitReached) break;
+        nodesAnalyzed++;
+
         const nodeText = `${node.name || ""} ${node.note || ""}`;
         const lowerText = nodeText.toLowerCase();
 
@@ -1593,13 +1680,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (presentConcepts.length >= 2) {
           // Create edges between all pairs of concepts in this node
-          for (let i = 0; i < presentConcepts.length; i++) {
+          for (let i = 0; i < presentConcepts.length && !edgeLimitReached; i++) {
             for (let j = i + 1; j < presentConcepts.length; j++) {
               const c1 = presentConcepts[i].lower;
               const c2 = presentConcepts[j].lower;
               const edgeKey = [c1, c2].sort().join("|||");
 
               if (!edgeMap.has(edgeKey)) {
+                if (edgeMap.size >= MAX_EDGES) {
+                  edgeLimitReached = true;
+                  break;
+                }
                 edgeMap.set(edgeKey, { weight: 0, contexts: [], labels: [] });
               }
 

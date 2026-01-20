@@ -285,6 +285,8 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 
 **Limits**:
 - Maximum 35 concepts per map (prevents oversized graphs that fail to render)
+- Maximum 5,000 nodes analyzed for edge building (prevents timeout on large datasets)
+- Maximum 1,000 unique edges per map (prevents memory exhaustion)
 - For larger concept sets, split into multiple focused maps by theme/category
 
 ---
@@ -444,6 +446,12 @@ Example output structure:
 - Typical operation: <2 seconds
 - Search with cache: <500ms
 - Full export: <5 seconds (depends on outline size)
+
+**Large dataset optimizations**:
+- Scope filtering uses indexed lookups (O(n) instead of O(n²))
+- Concept map edge building limited to 5,000 nodes and 1,000 edges
+- Hierarchical content insertion batches concurrent API calls (up to 10 per batch)
+- Parent-child relationships indexed for O(1) traversal
 
 ### Reliability
 

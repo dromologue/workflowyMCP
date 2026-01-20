@@ -211,9 +211,13 @@ describe("find_node selection logic", () => {
     });
 
     it("returns null for note_preview when no note", () => {
-      const nodeWithoutNote = { id: "x", name: "Test", path: "Path" };
-      const notePreview = (nodeWithoutNote as { note?: string }).note
-        ? (nodeWithoutNote as { note: string }).note.substring(0, 60)
+      const nodeWithoutNote: { id: string; name: string; path: string; note?: string } = {
+        id: "x",
+        name: "Test",
+        path: "Path"
+      };
+      const notePreview = nodeWithoutNote.note
+        ? nodeWithoutNote.note.substring(0, 60)
         : null;
 
       expect(notePreview).toBeNull();

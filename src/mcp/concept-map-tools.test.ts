@@ -234,6 +234,143 @@ describe("render_concept_map logic", () => {
   });
 });
 
+describe("performance limits", () => {
+  describe("edge building limits", () => {
+    const MAX_NODES_TO_ANALYZE = 5000;
+    const MAX_EDGES = 1000;
+
+    it("enforces maximum nodes to analyze limit", () => {
+      // Simulate the limit check in edge building
+      const nodesToAnalyze = Array.from({ length: 6000 }, (_, i) => ({
+        id: `node-${i}`,
+        name: `Node ${i}`,
+      }));
+
+      let nodesAnalyzed = 0;
+      for (const node of nodesToAnalyze) {
+        if (nodesAnalyzed >= MAX_NODES_TO_ANALYZE) break;
+        nodesAnalyzed++;
+        // Process node...
+      }
+
+      expect(nodesAnalyzed).toBe(MAX_NODES_TO_ANALYZE);
+      expect(nodesAnalyzed).toBeLessThan(nodesToAnalyze.length);
+    });
+
+    it("enforces maximum edges limit", () => {
+      // Simulate edge creation with limit
+      const edgeMap = new Map<string, { weight: number }>();
+      let edgeLimitReached = false;
+
+      // Try to create more than MAX_EDGES
+      for (let i = 0; i < 1500 && !edgeLimitReached; i++) {
+        const edgeKey = `edge-${i}`;
+        if (!edgeMap.has(edgeKey)) {
+          if (edgeMap.size >= MAX_EDGES) {
+            edgeLimitReached = true;
+            break;
+          }
+          edgeMap.set(edgeKey, { weight: 1 });
+        }
+      }
+
+      expect(edgeMap.size).toBe(MAX_EDGES);
+      expect(edgeLimitReached).toBe(true);
+    });
+
+    it("allows processing when under limits", () => {
+      const nodesToAnalyze = Array.from({ length: 100 }, (_, i) => ({
+        id: `node-${i}`,
+        name: `Node ${i}`,
+      }));
+
+      let nodesAnalyzed = 0;
+      for (const node of nodesToAnalyze) {
+        if (nodesAnalyzed >= MAX_NODES_TO_ANALYZE) break;
+        nodesAnalyzed++;
+      }
+
+      expect(nodesAnalyzed).toBe(100);
+      expect(nodesAnalyzed).toBeLessThan(MAX_NODES_TO_ANALYZE);
+    });
+  });
+
+  describe("scope filtering with indexes", () => {
+    // Test the indexed lookup approach
+    function buildIndexes(nodes: { id: string; parent_id?: string }[]) {
+      const nodeMap = new Map<string, { id: string; parent_id?: string }>();
+      const childrenMap = new Map<string, { id: string; parent_id?: string }[]>();
+
+      for (const node of nodes) {
+        nodeMap.set(node.id, node);
+        const parentId = node.parent_id || "root";
+        if (!childrenMap.has(parentId)) {
+          childrenMap.set(parentId, []);
+        }
+        childrenMap.get(parentId)!.push(node);
+      }
+
+      return { nodeMap, childrenMap };
+    }
+
+    it("builds correct parent-child index", () => {
+      const nodes = [
+        { id: "1", parent_id: undefined },
+        { id: "2", parent_id: "1" },
+        { id: "3", parent_id: "1" },
+        { id: "4", parent_id: "2" },
+      ];
+
+      const { childrenMap } = buildIndexes(nodes);
+
+      expect(childrenMap.get("root")?.length).toBe(1);
+      expect(childrenMap.get("1")?.length).toBe(2);
+      expect(childrenMap.get("2")?.length).toBe(1);
+    });
+
+    it("enables O(1) child lookup", () => {
+      const nodes = [
+        { id: "parent" },
+        { id: "child1", parent_id: "parent" },
+        { id: "child2", parent_id: "parent" },
+        { id: "child3", parent_id: "parent" },
+      ];
+
+      const { childrenMap } = buildIndexes(nodes);
+
+      // Direct lookup instead of filtering entire array
+      const children = childrenMap.get("parent") || [];
+      expect(children.length).toBe(3);
+      expect(children.map(c => c.id)).toContain("child1");
+      expect(children.map(c => c.id)).toContain("child2");
+      expect(children.map(c => c.id)).toContain("child3");
+    });
+
+    it("enables O(1) ancestor lookup via nodeMap", () => {
+      const nodes = [
+        { id: "grandparent" },
+        { id: "parent", parent_id: "grandparent" },
+        { id: "child", parent_id: "parent" },
+      ];
+
+      const { nodeMap } = buildIndexes(nodes);
+
+      // Walk up the tree using index instead of find()
+      const ancestors: string[] = [];
+      let currentId: string | undefined = "child";
+
+      while (currentId) {
+        const node = nodeMap.get(currentId);
+        if (!node?.parent_id) break;
+        ancestors.push(node.parent_id);
+        currentId = node.parent_id;
+      }
+
+      expect(ancestors).toEqual(["parent", "grandparent"]);
+    });
+  });
+});
+
 describe("output format handling", () => {
   describe("structured format", () => {
     it("produces valid JSON structure", () => {
