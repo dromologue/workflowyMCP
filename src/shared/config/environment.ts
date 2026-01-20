@@ -31,6 +31,24 @@ export const RETRY_CONFIG = {
   retryableStatuses: [429, 500, 502, 503, 504],
 };
 
+/** Request queue configuration for high-load scenarios */
+export const QUEUE_CONFIG = {
+  /** Maximum parallel requests to Workflowy API */
+  maxConcurrency: 3,
+  /** Milliseconds to wait before processing batch (allows collecting more operations) */
+  batchDelay: 50,
+  /** Maximum operations per batch */
+  maxBatchSize: 20,
+};
+
+/** Rate limiting configuration for proactive throttling */
+export const RATE_LIMIT_CONFIG = {
+  /** Maximum requests per second */
+  requestsPerSecond: 5,
+  /** Allow bursts up to this size */
+  burstSize: 10,
+};
+
 /** Validate required configuration */
 export function validateConfig(): void {
   if (!WORKFLOWY_API_KEY) {

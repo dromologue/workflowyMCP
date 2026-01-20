@@ -34,7 +34,17 @@ import {
   getCachedNodesIfValid,
   updateCache,
   invalidateCache,
+  invalidateNode,
+  startBatch,
+  endBatch,
 } from "../shared/utils/cache.js";
+import {
+  RequestQueue,
+  initializeRequestQueue,
+  type OperationType,
+  type BatchResult,
+} from "../shared/utils/requestQueue.js";
+import { QUEUE_CONFIG } from "../shared/config/environment.js";
 import { buildNodePaths } from "../shared/utils/node-paths.js";
 import {
   parseIndentedContent,
@@ -499,6 +509,14 @@ async function generateHierarchicalConceptMapImage(
 // Hierarchical Content Insertion
 // ============================================================================
 
+/**
+ * Insert hierarchical content with rate limiting.
+ * Uses the request queue for controlled API access.
+ *
+ * Note: Hierarchical content must be processed sequentially because
+ * child nodes depend on parent node IDs. However, the request queue
+ * provides rate limiting to avoid overwhelming the API.
+ */
 async function insertHierarchicalContent(
   rootParentId: string,
   content: string,
@@ -525,7 +543,11 @@ async function insertHierarchicalContent(
       position: nodePosition,
     };
 
-    const result = (await workflowyRequest("/nodes", "POST", body)) as CreatedNode;
+    // Use request queue for rate limiting
+    const result = (await requestQueue.enqueue({
+      type: "create",
+      params: body,
+    })) as CreatedNode;
     createdNodes.push(result);
 
     parentStack[line.indent + 1] = result.id;
@@ -533,6 +555,44 @@ async function insertHierarchicalContent(
   }
 
   return createdNodes;
+}
+
+/**
+ * Insert multiple independent content blocks in parallel.
+ * Each content block is processed hierarchically, but different
+ * blocks can be processed concurrently.
+ *
+ * Use this when inserting content into multiple different parent nodes.
+ */
+async function insertMultipleContentBlocks(
+  contentBlocks: Array<{
+    parentId: string;
+    content: string;
+    position?: "top" | "bottom";
+  }>
+): Promise<Array<{ parentId: string; nodes: CreatedNode[]; error?: string }>> {
+  const results = await Promise.allSettled(
+    contentBlocks.map(async (block) => {
+      const nodes = await insertHierarchicalContent(
+        block.parentId,
+        block.content,
+        block.position
+      );
+      return { parentId: block.parentId, nodes };
+    })
+  );
+
+  return results.map((result, index) => {
+    if (result.status === "fulfilled") {
+      return result.value;
+    } else {
+      return {
+        parentId: contentBlocks[index].parentId,
+        nodes: [],
+        error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+      };
+    }
+  });
 }
 
 // ============================================================================
@@ -677,6 +737,22 @@ const renderConceptMapSchema = z.object({
     output_path: z.string().optional().describe("Custom output file path"),
   }).optional().describe("Output options"),
 });
+
+// Batch Operations Schema for high-load scenarios
+const batchOperationsSchema = z.object({
+  operations: z.array(z.object({
+    type: z.enum(["create", "update", "delete", "move", "complete", "uncomplete"]).describe("Operation type"),
+    params: z.record(z.unknown()).describe("Operation parameters (varies by type)"),
+  })).describe("Array of operations to execute"),
+  parallel: z.boolean().optional().describe("Execute operations in parallel (default: true). Set to false for sequential execution."),
+});
+
+// ============================================================================
+// Request Queue Setup
+// ============================================================================
+
+const requestQueue = new RequestQueue(QUEUE_CONFIG);
+requestQueue.setApiRequestFn(workflowyRequest);
 
 // ============================================================================
 // MCP Server Setup
@@ -1007,6 +1083,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["title", "core_concept", "concepts", "relationships"],
+        },
+      },
+      {
+        name: "batch_operations",
+        description: "Execute multiple operations in a single call with controlled concurrency. Use this for bulk inserts, updates, or mixed operations to improve performance under high load. Operations are processed with rate limiting to avoid overwhelming the Workflowy API.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            operations: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  type: {
+                    type: "string",
+                    enum: ["create", "update", "delete", "move", "complete", "uncomplete"],
+                    description: "Operation type",
+                  },
+                  params: {
+                    type: "object",
+                    description: "Operation parameters. For create: {name, note?, parent_id?, position?}. For update: {node_id, name?, note?}. For delete/complete/uncomplete: {node_id}. For move: {node_id, parent_id, position?}",
+                  },
+                },
+                required: ["type", "params"],
+              },
+              description: "Array of operations to execute",
+            },
+            parallel: {
+              type: "boolean",
+              description: "Execute operations in parallel (default: true). Set to false for strict sequential execution.",
+            },
+          },
+          required: ["operations"],
         },
       },
     ],
@@ -2304,6 +2413,109 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               detail_concepts: detailConcepts.length,
               relationships_rendered: relationships.length,
             },
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "batch_operations": {
+      const { operations, parallel = true } = batchOperationsSchema.parse(args);
+
+      if (operations.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              message: "No operations to execute",
+              total: 0,
+              succeeded: 0,
+              failed: 0,
+              results: [],
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Start batch cache operation
+      startBatch();
+
+      const results: BatchResult[] = [];
+
+      if (parallel) {
+        // Execute operations through the request queue with controlled concurrency
+        const promises = operations.map(async (op, index) => {
+          try {
+            const result = await requestQueue.enqueue({
+              type: op.type as OperationType,
+              params: op.params as Record<string, unknown>,
+            });
+            return {
+              operationId: `op-${index}`,
+              status: "fulfilled" as const,
+              value: result,
+            };
+          } catch (error) {
+            return {
+              operationId: `op-${index}`,
+              status: "rejected" as const,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        });
+
+        const settled = await Promise.all(promises);
+        results.push(...settled);
+      } else {
+        // Sequential execution
+        for (let i = 0; i < operations.length; i++) {
+          const op = operations[i];
+          try {
+            const result = await requestQueue.enqueue({
+              type: op.type as OperationType,
+              params: op.params as Record<string, unknown>,
+            });
+            results.push({
+              operationId: `op-${i}`,
+              status: "fulfilled",
+              value: result,
+            });
+          } catch (error) {
+            results.push({
+              operationId: `op-${i}`,
+              status: "rejected",
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+
+      // End batch and apply cache invalidation
+      endBatch();
+      invalidateCache();
+
+      const succeeded = results.filter(r => r.status === "fulfilled").length;
+      const failed = results.filter(r => r.status === "rejected").length;
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: failed === 0,
+            message: failed === 0
+              ? `All ${succeeded} operations completed successfully`
+              : `${succeeded} succeeded, ${failed} failed`,
+            total: operations.length,
+            succeeded,
+            failed,
+            results: results.map((r, i) => ({
+              index: i,
+              operation: operations[i],
+              status: r.status,
+              result: r.status === "fulfilled" ? r.value : undefined,
+              error: r.status === "rejected" ? r.error : undefined,
+            })),
+            queue_stats: requestQueue.getStats(),
           }, null, 2),
         }],
       };
