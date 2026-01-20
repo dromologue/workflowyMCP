@@ -60,6 +60,15 @@ import {
   calculateRelevance,
   findMatchedKeywords,
 } from "../shared/utils/keyword-extraction.js";
+import {
+  createOrchestrator,
+  type OrchestratorProgress,
+  type MergedResult,
+} from "../shared/utils/orchestrator.js";
+import {
+  splitIntoSubtrees,
+  estimateTimeSavings,
+} from "../shared/utils/subtree-parser.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -698,6 +707,147 @@ async function insertMultipleContentBlocks(
 }
 
 // ============================================================================
+// Parallel Insertion Helper
+// ============================================================================
+
+interface ParallelInsertResult {
+  success: boolean;
+  message: string;
+  nodes: Array<{ id: string; name?: string }>;
+  stats?: {
+    total_nodes: number;
+    created_nodes: number;
+    workers_used: number;
+    duration_ms: number;
+  };
+  performance?: {
+    estimated_single_agent_ms: number;
+    actual_parallel_ms: number;
+    savings_percent: number;
+  };
+  mode: "single_agent" | "parallel_workers";
+  errors?: Array<{ subtreeId: string; error: string }>;
+  workload_analysis?: {
+    total_nodes: number;
+    subtree_count: number;
+    recommended_workers: number;
+    subtrees?: Array<{ id: string; node_count: number; root_text: string }>;
+  };
+}
+
+/**
+ * Insert content using parallel workers by default.
+ * Falls back to single-agent mode for small workloads.
+ * On error, includes workload analysis for debugging.
+ */
+async function parallelInsertContent(
+  parentId: string,
+  content: string,
+  position?: "top" | "bottom"
+): Promise<ParallelInsertResult> {
+  // Analyze workload to determine best approach
+  const splitResult = splitIntoSubtrees(content, {
+    maxSubtrees: 5,
+    targetNodesPerSubtree: 50,
+  });
+
+  // For small workloads or single subtrees, use simple insertion
+  if (splitResult.totalNodes < 20 || splitResult.subtrees.length === 1) {
+    try {
+      const createdNodes = await insertHierarchicalContent(parentId, content, position);
+      return {
+        success: true,
+        message: `Inserted ${createdNodes.length} node(s)`,
+        nodes: createdNodes,
+        mode: "single_agent",
+      };
+    } catch (error) {
+      // On error, return workload analysis
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+        nodes: [],
+        mode: "single_agent",
+        workload_analysis: {
+          total_nodes: splitResult.totalNodes,
+          subtree_count: splitResult.subtrees.length,
+          recommended_workers: splitResult.recommendedAgents,
+        },
+      };
+    }
+  }
+
+  // Use parallel insertion for larger workloads
+  try {
+    const orchestrator = createOrchestrator(
+      async (pId, subtreeContent, pos) => {
+        const nodes = await insertHierarchicalContent(pId, subtreeContent, pos);
+        return nodes.map((n) => ({ id: n.id, name: n.name }));
+      },
+      {
+        maxWorkers: 5,
+        workerRateLimit: 5,
+        retryOnFailure: true,
+        maxRetries: 2,
+        splitConfig: {
+          targetNodesPerSubtree: 50,
+          maxSubtrees: 5,
+        },
+      }
+    );
+
+    const startTime = Date.now();
+    const result = await orchestrator.execute({
+      parentId,
+      content,
+      position,
+    });
+
+    const duration = Date.now() - startTime;
+    const timeSavings = estimateTimeSavings(splitResult.totalNodes, splitResult.subtrees.length, 5);
+
+    return {
+      success: result.success,
+      message: result.success
+        ? `Inserted ${result.createdNodes} nodes using ${splitResult.subtrees.length} parallel workers`
+        : `Partial success: ${result.createdNodes} nodes created, ${result.failedSubtrees.length} subtrees failed`,
+      nodes: result.allNodeIds.map((id) => ({ id })),
+      stats: {
+        total_nodes: splitResult.totalNodes,
+        created_nodes: result.createdNodes,
+        workers_used: splitResult.subtrees.length,
+        duration_ms: duration,
+      },
+      performance: {
+        estimated_single_agent_ms: timeSavings.singleAgentMs,
+        actual_parallel_ms: duration,
+        savings_percent: Math.round(((timeSavings.singleAgentMs - duration) / timeSavings.singleAgentMs) * 100),
+      },
+      mode: "parallel_workers",
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+  } catch (error) {
+    // On parallel error, return workload analysis for debugging
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : String(error),
+      nodes: [],
+      mode: "parallel_workers",
+      workload_analysis: {
+        total_nodes: splitResult.totalNodes,
+        subtree_count: splitResult.subtrees.length,
+        recommended_workers: splitResult.recommendedAgents,
+        subtrees: splitResult.subtrees.map((s) => ({
+          id: s.id,
+          node_count: s.nodeCount,
+          root_text: s.rootLine.text,
+        })),
+      },
+    };
+  }
+}
+
+// ============================================================================
 // Zod Schemas
 // ============================================================================
 
@@ -847,6 +997,21 @@ const batchOperationsSchema = z.object({
     params: z.record(z.unknown()).describe("Operation parameters (varies by type)"),
   })).describe("Array of operations to execute"),
   parallel: z.boolean().optional().describe("Execute operations in parallel (default: true). Set to false for sequential execution."),
+});
+
+// Multi-Agent Orchestrator Schema for heavy workloads
+const parallelBulkInsertSchema = z.object({
+  parent_id: z.string().describe("The ID of the parent node to insert content under"),
+  content: z.string().describe("Hierarchical content to insert (indented with 2 spaces per level)"),
+  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: bottom)"),
+  max_workers: z.number().min(1).max(10).optional().describe("Maximum parallel workers (default: 5, max: 10)"),
+  target_nodes_per_worker: z.number().min(10).max(200).optional().describe("Target nodes per worker subtree (default: 50)"),
+});
+
+// Analyze workload schema (for planning before execution)
+const analyzeWorkloadSchema = z.object({
+  content: z.string().describe("Hierarchical content to analyze"),
+  max_workers: z.number().min(1).max(10).optional().describe("Maximum workers to consider (default: 5)"),
 });
 
 // ============================================================================
@@ -1218,6 +1383,61 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["operations"],
+        },
+      },
+      {
+        name: "parallel_bulk_insert",
+        description: "Insert large hierarchical content using multiple parallel workers. Designed for heavy workloads (50+ nodes). Automatically splits content into independent subtrees and processes them concurrently with separate rate limiters. Use analyze_workload first to estimate time savings. Returns progress updates during execution.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            parent_id: {
+              type: "string",
+              description: "The ID of the parent node to insert content under",
+            },
+            content: {
+              type: "string",
+              description: "Hierarchical content to insert (indented with 2 spaces per level). Each top-level item becomes a subtree that can be processed in parallel.",
+            },
+            position: {
+              type: "string",
+              enum: ["top", "bottom"],
+              description: "Position relative to siblings (default: bottom)",
+            },
+            max_workers: {
+              type: "number",
+              minimum: 1,
+              maximum: 10,
+              description: "Maximum parallel workers (default: 5). Each worker has its own rate limiter.",
+            },
+            target_nodes_per_worker: {
+              type: "number",
+              minimum: 10,
+              maximum: 200,
+              description: "Target nodes per worker subtree (default: 50). Smaller values = more parallelism but more overhead.",
+            },
+          },
+          required: ["parent_id", "content"],
+        },
+      },
+      {
+        name: "analyze_workload",
+        description: "Analyze hierarchical content to estimate parallel insertion performance. Returns subtree breakdown, recommended worker count, and estimated time savings compared to single-threaded insertion. Use this before parallel_bulk_insert to understand the workload.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "Hierarchical content to analyze (indented with 2 spaces per level)",
+            },
+            max_workers: {
+              type: "number",
+              minimum: 1,
+              maximum: 10,
+              description: "Maximum workers to consider for estimation (default: 5)",
+            },
+          },
+          required: ["content"],
         },
       },
     ],
@@ -1887,16 +2107,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "insert_content": {
       const { parent_id, content, position } = insertContentSchema.parse(args);
-      const createdNodes = await insertHierarchicalContent(parent_id, content, position);
+
+      // Validate parent exists
+      const allNodesForInsert = await getCachedNodes();
+      const parentNodeForInsert = allNodesForInsert.find((n) => n.id === parent_id);
+      if (!parentNodeForInsert) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Parent node not found: ${parent_id}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Use parallel insertion by default (automatically handles small vs large workloads)
+      const insertResult = await parallelInsertContent(parent_id, content, position);
       invalidateCache();
+
       return {
         content: [{
           type: "text",
-          text: JSON.stringify({
-            message: `Inserted ${createdNodes.length} node(s)`,
-            nodes: createdNodes,
-          }, null, 2),
+          text: JSON.stringify(insertResult, null, 2),
         }],
+        isError: !insertResult.success,
       };
     }
 
@@ -1941,17 +2178,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       if (matchingNodes.length === 1) {
         const targetNode = matchingNodes[0];
-        const createdNodes = await insertHierarchicalContent(targetNode.id, content, position);
+        // Use parallel insertion by default
+        const insertResult = await parallelInsertContent(targetNode.id, content, position);
         invalidateCache();
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+              ...insertResult,
               target: { id: targetNode.id, name: targetNode.name, path: nodesWithPaths[0].path },
-              nodes: createdNodes,
             }, null, 2),
           }],
+          isError: !insertResult.success,
         };
       }
 
@@ -1966,17 +2204,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         const targetNode = matchingNodes[index];
-        const createdNodes = await insertHierarchicalContent(targetNode.id, content, position);
+        // Use parallel insertion by default
+        const insertResult = await parallelInsertContent(targetNode.id, content, position);
         invalidateCache();
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              message: `Inserted ${createdNodes.length} node(s) into "${targetNode.name}"`,
+              ...insertResult,
               target: { id: targetNode.id, name: targetNode.name, path: nodesWithPaths[index].path },
-              nodes: createdNodes,
             }, null, 2),
           }],
+          isError: !insertResult.success,
         };
       }
 
@@ -2632,6 +2871,199 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               error: r.status === "rejected" ? r.error : undefined,
             })),
             queue_stats: requestQueue.getStats(),
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "analyze_workload": {
+      const { content, max_workers = 5 } = analyzeWorkloadSchema.parse(args);
+
+      const splitResult = splitIntoSubtrees(content, {
+        maxSubtrees: max_workers,
+        targetNodesPerSubtree: 50,
+      });
+
+      if (splitResult.totalNodes === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              message: "No content to analyze",
+              total_nodes: 0,
+            }, null, 2),
+          }],
+        };
+      }
+
+      const timeSavings = estimateTimeSavings(
+        splitResult.totalNodes,
+        Math.min(splitResult.recommendedAgents, max_workers),
+        5 // requests per second
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            analysis: {
+              total_nodes: splitResult.totalNodes,
+              subtree_count: splitResult.subtrees.length,
+              recommended_workers: Math.min(splitResult.recommendedAgents, max_workers),
+              subtrees: splitResult.subtrees.map((s) => ({
+                id: s.id,
+                node_count: s.nodeCount,
+                root_text: s.rootLine.text.substring(0, 50) + (s.rootLine.text.length > 50 ? "..." : ""),
+                estimated_ms: s.estimatedMs,
+              })),
+            },
+            time_estimates: {
+              single_agent_ms: timeSavings.singleAgentMs,
+              single_agent_seconds: Math.round(timeSavings.singleAgentMs / 100) / 10,
+              parallel_ms: timeSavings.parallelMs,
+              parallel_seconds: Math.round(timeSavings.parallelMs / 100) / 10,
+              savings_percent: timeSavings.savingsPercent,
+              savings_seconds: timeSavings.savingsSeconds,
+            },
+            recommendation: splitResult.totalNodes < 20
+              ? "Use insert_content for small workloads (< 20 nodes)"
+              : splitResult.totalNodes < 50
+              ? "Use insert_content or parallel_bulk_insert with 2 workers"
+              : `Use parallel_bulk_insert with ${Math.min(splitResult.recommendedAgents, max_workers)} workers for optimal performance`,
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "parallel_bulk_insert": {
+      const {
+        parent_id,
+        content,
+        position = "bottom",
+        max_workers = 5,
+        target_nodes_per_worker = 50,
+      } = parallelBulkInsertSchema.parse(args);
+
+      // Validate parent exists
+      const allNodes = await getCachedNodes();
+      const parentNode = allNodes.find((n) => n.id === parent_id);
+      if (!parentNode) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Parent node not found: ${parent_id}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Analyze the workload first
+      const splitResult = splitIntoSubtrees(content, {
+        maxSubtrees: max_workers,
+        targetNodesPerSubtree: target_nodes_per_worker,
+      });
+
+      if (splitResult.totalNodes === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              message: "No content to insert",
+              total_nodes: 0,
+              created_nodes: 0,
+            }, null, 2),
+          }],
+        };
+      }
+
+      // For small workloads, use the existing single-agent approach
+      if (splitResult.subtrees.length === 1) {
+        const createdNodes = await insertHierarchicalContent(parent_id, content, position);
+        invalidateCache();
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              message: `Inserted ${createdNodes.length} nodes (single-agent mode for small workload)`,
+              total_nodes: splitResult.totalNodes,
+              created_nodes: createdNodes.length,
+              node_ids: createdNodes.map((n) => n.id),
+              mode: "single_agent",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Create orchestrator for parallel processing
+      const orchestrator = createOrchestrator(
+        async (parentId, subtreeContent, pos) => {
+          const nodes = await insertHierarchicalContent(parentId, subtreeContent, pos);
+          return nodes.map((n) => ({ id: n.id, name: n.name }));
+        },
+        {
+          maxWorkers: max_workers,
+          workerRateLimit: 5,
+          retryOnFailure: true,
+          maxRetries: 2,
+          splitConfig: {
+            targetNodesPerSubtree: target_nodes_per_worker,
+            maxSubtrees: max_workers,
+          },
+        }
+      );
+
+      // Collect progress updates
+      const progressUpdates: OrchestratorProgress[] = [];
+      orchestrator.on("progress", (progress: OrchestratorProgress) => {
+        progressUpdates.push(progress);
+      });
+
+      // Execute the parallel insertion
+      const startTime = Date.now();
+      const result = await orchestrator.execute({
+        parentId: parent_id,
+        content,
+        position,
+      });
+
+      // Invalidate cache after bulk operations
+      invalidateCache();
+
+      const duration = Date.now() - startTime;
+      const timeSavings = estimateTimeSavings(splitResult.totalNodes, splitResult.subtrees.length, 5);
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: result.success,
+            message: result.success
+              ? `Successfully inserted ${result.createdNodes} nodes using ${splitResult.subtrees.length} parallel workers`
+              : `Partial success: ${result.createdNodes} nodes created, ${result.failedSubtrees.length} subtrees failed`,
+            stats: {
+              total_nodes: splitResult.totalNodes,
+              created_nodes: result.createdNodes,
+              failed_subtrees: result.failedSubtrees.length,
+              workers_used: splitResult.subtrees.length,
+              duration_ms: duration,
+              duration_seconds: Math.round(duration / 100) / 10,
+            },
+            performance: {
+              estimated_single_agent_ms: timeSavings.singleAgentMs,
+              actual_parallel_ms: duration,
+              actual_savings_percent: Math.round(((timeSavings.singleAgentMs - duration) / timeSavings.singleAgentMs) * 100),
+            },
+            node_ids: result.allNodeIds,
+            errors: result.errors.length > 0 ? result.errors : undefined,
+            mode: "parallel_workers",
           }, null, 2),
         }],
       };
