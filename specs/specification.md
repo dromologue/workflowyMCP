@@ -111,19 +111,30 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 | Feature | Description |
 |---------|-------------|
 | Create node | Add node with name, note, parent, position |
-| Hierarchical insert | Parse indented content into nested structure |
+| **Parallel bulk insert (default)** | Multi-worker insertion for all hierarchical content |
 | Smart insert | Search-and-insert workflow with selection |
+| Find insert targets | Search for potential parent nodes before insertion |
 | Markdown support | Headers, todos, code blocks, quotes |
 | Order preservation | Content appears in same order as provided |
-| **Staging node pattern** | Prevents nodes from appearing at unintended locations during insertion |
+| Staging node pattern | Prevents nodes from appearing at unintended locations during insertion |
+| Workload analysis | Estimate time savings before parallel execution |
+| Single-agent insert (fallback) | For small workloads (<20 nodes) where overhead isn't worth it |
+
+**Default insertion behavior**:
+
+All hierarchical content insertion uses the **multi-agent parallel approach by default**. The system automatically:
+1. Analyzes the workload to determine optimal worker count
+2. Splits content into independent subtrees
+3. Processes subtrees concurrently with independent rate limiters
+4. Falls back to single-agent mode only for very small workloads (<20 nodes)
 
 **Position behavior**:
 - `bottom` (default): Content appended after existing children, order preserved
 - `top`: First node placed at top, subsequent nodes follow in order
 
-**Staging node insertion**:
+**Staging node pattern**:
 
-To prevent nodes from briefly appearing at the root or wrong location during multi-node insertions, the `insert_content` and `smart_insert` tools use a staging node pattern:
+To prevent nodes from briefly appearing at the root or wrong location during multi-node insertions, the insertion tools use a staging node pattern:
 
 1. Create a temporary staging node (`__staging_temp__`) under the target parent
 2. Create all hierarchical content inside the staging node
@@ -132,7 +143,73 @@ To prevent nodes from briefly appearing at the root or wrong location during mul
 
 This ensures nodes are never visible at unintended locations during the operation.
 
-**Success criteria**: Claude-generated content appears in Workflowy with correct structure and order.
+**Success criteria**: Claude-generated content appears in Workflowy with correct structure and order, with 70%+ time savings for workloads over 50 nodes.
+
+---
+
+#### insert_content Tool
+
+Insert hierarchical content into a specific parent node.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `parent_id` | string | yes | Target parent node ID |
+| `content` | string | yes | Hierarchical content (2-space indented) |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
+
+**Behavior**: Automatically uses parallel insertion for workloads ≥20 nodes.
+
+---
+
+#### smart_insert Tool
+
+Search for a target node and insert content. Combines find + insert in one workflow.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `search_query` | string | yes | Search term to find the target parent |
+| `content` | string | yes | Hierarchical content to insert |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
+| `selection` | number | no | If multiple matches, the 1-based index to select |
+
+**Behavior**:
+1. Searches for nodes matching `search_query`
+2. If single match: inserts content immediately
+3. If multiple matches: returns options for user selection
+4. User calls again with `selection` to complete insertion
+
+---
+
+#### find_insert_targets Tool
+
+Search for potential target nodes to insert content into. Used when Claude needs to preview available targets before deciding where to insert.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | yes | Search term to find potential targets |
+
+**Response**:
+```json
+{
+  "found": true,
+  "count": 3,
+  "targets": [
+    { "id": "abc", "name": "Projects", "path": "Work > Projects", "children_count": 5 },
+    { "id": "def", "name": "Project Ideas", "path": "Personal > Project Ideas", "children_count": 12 }
+  ],
+  "message": "Found 3 potential targets. Use insert_content with the desired parent_id."
+}
+```
+
+**Use case**: When Claude wants to show the user available insertion targets before committing to an insertion location.
+
+---
 
 ### 4. Todo Management
 
@@ -344,11 +421,15 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 ```
 User: "Summarize this article and add it to my Research node"
 
-1. Claude generates summary
+1. Claude generates summary (hierarchical content)
 2. smart_insert searches for "Research"
 3. If multiple matches → return numbered options
-4. User selects → content inserted with hierarchy preserved
-5. Confirmation with target path shown
+4. User selects → system automatically:
+   - Analyzes workload size
+   - Uses parallel insertion if beneficial (≥20 nodes)
+   - Falls back to single-agent for small content
+5. Content inserted with hierarchy preserved
+6. Confirmation with target path and performance stats shown
 ```
 
 ### Flow 2: Reference Existing Notes
@@ -435,6 +516,44 @@ Example output structure:
 - Details: "phenomenology", "pragmatism" (connected with "influences", "contrasts with")
 - Cross-links: "Heidegger" → "phenomenology" ("develops"),
               "phenomenology" ↔ "pragmatism" ("contrasts with")
+```
+
+### Flow 5: Standard Content Insertion (Automatic Parallelization)
+
+```
+User: "Import this research outline into my Project node" (provides 200+ node outline)
+
+1. Claude calls insert_content or smart_insert (standard tools)
+   → System automatically detects 180 nodes
+   → Parallel insertion enabled by default
+
+2. Behind the scenes, the system:
+   - Analyzes workload: 180 nodes, 5 subtrees
+   - Assigns 4 workers (automatically determined)
+   - Each worker gets independent rate limiter (5 req/sec)
+   - Workers process their subtrees concurrently
+
+3. Progress tracked during execution:
+   - Worker 1: 45 nodes (completed)
+   - Worker 2: 38 nodes (in progress, 80%)
+   - Worker 3: 52 nodes (completed)
+   - Worker 4: 45 nodes (completed)
+
+4. Results returned to Claude:
+   {
+     "created_nodes": 180,
+     "duration_seconds": 8.7,
+     "actual_savings_percent": 76,
+     "mode": "parallel_workers"
+   }
+
+5. If any subtree fails:
+   - Automatic retry (up to 2 attempts)
+   - Partial success reported with failed subtree details
+
+Note: Claude doesn't need to explicitly choose parallel insertion - it happens
+automatically. The standard insert_content and smart_insert tools use
+parallel_bulk_insert under the hood for workloads ≥20 nodes.
 ```
 
 ## Constraints
@@ -572,6 +691,192 @@ High-load behavior is configured via environment constants:
 | Mixed 50 operations | Sequential | Parallel with rate limiting |
 
 **Success criteria**: Handle 100+ operations without API rate limit errors.
+
+---
+
+### 8. Multi-Agent Parallel Insertion (Default)
+
+**Goal**: Provide fast, efficient content insertion as the default method for all hierarchical content.
+
+This is the **default insertion method** for all hierarchical content. The system automatically uses multi-agent parallel insertion unless the workload is very small (<20 nodes).
+
+| Feature | Description |
+|---------|-------------|
+| **Automatic by default** | All `insert_content` and `smart_insert` calls use parallel insertion |
+| Workload analysis | Automatically determines optimal worker count |
+| Subtree splitting | Divides content into independent subtrees |
+| Parallel workers | Multiple workers with independent rate limiters |
+| Progress tracking | Real-time updates during execution |
+| Automatic retry | Failed subtrees retry up to 2 times |
+| Smart fallback | Falls back to single-agent for <20 nodes |
+
+---
+
+#### analyze_workload Tool
+
+Analyze hierarchical content to estimate parallel insertion performance.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `content` | string | yes | Hierarchical content to analyze (2-space indented) |
+| `max_workers` | number | no | Maximum workers to consider (1-10, default: 5) |
+
+**Response**:
+```json
+{
+  "success": true,
+  "analysis": {
+    "total_nodes": 150,
+    "subtree_count": 4,
+    "recommended_workers": 4,
+    "subtrees": [
+      {
+        "id": "subtree-0",
+        "node_count": 42,
+        "root_text": "First Section...",
+        "estimated_ms": 8400
+      }
+    ]
+  },
+  "time_estimates": {
+    "single_agent_ms": 30000,
+    "single_agent_seconds": 30,
+    "parallel_ms": 9400,
+    "parallel_seconds": 9.4,
+    "savings_percent": 69,
+    "savings_seconds": 20.6
+  },
+  "recommendation": "Use parallel_bulk_insert with 4 workers for optimal performance"
+}
+```
+
+**Use case**: Before inserting large content, analyze to understand time savings and determine optimal worker count.
+
+---
+
+#### parallel_bulk_insert Tool
+
+Insert large hierarchical content using multiple parallel workers.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `parent_id` | string | yes | Target parent node ID |
+| `content` | string | yes | Hierarchical content (2-space indented) |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
+| `max_workers` | number | no | Maximum parallel workers (1-10, default: 5) |
+| `target_nodes_per_worker` | number | no | Target nodes per subtree (10-200, default: 50) |
+
+**How it works**:
+
+1. **Content splitting**: Parses content into independent subtrees based on top-level nodes
+2. **Worker assignment**: Each subtree assigned to a worker with its own rate limiter
+3. **Parallel execution**: Workers process subtrees concurrently
+4. **Retry handling**: Failed subtrees automatically retry (up to 2 attempts)
+5. **Result merging**: All results combined with detailed stats
+
+**Response**:
+```json
+{
+  "success": true,
+  "message": "Successfully inserted 150 nodes using 4 parallel workers",
+  "stats": {
+    "total_nodes": 150,
+    "created_nodes": 150,
+    "failed_subtrees": 0,
+    "workers_used": 4,
+    "duration_ms": 8234,
+    "duration_seconds": 8.2
+  },
+  "performance": {
+    "estimated_single_agent_ms": 30000,
+    "actual_parallel_ms": 8234,
+    "actual_savings_percent": 73
+  },
+  "node_ids": ["abc123", "def456", ...],
+  "mode": "parallel_workers"
+}
+```
+
+**Small workload behavior**: For content with only one natural subtree, automatically falls back to single-agent mode to avoid unnecessary overhead.
+
+---
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Orchestrator                             │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐ │
+│  │ Worker 1  │  │ Worker 2  │  │ Worker 3  │  │ Worker N  │ │
+│  │ RateLimiter│  │ RateLimiter│  │ RateLimiter│  │ RateLimiter│ │
+│  │ Subtree A │  │ Subtree B │  │ Subtree C │  │ Subtree D │ │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘ │
+└────────┼──────────────┼──────────────┼──────────────┼───────┘
+         └──────────────┴──────────────┴──────────────┘
+                              ↓
+                   Workflowy API (5 req/sec each)
+```
+
+Each worker has its own rate limiter, allowing true parallelism without competing for the same token bucket.
+
+---
+
+#### Subtree Splitting Algorithm
+
+Content is split at top-level node boundaries:
+
+```
+Input:
+  Section A          ← Subtree 1 root
+    Child A1
+    Child A2
+  Section B          ← Subtree 2 root
+    Child B1
+      Grandchild B1a
+  Section C          ← Subtree 3 root
+    Child C1
+
+Output: 3 independent subtrees
+```
+
+**Balancing rules**:
+- Target nodes per subtree: 50 (configurable)
+- Minimum nodes for separate subtree: 5
+- Small adjacent groups merged to reduce overhead
+- Maximum subtrees capped at `max_workers`
+
+---
+
+#### Performance Benchmarks
+
+| Nodes | Single Agent | 5 Workers | Savings |
+|-------|--------------|-----------|---------|
+| 50 | ~10 sec | ~3 sec | 70% |
+| 100 | ~20 sec | ~5 sec | 75% |
+| 200 | ~40 sec | ~9 sec | 78% |
+| 500 | ~100 sec | ~22 sec | 78% |
+
+**Automatic tool selection**:
+
+The system automatically selects the optimal insertion strategy based on workload size:
+
+| Node Count | Automatic Behavior | Performance |
+|------------|-------------------|-------------|
+| < 20 | Single-agent (fallback) | Overhead not worth parallelization |
+| 20-50 | Parallel (2-3 workers) | ~50-60% time savings |
+| 50-100 | Parallel (3-4 workers) | ~70% time savings |
+| 100-200 | Parallel (4-5 workers) | ~75% time savings |
+| 200+ | Parallel (5-10 workers) | ~78%+ time savings |
+
+**No manual tool selection required**: Claude should simply use `insert_content` or `smart_insert` for all hierarchical content. The system automatically uses `parallel_bulk_insert` under the hood when beneficial.
+
+**Direct `parallel_bulk_insert` access**: Available for advanced use cases where explicit control over worker count or subtree splitting is needed.
+
+**Success criteria**: Insert 200+ nodes with >70% time savings compared to single-agent approach.
 
 ---
 
