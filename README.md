@@ -329,45 +329,71 @@ Fast node lookup that handles duplicates by presenting options for selection. Re
 ```
 
 ### Content Management
-- `create_node` / `update_node` / `delete_node` / `move_node`
+- `insert_content` - **Primary tool** for all node insertion (single, bulk, todos, any size)
+- `convert_markdown_to_workflowy` - Convert markdown to Workflowy format
 - `smart_insert` - Search-and-insert workflow
-- Markdown formatting support
+- `update_node` / `delete_node` / `move_node` - Node operations
 
 ### Todo Management
-- `create_todo` / `list_todos` / `complete_node` / `uncomplete_node`
+- `list_todos` / `complete_node` / `uncomplete_node`
+- Create todos via `insert_content` with `[ ]` or `[x]` syntax
 
 ### Knowledge Linking
 - `find_related` - Discover connections via keyword analysis
 - `create_links` - Auto-generate internal links
 
-### Bulk Operations (for heavy workloads)
-- `analyze_workload` - Estimate time savings from parallel insertion
-- `parallel_bulk_insert` - Insert large hierarchical content with multiple parallel workers
-- `batch_operations` - Execute multiple operations with controlled concurrency
+### File Insertion (Direct File Handoff)
+- `insert_file` - Insert file contents directly (server reads the file)
+- `submit_file_job` - Background file insertion for large files
 
-#### Parallel Bulk Insert
-
-For inserting 50+ nodes, use `parallel_bulk_insert` which splits content into independent subtrees and processes them concurrently:
+Claude doesn't need to read or parse files - just provide the path:
 
 ```
-"Analyze this content to estimate insertion time"
-→ Returns: 200 nodes, 4 subtrees, ~75% time savings with 4 workers
-
-"Insert this large outline into my Research node using parallel workers"
-→ Splits into subtrees, processes in parallel, returns progress
+"Insert ~/Documents/research.md into my Research node"
+→ Server reads file, detects markdown, converts, and inserts
 ```
 
 **Parameters:**
 | Parameter | Description |
 |-----------|-------------|
+| `file_path` | Absolute path to the file |
 | `parent_id` | Target parent node ID |
-| `content` | Hierarchical content (2-space indented) |
-| `max_workers` | Parallel workers (1-10, default: 5) |
-| `target_nodes_per_worker` | Nodes per subtree (10-200, default: 50) |
+| `format` | `auto` (default), `markdown`, or `plain` |
+
+### Async Job Queue (Background Processing)
+
+For large workloads that might hit API rate limits or timeout:
+
+- `submit_job` - Submit large workloads for background processing
+- `get_job_status` - Check job progress
+- `get_job_result` - Get results when complete
+- `list_jobs` - List all jobs
+- `cancel_job` - Cancel a job
+
+```
+"Submit this 500-node document for background insertion"
+→ Returns job_id, processes in background with rate limiting
+
+"Check status of job job-123"
+→ Returns: processing, 65% complete, 325/500 nodes
+```
+
+**Job types:**
+| Type | Use case |
+|------|----------|
+| `insert_content` | Large hierarchical content |
+| `insert_file` | Large file insertion |
+| `batch_operations` | Multiple create/update/delete operations |
+
+### Bulk Operations (for heavy workloads)
+- `analyze_workload` - Estimate time savings from parallel insertion
+- `batch_operations` - Execute multiple operations with controlled concurrency
+
+`insert_content` automatically uses parallel workers for large workloads (≥20 nodes).
 
 **Performance:**
-| Nodes | Single Agent | 5 Workers | Savings |
-|-------|--------------|-----------|---------|
+| Nodes | Single Agent | Parallel | Savings |
+|-------|--------------|----------|---------|
 | 50 | ~10 sec | ~3 sec | 70% |
 | 100 | ~20 sec | ~5 sec | 75% |
 | 200 | ~40 sec | ~9 sec | 78% |
@@ -413,7 +439,8 @@ src/
 │   │   ├── orchestrator.ts # Multi-agent insertion coordinator
 │   │   ├── subtree-parser.ts   # Content splitting for parallel processing
 │   │   ├── requestQueue.ts # Batched operations with concurrency control
-│   │   └── rateLimiter.ts  # Token bucket rate limiting
+│   │   ├── rateLimiter.ts  # Token bucket rate limiting
+│   │   └── jobQueue.ts     # Async job queue for background processing
 │   ├── config/
 │   │   └── environment.ts  # Env vars & validation
 │   └── types/
