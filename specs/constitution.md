@@ -2,6 +2,16 @@
 
 > Non-negotiable principles governing the Workflowy MCP Server project.
 
+## Detailed Principles
+
+This constitution establishes core principles. For detailed guidance, see:
+
+- **[Architecture Principles](./principles-architecture.md)** - Structural patterns, module boundaries, data flow
+- **[Development Principles](./principles-development.md)** - Code style, testing approach, patterns to follow
+- **[Security Principles](./principles-security.md)** - Secrets management, input validation, audit requirements
+
+---
+
 ## Mission
 
 **AI-native outlining**: A seamless bridge between Claude's intelligence and Workflowy's structure, enabling natural language interaction with hierarchical knowledge.

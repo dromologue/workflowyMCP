@@ -6,7 +6,12 @@
   "specification": "specs/specification.md",
   "implementationPlan": "specs/implementation-plan.md",
   "tasks": "specs/tasks.md",
+  "principles": {
+    "architecture": "specs/principles-architecture.md",
+    "development": "specs/principles-development.md",
+    "security": "specs/principles-security.md"
+  },
   "agents": ["claude"],
   "created": "2026-01-10",
-  "lastUpdated": "2026-01-10"
+  "lastUpdated": "2026-01-21"
 }

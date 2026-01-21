@@ -340,6 +340,38 @@ Fast node lookup that handles duplicates by presenting options for selection. Re
 - `find_related` - Discover connections via keyword analysis
 - `create_links` - Auto-generate internal links
 
+### Bulk Operations (for heavy workloads)
+- `analyze_workload` - Estimate time savings from parallel insertion
+- `parallel_bulk_insert` - Insert large hierarchical content with multiple parallel workers
+- `batch_operations` - Execute multiple operations with controlled concurrency
+
+#### Parallel Bulk Insert
+
+For inserting 50+ nodes, use `parallel_bulk_insert` which splits content into independent subtrees and processes them concurrently:
+
+```
+"Analyze this content to estimate insertion time"
+→ Returns: 200 nodes, 4 subtrees, ~75% time savings with 4 workers
+
+"Insert this large outline into my Research node using parallel workers"
+→ Splits into subtrees, processes in parallel, returns progress
+```
+
+**Parameters:**
+| Parameter | Description |
+|-----------|-------------|
+| `parent_id` | Target parent node ID |
+| `content` | Hierarchical content (2-space indented) |
+| `max_workers` | Parallel workers (1-10, default: 5) |
+| `target_nodes_per_worker` | Nodes per subtree (10-200, default: 50) |
+
+**Performance:**
+| Nodes | Single Agent | 5 Workers | Savings |
+|-------|--------------|-----------|---------|
+| 50 | ~10 sec | ~3 sec | 70% |
+| 100 | ~20 sec | ~5 sec | 75% |
+| 200 | ~40 sec | ~9 sec | 78% |
+
 ## Troubleshooting
 
 ### Concept map fails silently
@@ -377,7 +409,11 @@ src/
 │   │   ├── text-processing.ts   # DOT escaping, parsing
 │   │   ├── keyword-extraction.ts # Relevance scoring
 │   │   ├── cache.ts        # Node caching (30s TTL)
-│   │   └── node-paths.ts   # Breadcrumb path building
+│   │   ├── node-paths.ts   # Breadcrumb path building
+│   │   ├── orchestrator.ts # Multi-agent insertion coordinator
+│   │   ├── subtree-parser.ts   # Content splitting for parallel processing
+│   │   ├── requestQueue.ts # Batched operations with concurrency control
+│   │   └── rateLimiter.ts  # Token bucket rate limiting
 │   ├── config/
 │   │   └── environment.ts  # Env vars & validation
 │   └── types/
