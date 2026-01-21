@@ -70,9 +70,6 @@ import {
   estimateTimeSavings,
 } from "../shared/utils/subtree-parser.js";
 import {
-  convertMarkdownToIndented,
-} from "../shared/utils/markdown-converter.js";
-import {
   convertLargeMarkdownToWorkflowy,
   analyzeMarkdown,
   type ConversionOptions,
@@ -940,9 +937,8 @@ const generateConceptMapSchema = z.object({
 
 const insertContentSchema = z.object({
   parent_id: z.string().describe("The ID of the parent node to insert content under"),
-  content: z.string().describe("The content to insert. Use 2-space indentation for hierarchy (default), or markdown headers/lists if format='markdown'"),
+  content: z.string().describe("The content to insert. Must be 2-space indented format. Use convert_markdown_to_workflowy first if you have markdown."),
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
-  format: z.enum(["indented", "markdown"]).optional().describe("Content format: 'indented' (default) uses 2-space indentation for hierarchy, 'markdown' converts headers (# ## ###) and lists (- item) to hierarchy"),
 });
 
 const findInsertTargetsSchema = z.object({
@@ -951,7 +947,7 @@ const findInsertTargetsSchema = z.object({
 
 const smartInsertSchema = z.object({
   search_query: z.string().describe("Search text to find the target node for insertion"),
-  content: z.string().describe("The content to insert"),
+  content: z.string().describe("Content in 2-space indented format. Use convert_markdown_to_workflowy first if you have markdown."),
   selection: z.number().optional().describe("If multiple matches found, the number (1-based) of the node to use"),
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
 });
@@ -1233,14 +1229,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "insert_content",
-        description: "Insert hierarchical content into a specific node. Handles large documents (1000+ nodes) automatically with parallel processing. Use 2-space indentation for hierarchy (default), or set format='markdown' to convert markdown headers and lists.",
+        description: "Insert hierarchical content into Workflowy. Content MUST be in 2-space indented format. For markdown documents, first use convert_markdown_to_workflowy to get the properly formatted content, then pass the result here. Handles large documents (1000+ nodes) automatically with parallel processing.",
         inputSchema: {
           type: "object",
           properties: {
             parent_id: { type: "string", description: "The ID of the parent node to insert content under" },
-            content: { type: "string", description: "The content to insert. Use 2-space indentation for hierarchy, or markdown if format='markdown'" },
+            content: { type: "string", description: "Content in 2-space indented format. Each level of indentation = one level of hierarchy. Use convert_markdown_to_workflowy first if you have markdown." },
             position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings (default: top)" },
-            format: { type: "string", enum: ["indented", "markdown"], description: "Content format: 'indented' (default) uses 2-space indentation, 'markdown' converts # headers and - lists to hierarchy" },
           },
           required: ["parent_id", "content"],
         },
@@ -1258,12 +1253,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "smart_insert",
-        description: "Search for a node and insert content. If multiple matches, returns options for selection.",
+        description: "Search for a node by name and insert content. Content MUST be in 2-space indented format. For markdown, first use convert_markdown_to_workflowy to convert it. If multiple matches found, returns options for selection.",
         inputSchema: {
           type: "object",
           properties: {
             search_query: { type: "string", description: "Search text to find the target node" },
-            content: { type: "string", description: "The content to insert" },
+            content: { type: "string", description: "Content in 2-space indented format. Use convert_markdown_to_workflowy first if you have markdown." },
             selection: { type: "number", description: "If multiple matches found, the number (1-based) of the node to use" },
             position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings" },
           },
@@ -1465,7 +1460,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "convert_markdown_to_workflowy",
-        description: "Convert large markdown documents to Workflowy-compatible indented format. Handles headers (H1-H6), nested lists, task lists, code blocks, tables, blockquotes, and inline formatting. Use this to prepare markdown content for pasting into Workflowy or for use with insert_content. Returns the converted content plus statistics about the conversion.",
+        description: "REQUIRED for any markdown content. Converts markdown to Workflowy's 2-space indented format. This is the ONLY way to format markdown for Workflowy - other tools (insert_content, smart_insert) require pre-formatted content. Handles: headers (H1-H6, ATX and setext), nested lists, task lists [x]/[ ], fenced code blocks, tables, blockquotes, inline formatting. Returns converted content ready for insert_content or direct paste into Workflowy.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2173,7 +2168,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "insert_content": {
-      const { parent_id, content, position, format = "indented" } = insertContentSchema.parse(args);
+      const { parent_id, content, position } = insertContentSchema.parse(args);
 
       // Validate parent exists
       const allNodesForInsert = await getCachedNodes();
@@ -2191,42 +2186,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      // Convert markdown to indented format if needed
-      let processedContent = content;
-      let conversionWarnings: string[] | undefined;
-
-      if (format === "markdown") {
-        const conversion = convertMarkdownToIndented(content);
-        processedContent = conversion.content;
-        conversionWarnings = conversion.warnings;
-
-        if (conversion.nodeCount === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                success: false,
-                error: "Markdown conversion produced no content. Ensure your markdown has headers (# ## ###) or list items (- item).",
-              }, null, 2),
-            }],
-            isError: true,
-          };
-        }
-      }
-
-      // Use parallel insertion by default (automatically handles small vs large workloads)
-      const insertResult = await parallelInsertContent(parent_id, processedContent, position);
+      // Content must already be in 2-space indented format
+      // Use convert_markdown_to_workflowy first if you have markdown
+      const insertResult = await parallelInsertContent(parent_id, content, position);
       invalidateCache();
-
-      // Add conversion warnings to result if present
-      const resultWithWarnings = conversionWarnings
-        ? { ...insertResult, conversion_warnings: conversionWarnings }
-        : insertResult;
 
       return {
         content: [{
           type: "text",
-          text: JSON.stringify(resultWithWarnings, null, 2),
+          text: JSON.stringify(insertResult, null, 2),
         }],
         isError: !insertResult.success,
       };
