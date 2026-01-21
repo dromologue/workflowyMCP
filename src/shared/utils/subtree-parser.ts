@@ -58,8 +58,8 @@ export interface SplitConfig {
 }
 
 const DEFAULT_SPLIT_CONFIG: SplitConfig = {
-  targetNodesPerSubtree: 50,
-  maxSubtrees: 10,
+  targetNodesPerSubtree: 100,
+  maxSubtrees: 50,
   minNodesPerSubtree: 5,
   requestsPerSecond: 5,
 };

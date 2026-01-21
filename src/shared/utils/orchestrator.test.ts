@@ -33,10 +33,10 @@ describe("WorkflowyInsertionOrchestrator", () => {
       const orchestrator = new WorkflowyInsertionOrchestrator(mockInsertFn);
       const config = orchestrator.getConfig();
 
-      expect(config.maxWorkers).toBe(5);
+      expect(config.maxWorkers).toBe(10);
       expect(config.workerRateLimit).toBe(5);
       expect(config.retryOnFailure).toBe(true);
-      expect(config.maxRetries).toBe(2);
+      expect(config.maxRetries).toBe(3);
     });
 
     it("accepts custom config", () => {

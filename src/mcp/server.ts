@@ -69,6 +69,9 @@ import {
   splitIntoSubtrees,
   estimateTimeSavings,
 } from "../shared/utils/subtree-parser.js";
+import {
+  convertMarkdownToIndented,
+} from "../shared/utils/markdown-converter.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -932,8 +935,9 @@ const generateConceptMapSchema = z.object({
 
 const insertContentSchema = z.object({
   parent_id: z.string().describe("The ID of the parent node to insert content under"),
-  content: z.string().describe("The content to insert (can be multiline)"),
+  content: z.string().describe("The content to insert. Use 2-space indentation for hierarchy (default), or markdown headers/lists if format='markdown'"),
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
+  format: z.enum(["indented", "markdown"]).optional().describe("Content format: 'indented' (default) uses 2-space indentation for hierarchy, 'markdown' converts headers (# ## ###) and lists (- item) to hierarchy"),
 });
 
 const findInsertTargetsSchema = z.object({
@@ -1211,13 +1215,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "insert_content",
-        description: "Insert content (possibly multiline with indentation) into a specific node.",
+        description: "Insert hierarchical content into a specific node. Handles large documents (1000+ nodes) automatically with parallel processing. Use 2-space indentation for hierarchy (default), or set format='markdown' to convert markdown headers and lists.",
         inputSchema: {
           type: "object",
           properties: {
             parent_id: { type: "string", description: "The ID of the parent node to insert content under" },
-            content: { type: "string", description: "The content to insert (can be multiline)" },
-            position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings" },
+            content: { type: "string", description: "The content to insert. Use 2-space indentation for hierarchy, or markdown if format='markdown'" },
+            position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings (default: top)" },
+            format: { type: "string", enum: ["indented", "markdown"], description: "Content format: 'indented' (default) uses 2-space indentation, 'markdown' converts # headers and - lists to hierarchy" },
           },
           required: ["parent_id", "content"],
         },
@@ -2106,7 +2111,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "insert_content": {
-      const { parent_id, content, position } = insertContentSchema.parse(args);
+      const { parent_id, content, position, format = "indented" } = insertContentSchema.parse(args);
 
       // Validate parent exists
       const allNodesForInsert = await getCachedNodes();
@@ -2124,14 +2129,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      // Convert markdown to indented format if needed
+      let processedContent = content;
+      let conversionWarnings: string[] | undefined;
+
+      if (format === "markdown") {
+        const conversion = convertMarkdownToIndented(content);
+        processedContent = conversion.content;
+        conversionWarnings = conversion.warnings;
+
+        if (conversion.nodeCount === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: false,
+                error: "Markdown conversion produced no content. Ensure your markdown has headers (# ## ###) or list items (- item).",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+      }
+
       // Use parallel insertion by default (automatically handles small vs large workloads)
-      const insertResult = await parallelInsertContent(parent_id, content, position);
+      const insertResult = await parallelInsertContent(parent_id, processedContent, position);
       invalidateCache();
+
+      // Add conversion warnings to result if present
+      const resultWithWarnings = conversionWarnings
+        ? { ...insertResult, conversion_warnings: conversionWarnings }
+        : insertResult;
 
       return {
         content: [{
           type: "text",
-          text: JSON.stringify(insertResult, null, 2),
+          text: JSON.stringify(resultWithWarnings, null, 2),
         }],
         isError: !insertResult.success,
       };

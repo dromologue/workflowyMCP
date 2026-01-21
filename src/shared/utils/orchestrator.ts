@@ -56,18 +56,20 @@ export interface OrchestratorProgress {
 }
 
 export interface OrchestratorConfig {
-  /** Maximum concurrent workers (default: 5) */
+  /** Maximum concurrent workers (default: 10) */
   maxWorkers: number;
   /** Rate limit per worker: requests per second (default: 5) */
   workerRateLimit: number;
   /** Retry failed subtrees (default: true) */
   retryOnFailure: boolean;
-  /** Maximum retries per subtree (default: 2) */
+  /** Maximum retries per subtree (default: 3) */
   maxRetries: number;
   /** Progress callback interval in ms (default: 500) */
   progressInterval: number;
   /** Subtree splitting configuration */
   splitConfig?: Partial<SplitConfig>;
+  /** Wave size: process this many subtrees per wave (default: 10) */
+  waveSize?: number;
 }
 
 export interface InsertionTask {
@@ -87,11 +89,12 @@ export type InsertionFn = (
 // ============================================================================
 
 const DEFAULT_CONFIG: OrchestratorConfig = {
-  maxWorkers: 5,
+  maxWorkers: 10,
   workerRateLimit: 5,
   retryOnFailure: true,
-  maxRetries: 2,
+  maxRetries: 3,
   progressInterval: 500,
+  waveSize: 10,
 };
 
 // ============================================================================
