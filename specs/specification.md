@@ -110,27 +110,29 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 
 | Feature | Description |
 |---------|-------------|
-| Create node | Add node with name, note, parent, position |
-| **Parallel bulk insert (default)** | Multi-worker insertion for all hierarchical content |
+| **insert_content** | THE PRIMARY TOOL for all node insertion - single, bulk, todos, any size |
+| **convert_markdown_to_workflowy** | REQUIRED for markdown - converts to Workflowy format |
 | Smart insert | Search-and-insert workflow with selection |
 | Find insert targets | Search for potential parent nodes before insertion |
-| Markdown support | Headers, todos, code blocks, quotes |
+| Parallel processing | Auto-optimizes for any workload size (1 to 1000+ nodes) |
 | Order preservation | Content appears in same order as provided |
 | Staging node pattern | Prevents nodes from appearing at unintended locations during insertion |
-| Workload analysis | Estimate time savings before parallel execution |
-| Single-agent insert (fallback) | For small workloads (<20 nodes) where overhead isn't worth it |
 
-**Default insertion behavior**:
+**Single entry point for all insertions**:
 
-All hierarchical content insertion uses the **multi-agent parallel approach by default**. The system automatically:
-1. Analyzes the workload to determine optimal worker count
-2. Splits content into independent subtrees
-3. Processes subtrees concurrently with independent rate limiters
-4. Falls back to single-agent mode only for very small workloads (<20 nodes)
+`insert_content` is the ONLY tool needed for creating nodes. It handles:
+- **Single nodes**: One line of content
+- **Bulk hierarchical content**: Multiple indented lines
+- **Todos**: Use `[ ]` for pending, `[x]` for completed
+- **Any workload size**: Auto-parallelizes for large content (≥20 nodes)
+
+**Workflow for markdown content**:
+1. Convert markdown → `convert_markdown_to_workflowy`
+2. Insert result → `insert_content`
 
 **Position behavior**:
-- `bottom` (default): Content appended after existing children, order preserved
-- `top`: First node placed at top, subsequent nodes follow in order
+- `top` (default): First node placed at top, subsequent nodes follow in order
+- `bottom`: Content appended after existing children, order preserved
 
 **Staging node pattern**:
 
@@ -149,32 +151,70 @@ This ensures nodes are never visible at unintended locations during the operatio
 
 #### insert_content Tool
 
-Insert hierarchical content into a specific parent node.
+**THE PRIMARY TOOL** for all node insertion into Workflowy. Use this for everything: single nodes, bulk content, todos, any hierarchical structure.
 
 **Parameters**:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `parent_id` | string | yes | Target parent node ID |
-| `content` | string | yes | Hierarchical content (2-space indented) |
-| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
+| `content` | string | yes | Content in 2-space indented format (see examples below) |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
 
-**Behavior**: Automatically uses parallel insertion for workloads ≥20 nodes.
+**Content format examples**:
+
+```
+# Single node
+My new node
+
+# Multiple nodes (siblings)
+First node
+Second node
+Third node
+
+# Hierarchical content
+Parent node
+  Child 1
+  Child 2
+    Grandchild
+  Child 3
+
+# Todo items
+[ ] Pending task
+[x] Completed task
+[ ] Another pending task
+  [ ] Nested subtask
+
+# Mixed content
+Project Plan
+  [ ] Research phase
+    Gather requirements
+    Interview stakeholders
+  [ ] Design phase
+    Create wireframes
+    [x] Review with team
+```
+
+**For markdown content**: Use `convert_markdown_to_workflowy` first to convert markdown to indented format, then pass the result to `insert_content`.
+
+**Behavior**: Automatically uses parallel insertion for workloads ≥20 nodes, single-agent for smaller content.
 
 ---
 
 #### smart_insert Tool
 
-Search for a target node and insert content. Combines find + insert in one workflow.
+Search for a target node by name and insert content. Combines find + insert in one workflow.
 
 **Parameters**:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `search_query` | string | yes | Search term to find the target parent |
-| `content` | string | yes | Hierarchical content to insert |
-| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
+| `content` | string | yes | Content in 2-space indented format (same as insert_content) |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
 | `selection` | number | no | If multiple matches, the 1-based index to select |
+
+**Content must be in 2-space indented format**. For markdown, use `convert_markdown_to_workflowy` first.
 
 **Behavior**:
 1. Searches for nodes matching `search_query`
@@ -211,21 +251,94 @@ Search for potential target nodes to insert content into. Used when Claude needs
 
 ---
 
+#### convert_markdown_to_workflowy Tool
+
+**REQUIRED** for any markdown content. Converts markdown documents to Workflowy's 2-space indented format. This is the ONLY way to format markdown for Workflowy.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `markdown` | string | yes | The markdown content to convert |
+| `options` | object | no | Conversion settings (see below) |
+| `analyze_only` | boolean | no | If true, return stats only without converting |
+
+**Options**:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `preserveInlineFormatting` | boolean | true | Keep **bold**, *italic*, `code`, links |
+| `convertTables` | boolean | true | Convert tables to hierarchical lists |
+| `includeHorizontalRules` | boolean | true | Include --- as separator nodes |
+| `maxDepth` | number | 10 | Maximum nesting depth |
+| `preserveTaskLists` | boolean | true | Keep [x] and [ ] checkbox markers |
+
+**Supported markdown elements**:
+- Headers (H1-H6, ATX `#` and setext `===`/`---` styles)
+- Nested lists (ordered and unordered)
+- Task lists with checkboxes (`[ ]` and `[x]`)
+- Fenced code blocks with language labels
+- Tables (converted to hierarchical structure)
+- Blockquotes (single and nested)
+- Inline formatting (bold, italic, links)
+
+**Response**:
+```json
+{
+  "success": true,
+  "content": "Converted content...",
+  "node_count": 42,
+  "stats": {
+    "headers": 5,
+    "list_items": 20,
+    "code_blocks": 2,
+    "tables": 1,
+    "blockquotes": 3,
+    "task_items": 8,
+    "paragraphs": 15
+  },
+  "warnings": [],
+  "usage_hint": "Ready to use with insert_content"
+}
+```
+
+**Workflow**:
+```
+1. User provides markdown document
+2. Call convert_markdown_to_workflowy with markdown
+3. Take the "content" from response
+4. Call insert_content with that content
+```
+
+**Use case**: Converting README files, documentation, meeting notes, or any markdown content for insertion into Workflowy.
+
+---
+
 ### 4. Todo Management
 
 **Goal**: Create and manage task lists within Workflowy.
 
 | Feature | Description |
 |---------|-------------|
-| Create todo | Create a checkbox item with optional initial completion state |
+| Create todos | Use `insert_content` with checkbox syntax `[ ]` or `[x]` |
 | List todos | Retrieve all todos with filtering by status, parent, search |
 | Complete/Uncomplete | Toggle completion status of any node |
 
+**Creating todos**:
+
+Use `insert_content` with checkbox syntax:
+```
+[ ] Pending task
+[x] Completed task
+[ ] Another task
+  [ ] Nested subtask
+```
+
 **Todo identification**:
 - Nodes with `layoutMode: "todo"`
-- Nodes using markdown checkbox syntax (`- [ ]` or `- [x]`)
+- Nodes using checkbox syntax (`[ ]` or `[x]`)
 
-**Filtering options**:
+**Filtering options** (for `list_todos`):
 - `status`: "all", "pending", or "completed"
 - `parent_id`: Scope to todos under a specific node
 - `query`: Text search within todo names/notes
@@ -446,6 +559,16 @@ User: "What did I write about project planning?"
 ### Flow 3: Task Management
 
 ```
+User: "Add my weekly tasks to the Tasks node"
+
+1. find_node for "Tasks"
+2. insert_content with checkbox syntax:
+   [ ] Review inbox
+   [ ] Process email
+   [ ] Update project status
+   [x] Already done item
+3. Confirmation with created todos
+
 User: "Mark my weekly review tasks as complete"
 
 1. search_nodes for "weekly review"
@@ -518,14 +641,14 @@ Example output structure:
               "phenomenology" ↔ "pragmatism" ("contrasts with")
 ```
 
-### Flow 5: Standard Content Insertion (Automatic Parallelization)
+### Flow 5: Large Content Insertion (Automatic Parallelization)
 
 ```
 User: "Import this research outline into my Project node" (provides 200+ node outline)
 
-1. Claude calls insert_content or smart_insert (standard tools)
+1. Claude calls insert_content (the only insertion tool needed)
    → System automatically detects 180 nodes
-   → Parallel insertion enabled by default
+   → Parallel insertion enabled automatically
 
 2. Behind the scenes, the system:
    - Analyzes workload: 180 nodes, 5 subtrees
@@ -551,9 +674,27 @@ User: "Import this research outline into my Project node" (provides 200+ node ou
    - Automatic retry (up to 2 attempts)
    - Partial success reported with failed subtree details
 
-Note: Claude doesn't need to explicitly choose parallel insertion - it happens
-automatically. The standard insert_content and smart_insert tools use
-parallel_bulk_insert under the hood for workloads ≥20 nodes.
+Note: Claude uses insert_content for ALL insertions. Parallel optimization
+happens automatically for workloads ≥20 nodes.
+```
+
+### Flow 6: Markdown Document Import
+
+```
+User: "Import this markdown README into my Documentation node"
+
+1. Claude calls convert_markdown_to_workflowy with the markdown content
+   → Converts headers, lists, code blocks, tables to indented format
+   → Returns converted content and stats
+
+2. Claude calls insert_content with the converted content
+   → System auto-optimizes based on node count
+   → Content inserted with hierarchy preserved
+
+3. Confirmation with stats:
+   - 47 nodes created
+   - 5 headers, 20 list items, 2 code blocks converted
+   - Duration: 2.3 seconds
 ```
 
 ## Constraints
@@ -694,27 +835,29 @@ High-load behavior is configured via environment constants:
 
 ---
 
-### 8. Multi-Agent Parallel Insertion (Default)
+### 8. Multi-Agent Parallel Insertion (Automatic)
 
-**Goal**: Provide fast, efficient content insertion as the default method for all hierarchical content.
+**Goal**: Provide fast, efficient content insertion automatically for all hierarchical content.
 
-This is the **default insertion method** for all hierarchical content. The system automatically uses multi-agent parallel insertion unless the workload is very small (<20 nodes).
+Parallel insertion is **fully automatic** - Claude simply uses `insert_content` and the system optimizes based on workload size.
 
 | Feature | Description |
 |---------|-------------|
-| **Automatic by default** | All `insert_content` and `smart_insert` calls use parallel insertion |
-| Workload analysis | Automatically determines optimal worker count |
+| **Fully automatic** | `insert_content` auto-parallelizes based on workload |
+| Workload analysis | System determines optimal worker count |
 | Subtree splitting | Divides content into independent subtrees |
 | Parallel workers | Multiple workers with independent rate limiters |
 | Progress tracking | Real-time updates during execution |
 | Automatic retry | Failed subtrees retry up to 2 times |
 | Smart fallback | Falls back to single-agent for <20 nodes |
 
+**No manual tool selection required**: Claude should simply use `insert_content` for all hierarchical content. The system automatically uses parallel workers when beneficial (≥20 nodes).
+
 ---
 
 #### analyze_workload Tool
 
-Analyze hierarchical content to estimate parallel insertion performance.
+Analyze hierarchical content to estimate insertion performance. Useful for understanding large workloads before insertion.
 
 **Parameters**:
 
@@ -748,29 +891,17 @@ Analyze hierarchical content to estimate parallel insertion performance.
     "savings_percent": 69,
     "savings_seconds": 20.6
   },
-  "recommendation": "Use parallel_bulk_insert with 4 workers for optimal performance"
+  "recommendation": "Use insert_content - it auto-optimizes for any workload size"
 }
 ```
 
-**Use case**: Before inserting large content, analyze to understand time savings and determine optimal worker count.
+**Use case**: Before inserting large content, analyze to understand time estimates. Note: You don't need to analyze before inserting - `insert_content` handles optimization automatically.
 
 ---
 
-#### parallel_bulk_insert Tool
+#### How insert_content Handles Large Workloads
 
-Insert large hierarchical content using multiple parallel workers.
-
-**Parameters**:
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `parent_id` | string | yes | Target parent node ID |
-| `content` | string | yes | Hierarchical content (2-space indented) |
-| `position` | "top" \| "bottom" | no | Position relative to siblings (default: bottom) |
-| `max_workers` | number | no | Maximum parallel workers (1-10, default: 5) |
-| `target_nodes_per_worker` | number | no | Target nodes per subtree (10-200, default: 50) |
-
-**How it works**:
+When `insert_content` receives hierarchical content, it automatically:
 
 1. **Content splitting**: Parses content into independent subtrees based on top-level nodes
 2. **Worker assignment**: Each subtree assigned to a worker with its own rate limiter
@@ -778,30 +909,22 @@ Insert large hierarchical content using multiple parallel workers.
 4. **Retry handling**: Failed subtrees automatically retry (up to 2 attempts)
 5. **Result merging**: All results combined with detailed stats
 
-**Response**:
+**Response includes performance stats**:
 ```json
 {
   "success": true,
-  "message": "Successfully inserted 150 nodes using 4 parallel workers",
-  "stats": {
-    "total_nodes": 150,
-    "created_nodes": 150,
-    "failed_subtrees": 0,
-    "workers_used": 4,
-    "duration_ms": 8234,
-    "duration_seconds": 8.2
-  },
+  "message": "Successfully inserted 150 nodes",
+  "total_nodes": 150,
+  "created_nodes": 150,
+  "mode": "parallel_workers",
+  "duration_seconds": 8.2,
   "performance": {
     "estimated_single_agent_ms": 30000,
     "actual_parallel_ms": 8234,
     "actual_savings_percent": 73
-  },
-  "node_ids": ["abc123", "def456", ...],
-  "mode": "parallel_workers"
+  }
 }
 ```
-
-**Small workload behavior**: For content with only one natural subtree, automatically falls back to single-agent mode to avoid unnecessary overhead.
 
 ---
 
@@ -860,21 +983,19 @@ Output: 3 independent subtrees
 | 200 | ~40 sec | ~9 sec | 78% |
 | 500 | ~100 sec | ~22 sec | 78% |
 
-**Automatic tool selection**:
+**Automatic optimization**:
 
 The system automatically selects the optimal insertion strategy based on workload size:
 
 | Node Count | Automatic Behavior | Performance |
 |------------|-------------------|-------------|
-| < 20 | Single-agent (fallback) | Overhead not worth parallelization |
+| < 20 | Single-agent | Fast for small content |
 | 20-50 | Parallel (2-3 workers) | ~50-60% time savings |
 | 50-100 | Parallel (3-4 workers) | ~70% time savings |
 | 100-200 | Parallel (4-5 workers) | ~75% time savings |
-| 200+ | Parallel (5-10 workers) | ~78%+ time savings |
+| 200+ | Parallel (5 workers) | ~78%+ time savings |
 
-**No manual tool selection required**: Claude should simply use `insert_content` or `smart_insert` for all hierarchical content. The system automatically uses `parallel_bulk_insert` under the hood when beneficial.
-
-**Direct `parallel_bulk_insert` access**: Available for advanced use cases where explicit control over worker count or subtree splitting is needed.
+**No manual tool selection required**: Claude should simply use `insert_content` for all hierarchical content. Parallel optimization happens automatically.
 
 **Success criteria**: Insert 200+ nodes with >70% time savings compared to single-agent approach.
 
