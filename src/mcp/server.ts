@@ -72,6 +72,11 @@ import {
 import {
   convertMarkdownToIndented,
 } from "../shared/utils/markdown-converter.js";
+import {
+  convertLargeMarkdownToWorkflowy,
+  analyzeMarkdown,
+  type ConversionOptions,
+} from "../shared/utils/large-markdown-converter.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -1018,6 +1023,19 @@ const analyzeWorkloadSchema = z.object({
   max_workers: z.number().min(1).max(10).optional().describe("Maximum workers to consider (default: 5)"),
 });
 
+// Convert Markdown to Workflowy schema
+const convertMarkdownToWorkflowySchema = z.object({
+  markdown: z.string().describe("The markdown content to convert"),
+  options: z.object({
+    preserveInlineFormatting: z.boolean().optional().describe("Keep **bold**, *italic*, etc. (default: true)"),
+    convertTables: z.boolean().optional().describe("Convert tables to hierarchical lists (default: true)"),
+    includeHorizontalRules: z.boolean().optional().describe("Include --- as separator nodes (default: true)"),
+    maxDepth: z.number().optional().describe("Maximum nesting depth (default: 10)"),
+    preserveTaskLists: z.boolean().optional().describe("Keep [x] and [ ] checkboxes (default: true)"),
+  }).optional().describe("Conversion options"),
+  analyze_only: z.boolean().optional().describe("Only analyze the markdown, don't convert (returns stats)"),
+});
+
 // ============================================================================
 // Request Queue Setup
 // ============================================================================
@@ -1443,6 +1461,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["content"],
+        },
+      },
+      {
+        name: "convert_markdown_to_workflowy",
+        description: "Convert large markdown documents to Workflowy-compatible indented format. Handles headers (H1-H6), nested lists, task lists, code blocks, tables, blockquotes, and inline formatting. Use this to prepare markdown content for pasting into Workflowy or for use with insert_content. Returns the converted content plus statistics about the conversion.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            markdown: {
+              type: "string",
+              description: "The markdown content to convert. Supports headers, lists, code blocks, tables, blockquotes, task lists, and inline formatting.",
+            },
+            options: {
+              type: "object",
+              properties: {
+                preserveInlineFormatting: {
+                  type: "boolean",
+                  description: "Keep **bold**, *italic*, `code`, and links (default: true)",
+                },
+                convertTables: {
+                  type: "boolean",
+                  description: "Convert markdown tables to hierarchical lists (default: true)",
+                },
+                includeHorizontalRules: {
+                  type: "boolean",
+                  description: "Include --- horizontal rules as separator nodes (default: true)",
+                },
+                maxDepth: {
+                  type: "number",
+                  description: "Maximum nesting depth for output (default: 10)",
+                },
+                preserveTaskLists: {
+                  type: "boolean",
+                  description: "Keep [x] and [ ] checkbox markers for task lists (default: true)",
+                },
+              },
+              description: "Optional conversion settings",
+            },
+            analyze_only: {
+              type: "boolean",
+              description: "If true, only analyze the markdown and return statistics without converting",
+            },
+          },
+          required: ["markdown"],
         },
       },
     ],
@@ -3097,6 +3159,67 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             node_ids: result.allNodeIds,
             errors: result.errors.length > 0 ? result.errors : undefined,
             mode: "parallel_workers",
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "convert_markdown_to_workflowy": {
+      const { markdown, options = {}, analyze_only = false } = convertMarkdownToWorkflowySchema.parse(args);
+
+      // If analyze_only, just return stats
+      if (analyze_only) {
+        const stats = analyzeMarkdown(markdown);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              mode: "analyze_only",
+              stats: {
+                headers: stats.headers,
+                list_items: stats.listItems,
+                code_blocks: stats.codeBlocks,
+                tables: stats.tables,
+                blockquotes: stats.blockquotes,
+                task_items: stats.taskItems,
+                paragraphs: stats.paragraphs,
+                original_lines: stats.originalLines,
+                estimated_nodes: stats.estimatedNodes,
+              },
+              recommendation: stats.estimatedNodes > 100
+                ? "Large document - consider using parallel_bulk_insert after conversion"
+                : "Standard size - can be used directly with insert_content",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Convert the markdown
+      const result = convertLargeMarkdownToWorkflowy(markdown, options as ConversionOptions);
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            content: result.content,
+            node_count: result.nodeCount,
+            stats: {
+              headers: result.stats.headers,
+              list_items: result.stats.listItems,
+              code_blocks: result.stats.codeBlocks,
+              tables: result.stats.tables,
+              blockquotes: result.stats.blockquotes,
+              task_items: result.stats.taskItems,
+              paragraphs: result.stats.paragraphs,
+              original_lines: result.stats.originalLines,
+              output_lines: result.stats.outputLines,
+            },
+            warnings: result.warnings.length > 0 ? result.warnings : undefined,
+            usage_hint: result.nodeCount > 100
+              ? "Large output - use parallel_bulk_insert for best performance"
+              : "Ready to use with insert_content or paste directly into Workflowy",
           }, null, 2),
         }],
       };
