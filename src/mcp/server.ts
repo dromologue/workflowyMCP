@@ -74,6 +74,19 @@ import {
   analyzeMarkdown,
   type ConversionOptions,
 } from "../shared/utils/large-markdown-converter.js";
+import {
+  JobQueue,
+  getDefaultJobQueue,
+  type Job,
+  type JobStatus,
+  type InsertContentJobParams,
+  type InsertFileJobParams,
+  type BatchOperationJobParams,
+  type InsertContentJobResult,
+  type InsertFileJobResult,
+  type BatchOperationJobResult,
+} from "../shared/utils/jobQueue.js";
+import { getDefaultRateLimiter } from "../shared/utils/rateLimiter.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -1009,12 +1022,308 @@ const convertMarkdownToWorkflowySchema = z.object({
   analyze_only: z.boolean().optional().describe("Only analyze the markdown, don't convert (returns stats)"),
 });
 
+// Job Queue Schemas
+const submitJobSchema = z.object({
+  type: z.enum(["insert_content", "batch_operations"]).describe("Type of job to submit"),
+  params: z.record(z.unknown()).describe("Job parameters (varies by type)"),
+  description: z.string().optional().describe("Optional description for tracking"),
+});
+
+const getJobStatusSchema = z.object({
+  job_id: z.string().describe("The ID of the job to check"),
+});
+
+const getJobResultSchema = z.object({
+  job_id: z.string().describe("The ID of the job to get results for"),
+});
+
+const listJobsSchema = z.object({
+  status: z.array(z.enum(["pending", "processing", "completed", "failed", "cancelled"]))
+    .optional()
+    .describe("Filter by job status (default: all)"),
+});
+
+const cancelJobSchema = z.object({
+  job_id: z.string().describe("The ID of the job to cancel"),
+});
+
+// File insertion schema - allows Claude to pass file path without reading
+const insertFileSchema = z.object({
+  file_path: z.string().describe("Absolute path to the file to insert"),
+  parent_id: z.string().describe("The ID of the parent node to insert content under"),
+  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
+  format: z.enum(["auto", "markdown", "plain"]).optional().describe("File format: 'auto' detects from extension, 'markdown' forces markdown conversion, 'plain' treats as pre-formatted (default: auto)"),
+});
+
+// Submit file job schema - for large files
+const submitFileJobSchema = z.object({
+  file_path: z.string().describe("Absolute path to the file to insert"),
+  parent_id: z.string().describe("The ID of the parent node to insert content under"),
+  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
+  format: z.enum(["auto", "markdown", "plain"]).optional().describe("File format handling (default: auto)"),
+  description: z.string().optional().describe("Optional description for tracking"),
+});
+
 // ============================================================================
 // Request Queue Setup
 // ============================================================================
 
 const requestQueue = new RequestQueue(QUEUE_CONFIG);
 requestQueue.setApiRequestFn(workflowyRequest);
+
+// ============================================================================
+// Job Queue Setup
+// ============================================================================
+
+const jobQueue = getDefaultJobQueue();
+
+// Register insert_content job executor
+jobQueue.registerExecutor<InsertContentJobParams, InsertContentJobResult>(
+  "insert_content",
+  async (params, onProgress, signal) => {
+    const { parentId, content, position } = params;
+    const rateLimiter = getDefaultRateLimiter();
+
+    // Parse content to count nodes
+    const lines = content.split("\n").filter(line => line.trim());
+    const totalNodes = lines.length;
+
+    onProgress({ total: totalNodes, completed: 0, failed: 0, currentOperation: "Starting insertion" });
+
+    // Check abort before starting
+    if (signal.aborted) {
+      throw new Error("Job cancelled");
+    }
+
+    try {
+      // Use the existing parallel insert content logic but with rate limiting
+      const createdNodes = await insertHierarchicalContent(parentId, content, position);
+      invalidateCache();
+
+      onProgress({
+        completed: createdNodes.length,
+        currentOperation: "Completed",
+      });
+
+      return {
+        success: true,
+        nodesCreated: createdNodes.length,
+        nodeIds: createdNodes.map(n => n.id),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        nodesCreated: 0,
+        nodeIds: [],
+        errors: [error instanceof Error ? error.message : String(error)],
+      };
+    }
+  }
+);
+
+// Register batch_operations job executor
+jobQueue.registerExecutor<BatchOperationJobParams, BatchOperationJobResult>(
+  "batch_operations",
+  async (params, onProgress, signal) => {
+    const { operations } = params;
+    const rateLimiter = getDefaultRateLimiter();
+    const results: BatchOperationJobResult["results"] = [];
+    let totalSucceeded = 0;
+    let totalFailed = 0;
+
+    onProgress({
+      total: operations.length,
+      completed: 0,
+      failed: 0,
+      currentOperation: "Starting batch operations",
+    });
+
+    startBatch();
+
+    for (let i = 0; i < operations.length; i++) {
+      // Check for abort
+      if (signal.aborted) {
+        endBatch();
+        throw new Error("Job cancelled");
+      }
+
+      const op = operations[i];
+      onProgress({
+        currentOperation: `Processing operation ${i + 1}/${operations.length}: ${op.type}`,
+      });
+
+      // Wait for rate limiter
+      await rateLimiter.acquire();
+
+      try {
+        let result: unknown;
+
+        switch (op.type) {
+          case "create":
+            result = await workflowyRequest("/nodes", "POST", op.params as object);
+            break;
+          case "update": {
+            const { node_id, ...updateParams } = op.params as { node_id: string; [key: string]: unknown };
+            result = await workflowyRequest(`/nodes/${node_id}`, "POST", updateParams);
+            break;
+          }
+          case "delete": {
+            const nodeId = (op.params as { node_id: string }).node_id;
+            result = await workflowyRequest(`/nodes/${nodeId}`, "DELETE");
+            break;
+          }
+          case "move": {
+            const { node_id: moveId, ...moveParams } = op.params as { node_id: string; [key: string]: unknown };
+            result = await workflowyRequest(`/nodes/${moveId}`, "POST", moveParams);
+            break;
+          }
+          case "complete": {
+            const completeId = (op.params as { node_id: string }).node_id;
+            result = await workflowyRequest(`/nodes/${completeId}/complete`, "POST");
+            break;
+          }
+          case "uncomplete": {
+            const uncompleteId = (op.params as { node_id: string }).node_id;
+            result = await workflowyRequest(`/nodes/${uncompleteId}/uncomplete`, "POST");
+            break;
+          }
+        }
+
+        results.push({ index: i, status: "success", result });
+        totalSucceeded++;
+        onProgress({ completed: totalSucceeded, failed: totalFailed });
+      } catch (error) {
+        results.push({
+          index: i,
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        totalFailed++;
+        onProgress({ completed: totalSucceeded, failed: totalFailed });
+      }
+    }
+
+    endBatch();
+    invalidateCache();
+
+    return {
+      success: totalFailed === 0,
+      results,
+      totalSucceeded,
+      totalFailed,
+    };
+  }
+);
+
+// Helper function to read and process a file for insertion
+async function readAndProcessFile(
+  filePath: string,
+  format: "auto" | "markdown" | "plain" = "auto"
+): Promise<{ content: string; format: string; fileName: string; fileSize: number }> {
+  // Check file exists
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  const stats = fs.statSync(filePath);
+  if (!stats.isFile()) {
+    throw new Error(`Path is not a file: ${filePath}`);
+  }
+
+  const fileName = path.basename(filePath);
+  const fileSize = stats.size;
+  const ext = path.extname(filePath).toLowerCase();
+
+  // Read file content
+  const rawContent = fs.readFileSync(filePath, "utf-8");
+
+  // Determine format
+  let actualFormat = format;
+  if (format === "auto") {
+    if (ext === ".md" || ext === ".markdown") {
+      actualFormat = "markdown";
+    } else {
+      actualFormat = "plain";
+    }
+  }
+
+  // Process content based on format
+  let processedContent: string;
+  if (actualFormat === "markdown") {
+    // Convert markdown to Workflowy format
+    const result = convertLargeMarkdownToWorkflowy(rawContent);
+    processedContent = result.content;
+  } else {
+    // Plain format - assume already in 2-space indented format or single-level content
+    processedContent = rawContent;
+  }
+
+  return {
+    content: processedContent,
+    format: actualFormat,
+    fileName,
+    fileSize,
+  };
+}
+
+// Register insert_file job executor
+jobQueue.registerExecutor<InsertFileJobParams, InsertFileJobResult>(
+  "insert_file",
+  async (params, onProgress, signal) => {
+    const { filePath, parentId, position, format } = params;
+
+    onProgress({ total: 1, completed: 0, failed: 0, currentOperation: "Reading file" });
+
+    if (signal.aborted) {
+      throw new Error("Job cancelled");
+    }
+
+    try {
+      // Read and process the file
+      const { content, format: actualFormat, fileName, fileSize } = await readAndProcessFile(
+        filePath,
+        format
+      );
+
+      onProgress({ currentOperation: "Processing content" });
+
+      // Count nodes
+      const lines = content.split("\n").filter((line: string) => line.trim());
+      const totalNodes = lines.length;
+
+      onProgress({ total: totalNodes, currentOperation: "Inserting content" });
+
+      if (signal.aborted) {
+        throw new Error("Job cancelled");
+      }
+
+      // Insert content
+      const createdNodes = await insertHierarchicalContent(parentId, content, position);
+      invalidateCache();
+
+      onProgress({ completed: createdNodes.length, currentOperation: "Completed" });
+
+      return {
+        success: true,
+        nodesCreated: createdNodes.length,
+        nodeIds: createdNodes.map((n) => n.id),
+        fileName,
+        fileSize,
+        format: actualFormat,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        nodesCreated: 0,
+        nodeIds: [],
+        fileName: path.basename(filePath),
+        fileSize: 0,
+        format: format || "auto",
+        errors: [error instanceof Error ? error.message : String(error)],
+      };
+    }
+  }
+);
 
 // ============================================================================
 // MCP Server Setup
@@ -1413,6 +1722,154 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["markdown"],
+        },
+      },
+      // ========================================================================
+      // Async Job Queue Tools - For handling large workloads without hitting API limits
+      // ========================================================================
+      {
+        name: "submit_job",
+        description: "Submit a large workload for background processing. The MCP server queues and processes operations respecting API rate limits. Returns a job ID to track progress. Use this for large insert_content or batch_operations to avoid timeouts and rate limit errors.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              enum: ["insert_content", "batch_operations"],
+              description: "Type of job: 'insert_content' for hierarchical content insertion, 'batch_operations' for multiple operations",
+            },
+            params: {
+              type: "object",
+              description: "Job parameters. For insert_content: {parentId, content, position?}. For batch_operations: {operations: [{type, params}...]}",
+            },
+            description: {
+              type: "string",
+              description: "Optional human-readable description for tracking",
+            },
+          },
+          required: ["type", "params"],
+        },
+      },
+      {
+        name: "get_job_status",
+        description: "Check the progress of a submitted job. Returns status (pending/processing/completed/failed/cancelled) and progress information.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: {
+              type: "string",
+              description: "The job ID returned from submit_job",
+            },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "get_job_result",
+        description: "Get the result of a completed job. Only available for jobs with status 'completed' or 'failed'. Returns the operation results or error details.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: {
+              type: "string",
+              description: "The job ID returned from submit_job",
+            },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "list_jobs",
+        description: "List all jobs with optional status filtering. Shows job IDs, types, status, and progress for tracking multiple operations.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: ["pending", "processing", "completed", "failed", "cancelled"],
+              },
+              description: "Filter by status (default: all)",
+            },
+          },
+        },
+      },
+      {
+        name: "cancel_job",
+        description: "Cancel a pending or processing job. Cannot cancel already completed/failed/cancelled jobs.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: {
+              type: "string",
+              description: "The job ID to cancel",
+            },
+          },
+          required: ["job_id"],
+        },
+      },
+      // ========================================================================
+      // File Insertion Tools - Claude can pass file paths without reading
+      // ========================================================================
+      {
+        name: "insert_file",
+        description: "Insert a file's contents into Workflowy. The server reads the file, converts markdown if needed, and inserts. Claude does NOT need to read the file first. Supports .md, .markdown, .txt, and plain text files.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Absolute path to the file to insert",
+            },
+            parent_id: {
+              type: "string",
+              description: "The ID of the parent node to insert content under",
+            },
+            position: {
+              type: "string",
+              enum: ["top", "bottom"],
+              description: "Position relative to siblings (default: top)",
+            },
+            format: {
+              type: "string",
+              enum: ["auto", "markdown", "plain"],
+              description: "How to process the file: 'auto' detects from extension (.md/.markdown → markdown), 'markdown' forces markdown conversion, 'plain' treats as pre-formatted 2-space indented content (default: auto)",
+            },
+          },
+          required: ["file_path", "parent_id"],
+        },
+      },
+      {
+        name: "submit_file_job",
+        description: "Submit a large file for background insertion. Use this for large files to avoid timeouts. The server reads, converts, and inserts the file while respecting API rate limits. Returns a job ID to track progress.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "Absolute path to the file to insert",
+            },
+            parent_id: {
+              type: "string",
+              description: "The ID of the parent node to insert content under",
+            },
+            position: {
+              type: "string",
+              enum: ["top", "bottom"],
+              description: "Position relative to siblings (default: top)",
+            },
+            format: {
+              type: "string",
+              enum: ["auto", "markdown", "plain"],
+              description: "How to process the file (default: auto)",
+            },
+            description: {
+              type: "string",
+              description: "Optional description for tracking",
+            },
+          },
+          required: ["file_path", "parent_id"],
         },
       },
     ],
@@ -2924,6 +3381,418 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             usage_hint: result.nodeCount > 100
               ? "Large output - use insert_content for best performance"
               : "Ready to use with insert_content or paste directly into Workflowy",
+          }, null, 2),
+        }],
+      };
+    }
+
+    // ========================================================================
+    // Async Job Queue Handlers
+    // ========================================================================
+
+    case "submit_job": {
+      const { type, params, description } = submitJobSchema.parse(args);
+
+      // Validate params based on job type
+      if (type === "insert_content") {
+        const insertParams = params as { parentId?: string; parent_id?: string; content?: string; position?: string };
+        const parentId = insertParams.parentId || insertParams.parent_id;
+
+        if (!parentId || !insertParams.content) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: false,
+                error: "insert_content jobs require parentId (or parent_id) and content parameters",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Validate parent exists
+        const allNodes = await getCachedNodes();
+        const parentNode = allNodes.find((n) => n.id === parentId);
+        if (!parentNode) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: false,
+                error: `Parent node not found: ${parentId}`,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Analyze workload for description
+        const lines = insertParams.content.split("\n").filter((line: string) => line.trim());
+        const nodeCount = lines.length;
+        const jobDescription = description || `Insert ${nodeCount} nodes under "${parentNode.name}"`;
+
+        const job = jobQueue.submit<InsertContentJobParams, InsertContentJobResult>(
+          "insert_content",
+          {
+            parentId,
+            content: insertParams.content,
+            position: (insertParams.position as "top" | "bottom") || "top",
+          },
+          jobDescription
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              job_id: job.id,
+              type: job.type,
+              status: job.status,
+              description: job.description,
+              estimated_nodes: nodeCount,
+              message: "Job submitted for background processing. Use get_job_status to check progress.",
+              tip: "The server will process this job respecting API rate limits to avoid errors.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      if (type === "batch_operations") {
+        const batchParams = params as { operations?: Array<{ type: string; params: Record<string, unknown> }> };
+
+        if (!batchParams.operations || !Array.isArray(batchParams.operations)) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: false,
+                error: "batch_operations jobs require an operations array",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        const opCount = batchParams.operations.length;
+        const jobDescription = description || `Batch of ${opCount} operations`;
+
+        const job = jobQueue.submit<BatchOperationJobParams, BatchOperationJobResult>(
+          "batch_operations",
+          {
+            operations: batchParams.operations as BatchOperationJobParams["operations"],
+          },
+          jobDescription
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              job_id: job.id,
+              type: job.type,
+              status: job.status,
+              description: job.description,
+              operation_count: opCount,
+              message: "Job submitted for background processing. Use get_job_status to check progress.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: false,
+            error: `Unknown job type: ${type}`,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    case "get_job_status": {
+      const { job_id } = getJobStatusSchema.parse(args);
+      const status = jobQueue.getJobStatus(job_id);
+
+      if (!status.found) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Job not found: ${job_id}`,
+              tip: "Job IDs expire after 30 minutes. Use list_jobs to see active jobs.",
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            job_id,
+            status: status.status,
+            progress: status.progress,
+            description: status.description,
+            created_at: status.createdAt ? new Date(status.createdAt).toISOString() : undefined,
+            started_at: status.startedAt ? new Date(status.startedAt).toISOString() : undefined,
+            completed_at: status.completedAt ? new Date(status.completedAt).toISOString() : undefined,
+            ...(status.error && { error: status.error }),
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "get_job_result": {
+      const { job_id } = getJobResultSchema.parse(args);
+      const result = jobQueue.getJobResult(job_id);
+
+      if (!result.found) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Job not found: ${job_id}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      if (result.status === "pending" || result.status === "processing") {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              job_id,
+              status: result.status,
+              message: "Job is still running. Use get_job_status to check progress.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: result.status === "completed",
+            job_id,
+            status: result.status,
+            result: result.result,
+            error: result.error,
+            item_errors: result.itemErrors,
+          }, null, 2),
+        }],
+        isError: result.status === "failed",
+      };
+    }
+
+    case "list_jobs": {
+      const { status } = listJobsSchema.parse(args);
+      const jobs = jobQueue.listJobs(status as JobStatus[] | undefined);
+      const stats = jobQueue.getStats();
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            jobs: jobs.map((j) => ({
+              job_id: j.id,
+              type: j.type,
+              status: j.status,
+              progress: j.progress,
+              description: j.description,
+              created_at: new Date(j.createdAt).toISOString(),
+            })),
+            queue_stats: stats,
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "cancel_job": {
+      const { job_id } = cancelJobSchema.parse(args);
+      const result = jobQueue.cancelJob(job_id);
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: result.success,
+            message: result.message,
+          }, null, 2),
+        }],
+        isError: !result.success,
+      };
+    }
+
+    // ========================================================================
+    // File Insertion Handlers
+    // ========================================================================
+
+    case "insert_file": {
+      const { file_path, parent_id, position, format } = insertFileSchema.parse(args);
+
+      // Validate parent exists
+      const allNodes = await getCachedNodes();
+      const parentNode = allNodes.find((n) => n.id === parent_id);
+      if (!parentNode) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Parent node not found: ${parent_id}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        // Read and process the file
+        const { content, format: actualFormat, fileName, fileSize } = await readAndProcessFile(
+          file_path,
+          format
+        );
+
+        // Count nodes for info
+        const lines = content.split("\n").filter((line: string) => line.trim());
+        const nodeCount = lines.length;
+
+        // For large files, suggest using submit_file_job
+        if (nodeCount > 100) {
+          // Still process but warn
+          const insertResult = await parallelInsertContent(parent_id, content, position);
+          invalidateCache();
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                ...insertResult,
+                file: {
+                  name: fileName,
+                  size: fileSize,
+                  format: actualFormat,
+                  node_count: nodeCount,
+                },
+                tip: nodeCount > 200
+                  ? "For very large files, consider using submit_file_job to avoid timeouts"
+                  : undefined,
+              }, null, 2),
+            }],
+            isError: !insertResult.success,
+          };
+        }
+
+        // For smaller files, use parallel insertion
+        const insertResult = await parallelInsertContent(parent_id, content, position);
+        invalidateCache();
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ...insertResult,
+              file: {
+                name: fileName,
+                size: fileSize,
+                format: actualFormat,
+                node_count: nodeCount,
+              },
+            }, null, 2),
+          }],
+          isError: !insertResult.success,
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+
+    case "submit_file_job": {
+      const { file_path, parent_id, position, format, description } = submitFileJobSchema.parse(args);
+
+      // Validate parent exists
+      const allNodes = await getCachedNodes();
+      const parentNode = allNodes.find((n) => n.id === parent_id);
+      if (!parentNode) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Parent node not found: ${parent_id}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Validate file exists
+      if (!fs.existsSync(file_path)) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `File not found: ${file_path}`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      const stats = fs.statSync(file_path);
+      const fileName = path.basename(file_path);
+      const jobDescription = description || `Insert file "${fileName}" under "${parentNode.name}"`;
+
+      const job = jobQueue.submit<InsertFileJobParams, InsertFileJobResult>(
+        "insert_file",
+        {
+          filePath: file_path,
+          parentId: parent_id,
+          position: position || "top",
+          format: format || "auto",
+        },
+        jobDescription
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            job_id: job.id,
+            type: job.type,
+            status: job.status,
+            description: job.description,
+            file: {
+              name: fileName,
+              size: stats.size,
+              path: file_path,
+            },
+            message: "File job submitted for background processing. Use get_job_status to check progress.",
           }, null, 2),
         }],
       };

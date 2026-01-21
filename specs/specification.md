@@ -117,6 +117,8 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 | Parallel processing | Auto-optimizes for any workload size (1 to 1000+ nodes) |
 | Order preservation | Content appears in same order as provided |
 | Staging node pattern | Prevents nodes from appearing at unintended locations during insertion |
+| **File insertion** | Insert files directly without Claude reading them first |
+| **Async job queue** | Background processing for large workloads with progress tracking |
 
 **Single entry point for all insertions**:
 
@@ -998,6 +1000,326 @@ The system automatically selects the optimal insertion strategy based on workloa
 **No manual tool selection required**: Claude should simply use `insert_content` for all hierarchical content. Parallel optimization happens automatically.
 
 **Success criteria**: Insert 200+ nodes with >70% time savings compared to single-agent approach.
+
+---
+
+### 9. Async Job Queue (Background Processing)
+
+**Goal**: Handle large workloads without hitting API rate limits or timeouts. Claude can hand off large operations to the server for background processing.
+
+| Feature | Description |
+|---------|-------------|
+| **Job submission** | Submit large workloads for background processing |
+| **Progress tracking** | Check job status and progress percentage |
+| **Result retrieval** | Get results when job completes |
+| **Job cancellation** | Cancel pending or in-progress jobs |
+| **Rate limit handling** | Server manages API pacing automatically |
+
+**Why use the job queue**:
+- Avoid API rate limit errors on large operations
+- Prevent Claude timeouts on long-running tasks
+- Enable true background processing
+- Track progress of long operations
+
+---
+
+#### submit_job Tool
+
+Submit a large workload for background processing. Returns a job ID to track progress.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `type` | "insert_content" \| "batch_operations" | yes | Type of job |
+| `params` | object | yes | Job parameters (varies by type) |
+| `description` | string | no | Human-readable description |
+
+**Job params by type**:
+- `insert_content`: `{parentId, content, position?}`
+- `batch_operations`: `{operations: [{type, params}...]}`
+
+**Response**:
+```json
+{
+  "success": true,
+  "job_id": "job-1234567890-1",
+  "type": "insert_content",
+  "status": "pending",
+  "description": "Insert 150 nodes under 'Research'",
+  "estimated_nodes": 150,
+  "message": "Job submitted for background processing. Use get_job_status to check progress."
+}
+```
+
+---
+
+#### get_job_status Tool
+
+Check the progress of a submitted job.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | yes | The job ID from submit_job |
+
+**Response**:
+```json
+{
+  "success": true,
+  "job_id": "job-1234567890-1",
+  "status": "processing",
+  "progress": {
+    "total": 150,
+    "completed": 89,
+    "failed": 0,
+    "percentComplete": 59,
+    "currentOperation": "Inserting content"
+  },
+  "created_at": "2024-01-15T10:30:00.000Z",
+  "started_at": "2024-01-15T10:30:01.000Z"
+}
+```
+
+**Job statuses**:
+- `pending`: Waiting to start
+- `processing`: Currently executing
+- `completed`: Finished successfully
+- `failed`: Finished with errors
+- `cancelled`: Cancelled by user
+
+---
+
+#### get_job_result Tool
+
+Get the result of a completed job.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | yes | The job ID from submit_job |
+
+**Response** (completed job):
+```json
+{
+  "success": true,
+  "job_id": "job-1234567890-1",
+  "status": "completed",
+  "result": {
+    "success": true,
+    "nodesCreated": 150,
+    "nodeIds": ["abc123", "def456", ...]
+  }
+}
+```
+
+---
+
+#### list_jobs Tool
+
+List all jobs with optional status filtering.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `status` | array | no | Filter by status (default: all) |
+
+**Response**:
+```json
+{
+  "success": true,
+  "jobs": [
+    {
+      "job_id": "job-1234567890-1",
+      "type": "insert_content",
+      "status": "completed",
+      "progress": { "total": 150, "completed": 150, "percentComplete": 100 },
+      "description": "Insert 150 nodes",
+      "created_at": "2024-01-15T10:30:00.000Z"
+    }
+  ],
+  "queue_stats": {
+    "pending": 0,
+    "processing": 1,
+    "completed": 5,
+    "failed": 0,
+    "cancelled": 0,
+    "total": 6
+  }
+}
+```
+
+---
+
+#### cancel_job Tool
+
+Cancel a pending or in-progress job.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | yes | The job ID to cancel |
+
+**Response**:
+```json
+{
+  "success": true,
+  "message": "Job job-1234567890-1 cancelled"
+}
+```
+
+---
+
+#### Job Queue Workflow
+
+```
+User: "Insert this large research document (500+ nodes)"
+
+1. Claude calls submit_job with type: "insert_content"
+   → Returns: {job_id: "job-123", status: "pending"}
+
+2. Claude can check progress:
+   get_job_status(job_id: "job-123")
+   → Returns: {status: "processing", progress: {completed: 245, total: 512, percentComplete: 48}}
+
+3. When done, get results:
+   get_job_result(job_id: "job-123")
+   → Returns: {status: "completed", result: {nodesCreated: 512, nodeIds: [...]}}
+
+The server handles all rate limiting internally (5 req/sec with burst of 10).
+Jobs are retained for 30 minutes after completion.
+```
+
+**Success criteria**: Insert 500+ nodes without API rate limit errors or timeouts.
+
+---
+
+### 10. File Insertion (Direct File Handoff)
+
+**Goal**: Allow Claude to pass file paths directly to the server without reading file contents first.
+
+| Feature | Description |
+|---------|-------------|
+| **Direct file insertion** | Server reads and inserts file contents |
+| **Auto format detection** | Detects markdown from file extension |
+| **Markdown conversion** | Automatically converts .md files |
+| **Background file jobs** | Submit large files for background processing |
+
+**Why use file insertion**:
+- Claude doesn't need to read or parse file contents
+- Server handles format detection and conversion
+- Reduces token usage in conversation
+- Better handling of large files
+
+---
+
+#### insert_file Tool
+
+Insert a file's contents into Workflowy. The server reads, converts (if needed), and inserts.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | yes | Absolute path to the file |
+| `parent_id` | string | yes | Target parent node ID |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
+| `format` | "auto" \| "markdown" \| "plain" | no | How to process the file (default: auto) |
+
+**Format options**:
+- `auto`: Detect from extension (`.md`/`.markdown` → markdown conversion, else plain)
+- `markdown`: Force markdown-to-Workflowy conversion
+- `plain`: Treat as pre-formatted 2-space indented content
+
+**Response**:
+```json
+{
+  "success": true,
+  "message": "Inserted 47 nodes using parallel workers",
+  "nodes": [...],
+  "file": {
+    "name": "research-notes.md",
+    "size": 15234,
+    "format": "markdown",
+    "node_count": 47
+  }
+}
+```
+
+---
+
+#### submit_file_job Tool
+
+Submit a large file for background insertion. Use for large files to avoid timeouts.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | yes | Absolute path to the file |
+| `parent_id` | string | yes | Target parent node ID |
+| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
+| `format` | "auto" \| "markdown" \| "plain" | no | How to process the file (default: auto) |
+| `description` | string | no | Optional description for tracking |
+
+**Response**:
+```json
+{
+  "success": true,
+  "job_id": "job-1234567890-2",
+  "type": "insert_file",
+  "status": "pending",
+  "description": "Insert file 'thesis.md' under 'Research'",
+  "file": {
+    "name": "thesis.md",
+    "size": 245678,
+    "path": "/Users/me/Documents/thesis.md"
+  },
+  "message": "File job submitted for background processing. Use get_job_status to check progress."
+}
+```
+
+---
+
+#### File Insertion Workflow
+
+```
+User: "Add my research notes from ~/Documents/research.md to my Research node"
+
+1. Claude calls insert_file:
+   insert_file(
+     file_path: "/Users/me/Documents/research.md",
+     parent_id: "xyz123"
+   )
+
+2. Server automatically:
+   - Reads the file
+   - Detects .md extension → markdown format
+   - Converts markdown to Workflowy format
+   - Inserts using parallel workers
+
+3. Returns result:
+   {
+     "success": true,
+     "file": {"name": "research.md", "format": "markdown", "node_count": 89}
+   }
+
+Claude never needs to read or parse the file - server handles everything.
+```
+
+**For large files** (200+ nodes expected):
+```
+1. Claude calls submit_file_job instead
+2. Server processes in background with rate limiting
+3. Claude checks progress with get_job_status
+4. Gets results with get_job_result when complete
+```
+
+**Success criteria**: Insert file contents without Claude reading the file first.
 
 ---
 
