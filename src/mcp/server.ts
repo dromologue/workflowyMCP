@@ -868,13 +868,6 @@ const getChildrenSchema = z.object({
   parent_id: z.string().optional().describe("Parent node ID. Omit to get root-level nodes"),
 });
 
-const createNodeSchema = z.object({
-  name: z.string().describe("The text content of the new node"),
-  note: z.string().optional().describe("Optional note for the node"),
-  parent_id: z.string().optional().describe('Parent node ID, target key (e.g., "inbox"), or omit for root level'),
-  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
-});
-
 const updateNodeSchema = z.object({
   node_id: z.string().describe("The ID of the node to update"),
   name: z.string().optional().describe("New text content for the node"),
@@ -897,14 +890,6 @@ const completeNodeSchema = z.object({
 
 const uncompleteNodeSchema = z.object({
   node_id: z.string().describe("The ID of the node to mark as incomplete"),
-});
-
-const createTodoSchema = z.object({
-  name: z.string().describe("The text content of the todo item"),
-  note: z.string().optional().describe("Optional note for the todo"),
-  parent_id: z.string().optional().describe('Parent node ID, target key (e.g., "inbox"), or omit for root level'),
-  completed: z.boolean().optional().describe("Whether the todo starts as completed (default: false)"),
-  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: bottom)"),
 });
 
 const listTodosSchema = z.object({
@@ -1005,14 +990,6 @@ const batchOperationsSchema = z.object({
 });
 
 // Multi-Agent Orchestrator Schema for heavy workloads
-const parallelBulkInsertSchema = z.object({
-  parent_id: z.string().describe("The ID of the parent node to insert content under"),
-  content: z.string().describe("Hierarchical content to insert (indented with 2 spaces per level)"),
-  position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: bottom)"),
-  max_workers: z.number().min(1).max(10).optional().describe("Maximum parallel workers (default: 5, max: 10)"),
-  target_nodes_per_worker: z.number().min(10).max(200).optional().describe("Target nodes per worker subtree (default: 50)"),
-});
-
 // Analyze workload schema (for planning before execution)
 const analyzeWorkloadSchema = z.object({
   content: z.string().describe("Hierarchical content to analyze"),
@@ -1085,20 +1062,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "create_node",
-        description: "Create a new node in Workflowy.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "The text content of the new node" },
-            note: { type: "string", description: "Optional note for the node" },
-            parent_id: { type: "string", description: "Parent node ID or omit for root level" },
-            position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings" },
-          },
-          required: ["name"],
-        },
-      },
-      {
         name: "update_node",
         description: "Update an existing node's name and/or note.",
         inputSchema: {
@@ -1158,21 +1121,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "create_todo",
-        description: "Create a new todo item with a checkbox.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "The text content of the todo item" },
-            note: { type: "string", description: "Optional note for the todo" },
-            parent_id: { type: "string", description: "Parent node ID or omit for root level" },
-            completed: { type: "boolean", description: "Whether the todo starts as completed" },
-            position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings" },
-          },
-          required: ["name"],
-        },
-      },
-      {
         name: "list_todos",
         description: "List all todos with optional filtering by status, parent, and search text.",
         inputSchema: {
@@ -1229,12 +1177,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "insert_content",
-        description: "Insert hierarchical content into Workflowy. Content MUST be in 2-space indented format. For markdown documents, first use convert_markdown_to_workflowy to get the properly formatted content, then pass the result here. Handles large documents (1000+ nodes) automatically with parallel processing.",
+        description: "THE PRIMARY TOOL for inserting nodes into Workflowy. Use this for ALL node creation - single nodes, bulk content, todos, any hierarchical structure. Content MUST be in 2-space indented format. For markdown, first use convert_markdown_to_workflowy. For todos, use [ ] or [x] prefix. Auto-optimizes for any workload size (1 to 1000+ nodes).",
         inputSchema: {
           type: "object",
           properties: {
             parent_id: { type: "string", description: "The ID of the parent node to insert content under" },
-            content: { type: "string", description: "Content in 2-space indented format. Each level of indentation = one level of hierarchy. Use convert_markdown_to_workflowy first if you have markdown." },
+            content: { type: "string", description: "Content in 2-space indented format. Single line = single node. Multiple indented lines = hierarchy. Use [ ] for todos, [x] for completed todos. Use convert_markdown_to_workflowy first if you have markdown." },
             position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings (default: top)" },
           },
           required: ["parent_id", "content"],
@@ -1404,43 +1352,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "parallel_bulk_insert",
-        description: "Insert large hierarchical content using multiple parallel workers. Designed for heavy workloads (50+ nodes). Automatically splits content into independent subtrees and processes them concurrently with separate rate limiters. Use analyze_workload first to estimate time savings. Returns progress updates during execution.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            parent_id: {
-              type: "string",
-              description: "The ID of the parent node to insert content under",
-            },
-            content: {
-              type: "string",
-              description: "Hierarchical content to insert (indented with 2 spaces per level). Each top-level item becomes a subtree that can be processed in parallel.",
-            },
-            position: {
-              type: "string",
-              enum: ["top", "bottom"],
-              description: "Position relative to siblings (default: bottom)",
-            },
-            max_workers: {
-              type: "number",
-              minimum: 1,
-              maximum: 10,
-              description: "Maximum parallel workers (default: 5). Each worker has its own rate limiter.",
-            },
-            target_nodes_per_worker: {
-              type: "number",
-              minimum: 10,
-              maximum: 200,
-              description: "Target nodes per worker subtree (default: 50). Smaller values = more parallelism but more overhead.",
-            },
-          },
-          required: ["parent_id", "content"],
-        },
-      },
-      {
         name: "analyze_workload",
-        description: "Analyze hierarchical content to estimate parallel insertion performance. Returns subtree breakdown, recommended worker count, and estimated time savings compared to single-threaded insertion. Use this before parallel_bulk_insert to understand the workload.",
+        description: "Analyze hierarchical content to estimate insertion performance. Returns subtree breakdown, node count, and estimated time. Use this to understand workload before insert_content.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1545,20 +1458,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    case "create_node": {
-      const { name: nodeName, note, parent_id, position } = createNodeSchema.parse(args);
-      const body: Record<string, unknown> = { name: nodeName };
-      if (note) body.note = note;
-      if (parent_id) body.parent_id = parent_id;
-      if (position) body.position = position;
-
-      const result = await workflowyRequest("/nodes", "POST", body);
-      invalidateCache();
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    }
-
     case "update_node": {
       const { node_id, name: nodeName, note } = updateNodeSchema.parse(args);
       const body: Record<string, unknown> = {};
@@ -1608,35 +1507,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       invalidateCache();
       return {
         content: [{ type: "text", text: `Node ${node_id} marked as incomplete` }],
-      };
-    }
-
-    case "create_todo": {
-      const { name: todoName, note, parent_id, completed, position } = createTodoSchema.parse(args);
-      const body: Record<string, unknown> = {
-        name: todoName,
-        layoutMode: "todo",
-      };
-      if (note) body.note = note;
-      if (parent_id) body.parent_id = parent_id;
-      if (position) body.position = position;
-
-      const result = (await workflowyRequest("/nodes", "POST", body)) as { id: string };
-
-      if (completed) {
-        await workflowyRequest(`/nodes/${result.id}/complete`, "POST");
-      }
-
-      invalidateCache();
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            ...result,
-            completed: completed || false,
-            message: `Todo created${completed ? " and marked complete" : ""}`,
-          }, null, 2),
-        }],
       };
     }
 
@@ -2992,141 +2862,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
             recommendation: splitResult.totalNodes < 20
               ? "Use insert_content for small workloads (< 20 nodes)"
-              : splitResult.totalNodes < 50
-              ? "Use insert_content or parallel_bulk_insert with 2 workers"
-              : `Use parallel_bulk_insert with ${Math.min(splitResult.recommendedAgents, max_workers)} workers for optimal performance`,
-          }, null, 2),
-        }],
-      };
-    }
-
-    case "parallel_bulk_insert": {
-      const {
-        parent_id,
-        content,
-        position = "bottom",
-        max_workers = 5,
-        target_nodes_per_worker = 50,
-      } = parallelBulkInsertSchema.parse(args);
-
-      // Validate parent exists
-      const allNodes = await getCachedNodes();
-      const parentNode = allNodes.find((n) => n.id === parent_id);
-      if (!parentNode) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              error: `Parent node not found: ${parent_id}`,
-            }, null, 2),
-          }],
-          isError: true,
-        };
-      }
-
-      // Analyze the workload first
-      const splitResult = splitIntoSubtrees(content, {
-        maxSubtrees: max_workers,
-        targetNodesPerSubtree: target_nodes_per_worker,
-      });
-
-      if (splitResult.totalNodes === 0) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: "No content to insert",
-              total_nodes: 0,
-              created_nodes: 0,
-            }, null, 2),
-          }],
-        };
-      }
-
-      // For small workloads, use the existing single-agent approach
-      if (splitResult.subtrees.length === 1) {
-        const createdNodes = await insertHierarchicalContent(parent_id, content, position);
-        invalidateCache();
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Inserted ${createdNodes.length} nodes (single-agent mode for small workload)`,
-              total_nodes: splitResult.totalNodes,
-              created_nodes: createdNodes.length,
-              node_ids: createdNodes.map((n) => n.id),
-              mode: "single_agent",
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Create orchestrator for parallel processing
-      const orchestrator = createOrchestrator(
-        async (parentId, subtreeContent, pos) => {
-          const nodes = await insertHierarchicalContent(parentId, subtreeContent, pos);
-          return nodes.map((n) => ({ id: n.id, name: n.name }));
-        },
-        {
-          maxWorkers: max_workers,
-          workerRateLimit: 5,
-          retryOnFailure: true,
-          maxRetries: 2,
-          splitConfig: {
-            targetNodesPerSubtree: target_nodes_per_worker,
-            maxSubtrees: max_workers,
-          },
-        }
-      );
-
-      // Collect progress updates
-      const progressUpdates: OrchestratorProgress[] = [];
-      orchestrator.on("progress", (progress: OrchestratorProgress) => {
-        progressUpdates.push(progress);
-      });
-
-      // Execute the parallel insertion
-      const startTime = Date.now();
-      const result = await orchestrator.execute({
-        parentId: parent_id,
-        content,
-        position,
-      });
-
-      // Invalidate cache after bulk operations
-      invalidateCache();
-
-      const duration = Date.now() - startTime;
-      const timeSavings = estimateTimeSavings(splitResult.totalNodes, splitResult.subtrees.length, 5);
-
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            success: result.success,
-            message: result.success
-              ? `Successfully inserted ${result.createdNodes} nodes using ${splitResult.subtrees.length} parallel workers`
-              : `Partial success: ${result.createdNodes} nodes created, ${result.failedSubtrees.length} subtrees failed`,
-            stats: {
-              total_nodes: splitResult.totalNodes,
-              created_nodes: result.createdNodes,
-              failed_subtrees: result.failedSubtrees.length,
-              workers_used: splitResult.subtrees.length,
-              duration_ms: duration,
-              duration_seconds: Math.round(duration / 100) / 10,
-            },
-            performance: {
-              estimated_single_agent_ms: timeSavings.singleAgentMs,
-              actual_parallel_ms: duration,
-              actual_savings_percent: Math.round(((timeSavings.singleAgentMs - duration) / timeSavings.singleAgentMs) * 100),
-            },
-            node_ids: result.allNodeIds,
-            errors: result.errors.length > 0 ? result.errors : undefined,
-            mode: "parallel_workers",
+              : "Use insert_content - it auto-optimizes for any workload size",
           }, null, 2),
         }],
       };
@@ -3156,7 +2892,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 estimated_nodes: stats.estimatedNodes,
               },
               recommendation: stats.estimatedNodes > 100
-                ? "Large document - consider using parallel_bulk_insert after conversion"
+                ? "Large document - consider using insert_content after conversion"
                 : "Standard size - can be used directly with insert_content",
             }, null, 2),
           }],
@@ -3186,7 +2922,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
             warnings: result.warnings.length > 0 ? result.warnings : undefined,
             usage_hint: result.nodeCount > 100
-              ? "Large output - use parallel_bulk_insert for best performance"
+              ? "Large output - use insert_content for best performance"
               : "Ready to use with insert_content or paste directly into Workflowy",
           }, null, 2),
         }],
