@@ -21,7 +21,7 @@ TypeScript MCP server for Workflowy content management and concept mapping. Uses
 
 ### Three Layers
 
-- **`src/mcp/server.ts`** — The main file (~3800 lines). Contains all 24+ MCP tool definitions, handlers, and orchestration logic. Tools are registered inline via `ListToolsRequestSchema`; Zod schemas validate inputs in each handler.
+- **`src/mcp/server.ts`** — The main file (~4050 lines). Contains all 28 MCP tool definitions, handlers, and orchestration logic. Tools are registered inline via `ListToolsRequestSchema`; Zod schemas validate inputs in each handler.
 - **`src/shared/`** — Reusable modules: API clients, utilities, config, types.
 - **`src/cli/`** — Standalone CLI for concept map generation (uses Anthropic SDK + Graphviz WASM).
 
@@ -63,7 +63,6 @@ Tests use Vitest with `globals: true`. All tests mock `workflowyRequest` — no 
 
 Environment variables loaded from `.env` via dotenv (`src/shared/config/environment.ts`):
 - `WORKFLOWY_API_KEY` (required)
-- `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN` (for concept map image hosting)
 - `ANTHROPIC_API_KEY` (for CLI `--auto` concept extraction)
 
 ## Module System

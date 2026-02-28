@@ -55,34 +55,46 @@ src/
 │   ├── concept-map.ts    # Standalone concept map generation
 │   └── setup.ts          # Interactive credential wizard
 ├── mcp/
-│   └── server.ts         # MCP server with all tool handlers (~2000 lines)
+│   └── server.ts         # MCP server with all tool handlers (~4050 lines)
 └── shared/               # Shared utilities (used by CLI and MCP)
     ├── api/
     │   ├── workflowy.ts  # Workflowy API client with retry
-    │   ├── dropbox.ts    # Dropbox OAuth + image upload
     │   └── retry.ts      # Retry logic with exponential backoff
     ├── config/
     │   └── environment.ts # Environment variables, constants
     ├── types/
     │   └── index.ts      # All TypeScript interfaces
     └── utils/
-        ├── cache.ts          # Node caching with TTL
-        ├── node-paths.ts     # Breadcrumb path building
-        ├── text-processing.ts # Parsing, formatting, link extraction
-        └── keyword-extraction.ts # Keywords, relevance scoring
+        ├── cache.ts               # Node caching with TTL
+        ├── concept-map-html.ts    # Interactive HTML concept map generator
+        ├── date-parser.ts         # Due date parsing from node text
+        ├── jobQueue.ts            # Background job processing
+        ├── keyword-extraction.ts  # Keywords, relevance scoring
+        ├── large-markdown-converter.ts # Markdown → Workflowy format
+        ├── node-paths.ts          # Breadcrumb path building
+        ├── orchestrator.ts        # Parallel insertion orchestration
+        ├── rateLimiter.ts         # Token bucket rate limiter
+        ├── requestQueue.ts        # Concurrent request queue
+        ├── scope-utils.ts         # Subtree traversal, scope filtering
+        ├── subtree-parser.ts      # Content splitting for parallel insertion
+        ├── tag-parser.ts          # Tag and assignee extraction
+        └── text-processing.ts     # Parsing, formatting, link extraction
 ```
 
 ### MCP Tools (in server.ts)
 
 | Category | Tools |
 |----------|-------|
-| Search & Navigation | **find_node**, search_nodes, get_node, get_children, export_all, list_targets, find_insert_targets |
-| Content Creation | create_node, insert_content, smart_insert |
-| Content Modification | update_node, move_node, delete_node |
-| Todo Management | create_todo, list_todos, complete_node, uncomplete_node |
+| Search & Navigation | **find_node**, search_nodes (with filters), get_node, get_children, **find_backlinks** |
+| Content Creation | create_node, insert_content, smart_insert, convert_markdown_to_workflowy |
+| Content Modification | update_node, move_node, delete_node, **duplicate_node**, **create_from_template**, **bulk_update** |
+| Todo Management | create_todo, list_todos, complete_node, uncomplete_node, **list_upcoming**, **list_overdue** |
+| Project Management | **get_project_summary**, **get_recent_changes**, **daily_review** |
 | Knowledge Linking | find_related, create_links |
-| Concept Mapping (Legacy) | generate_concept_map |
-| **LLM-Powered Concept Mapping** | **get_node_content_for_analysis, render_concept_map** |
+| Concept Mapping | get_node_content_for_analysis, **render_interactive_concept_map** (MCP Apps) |
+| Graph Analysis | **analyze_relationships**, **create_adjacency_matrix**, **calculate_centrality**, **analyze_network_structure** |
+| Batch & Async | batch_operations, submit_job, get_job_status, list_jobs, cancel_job |
+| File Insertion | insert_file, submit_file_job |
 
 ## Key Design Decisions
 
@@ -198,38 +210,13 @@ Target Parent             ← 3. Move top-level nodes
 - (-) English-centric stop word list
 - (-) No semantic understanding (only keyword matching)
 
-### ADR-007: Concept Map Generation (Legacy)
-
-**Context**: Visual representation of node relationships aids understanding of knowledge structure.
-
-**Decision**: Generate Graphviz DOT format, render via @hpcc-js/wasm-graphviz, convert to PNG/JPEG via Sharp, host on Dropbox for Workflowy embedding.
-
-**Architecture** (keyword-based):
-```
-Node Content → Keyword Extraction → Related Node Scoring
-                                          ↓
-DOT Graph ← Edge/Node Building ← Top N Results
-    ↓
-SVG (Graphviz WASM) → PNG/JPEG (Sharp @ 2400px, 300 DPI)
-    ↓
-Dropbox Upload → Shareable URL → Workflowy Node Insert
-```
-
-**Consequences**:
-- (+) No native dependencies (WASM-based)
-- (+) High-quality output suitable for embedding
-- (+) Optional Dropbox hosting with local fallback
-- (-) Requires Dropbox OAuth setup for auto-insert
-- (-) Large dependencies (Sharp, Graphviz WASM)
-- (-) Keyword matching lacks semantic understanding
-
 ### ADR-009: LLM-Powered Concept Mapping
 
-**Context**: The keyword-based concept map approach (ADR-007) requires users to provide concepts upfront and only finds relationships through co-occurrence patterns. This misses the semantic understanding that Claude can provide.
+**Context**: Users want to visualize conceptual relationships in their Workflowy content. Claude's semantic understanding can discover meaningful concepts and relationships that keyword matching cannot.
 
 **Decision**: Implement a two-tool workflow where Claude acts as the semantic analyzer:
 1. `get_node_content_for_analysis` - Extracts subtree content formatted for LLM analysis
-2. `render_concept_map` - Renders Claude's discovered concepts and relationships
+2. `render_interactive_concept_map` - Renders Claude's discovered concepts and relationships as interactive HTML
 
 **Architecture** (LLM-powered):
 ```
@@ -238,7 +225,7 @@ Dropbox Upload → Shareable URL → Workflowy Node Insert
         ┌──────────────────────┼──────────────────────┐
         │                      │                      │
         ▼                      │                      ▼
-get_node_content_for_analysis  │           render_concept_map
+get_node_content_for_analysis  │    render_interactive_concept_map
         │                      │                      │
         ▼                      │                      │
 ┌───────────────────┐          │         ┌───────────────────┐
@@ -250,9 +237,9 @@ get_node_content_for_analysis  │           render_concept_map
                                │                   │
                                │                   ▼
                                │    ┌────────────────────────┐
-                               │    │ Graphviz DOT → SVG     │
-                               │    │ Sharp → PNG/JPEG       │
-                               │    │ Dropbox → Workflowy    │
+                               │    │ Interactive HTML + SVG  │
+                               │    │ MCP Apps protocol       │
+                               │    │ Inline in conversation  │
                                │    └────────────────────────┘
 ```
 
@@ -271,10 +258,56 @@ get_node_content_for_analysis  │           render_concept_map
 - (+) No need to provide concepts upfront - Claude finds them
 - (+) Meaningful relationship labels based on actual content meaning
 - (+) Follows links to include cross-referenced content
-- (+) Same high-quality visual output as legacy approach
+- (+) Interactive HTML output with zoom, pan, and collapse/expand
+- (+) No external dependencies (no Dropbox, no image hosting)
 - (-) Requires two tool calls instead of one
 - (-) Depends on Claude's analysis quality
 - (-) Cannot be used without an LLM orchestrator
+- (-) Requires Claude Desktop MCP Apps support
+
+### ADR-011: Tag/Assignee/Date Parsing from Node Text
+
+**Context**: Workflowy has no native tag, assignee, or due date fields. Users encode this metadata inline in node text using conventions like `#tag`, `@person`, and `due:YYYY-MM-DD`.
+
+**Decision**: Parse tags, assignees, and due dates from node text using regex. Provide reusable utility modules (`tag-parser.ts`, `date-parser.ts`) used by search filters, project summary, daily review, and bulk update tools.
+
+**Parsing rules**:
+- Tags: `/#([\w-]+)/g` — extracted from name and note, lowercased, deduplicated
+- Assignees: `/@([\w-]+)/g` — same treatment
+- Due dates (priority order): `due:YYYY-MM-DD` > `#due-YYYY-MM-DD` > bare `YYYY-MM-DD`
+
+**Consequences**:
+- (+) Works with existing Workflowy data without schema changes
+- (+) Consistent parsing across all tools
+- (-) Relies on user conventions — non-standard formats ignored
+- (-) Bare dates may false-positive on unrelated date strings
+
+### ADR-012: Interactive Concept Maps via MCP Apps
+
+**Context**: Static PNG/JPEG concept maps cannot be explored interactively. Users want to collapse/expand concept clusters and zoom into areas of interest.
+
+**Decision**: Implement interactive concept maps using the MCP Apps protocol extension. The `render_interactive_concept_map` tool declares a `_meta.ui.resourceUri` pointing to a `ui://` HTML resource. The server handles `ListResources` and `ReadResource` to serve self-contained HTML with SVG + vanilla JS.
+
+**Architecture**:
+```
+Tool declaration → _meta.ui.resourceUri: "ui://concept-map/interactive"
+Tool call        → generates HTML, stores in module-level variable
+Host (Claude)    → fetches ui:// resource via ReadResource
+                 → renders in sandboxed iframe inline in conversation
+```
+
+**Key decisions**:
+1. Manual MCP Apps protocol on low-level `Server` class (avoids migration to `McpServer`)
+2. Self-contained HTML (~20KB, no external dependencies)
+3. Radial layout with collapsible major/detail clusters
+4. Module-level state for last-generated map (simple, stateless per tool call)
+
+**Consequences**:
+- (+) Interactive exploration of concept relationships
+- (+) No external dependencies or image hosting needed
+- (+) Works alongside existing static maps (separate tool)
+- (-) Requires Claude Desktop MCP Apps support
+- (-) Module-level state means only one interactive map at a time
 
 ### ADR-008: Retry Logic with Exponential Backoff
 

@@ -86,8 +86,16 @@ WORKFLOWY_API_KEY=your-api-key
 | Tool | What it does |
 |------|-------------|
 | `get_node_content_for_analysis` | Export subtree content for Claude to analyze |
-| `render_concept_map` | Generate a visual concept map image |
-| `generate_concept_map` | Legacy: combined search + render |
+| `render_interactive_concept_map` | Generate an interactive HTML concept map inline in Claude Desktop |
+
+### Graph Analysis
+
+| Tool | What it does |
+|------|-------------|
+| `analyze_relationships` | Extract relationships from data objects, compute graph density |
+| `create_adjacency_matrix` | Build adjacency matrix from relationship pairs |
+| `calculate_centrality` | Degree, betweenness, closeness, eigenvector centrality |
+| `analyze_network_structure` | Combined relationship extraction + centrality in one step |
 
 ### Files & Bulk
 
@@ -106,18 +114,6 @@ Tags, assignees, and due dates are parsed from node text:
 - **Assignees:** `@alice`, `@bob`
 - **Due dates:** `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15`
 
-## Optional: Dropbox (for concept map images)
-
-Add to `.env`:
-
-```
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=your-refresh-token
-```
-
-Without Dropbox, concept map images save to `~/Downloads/`.
-
 ## Optional: Anthropic API (for CLI auto-extraction)
 
 ```
@@ -125,6 +121,18 @@ ANTHROPIC_API_KEY=sk-ant-your-key
 ```
 
 Enables `--auto` mode in the CLI concept map tool.
+
+## Generating Interactive Concept Maps
+
+Ask Claude to analyze a Workflowy subtree and render an interactive concept map:
+
+```
+Analyze the content under [node name] and create an interactive concept map using render_interactive_concept_map.
+First use get_node_content_for_analysis to read the content, then identify the key concepts and relationships,
+and render them as an interactive map.
+```
+
+Claude will extract the content, identify concepts and relationships semantically, and render a zoomable, collapsible HTML concept map inline in the conversation.
 
 ## CLI Concept Maps
 

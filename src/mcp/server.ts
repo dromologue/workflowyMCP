@@ -8,23 +8,20 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs";
-import { Graphviz } from "@hpcc-js/wasm-graphviz";
-import sharp from "sharp";
 
 // Import from shared modules
 import { validateConfig } from "../shared/config/environment.js";
 import { workflowyRequest } from "../shared/api/workflowy.js";
-import { uploadToDropbox } from "../shared/api/dropbox.js";
 import type {
   WorkflowyNode,
   NodeWithPath,
   RelatedNode,
-  ConceptMapNode as LegacyConceptMapNode,
-  ConceptMapEdge as LegacyConceptMapEdge,
   CreatedNode,
   AnalysisContentNode,
   AnalysisContentResult,
@@ -48,11 +45,8 @@ import { buildNodePaths } from "../shared/utils/node-paths.js";
 import {
   parseIndentedContent,
   formatNodesForSelection,
-  escapeForDot,
   generateWorkflowyLink,
-  validateConceptMapInput,
   extractWorkflowyLinks,
-  CONCEPT_MAP_LIMITS,
 } from "../shared/utils/text-processing.js";
 import {
   extractKeywords,
@@ -94,6 +88,17 @@ import {
 } from "../shared/utils/scope-utils.js";
 import { parseTags, parseNodeTags, nodeHasTag, nodeHasAssignee } from "../shared/utils/tag-parser.js";
 import { parseDueDateFromNode, isOverdue, isDueWithin } from "../shared/utils/date-parser.js";
+import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
+import {
+  buildGraphStructure,
+  calculateDegreeCentrality,
+  calculateBetweennessCentrality,
+  calculateClosenessCentrality,
+  calculateEigenvectorCentrality,
+  extractRelationshipsFromData,
+  formatCentralityResults,
+  type GraphEdge,
+} from "../shared/utils/graph-analysis.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -183,306 +188,6 @@ async function findRelatedNodes(
   return { keywords, relatedNodes };
 }
 
-// ============================================================================
-// Concept Map Generation
-// ============================================================================
-
-// Relationship words to look for when concepts co-occur
-const RELATIONSHIP_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /\b(leads?\s+to|results?\s+in|causes?|produces?)\b/i, label: "leads to" },
-  { pattern: /\b(influences?|affects?|impacts?)\b/i, label: "influences" },
-  { pattern: /\b(is\s+part\s+of|belongs?\s+to|within)\b/i, label: "is part of" },
-  { pattern: /\b(includes?|contains?|comprises?)\b/i, label: "includes" },
-  { pattern: /\b(requires?|needs?|depends?\s+on)\b/i, label: "requires" },
-  { pattern: /\b(contrasts?\s+with|differs?\s+from|versus|vs\.?|unlike)\b/i, label: "contrasts with" },
-  { pattern: /\b(similar\s+to|like|resembles?)\b/i, label: "similar to" },
-  { pattern: /\b(defines?|means?|is\s+defined\s+as)\b/i, label: "defines" },
-  { pattern: /\b(examples?\s+of|such\s+as|e\.g\.|for\s+instance)\b/i, label: "example of" },
-  { pattern: /\b(types?\s+of|kinds?\s+of|forms?\s+of)\b/i, label: "type of" },
-  { pattern: /\b(supports?|reinforces?|strengthens?)\b/i, label: "supports" },
-  { pattern: /\b(opposes?|contradicts?|challenges?)\b/i, label: "opposes" },
-  { pattern: /\b(precedes?|before|prior\s+to)\b/i, label: "precedes" },
-  { pattern: /\b(follows?|after|subsequent\s+to)\b/i, label: "follows" },
-  { pattern: /\b(enables?|allows?|permits?)\b/i, label: "enables" },
-  { pattern: /\b(prevents?|blocks?|inhibits?)\b/i, label: "prevents" },
-  { pattern: /\b(creates?|generates?|builds?)\b/i, label: "creates" },
-  { pattern: /\b(uses?|utilizes?|employs?)\b/i, label: "uses" },
-  { pattern: /\b(extends?|expands?|builds?\s+on)\b/i, label: "extends" },
-  { pattern: /\b(criticizes?|critiques?|questions?)\b/i, label: "critiques" },
-];
-
-interface ConceptMapNode {
-  id: string;
-  label: string;
-  level: number; // 0 = core, 1 = major concept, 2 = detail
-  occurrences: number;
-  depth: number; // average depth in Workflowy hierarchy where found
-}
-
-interface ConceptMapEdge {
-  from: string;
-  to: string;
-  label: string; // relationship label
-  weight: number; // strength of connection
-  sourceContexts: string[]; // excerpts showing the relationship
-}
-
-function extractRelationshipLabel(text: string, concept1: string, concept2: string): string {
-  // Find the text between or around the two concepts
-  const lowerText = text.toLowerCase();
-  const pos1 = lowerText.indexOf(concept1.toLowerCase());
-  const pos2 = lowerText.indexOf(concept2.toLowerCase());
-
-  if (pos1 === -1 || pos2 === -1) return "relates to";
-
-  // Get the text between the concepts (with some buffer)
-  const start = Math.max(0, Math.min(pos1, pos2) - 20);
-  const end = Math.min(text.length, Math.max(pos1 + concept1.length, pos2 + concept2.length) + 20);
-  const context = text.substring(start, end);
-
-  // Look for relationship patterns
-  for (const { pattern, label } of RELATIONSHIP_PATTERNS) {
-    if (pattern.test(context)) {
-      return label;
-    }
-  }
-
-  return "relates to";
-}
-
-function generateHierarchicalConceptMap(
-  coreNode: ConceptMapNode,
-  conceptNodes: ConceptMapNode[],
-  edges: ConceptMapEdge[],
-  title: string
-): string {
-  const lines: string[] = [
-    "digraph ConceptMap {",
-    '  charset="UTF-8";',  // Ensure proper handling of accented characters
-    '  layout=neato;',     // Force-directed layout for better space usage
-    '  overlap=false;',    // Prevent node overlap
-    '  splines=true;',     // Curved edges
-    '  sep="+20";',        // Minimum separation between nodes
-    '  ratio=1;',          // Force 1:1 square aspect ratio
-    '  size="14,14!";',    // Force exact square dimensions (! = force)
-    '  bgcolor="white";',
-    `  label="${escapeForDot(title)}";`,
-    '  labelloc="t";',
-    '  fontsize=28;',
-    '  fontname="Arial Bold";',
-    "",
-    "  // Node styling",
-    '  node [shape=box, style="rounded,filled", fontname="Arial"];',
-    "",
-  ];
-
-  // Core concept - largest, distinctive color, pinned at center
-  lines.push("  // Core concept (center)");
-  lines.push(
-    `  "${coreNode.id}" [label="${escapeForDot(coreNode.label)}", fillcolor="#1a5276", fontcolor="white", fontsize=16, penwidth=3, width=2.5, pos="7,7!", pin=true];`
-  );
-  lines.push("");
-
-  // Group concepts by level for ranking
-  const level1 = conceptNodes.filter(n => n.level === 1);
-  const level2 = conceptNodes.filter(n => n.level === 2);
-
-  // Level 1 - Major concepts (medium size, warm colors)
-  if (level1.length > 0) {
-    lines.push("  // Major concepts");
-    const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c"];
-    level1.forEach((node, index) => {
-      const color = majorColors[index % majorColors.length];
-      const width = Math.max(1.5, Math.min(1.5 + node.occurrences * 0.1, 2.2));
-      lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=13, width=${width}];`
-      );
-    });
-    lines.push("");
-  }
-
-  // Level 2 - Detail concepts (smaller, lighter colors)
-  if (level2.length > 0) {
-    lines.push("  // Detail concepts");
-    const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4"];
-    level2.forEach((node, index) => {
-      const color = detailColors[index % detailColors.length];
-      const width = Math.max(1.0, Math.min(1.0 + node.occurrences * 0.08, 1.8));
-      lines.push(
-        `  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=11, width=${width}];`
-      );
-    });
-    lines.push("");
-  }
-
-  // Edges with relationship labels
-  lines.push("  // Relationships (labeled connections)");
-  const addedEdges = new Set<string>();
-
-  edges.forEach((edge) => {
-    const edgeKey = [edge.from, edge.to].sort().join("|||");
-    if (addedEdges.has(edgeKey)) return;
-    addedEdges.add(edgeKey);
-
-    const penwidth = Math.min(1 + edge.weight * 0.3, 3);
-    const label = edge.label !== "relates to" ? edge.label : "";
-
-    // Use different edge styles based on relationship type
-    let edgeStyle = "";
-    if (edge.label.includes("contrasts") || edge.label.includes("opposes")) {
-      edgeStyle = ', style="dashed", color="#c0392b"';
-    } else if (edge.label.includes("supports") || edge.label.includes("extends")) {
-      edgeStyle = ', color="#27ae60"';
-    } else if (edge.label.includes("requires") || edge.label.includes("depends")) {
-      edgeStyle = ', color="#8e44ad"';
-    } else {
-      edgeStyle = ', color="#566573"';
-    }
-
-    if (label) {
-      lines.push(
-        `  "${edge.from}" -> "${edge.to}" [label="${escapeForDot(label)}", fontsize=9, penwidth=${penwidth}${edgeStyle}];`
-      );
-    } else {
-      lines.push(
-        `  "${edge.from}" -> "${edge.to}" [penwidth=${penwidth}${edgeStyle}];`
-      );
-    }
-  });
-
-  lines.push("}");
-  return lines.join("\n");
-}
-
-// Legacy function for backward compatibility (hub-and-spoke style)
-function generateDotGraph(
-  centerNode: LegacyConceptMapNode,
-  relatedNodes: Array<{ node: LegacyConceptMapNode; keywords: string[]; weight: number }>,
-  title: string
-): string {
-  const lines: string[] = [
-    "digraph ConceptMap {",
-    '  charset="UTF-8";',  // Ensure proper handling of accented characters
-    '  layout=neato;',     // Force-directed layout for better space usage
-    '  overlap=false;',    // Prevent node overlap
-    '  splines=true;',     // Curved edges
-    '  sep="+20";',        // Minimum separation between nodes
-    '  ratio=1;',          // Force 1:1 square aspect ratio
-    '  size="14,14!";',    // Force exact square dimensions (! = force)
-    '  bgcolor="white";',
-    `  label="${escapeForDot(title)}";`,
-    '  labelloc="t";',
-    '  fontsize=24;',
-    '  fontname="Arial";',
-    "",
-    "  // Node styling",
-    '  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=12];',
-    "",
-    "  // Center node (pinned at center)",
-    `  "${centerNode.id}" [label="${escapeForDot(centerNode.label)}", fillcolor="#4A90D9", fontcolor="white", penwidth=2, pos="7,7!", pin=true];`,
-    "",
-    "  // Related nodes",
-  ];
-
-  const colors = ["#7CB342", "#F9A825", "#EF6C00", "#AB47BC", "#26A69A"];
-
-  relatedNodes.forEach((item, index) => {
-    const color = colors[index % colors.length];
-    lines.push(
-      `  "${item.node.id}" [label="${escapeForDot(item.node.label)}", fillcolor="${color}", fontcolor="white"];`
-    );
-  });
-
-  lines.push("");
-  lines.push("  // Edges");
-
-  relatedNodes.forEach((item) => {
-    const keywordLabel = item.keywords.slice(0, 2).join(", ");
-    const penwidth = Math.min(1 + item.weight / 3, 4);
-    lines.push(
-      `  "${centerNode.id}" -> "${item.node.id}" [label="${escapeForDot(keywordLabel)}", penwidth=${penwidth}, color="#666666"];`
-    );
-  });
-
-  lines.push("}");
-  return lines.join("\n");
-}
-
-async function generateConceptMapImage(
-  centerNode: { id: string; name: string },
-  relatedNodes: RelatedNode[],
-  title: string,
-  format: "png" | "jpeg" = "png"
-): Promise<{ success: boolean; buffer?: Buffer; error?: string }> {
-  try {
-    const graphviz = await Graphviz.load();
-
-    const center: LegacyConceptMapNode = {
-      id: centerNode.id,
-      label: centerNode.name || "Center",
-      isCenter: true,
-    };
-
-    const related = relatedNodes.map((n) => ({
-      node: { id: n.id, label: n.name || "Node", isCenter: false },
-      keywords: n.matchedKeywords,
-      weight: n.relevanceScore,
-    }));
-
-    const dotGraph = generateDotGraph(center, related, title);
-    const svg = graphviz.dot(dotGraph, "svg");
-
-    const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-      .resize(2000, 2000, {
-        fit: "inside",        // Fit within square bounds
-        withoutEnlargement: false,
-      })
-      .flatten({ background: "#ffffff" })
-      [format]({
-        quality: format === "jpeg" ? 95 : undefined,
-      })
-      .toBuffer();
-
-    return { success: true, buffer: imageBuffer };
-  } catch (err) {
-    return {
-      success: false,
-      error: `Failed to generate concept map: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-}
-
-async function generateHierarchicalConceptMapImage(
-  coreNode: ConceptMapNode,
-  conceptNodes: ConceptMapNode[],
-  edges: ConceptMapEdge[],
-  title: string,
-  format: "png" | "jpeg" = "png"
-): Promise<{ success: boolean; buffer?: Buffer; error?: string }> {
-  try {
-    const graphviz = await Graphviz.load();
-    const dotGraph = generateHierarchicalConceptMap(coreNode, conceptNodes, edges, title);
-    const svg = graphviz.dot(dotGraph, "svg");
-
-    const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-      .resize(2000, 2000, {
-        fit: "inside",        // Fit within square bounds
-        withoutEnlargement: false,
-      })
-      .flatten({ background: "#ffffff" })
-      [format]({
-        quality: format === "jpeg" ? 95 : undefined,
-      })
-      .toBuffer();
-
-    return { success: true, buffer: imageBuffer };
-  } catch (err) {
-    return {
-      success: false,
-      error: `Failed to generate concept map: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-}
 
 // ============================================================================
 // Hierarchical Content Insertion
@@ -863,24 +568,10 @@ const createLinksSchema = z.object({
   position: z.enum(["note", "child"]).optional().describe("Where to place links: 'note' appends to node note, 'child' creates a 'Related' child node (default: child)"),
 });
 
-const generateConceptMapSchema = z.object({
-  node_id: z.string().describe("The ID of the parent node whose children will be analyzed"),
-  core_concept: z.string().optional().describe("The central/main concept of the map. If omitted, uses the parent node name."),
-  concepts: z.array(z.string()).describe("REQUIRED: The concepts to map. These become nodes connected to the core and to each other based on relationships found in content."),
-  scope: z.enum(["this_node", "children", "siblings", "ancestors", "all"]).optional().describe("Search scope for content to analyze (default: 'children')"),
-  output_path: z.string().optional().describe("Output file path. Defaults to ~/Downloads/concept-map-{timestamp}.png"),
-  format: z.enum(["png", "jpeg"]).optional().describe("Image format (default: png)"),
-  title: z.string().optional().describe("Title for the concept map (defaults to core concept)"),
-});
-
 const insertContentSchema = z.object({
   parent_id: z.string().describe("The ID of the parent node to insert content under"),
   content: z.string().describe("The content to insert. Must be 2-space indented format. Use convert_markdown_to_workflowy first if you have markdown."),
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
-});
-
-const findInsertTargetsSchema = z.object({
-  query: z.string().describe("Search text to find potential target nodes"),
 });
 
 const smartInsertSchema = z.object({
@@ -904,33 +595,6 @@ const getNodeContentForAnalysisSchema = z.object({
   max_nodes: z.number().optional().describe("Maximum number of nodes to return (default: 500)"),
   follow_links: z.boolean().optional().describe("Follow Workflowy internal links to include linked content (default: true)"),
   format: z.enum(["structured", "outline"]).optional().describe("Output format: 'structured' for JSON, 'outline' for indented text (default: structured)"),
-});
-
-const renderConceptMapSchema = z.object({
-  title: z.string().describe("Title for the concept map"),
-  core_concept: z.object({
-    label: z.string().describe("The central concept label"),
-    description: z.string().optional().describe("Optional description for the core concept"),
-  }).describe("The central/main concept of the map"),
-  concepts: z.array(z.object({
-    id: z.string().describe("Unique identifier (slug form, e.g., 'truth-procedure')"),
-    label: z.string().describe("Display label for the concept"),
-    level: z.enum(["major", "detail"]).describe("Hierarchy level: 'major' for key concepts, 'detail' for supporting concepts"),
-    importance: z.number().optional().describe("Importance score 1-10 (affects node size, default: 5)"),
-    description: z.string().optional().describe("Brief description of the concept"),
-  })).describe("The concepts discovered through analysis"),
-  relationships: z.array(z.object({
-    from: z.string().describe("Source concept ID (or 'core' for the central concept)"),
-    to: z.string().describe("Target concept ID"),
-    type: z.string().describe("Relationship type (e.g., 'produces', 'critiques', 'enables', 'contrasts with')"),
-    strength: z.number().optional().describe("Relationship strength 1-10 (affects edge weight, default: 5)"),
-    evidence: z.string().optional().describe("Brief quote or note showing the relationship"),
-  })).describe("Relationships between concepts"),
-  output: z.object({
-    format: z.enum(["png", "jpeg"]).optional().describe("Image format (default: png)"),
-    insert_into_workflowy: z.string().optional().describe("Node ID to insert the concept map into"),
-    output_path: z.string().optional().describe("Custom output file path"),
-  }).optional().describe("Output options"),
 });
 
 // Batch Operations Schema for high-load scenarios
@@ -1086,6 +750,64 @@ const dailyReviewSchema = z.object({
   recent_days: z.number().optional().describe("Days back for recent changes (default: 1)"),
   pending_limit: z.number().optional().describe("Max pending todos to show (default: 20)"),
 });
+
+const renderInteractiveConceptMapSchema = z.object({
+  title: z.string().describe("Title for the concept map"),
+  core_concept: z.object({
+    label: z.string().describe("Label for the central concept"),
+    description: z.string().optional().describe("Optional description"),
+  }),
+  concepts: z.array(z.object({
+    id: z.string().describe("Unique identifier for this concept"),
+    label: z.string().describe("Display label"),
+    level: z.enum(["major", "detail"]).describe("Major concepts form the inner ring; details orbit their parent"),
+    importance: z.number().optional().describe("1-10 importance score (affects node size)"),
+    parent_major_id: z.string().optional().describe("Which major concept this detail belongs to (for collapse grouping)"),
+  })),
+  relationships: z.array(z.object({
+    from: z.string().describe("Source concept ID"),
+    to: z.string().describe("Target concept ID"),
+    type: z.string().describe("Relationship type (e.g. 'supports', 'contrasts with', 'requires')"),
+    strength: z.number().optional().describe("1-10 relationship strength (affects line thickness)"),
+  })),
+});
+
+// Graph analysis schemas
+const graphEdgeSchema = z.object({
+  from: z.string().describe("Source vertex name"),
+  to: z.string().describe("Target vertex name"),
+  weight: z.number().optional().default(1).describe("Edge weight (default: 1)"),
+});
+
+const analyzeRelationshipsSchema = z.object({
+  data: z.array(z.record(z.unknown())).describe("Array of data objects to analyze for relationships"),
+  relationship_fields: z.array(z.string()).describe("Fields that contain relationship references (e.g. ['parent_id', 'friends'])"),
+  node_label_field: z.string().optional().default("id").describe("Field to use as node labels (default: 'id')"),
+});
+
+const createAdjacencyMatrixSchema = z.object({
+  relationships: z.array(graphEdgeSchema).describe("Array of relationship objects with from/to/weight"),
+  vertices: z.array(z.string()).describe("Array of vertex names"),
+});
+
+const calculateCentralitySchema = z.object({
+  relationships: z.array(graphEdgeSchema).describe("Array of relationship objects with from/to/weight"),
+  vertices: z.array(z.string()).describe("Array of vertex names"),
+  measures: z.array(z.enum(["degree", "betweenness", "closeness", "eigenvector", "all"]))
+    .optional().default(["all"]).describe("Centrality measures to calculate (default: all)"),
+  top_n: z.number().optional().default(10).describe("Number of top nodes to return per measure (default: 10)"),
+});
+
+const analyzeNetworkStructureSchema = z.object({
+  data: z.array(z.record(z.unknown())).describe("Array of data objects to analyze"),
+  relationship_fields: z.array(z.string()).describe("Fields that contain relationship references"),
+  node_label_field: z.string().optional().default("id").describe("Field to use as node labels (default: 'id')"),
+  include_centrality: z.boolean().optional().default(true).describe("Whether to include centrality analysis (default: true)"),
+});
+
+// State for the last generated interactive map (served via MCP resources)
+let lastInteractiveMapHTML: string | null = null;
+let lastInteractiveMapTitle: string = "";
 
 // ============================================================================
 // Request Queue Setup
@@ -1354,7 +1076,7 @@ jobQueue.registerExecutor<InsertFileJobParams, InsertFileJobResult>(
 
 const server = new Server(
   { name: "workflowy-mcp-server", version: "1.0.0" },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: {} } }
 );
 
 // Tool definitions
@@ -1498,23 +1220,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "generate_concept_map",
-        description: "Generate a hierarchical concept map following academic concept mapping principles. Places a core concept at the center, arranges major and detail concepts in hierarchy based on Workflowy structure depth, and labels relationships between concepts (influences, contrasts with, includes, etc.) extracted from content context. Visual encoding: larger nodes = more occurrences, colored edges = relationship types, dashed lines = contrasting relationships.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            node_id: { type: "string", description: "The ID of the parent node whose children will be analyzed" },
-            core_concept: { type: "string", description: "The central/main concept of the map (defaults to parent node name)" },
-            concepts: { type: "array", items: { type: "string" }, description: "REQUIRED: The concepts to map. These become nodes arranged hierarchically around the core, connected by labeled relationships found in your content." },
-            scope: { type: "string", enum: ["this_node", "children", "siblings", "ancestors", "all"], description: "Search scope for content to analyze (default: children)" },
-            output_path: { type: "string", description: "Output file path" },
-            format: { type: "string", enum: ["png", "jpeg"], description: "Image format" },
-            title: { type: "string", description: "Title for the concept map" },
-          },
-          required: ["node_id", "concepts"],
-        },
-      },
-      {
         name: "insert_content",
         description: "THE PRIMARY TOOL for inserting nodes into Workflowy. Use this for ALL node creation - single nodes, bulk content, todos, any hierarchical structure. Content MUST be in 2-space indented format. For markdown, first use convert_markdown_to_workflowy. For todos, use [ ] or [x] prefix. Auto-optimizes for any workload size (1 to 1000+ nodes).",
         inputSchema: {
@@ -1525,17 +1230,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             position: { type: "string", enum: ["top", "bottom"], description: "Position relative to siblings (default: top)" },
           },
           required: ["parent_id", "content"],
-        },
-      },
-      {
-        name: "find_insert_targets",
-        description: "Search for potential target nodes to insert content into.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Search text to find potential target nodes" },
-          },
-          required: ["query"],
         },
       },
       {
@@ -1565,22 +1259,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["name"],
         },
       },
-      {
-        name: "export_all",
-        description: "Export all nodes from Workflowy. Rate limited to 1 request per minute.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "list_targets",
-        description: "List available Workflowy shortcuts/targets (inbox, starred nodes, etc.).",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
       // LLM-Powered Concept Map Tools
       {
         name: "get_node_content_for_analysis",
@@ -1596,65 +1274,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             format: { type: "string", enum: ["structured", "outline"], description: "Output format: 'structured' for JSON with metadata, 'outline' for indented text (default: structured)" },
           },
           required: ["node_id"],
-        },
-      },
-      {
-        name: "render_concept_map",
-        description: "Render a concept map from your semantic analysis. After analyzing content with get_node_content_for_analysis, use this tool to create a visual concept map. Provide the concepts you discovered and the relationships between them. Common relationship types: 'produces', 'enables', 'requires', 'critiques', 'contrasts with', 'extends', 'includes', 'examples of', 'influences'. The map will be rendered as an image and optionally inserted into Workflowy.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Title for the concept map" },
-            core_concept: {
-              type: "object",
-              properties: {
-                label: { type: "string", description: "The central concept label" },
-                description: { type: "string", description: "Optional description" },
-              },
-              required: ["label"],
-              description: "The central/main concept of the map",
-            },
-            concepts: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  id: { type: "string", description: "Unique identifier (slug form)" },
-                  label: { type: "string", description: "Display label" },
-                  level: { type: "string", enum: ["major", "detail"], description: "Hierarchy level" },
-                  importance: { type: "number", description: "Importance 1-10 (affects size)" },
-                  description: { type: "string", description: "Brief description" },
-                },
-                required: ["id", "label", "level"],
-              },
-              description: "The concepts discovered through analysis",
-            },
-            relationships: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  from: { type: "string", description: "Source concept ID (or 'core')" },
-                  to: { type: "string", description: "Target concept ID" },
-                  type: { type: "string", description: "Relationship type (e.g., 'produces', 'critiques')" },
-                  strength: { type: "number", description: "Strength 1-10 (affects edge weight)" },
-                  evidence: { type: "string", description: "Brief quote showing relationship" },
-                },
-                required: ["from", "to", "type"],
-              },
-              description: "Relationships between concepts",
-            },
-            output: {
-              type: "object",
-              properties: {
-                format: { type: "string", enum: ["png", "jpeg"], description: "Image format (default: png)" },
-                insert_into_workflowy: { type: "string", description: "Node ID to insert the map into" },
-                output_path: { type: "string", description: "Custom output file path" },
-              },
-              description: "Output options",
-            },
-          },
-          required: ["title", "core_concept", "concepts", "relationships"],
         },
       },
       {
@@ -2044,6 +1663,175 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
         },
       },
+      {
+        name: "render_interactive_concept_map",
+        description: "Render an interactive, collapsible concept map. Click major concepts to expand/collapse detail nodes. Supports zoom/pan.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Title for the concept map" },
+            core_concept: {
+              type: "object",
+              properties: {
+                label: { type: "string", description: "Label for the central concept" },
+                description: { type: "string", description: "Optional description" },
+              },
+              required: ["label"],
+            },
+            concepts: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string", description: "Unique ID" },
+                  label: { type: "string", description: "Display label" },
+                  level: { type: "string", enum: ["major", "detail"], description: "Major or detail level" },
+                  importance: { type: "number", description: "1-10 importance (affects size)" },
+                  parent_major_id: { type: "string", description: "Parent major concept ID (for detail nodes)" },
+                },
+                required: ["id", "label", "level"],
+              },
+            },
+            relationships: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  from: { type: "string", description: "Source concept ID" },
+                  to: { type: "string", description: "Target concept ID" },
+                  type: { type: "string", description: "Relationship type" },
+                  strength: { type: "number", description: "1-10 strength" },
+                },
+                required: ["from", "to", "type"],
+              },
+            },
+          },
+          required: ["title", "core_concept", "concepts", "relationships"],
+        },
+        _meta: {
+          ui: {
+            resourceUri: "ui://concept-map/interactive",
+          },
+        },
+      },
+      // ── Graph Analysis Tools ──
+      {
+        name: "analyze_relationships",
+        description: "Extract relationships from data objects and compute graph density. Detects one-to-one and one-to-many relationships from arrays of data objects.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            data: {
+              type: "array",
+              description: "Array of data objects to analyze for relationships",
+              items: { type: "object" },
+            },
+            relationship_fields: {
+              type: "array",
+              description: "Fields that contain relationship references (e.g. ['parent_id', 'friends'])",
+              items: { type: "string" },
+            },
+            node_label_field: {
+              type: "string",
+              description: "Field to use as node labels (default: 'id')",
+            },
+          },
+          required: ["data", "relationship_fields"],
+        },
+      },
+      {
+        name: "create_adjacency_matrix",
+        description: "Build adjacency matrix from explicit relationship pairs and vertex list. Returns the matrix as formatted text.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            relationships: {
+              type: "array",
+              description: "Array of relationship objects with from/to/weight",
+              items: {
+                type: "object",
+                properties: {
+                  from: { type: "string" },
+                  to: { type: "string" },
+                  weight: { type: "number" },
+                },
+                required: ["from", "to"],
+              },
+            },
+            vertices: {
+              type: "array",
+              description: "Array of vertex names",
+              items: { type: "string" },
+            },
+          },
+          required: ["relationships", "vertices"],
+        },
+      },
+      {
+        name: "calculate_centrality",
+        description: "Calculate centrality measures (degree, betweenness, closeness, eigenvector) for graph nodes. Identifies the most important/central nodes in a network.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            relationships: {
+              type: "array",
+              description: "Array of relationship objects with from/to/weight",
+              items: {
+                type: "object",
+                properties: {
+                  from: { type: "string" },
+                  to: { type: "string" },
+                  weight: { type: "number" },
+                },
+                required: ["from", "to"],
+              },
+            },
+            vertices: {
+              type: "array",
+              description: "Array of vertex names",
+              items: { type: "string" },
+            },
+            measures: {
+              type: "array",
+              description: "Centrality measures to calculate: degree, betweenness, closeness, eigenvector, all (default: all)",
+              items: { type: "string", enum: ["degree", "betweenness", "closeness", "eigenvector", "all"] },
+            },
+            top_n: {
+              type: "number",
+              description: "Number of top nodes to return per measure (default: 10)",
+            },
+          },
+          required: ["relationships", "vertices"],
+        },
+      },
+      {
+        name: "analyze_network_structure",
+        description: "Comprehensive network analysis: extracts relationships from data, builds graph, and optionally computes all centrality measures. Combines analyze_relationships + calculate_centrality in one step.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            data: {
+              type: "array",
+              description: "Array of data objects to analyze",
+              items: { type: "object" },
+            },
+            relationship_fields: {
+              type: "array",
+              description: "Fields that contain relationship references",
+              items: { type: "string" },
+            },
+            node_label_field: {
+              type: "string",
+              description: "Field to use as node labels (default: 'id')",
+            },
+            include_centrality: {
+              type: "boolean",
+              description: "Whether to include centrality analysis (default: true)",
+            },
+          },
+          required: ["data", "relationship_fields"],
+        },
+      },
     ],
   };
 });
@@ -2359,383 +2147,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    case "generate_concept_map": {
-      const { node_id, core_concept, concepts, scope, output_path, format, title } =
-        generateConceptMapSchema.parse(args);
-      const allNodes = await getCachedNodes();
-
-      if (!Array.isArray(allNodes) || allNodes.length === 0) {
-        return {
-          content: [{ type: "text", text: "Error: Could not retrieve nodes from Workflowy" }],
-          isError: true,
-        };
-      }
-
-      const sourceNode = allNodes.find((n) => n.id === node_id);
-      if (!sourceNode) {
-        return {
-          content: [{ type: "text", text: `Error: Node with ID "${node_id}" not found` }],
-          isError: true,
-        };
-      }
-
-      // Validate concepts input (min/max limits)
-      const validation = validateConceptMapInput(concepts);
-      if (!validation.valid) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              message: validation.error,
-              tip: validation.tip,
-              ...(validation.provided !== undefined && { provided: validation.provided }),
-              ...(validation.maximum !== undefined && { maximum: validation.maximum }),
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Normalize concepts (preserve original case for display, lowercase for matching)
-      const conceptList = concepts.map(c => ({
-        original: c.trim(),
-        lower: c.toLowerCase().trim()
-      })).filter(c => c.lower.length > 0);
-
-      // The core concept - either explicitly provided or use the parent node name
-      const coreConcept = core_concept?.trim() || sourceNode.name || "Core Concept";
-
-      // Get nodes to analyze based on scope
-      const searchScope = scope || "children";
-      const scopedNodes = filterNodesByScope(sourceNode, allNodes, searchScope);
-      const nodesToAnalyze = scopedNodes.length > 0
-        ? scopedNodes
-        : allNodes.filter((n) => n.id !== sourceNode.id);
-
-      // Helper to calculate depth of a node from the source
-      const getNodeDepth = (nodeId: string): number => {
-        let depth = 0;
-        let currentId = nodeId;
-        let safety = 0;
-        while (currentId && currentId !== sourceNode.id && safety < 100) {
-          const node = allNodes.find(n => n.id === currentId);
-          if (!node || !node.parent_id) break;
-          currentId = node.parent_id;
-          depth++;
-          safety++;
-        }
-        return depth;
-      };
-
-      // Track concept occurrences with depth and context
-      interface ConceptOccurrence {
-        nodeId: string;
-        nodeName: string;
-        depth: number;
-        fullText: string;
-      }
-
-      const conceptOccurrences = new Map<string, ConceptOccurrence[]>();
-
-      for (const concept of conceptList) {
-        conceptOccurrences.set(concept.lower, []);
-      }
-
-      // Analyze all nodes for concept occurrences
-      for (const node of nodesToAnalyze) {
-        const nodeText = `${node.name || ""} ${node.note || ""}`;
-        const lowerText = nodeText.toLowerCase();
-        const depth = getNodeDepth(node.id);
-
-        for (const concept of conceptList) {
-          if (lowerText.includes(concept.lower)) {
-            conceptOccurrences.get(concept.lower)!.push({
-              nodeId: node.id,
-              nodeName: node.name || "Untitled",
-              depth,
-              fullText: nodeText,
-            });
-          }
-        }
-      }
-
-      // Build concept map nodes with hierarchy based on occurrence depth and frequency
-      const coreMapNode: ConceptMapNode = {
-        id: "core",
-        label: coreConcept,
-        level: 0,
-        occurrences: nodesToAnalyze.length, // Core represents the whole topic
-        depth: 0,
-      };
-
-      const conceptMapNodes: ConceptMapNode[] = [];
-      const conceptsWithOccurrences: Array<{
-        concept: typeof conceptList[0];
-        occurrences: ConceptOccurrence[];
-        avgDepth: number;
-      }> = [];
-
-      for (const concept of conceptList) {
-        const occs = conceptOccurrences.get(concept.lower) || [];
-        if (occs.length > 0) {
-          const avgDepth = occs.reduce((sum, o) => sum + o.depth, 0) / occs.length;
-          conceptsWithOccurrences.push({ concept, occurrences: occs, avgDepth });
-        }
-      }
-
-      if (conceptsWithOccurrences.length < 2) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              message: "Less than 2 concepts were found in the content. Need at least 2 to create a meaningful map.",
-              concepts_searched: conceptList.map(c => c.original),
-              concepts_found: conceptsWithOccurrences.map(c => ({
-                concept: c.concept.original,
-                occurrences: c.occurrences.length,
-                avg_depth: c.avgDepth.toFixed(1),
-              })),
-              scope_used: searchScope,
-              nodes_analyzed: nodesToAnalyze.length,
-              tip: "Try different concepts or use scope: 'all' to search more broadly.",
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Sort by average depth to determine hierarchy level
-      // Lower depth = closer to parent = major concept (level 1)
-      // Higher depth = deeper nested = detail concept (level 2)
-      conceptsWithOccurrences.sort((a, b) => a.avgDepth - b.avgDepth);
-      const medianDepth = conceptsWithOccurrences[Math.floor(conceptsWithOccurrences.length / 2)]?.avgDepth || 1;
-
-      for (const { concept, occurrences, avgDepth } of conceptsWithOccurrences) {
-        const level = avgDepth <= medianDepth ? 1 : 2;
-        conceptMapNodes.push({
-          id: concept.lower,
-          label: concept.original,
-          level,
-          occurrences: occurrences.length,
-          depth: avgDepth,
-        });
-      }
-
-      // Build edges with relationship labels
-      const conceptMapEdges: ConceptMapEdge[] = [];
-      const edgeMap = new Map<string, { weight: number; contexts: string[]; labels: string[] }>();
-
-      // First, connect all concepts to the core (the main topic)
-      for (const node of conceptMapNodes) {
-        conceptMapEdges.push({
-          from: "core",
-          to: node.id,
-          label: node.level === 1 ? "includes" : "details",
-          weight: node.occurrences,
-          sourceContexts: [],
-        });
-      }
-
-      // Then, find relationships between concepts based on co-occurrence
-      // Limit nodes analyzed to prevent O(n*c²) explosion with large datasets
-      const MAX_NODES_TO_ANALYZE = 5000;
-      const MAX_EDGES = 1000;
-      let nodesAnalyzed = 0;
-      let edgeLimitReached = false;
-
-      for (const node of nodesToAnalyze) {
-        // Early termination if limits reached
-        if (nodesAnalyzed >= MAX_NODES_TO_ANALYZE || edgeLimitReached) break;
-        nodesAnalyzed++;
-
-        const nodeText = `${node.name || ""} ${node.note || ""}`;
-        const lowerText = nodeText.toLowerCase();
-
-        // Find which concepts appear in this node
-        const presentConcepts = conceptList.filter(c => lowerText.includes(c.lower));
-
-        if (presentConcepts.length >= 2) {
-          // Create edges between all pairs of concepts in this node
-          for (let i = 0; i < presentConcepts.length && !edgeLimitReached; i++) {
-            for (let j = i + 1; j < presentConcepts.length; j++) {
-              const c1 = presentConcepts[i].lower;
-              const c2 = presentConcepts[j].lower;
-              const edgeKey = [c1, c2].sort().join("|||");
-
-              if (!edgeMap.has(edgeKey)) {
-                if (edgeMap.size >= MAX_EDGES) {
-                  edgeLimitReached = true;
-                  break;
-                }
-                edgeMap.set(edgeKey, { weight: 0, contexts: [], labels: [] });
-              }
-
-              const edge = edgeMap.get(edgeKey)!;
-              edge.weight++;
-
-              // Extract relationship label from context
-              const relationLabel = extractRelationshipLabel(nodeText, c1, c2);
-              if (!edge.labels.includes(relationLabel)) {
-                edge.labels.push(relationLabel);
-              }
-
-              // Store context excerpt (limit to 100 chars)
-              const contextExcerpt = nodeText.substring(0, 100) + (nodeText.length > 100 ? "..." : "");
-              if (edge.contexts.length < 3 && !edge.contexts.includes(contextExcerpt)) {
-                edge.contexts.push(contextExcerpt);
-              }
-            }
-          }
-        }
-      }
-
-      // Convert edge map to array (concept-to-concept edges)
-      for (const [key, data] of edgeMap) {
-        const [from, to] = key.split("|||");
-        // Use the most common relationship label, or "relates to" if none found
-        const label = data.labels.find(l => l !== "relates to") || data.labels[0] || "relates to";
-        conceptMapEdges.push({
-          from,
-          to,
-          label,
-          weight: data.weight,
-          sourceContexts: data.contexts,
-        });
-      }
-
-      const imageFormat = format || "png";
-      const mapTitle = title || `Concept Map: ${coreConcept}`;
-
-      const result = await generateHierarchicalConceptMapImage(
-        coreMapNode,
-        conceptMapNodes,
-        conceptMapEdges,
-        mapTitle,
-        imageFormat
-      );
-
-      if (!result.success || !result.buffer) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              message: "Failed to generate concept map image",
-              error: result.error,
-            }, null, 2),
-          }],
-          isError: true,
-        };
-      }
-
-      const timestamp = Date.now();
-      const filename = `concept-map-${timestamp}.${imageFormat}`;
-
-      // Try to upload to Dropbox and insert into Workflowy
-      const uploadResult = await uploadToDropbox(result.buffer, filename);
-
-      // Build analysis summary
-      const majorConcepts = conceptMapNodes.filter(n => n.level === 1);
-      const detailConcepts = conceptMapNodes.filter(n => n.level === 2);
-      const conceptConnections = conceptMapEdges.filter(e => e.from !== "core" && e.to !== "core");
-
-      if (uploadResult.success && uploadResult.url) {
-        const imageMarkdown = `![Concept Map](${uploadResult.url})`;
-        const nodeNote = [
-          `Core: ${coreConcept}`,
-          `Major concepts: ${majorConcepts.map(c => c.label).join(", ")}`,
-          `Detail concepts: ${detailConcepts.map(c => c.label).join(", ") || "none"}`,
-          `Relationships: ${conceptConnections.length}`,
-        ].join("\n");
-
-        try {
-          await workflowyRequest("/nodes", "POST", {
-            parent_id: sourceNode.id,
-            name: `📊 ${mapTitle}`,
-            note: `${imageMarkdown}\n\n${nodeNote}`,
-            priority: 0,
-          });
-          invalidateCache();
-
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                success: true,
-                message: "Concept map created and inserted into Workflowy",
-                inserted_into: { id: sourceNode.id, name: sourceNode.name },
-                image_url: uploadResult.url,
-                format: imageFormat,
-                scope: searchScope,
-                structure: {
-                  core_concept: coreConcept,
-                  major_concepts: majorConcepts.map(c => ({
-                    concept: c.label,
-                    found_in: c.occurrences,
-                  })),
-                  detail_concepts: detailConcepts.map(c => ({
-                    concept: c.label,
-                    found_in: c.occurrences,
-                  })),
-                },
-                relationships: conceptConnections.slice(0, 10).map(e => ({
-                  between: [e.from, e.to],
-                  relationship: e.label,
-                  strength: e.weight,
-                })),
-              }, null, 2),
-            }],
-          };
-        } catch (insertError) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                success: true,
-                message: "Concept map uploaded but failed to insert into Workflowy",
-                image_url: uploadResult.url,
-                insert_error: insertError instanceof Error ? insertError.message : String(insertError),
-                tip: "You can manually add this image URL to your Workflowy node.",
-              }, null, 2),
-            }],
-          };
-        }
-      } else {
-        // Dropbox upload failed - save locally as fallback
-        const defaultPath = path.join(process.env.HOME || "/tmp", "Downloads", filename);
-        const finalPath = output_path || defaultPath;
-
-        const dir = path.dirname(finalPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-
-        fs.writeFileSync(finalPath, result.buffer);
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: "Concept map saved locally (Dropbox not configured)",
-              file_path: finalPath,
-              dropbox_error: uploadResult.error,
-              format: imageFormat,
-              scope: searchScope,
-              parent_node: { id: sourceNode.id, name: sourceNode.name },
-              structure: {
-                core_concept: coreConcept,
-                major_concepts: majorConcepts.map(c => c.label),
-                detail_concepts: detailConcepts.map(c => c.label),
-                total_relationships: conceptConnections.length,
-              },
-              tip: "Configure Dropbox to auto-insert concept maps into Workflowy. See README.",
-            }, null, 2),
-          }],
-        };
-      }
-    }
-
     case "insert_content": {
       const { parent_id, content, position } = insertContentSchema.parse(args);
 
@@ -2766,23 +2177,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           text: JSON.stringify(insertResult, null, 2),
         }],
         isError: !insertResult.success,
-      };
-    }
-
-    case "find_insert_targets": {
-      const { query } = findInsertTargetsSchema.parse(args);
-      const allNodes = await getCachedNodes();
-      const lowerQuery = query.toLowerCase();
-
-      const matchingNodes = allNodes.filter((node) => {
-        const nameMatch = node.name?.toLowerCase().includes(lowerQuery);
-        const noteMatch = node.note?.toLowerCase().includes(lowerQuery);
-        return nameMatch || noteMatch;
-      });
-
-      const nodesWithPaths = buildNodePaths(matchingNodes);
-      return {
-        content: [{ type: "text", text: formatNodesForSelection(nodesWithPaths) }],
       };
     }
 
@@ -2856,20 +2250,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           type: "text",
           text: `Multiple nodes match "${search_query}". Please select one:\n\n${formatNodesForSelection(nodesWithPaths)}\n\nCall smart_insert again with the selection parameter (1-${matchingNodes.length}) to insert your content.`,
         }],
-      };
-    }
-
-    case "export_all": {
-      const result = await workflowyRequest("/nodes-export");
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    }
-
-    case "list_targets": {
-      const result = await workflowyRequest("/targets");
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     }
 
@@ -3194,213 +2574,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{
           type: "text",
           text: JSON.stringify(result, null, 2),
-        }],
-      };
-    }
-
-    case "render_concept_map": {
-      const { title, core_concept, concepts, relationships, output } =
-        renderConceptMapSchema.parse(args);
-
-      // Validate we have enough concepts
-      if (concepts.length < 2) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              error: "At least 2 concepts are required to create a concept map",
-              provided: concepts.length,
-            }, null, 2),
-          }],
-        };
-      }
-
-      if (concepts.length > 35) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              error: "Too many concepts - maximum is 35 for readability",
-              provided: concepts.length,
-              maximum: 35,
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Build concept map nodes
-      const coreMapNode: ConceptMapNode = {
-        id: "core",
-        label: core_concept.label,
-        level: 0,
-        occurrences: 10, // Core is always prominent
-        depth: 0,
-      };
-
-      const conceptMapNodes: ConceptMapNode[] = concepts.map((c) => ({
-        id: c.id,
-        label: c.label,
-        level: c.level === "major" ? 1 : 2,
-        occurrences: c.importance || 5,
-        depth: c.level === "major" ? 1 : 2,
-      }));
-
-      // Build edges
-      const conceptMapEdges: ConceptMapEdge[] = relationships.map((r) => ({
-        from: r.from,
-        to: r.to,
-        label: r.type,
-        weight: r.strength || 5,
-        sourceContexts: r.evidence ? [r.evidence] : [],
-      }));
-
-      // Generate the image
-      const imageFormat = output?.format || "png";
-      const result = await generateHierarchicalConceptMapImage(
-        coreMapNode,
-        conceptMapNodes,
-        conceptMapEdges,
-        title,
-        imageFormat
-      );
-
-      if (!result.success || !result.buffer) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: false,
-              error: result.error || "Failed to generate concept map image",
-            }, null, 2),
-          }],
-          isError: true,
-        };
-      }
-
-      const timestamp = Date.now();
-      const filename = `concept-map-${timestamp}.${imageFormat}`;
-
-      // Try to upload to Dropbox
-      const uploadResult = await uploadToDropbox(result.buffer, filename);
-
-      const majorConcepts = concepts.filter((c) => c.level === "major");
-      const detailConcepts = concepts.filter((c) => c.level === "detail");
-
-      // If we should insert into Workflowy
-      if (uploadResult.success && uploadResult.url && output?.insert_into_workflowy) {
-        const allNodes = await getCachedNodes();
-        const targetNode = allNodes.find((n) => n.id === output.insert_into_workflowy);
-
-        if (targetNode) {
-          const imageMarkdown = `![Concept Map](${uploadResult.url})`;
-          const nodeNote = [
-            `Core: ${core_concept.label}`,
-            `Major concepts: ${majorConcepts.map((c) => c.label).join(", ")}`,
-            `Detail concepts: ${detailConcepts.map((c) => c.label).join(", ") || "none"}`,
-            `Relationships: ${relationships.length}`,
-          ].join("\n");
-
-          try {
-            await workflowyRequest("/nodes", "POST", {
-              parent_id: targetNode.id,
-              name: `📊 ${title}`,
-              note: `${imageMarkdown}\n\n${nodeNote}`,
-              priority: 0,
-            });
-            invalidateCache();
-
-            return {
-              content: [{
-                type: "text",
-                text: JSON.stringify({
-                  success: true,
-                  message: "Concept map created and inserted into Workflowy",
-                  image_url: uploadResult.url,
-                  inserted_into: { id: targetNode.id, name: targetNode.name },
-                  stats: {
-                    concepts_rendered: concepts.length,
-                    major_concepts: majorConcepts.length,
-                    detail_concepts: detailConcepts.length,
-                    relationships_rendered: relationships.length,
-                  },
-                }, null, 2),
-              }],
-            };
-          } catch (insertError) {
-            // Continue to return success even if insert failed
-            return {
-              content: [{
-                type: "text",
-                text: JSON.stringify({
-                  success: true,
-                  message: "Concept map created but failed to insert into Workflowy",
-                  image_url: uploadResult.url,
-                  insert_error: insertError instanceof Error ? insertError.message : String(insertError),
-                  stats: {
-                    concepts_rendered: concepts.length,
-                    major_concepts: majorConcepts.length,
-                    detail_concepts: detailConcepts.length,
-                    relationships_rendered: relationships.length,
-                  },
-                }, null, 2),
-              }],
-            };
-          }
-        }
-      }
-
-      // If Dropbox upload succeeded but no Workflowy insert requested
-      if (uploadResult.success && uploadResult.url) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: "Concept map created",
-              image_url: uploadResult.url,
-              stats: {
-                concepts_rendered: concepts.length,
-                major_concepts: majorConcepts.length,
-                detail_concepts: detailConcepts.length,
-                relationships_rendered: relationships.length,
-              },
-            }, null, 2),
-          }],
-        };
-      }
-
-      // Fallback to local file
-      const defaultPath = path.join(
-        process.env.HOME || "/tmp",
-        "Downloads",
-        filename
-      );
-      const finalPath = output?.output_path || defaultPath;
-
-      const dir = path.dirname(finalPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      fs.writeFileSync(finalPath, result.buffer);
-
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            success: true,
-            message: "Concept map saved locally (Dropbox not configured)",
-            file_path: finalPath,
-            dropbox_error: uploadResult.error,
-            stats: {
-              concepts_rendered: concepts.length,
-              major_concepts: majorConcepts.length,
-              detail_concepts: detailConcepts.length,
-              relationships_rendered: relationships.length,
-            },
-          }, null, 2),
         }],
       };
     }
@@ -4639,12 +3812,232 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: JSON.stringify(review, null, 2) }] };
     }
 
+    case "render_interactive_concept_map": {
+      const parsed = renderInteractiveConceptMapSchema.parse(args);
+      const coreId = "core";
+      const coreNode = { id: coreId, label: parsed.core_concept.label };
+
+      // Build concept list with auto-assignment of unparented details
+      const majors = parsed.concepts.filter((c) => c.level === "major");
+      const concepts = parsed.concepts.map((c) => {
+        const concept = {
+          id: c.id,
+          label: c.label,
+          level: c.level as "major" | "detail",
+          importance: c.importance ?? (c.level === "major" ? 6 : 3),
+          parentMajorId: c.parent_major_id,
+        };
+
+        // Auto-assign detail concepts without a parent to their most-connected major
+        if (concept.level === "detail" && !concept.parentMajorId && majors.length > 0) {
+          const connectionCounts = new Map<string, number>();
+          for (const rel of parsed.relationships) {
+            if (rel.from === c.id || rel.to === c.id) {
+              const otherId = rel.from === c.id ? rel.to : rel.from;
+              const otherMajor = majors.find((m) => m.id === otherId);
+              if (otherMajor) {
+                connectionCounts.set(otherMajor.id, (connectionCounts.get(otherMajor.id) || 0) + (rel.strength || 5));
+              }
+            }
+          }
+          if (connectionCounts.size > 0) {
+            let bestId = majors[0].id;
+            let bestScore = 0;
+            for (const [id, score] of connectionCounts) {
+              if (score > bestScore) { bestId = id; bestScore = score; }
+            }
+            concept.parentMajorId = bestId;
+          } else {
+            // Fallback: assign to first major concept
+            concept.parentMajorId = majors[0].id;
+          }
+        }
+
+        return concept;
+      });
+
+      const relationships = parsed.relationships.map((r) => ({
+        from: r.from,
+        to: r.to,
+        type: r.type,
+        strength: r.strength ?? 5,
+      }));
+
+      const html = generateInteractiveConceptMapHTML(parsed.title, coreNode, concepts, relationships);
+      lastInteractiveMapHTML = html;
+      lastInteractiveMapTitle = parsed.title;
+
+      // Save HTML to ~/Downloads/ as fallback (always available regardless of MCP Apps support)
+      const timestamp = Date.now();
+      const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
+      const downloadsDir = path.join(process.env.HOME || "~", "Downloads");
+      const filePath = path.join(downloadsDir, `concept-map-${slug}-${timestamp}.html`);
+      try {
+        fs.writeFileSync(filePath, html);
+      } catch {
+        // Fallback write failure is non-fatal
+      }
+
+      const stats = {
+        success: true,
+        title: parsed.title,
+        file_path: filePath,
+        stats: {
+          major_concepts: majors.length,
+          detail_concepts: concepts.length - majors.length,
+          relationships: relationships.length,
+        },
+        instructions: "Open the HTML file in a browser to view the interactive concept map with collapsible clusters, zoom/pan, and relationship labels.",
+      };
+
+      return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
+    }
+
+    // ── Graph Analysis Tools ──
+
+    case "analyze_relationships": {
+      const parsed = analyzeRelationshipsSchema.parse(args);
+      const result = extractRelationshipsFromData(
+        parsed.data as Array<Record<string, unknown>>,
+        parsed.relationship_fields,
+        parsed.node_label_field
+      );
+
+      let text = `Relationship Analysis Results\n\n`;
+      text += `Vertices found: ${result.vertices.length}\n`;
+      text += `Relationships found: ${result.relationships.length}\n`;
+      text += `Graph density: ${result.density.toFixed(3)}\n\n`;
+      text += `Vertices: ${result.vertices.join(", ")}\n\n`;
+      text += `Relationships:\n`;
+      for (const r of result.relationships) {
+        text += `  ${r.from} -> ${r.to} (weight: ${r.weight})\n`;
+      }
+
+      return { content: [{ type: "text", text }] };
+    }
+
+    case "create_adjacency_matrix": {
+      const parsed = createAdjacencyMatrixSchema.parse(args);
+      const graph = buildGraphStructure(parsed.relationships as GraphEdge[], parsed.vertices);
+
+      let text = `Adjacency Matrix (${parsed.vertices.length}x${parsed.vertices.length})\n\n`;
+      // Header row
+      text += `${"".padEnd(15)} ${parsed.vertices.map((v) => v.padEnd(8)).join(" ")}\n`;
+      for (const from of parsed.vertices) {
+        text += `${from.padEnd(15)} ${parsed.vertices.map((to) => String(graph.adjacencyMatrix[from][to]).padEnd(8)).join(" ")}\n`;
+      }
+      text += `\nVertices: ${parsed.vertices.length}\n`;
+      text += `Edges: ${parsed.relationships.length}\n`;
+
+      return { content: [{ type: "text", text }] };
+    }
+
+    case "calculate_centrality": {
+      const parsed = calculateCentralitySchema.parse(args);
+      const graph = buildGraphStructure(parsed.relationships as GraphEdge[], parsed.vertices);
+
+      const requestedMeasures = parsed.measures.includes("all")
+        ? ["degree", "betweenness", "closeness", "eigenvector"]
+        : parsed.measures;
+
+      const results: Record<string, Record<string, number>> = {};
+      for (const measure of requestedMeasures) {
+        switch (measure) {
+          case "degree":
+            results.degree = calculateDegreeCentrality(graph);
+            break;
+          case "betweenness":
+            results.betweenness = calculateBetweennessCentrality(graph);
+            break;
+          case "closeness":
+            results.closeness = calculateClosenessCentrality(graph);
+            break;
+          case "eigenvector":
+            results.eigenvector = calculateEigenvectorCentrality(graph);
+            break;
+        }
+      }
+
+      let text = formatCentralityResults(results, parsed.top_n);
+      text += `Analysis Summary\n`;
+      text += `- Vertices analyzed: ${parsed.vertices.length}\n`;
+      text += `- Relationships: ${parsed.relationships.length}\n`;
+      text += `- Measures calculated: ${Object.keys(results).join(", ")}\n`;
+
+      return { content: [{ type: "text", text }] };
+    }
+
+    case "analyze_network_structure": {
+      const parsed = analyzeNetworkStructureSchema.parse(args);
+
+      // Extract relationships from data
+      const extraction = extractRelationshipsFromData(
+        parsed.data as Array<Record<string, unknown>>,
+        parsed.relationship_fields,
+        parsed.node_label_field
+      );
+
+      let text = `Network Structure Analysis\n\n`;
+      text += `Vertices found: ${extraction.vertices.length}\n`;
+      text += `Relationships found: ${extraction.relationships.length}\n`;
+      text += `Graph density: ${extraction.density.toFixed(3)}\n\n`;
+      text += `Relationships:\n`;
+      for (const r of extraction.relationships) {
+        text += `  ${r.from} -> ${r.to} (weight: ${r.weight})\n`;
+      }
+
+      if (parsed.include_centrality && extraction.vertices.length > 0 && extraction.relationships.length > 0) {
+        const graph = buildGraphStructure(extraction.relationships, extraction.vertices);
+        const results: Record<string, Record<string, number>> = {
+          degree: calculateDegreeCentrality(graph),
+          betweenness: calculateBetweennessCentrality(graph),
+          closeness: calculateClosenessCentrality(graph),
+          eigenvector: calculateEigenvectorCentrality(graph),
+        };
+
+        text += `\n${formatCentralityResults(results, 5)}`;
+      }
+
+      return { content: [{ type: "text", text }] };
+    }
+
     default:
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true,
       };
   }
+});
+
+// ============================================================================
+// MCP Resource Handlers (for interactive concept map UI)
+// ============================================================================
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: lastInteractiveMapHTML
+    ? [
+        {
+          uri: "ui://concept-map/interactive",
+          name: lastInteractiveMapTitle || "Interactive Concept Map",
+          mimeType: "text/html;profile=mcp-app",
+        },
+      ]
+    : [],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  if (request.params.uri === "ui://concept-map/interactive" && lastInteractiveMapHTML) {
+    return {
+      contents: [
+        {
+          uri: request.params.uri,
+          mimeType: "text/html;profile=mcp-app",
+          text: lastInteractiveMapHTML,
+        },
+      ],
+    };
+  }
+  return { contents: [] };
 });
 
 // Start server

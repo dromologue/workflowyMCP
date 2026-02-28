@@ -188,11 +188,11 @@
 
 *Future considerations, not committed.*
 
-- [ ] **B-001**: Batch operations for bulk updates
-- [ ] **B-002**: Template system for common patterns
 - [ ] **B-003**: Offline queue for unreachable API
 - [ ] **B-004**: Conflict detection for concurrent edits
 - [ ] **B-005**: Support for Workflowy mirrors/live copies
+- [ ] **B-006**: Recurring task support (repeat rules for todos)
+- [ ] **B-007**: Cross-outline collaboration
 
 ---
 
@@ -273,3 +273,58 @@
   - Duplicate handling with numbered options and selection parameter
   - Returns node_id ready for use with other tools
   - Full test coverage (28 unit tests)
+
+- [x] **T-034**: Add task & knowledge management utility modules
+  - `tag-parser.ts`: Extract #tags and @mentions from node text (21 tests)
+  - `date-parser.ts`: Parse due dates in 3 formats with priority order (22 tests)
+  - `scope-utils.ts`: Subtree traversal, scope filtering, children index (13 tests)
+  - Extracted `filterNodesByScope` from server.ts to shared utility
+
+- [x] **T-035**: Enhance search_nodes with structured filters
+  - Added optional parameters: tag, assignee, status, root_id, scope, modified_after, modified_before
+  - Filter pipeline: scope → text → tag → assignee → status → date range
+  - Enriched JSON output with tags, assignees, due dates when filters present
+  - 12 unit tests for filter pipeline
+
+- [x] **T-036**: Add project management tools
+  - `get_project_summary`: Stats, tag counts, assignees, overdue items for a subtree (12 tests)
+  - `get_recent_changes`: Nodes modified within a time window (9 tests)
+
+- [x] **T-037**: Add due date and scheduling tools
+  - `list_upcoming`: Todos due in next N days, sorted by urgency (19 tests, shared with list_overdue)
+  - `list_overdue`: Past-due items sorted by most overdue first
+  - `daily_review`: One-call standup summary (14 tests)
+
+- [x] **T-038**: Add knowledge linking tools
+  - `find_backlinks`: Find all nodes linking to a given node (9 tests)
+
+- [x] **T-039**: Add content reuse tools
+  - `duplicate_node`: Deep-copy a node and its subtree (4 tests)
+  - `create_from_template`: Copy template with `{{variable}}` substitution (8 tests)
+
+- [x] **T-040**: Add bulk update tool
+  - Filter by query, tag, assignee, status, root_id
+  - Operations: complete, uncomplete, delete, add_tag, remove_tag
+  - Dry-run mode and configurable safety limit (11 tests)
+
+- [x] **T-041**: Add interactive concept maps via MCP Apps
+  - `render_interactive_concept_map` tool with `_meta.ui.resourceUri`
+  - Self-contained HTML generator (`concept-map-html.ts`) with SVG + vanilla JS
+  - Collapsible major/detail clusters, zoom/pan, expand/collapse all
+  - MCP resource handlers (ListResources, ReadResource) for serving HTML
+  - Auto-assignment of unparented detail concepts to most-connected major
+  - 13 unit tests for HTML generator
+
+- [x] **T-042**: Legacy cleanup and code removal
+  - Removed 5 redundant tools: generate_concept_map, render_concept_map, find_insert_targets, export_all, list_targets
+  - Removed 7 dead functions/constants from server.ts
+  - Removed legacy types from shared/types
+  - Removed legacy tests (15 tests)
+  - Server.ts reduced from ~4800 to ~3780 lines
+- [x] **T-043**: Graph-Tools consolidation
+  - Ported 7 graph algorithms from ~/code/Graph-Tools/mcp-graph-server/ to TypeScript
+  - Created src/shared/utils/graph-analysis.ts (~280 lines, zero external dependencies)
+  - Created src/shared/utils/graph-analysis.test.ts (31 tests)
+  - Added 4 MCP tools: analyze_relationships, create_adjacency_matrix, calculate_centrality, analyze_network_structure
+  - Eliminated Ruby CLI, D3.js visualization, Express server, and file I/O dependencies
+  - Users now run one MCP server instead of two

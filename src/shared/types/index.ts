@@ -45,29 +45,6 @@ export interface CreatedNode {
   parent_id: string;
 }
 
-/** Concept map node for visualization */
-export interface ConceptMapNode {
-  id: string;
-  label: string;
-  isCenter: boolean;
-}
-
-/** Concept map edge for visualization */
-export interface ConceptMapEdge {
-  from: string;
-  to: string;
-  keywords: string[];
-  weight: number;
-}
-
-/** Scope options for concept map generation */
-export type ConceptMapScope =
-  | "this_node"
-  | "children"
-  | "siblings"
-  | "ancestors"
-  | "all";
-
 /** Dropbox token response */
 export interface DropboxTokenResponse {
   access_token: string;
@@ -112,51 +89,3 @@ export interface AnalysisContentResult {
   content: AnalysisContentNode[];
 }
 
-/** Concept input for render_concept_map */
-export interface ConceptInput {
-  id: string;
-  label: string;
-  level: "major" | "detail";
-  importance?: number;
-  description?: string;
-}
-
-/** Relationship input for render_concept_map */
-export interface RelationshipInput {
-  from: string;
-  to: string;
-  type: string;
-  strength?: number;
-  evidence?: string;
-}
-
-/** Core concept for render_concept_map */
-export interface CoreConceptInput {
-  label: string;
-  description?: string;
-}
-
-/** Output options for render_concept_map */
-export interface RenderOutputOptions {
-  format?: "png" | "jpeg";
-  insert_into_workflowy?: string;
-  output_path?: string;
-}
-
-/** Result from render_concept_map */
-export interface RenderConceptMapResult {
-  success: boolean;
-  image_url?: string;
-  file_path?: string;
-  inserted_into?: {
-    id: string;
-    name: string;
-  };
-  error?: string;
-  stats?: {
-    concepts_rendered: number;
-    major_concepts: number;
-    detail_concepts: number;
-    relationships_rendered: number;
-  };
-}

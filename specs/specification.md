@@ -30,11 +30,72 @@ The Workflowy MCP Server is a Model Context Protocol server that enables Claude 
 |---------|-------------|
 | **Fast node lookup** | Find nodes by exact name with duplicate handling |
 | Text search | Search node names and notes by keyword |
+| **Filtered search** | Filter by tag, assignee, completion status, and date range |
 | Path display | Show full breadcrumb path for disambiguation |
-| Target listing | Access Workflowy shortcuts (inbox, starred) |
-| Full export | Retrieve entire outline for comprehensive analysis |
+| **Backlinks** | Find all nodes linking to a given node |
 
 **Success criteria**: User can locate any node in <2 tool calls.
+
+#### search_nodes Tool (Enhanced)
+
+Full-text search with optional structured filters. When filters are applied, returns enriched results with tags, assignees, and due dates.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | yes | Text to search for in names and notes |
+| `tag` | string | no | Filter by tag (e.g. "inbox", "urgent") |
+| `assignee` | string | no | Filter by assignee (e.g. "alice") |
+| `status` | "all" \| "pending" \| "completed" | no | Filter by completion status |
+| `root_id` | string | no | Limit search to a subtree |
+| `scope` | string | no | Scope type: this_node, children, siblings, ancestors, all |
+| `modified_after` | string | no | ISO date — only nodes modified after this date |
+| `modified_before` | string | no | ISO date — only nodes modified before this date |
+
+**Filter pipeline** (applied in order):
+1. Scope/subtree narrowing
+2. Text search (name + note)
+3. Tag filtering (parsed from `#tag` in text)
+4. Assignee filtering (parsed from `@person` in text)
+5. Status filtering (completed vs pending)
+6. Date range filtering
+
+**Conventions** for tags, assignees, and due dates:
+- **Tags**: `#inbox`, `#review`, `#urgent` — parsed from node name and note text
+- **Assignees**: `@alice`, `@bob` — parsed from node name and note text
+- **Due dates**: `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15` — parsed in priority order
+
+---
+
+#### find_backlinks Tool
+
+Find all nodes that contain a Workflowy internal link to a given node.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | yes | The node to find backlinks for |
+| `include_context` | boolean | no | Include surrounding text context (default: true) |
+
+**Response**:
+```json
+{
+  "target": { "id": "abc", "name": "Target Node" },
+  "backlink_count": 3,
+  "backlinks": [
+    {
+      "id": "xyz",
+      "name": "Linking Node",
+      "path": "Work > Notes > Linking Node",
+      "context": "...as discussed in [Target Node]..."
+    }
+  ]
+}
+```
+
+---
 
 ---
 
@@ -113,7 +174,6 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 | **insert_content** | THE PRIMARY TOOL for all node insertion - single, bulk, todos, any size |
 | **convert_markdown_to_workflowy** | REQUIRED for markdown - converts to Workflowy format |
 | Smart insert | Search-and-insert workflow with selection |
-| Find insert targets | Search for potential parent nodes before insertion |
 | Parallel processing | Auto-optimizes for any workload size (1 to 1000+ nodes) |
 | Order preservation | Content appears in same order as provided |
 | Staging node pattern | Prevents nodes from appearing at unintended locations during insertion |
@@ -226,33 +286,6 @@ Search for a target node by name and insert content. Combines find + insert in o
 
 ---
 
-#### find_insert_targets Tool
-
-Search for potential target nodes to insert content into. Used when Claude needs to preview available targets before deciding where to insert.
-
-**Parameters**:
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `query` | string | yes | Search term to find potential targets |
-
-**Response**:
-```json
-{
-  "found": true,
-  "count": 3,
-  "targets": [
-    { "id": "abc", "name": "Projects", "path": "Work > Projects", "children_count": 5 },
-    { "id": "def", "name": "Project Ideas", "path": "Personal > Project Ideas", "children_count": 12 }
-  ],
-  "message": "Found 3 potential targets. Use insert_content with the desired parent_id."
-}
-```
-
-**Use case**: When Claude wants to show the user available insertion targets before committing to an insertion location.
-
----
-
 #### convert_markdown_to_workflowy Tool
 
 **REQUIRED** for any markdown content. Converts markdown documents to Workflowy's 2-space indented format. This is the ONLY way to format markdown for Workflowy.
@@ -325,6 +358,9 @@ Search for potential target nodes to insert content into. Used when Claude needs
 | Create todos | Use `insert_content` with checkbox syntax `[ ]` or `[x]` |
 | List todos | Retrieve all todos with filtering by status, parent, search |
 | Complete/Uncomplete | Toggle completion status of any node |
+| **List upcoming** | Todos due in the next N days, sorted by urgency |
+| **List overdue** | Past-due items sorted by most overdue first |
+| **Daily review** | One-call standup summary: overdue, upcoming, recent, pending |
 
 **Creating todos**:
 
@@ -345,6 +381,75 @@ Use `insert_content` with checkbox syntax:
 - `parent_id`: Scope to todos under a specific node
 - `query`: Text search within todo names/notes
 
+**Due date parsing** (priority order):
+1. `due:2026-03-15` — explicit due date tag
+2. `#due-2026-03-15` — hashtag-style due date
+3. `2026-03-15` — bare date in text
+
+---
+
+#### list_upcoming Tool
+
+List todos due within a time window, sorted by urgency.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `days` | number | no | Days ahead to look (default: 7) |
+| `root_id` | string | no | Limit to a subtree |
+| `include_no_date` | boolean | no | Include undated pending todos (default: false) |
+| `limit` | number | no | Max results (default: 50) |
+
+---
+
+#### list_overdue Tool
+
+List past-due incomplete items, sorted by most overdue first.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `root_id` | string | no | Limit to a subtree |
+| `limit` | number | no | Max results (default: 50) |
+
+---
+
+#### daily_review Tool
+
+One-call daily standup summary combining overdue items, upcoming deadlines, recent changes, and top pending todos.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `root_id` | string | no | Limit review to a subtree |
+| `overdue_limit` | number | no | Max overdue items to show (default: 10) |
+| `upcoming_days` | number | no | Days ahead for upcoming items (default: 7) |
+| `recent_days` | number | no | Days back for recent changes (default: 1) |
+| `pending_limit` | number | no | Max pending todos to show (default: 20) |
+
+**Response**:
+```json
+{
+  "as_of": "2026-02-28",
+  "summary": {
+    "total_nodes": 1250,
+    "pending_todos": 47,
+    "overdue_count": 3,
+    "due_today": 2,
+    "modified_today": 12
+  },
+  "overdue": [...],
+  "due_soon": [...],
+  "recent_changes": [...],
+  "top_pending": [...]
+}
+```
+
+---
+
 **Success criteria**: Full task management workflow without leaving Claude.
 
 ### 5. Knowledge Linking
@@ -356,7 +461,6 @@ Use `insert_content` with checkbox syntax:
 | Find related | Analyze node content, extract keywords, find matching nodes |
 | Create links | Generate Workflowy internal links to related nodes |
 | Auto-discovery | Automatically find relevant connections based on content |
-| Concept map (legacy) | Generate visual graph using keyword matching |
 | **LLM-powered concept map** | Multi-tool workflow for semantic concept discovery |
 
 **Keyword extraction**:
@@ -379,7 +483,7 @@ The LLM-powered approach uses Claude's semantic understanding to discover meanin
 **Two-tool workflow**:
 
 1. **`get_node_content_for_analysis`**: Extracts subtree content formatted for LLM analysis
-2. **`render_concept_map`**: Renders Claude's discovered concepts and relationships
+2. **`render_interactive_concept_map`**: Renders Claude's discovered concepts and relationships as an interactive HTML map
 
 **Why this approach**:
 - Claude reads and **understands** the content semantically
@@ -432,39 +536,7 @@ Extracts content from a Workflowy subtree, including linked content.
 }
 ```
 
-**Tool 2: `render_concept_map`**
-
-Renders a visual concept map from Claude's semantic analysis.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `title` | string | yes | Map title |
-| `core_concept` | object | yes | Central concept (`{label, description?}`) |
-| `concepts` | array | yes | Discovered concepts (2-35) |
-| `relationships` | array | yes | Relationships between concepts |
-| `output` | object | no | Format, insertion target, output path |
-
-**Concept structure**:
-```json
-{
-  "id": "truth-procedure",
-  "label": "Truth Procedure",
-  "level": "major",  // or "detail"
-  "importance": 8,   // 1-10, affects node size
-  "description": "Optional description"
-}
-```
-
-**Relationship structure**:
-```json
-{
-  "from": "core",  // or concept id
-  "to": "truth-procedure",
-  "type": "produces",  // semantic relationship
-  "strength": 9,   // 1-10, affects edge weight
-  "evidence": "Brief quote showing relationship"
-}
-```
+**Tool 2: `render_interactive_concept_map`** — see Interactive Concept Maps section below.
 
 **Common relationship types**:
 - `produces`, `enables`, `requires` (causal/dependency)
@@ -475,46 +547,118 @@ Renders a visual concept map from Claude's semantic analysis.
 
 ---
 
-#### Legacy Concept Map (Keyword-Based)
+#### Interactive Concept Maps (MCP Apps)
 
-The original `generate_concept_map` tool uses keyword matching. It requires the user to provide concepts upfront and finds relationships through co-occurrence and pattern matching.
+The interactive approach renders concept maps as collapsible, zoomable HTML visualizations directly inside Claude Desktop, using the MCP Apps protocol.
 
-**Parameters**:
-- `node_id`: Parent node whose children will be analyzed
-- `core_concept`: The central concept (defaults to parent node name)
-- `concepts`: List of concepts/terms to map (required, minimum 2, maximum 35)
-- `scope`: Search scope for content analysis (default: children)
-- `format`: PNG (default) or JPEG
-- `title`: Custom title for the map
+**Tool: `render_interactive_concept_map`**
 
-**Limits**:
-- Maximum 35 concepts per map (prevents oversized graphs that fail to render)
-- Maximum 5,000 nodes analyzed for edge building (prevents timeout on large datasets)
-- Maximum 1,000 unique edges per map (prevents memory exhaustion)
-- For larger concept sets, split into multiple focused maps by theme/category
+Renders an interactive, collapsible concept map as an inline HTML visualization.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | yes | Map title |
+| `core_concept` | object | yes | Central concept (`{label, description?}`) |
+| `concepts` | array | yes | Discovered concepts |
+| `relationships` | array | yes | Relationships between concepts |
+
+**Concept structure**:
+```json
+{
+  "id": "truth-procedure",
+  "label": "Truth Procedure",
+  "level": "major",
+  "importance": 8,
+  "parent_major_id": "event"
+}
+```
+
+The `parent_major_id` field groups detail concepts under their parent major concept for collapse/expand behavior. If omitted, detail concepts are auto-assigned to their most-connected major concept.
+
+**Interactions**:
+- **Click major concept**: Collapse/expand its detail children (CSS transition animation)
+- **Mouse wheel**: Zoom in/out
+- **Click + drag**: Pan the view
+- **Expand All / Collapse All**: Toolbar buttons
+- **Hover**: Highlight connected edges
+- **Reset**: Return to default view
+
+**MCP Apps protocol**:
+- Tool declares `_meta.ui.resourceUri: "ui://concept-map/interactive"`
+- Server serves self-contained HTML via `ListResources` and `ReadResource` handlers
+- Claude Desktop renders the HTML in a sandboxed iframe inline in the conversation
+
+**Layout algorithm**:
+- Core concept at center
+- Major concepts evenly distributed on a circle (radius 280)
+- Detail concepts in arcs around their parent major concept (radius 100)
+- Edges drawn as quadratic bezier curves with slight curvature
+
+**Visual encoding** (same as static maps):
+- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
+- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
+
+**Workflow**:
+```
+1. get_node_content_for_analysis → Extract subtree content
+2. Claude analyzes content semantically
+3. render_interactive_concept_map → Interactive HTML map rendered inline
+```
+
+**Success criteria**: Surface relevant connections user might not have noticed.
 
 ---
 
-#### Visual Encoding (Both Approaches)
+#### Graph Analysis
 
-- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
-- **Node size**: Larger = more important/frequent
-- **Edge labels**: Relationship type
-- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
+Four tools for network/graph analysis. These tools operate on generic data — not tied to Workflowy nodes — making them useful for analyzing any relationship data Claude encounters.
 
-**Output**:
-- Square aspect ratio (2000x2000 max, 300 DPI) for balanced visual layout
-- Unicode support for accented characters (French, German, etc.)
-- Auto-insert into source node via Dropbox image hosting
-- Fallback: save locally to `~/Downloads/` if Dropbox not configured
+**Tool: `analyze_relationships`**
 
-**Image hosting** (Dropbox):
-- Requires Dropbox OAuth configuration (app key, secret, refresh token)
-- Images stored in `/workflowy/conceptMaps/` folder
-- Shareable links generated automatically
-- Concept maps inserted as child nodes with markdown image syntax
+Extract relationships from data objects and compute graph density.
 
-**Success criteria**: Surface relevant connections user might not have noticed.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data` | array | required | Array of data objects to analyze |
+| `relationship_fields` | string[] | required | Fields containing relationship references |
+| `node_label_field` | string | "id" | Field to use as node labels |
+
+**Tool: `create_adjacency_matrix`**
+
+Build and display an adjacency matrix from explicit relationship pairs.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `relationships` | array | yes | Array of `{from, to, weight}` objects |
+| `vertices` | string[] | yes | Vertex names |
+
+**Tool: `calculate_centrality`**
+
+Calculate centrality measures to identify the most important nodes in a network.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `relationships` | array | required | Array of `{from, to, weight}` objects |
+| `vertices` | string[] | required | Vertex names |
+| `measures` | string[] | ["all"] | Which measures: degree, betweenness, closeness, eigenvector, all |
+| `top_n` | number | 10 | Number of top nodes to show per measure |
+
+**Tool: `analyze_network_structure`**
+
+Combined relationship extraction + centrality analysis in one step. Equivalent to `analyze_relationships` + `calculate_centrality`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data` | array | required | Array of data objects to analyze |
+| `relationship_fields` | string[] | required | Fields containing relationship references |
+| `node_label_field` | string | "id" | Field to use as node labels |
+| `include_centrality` | boolean | true | Whether to include centrality analysis |
+
+**Centrality measures**:
+- **Degree**: Number of connections (in + out) normalized by graph size
+- **Betweenness**: How often a node lies on shortest paths between other nodes
+- **Closeness**: Inverse of average distance to all other reachable nodes
+- **Eigenvector**: Importance based on being connected to other important nodes
 
 ### 6. Content Modification
 
@@ -526,8 +670,141 @@ The original `generate_concept_map` tool uses keyword matching. It requires the 
 | Move node | Relocate to different parent |
 | Complete/Uncomplete | Toggle task completion status |
 | Delete node | Permanent removal |
+| **Duplicate node** | Deep-copy a node and its subtree to a new location |
+| **Create from template** | Copy a template subtree with `{{variable}}` substitution |
+| **Bulk update** | Apply an operation to all nodes matching a filter |
 
-**Success criteria**: All CRUD operations available and reversible (except delete).
+---
+
+#### duplicate_node Tool
+
+Deep-copy a node and its entire subtree to a new parent. Preserves hierarchy, names, and notes.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_id` | string | yes | Node to duplicate |
+| `target_parent_id` | string | yes | Where to place the copy |
+| `position` | "top" \| "bottom" | no | Position under target (default: top) |
+
+---
+
+#### create_from_template Tool
+
+Copy a template subtree with variable substitution. Template nodes use `{{variable_name}}` placeholders in names and notes.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `template_id` | string | yes | Root node of the template subtree |
+| `target_parent_id` | string | yes | Where to place the instantiated copy |
+| `variables` | object | yes | Key-value map of variable substitutions |
+| `position` | "top" \| "bottom" | no | Position under target (default: top) |
+
+**Example**:
+```json
+{
+  "template_id": "tmpl-abc",
+  "target_parent_id": "projects",
+  "variables": {
+    "project_name": "Alpha",
+    "owner": "Alice",
+    "deadline": "2026-04-01"
+  }
+}
+```
+
+Template node `{{project_name}} Plan` becomes `Alpha Plan`. All `{{owner}}` in names and notes become `Alice`.
+
+---
+
+#### bulk_update Tool
+
+Apply an operation to all nodes matching a filter. Supports dry-run mode for previewing matches.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `filter` | object | yes | Filter criteria (query, tag, assignee, status, root_id) |
+| `operation` | string | yes | One of: complete, uncomplete, delete, add_tag, remove_tag |
+| `tag` | string | conditional | Tag to add/remove (required for add_tag/remove_tag) |
+| `dry_run` | boolean | no | Preview matches without modifying (default: false) |
+| `limit` | number | no | Max nodes to modify (default: 50, safety limit) |
+
+**Operations**:
+- `complete` / `uncomplete`: Toggle completion status
+- `delete`: Permanently remove matching nodes
+- `add_tag`: Append `#tag` to node names
+- `remove_tag`: Remove `#tag` from names and notes
+
+---
+
+### 6b. Project Management
+
+**Goal**: High-level project visibility and tracking.
+
+| Feature | Description |
+|---------|-------------|
+| **Project summary** | Stats, tag counts, assignees, overdue items for a subtree |
+| **Recent changes** | Nodes modified within a time window |
+
+---
+
+#### get_project_summary Tool
+
+Get a comprehensive summary of a subtree: total nodes, tag distribution, assignee distribution, overdue count, and completion stats.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | yes | Root node of the project |
+| `depth` | number | no | Max depth to analyze (default: unlimited) |
+
+**Response**:
+```json
+{
+  "root": { "id": "abc", "name": "Project Alpha" },
+  "stats": {
+    "total_nodes": 85,
+    "total_todos": 32,
+    "completed_todos": 18,
+    "pending_todos": 14,
+    "completion_rate": "56%",
+    "overdue_count": 3,
+    "has_notes": 25
+  },
+  "top_tags": [
+    { "tag": "inbox", "count": 8 },
+    { "tag": "review", "count": 5 }
+  ],
+  "top_assignees": [
+    { "assignee": "alice", "count": 12 },
+    { "assignee": "bob", "count": 7 }
+  ]
+}
+```
+
+---
+
+#### get_recent_changes Tool
+
+Find nodes modified within a time window.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `hours` | number | no | How many hours back to look (default: 24) |
+| `root_id` | string | no | Limit to a subtree |
+| `limit` | number | no | Max results (default: 50) |
+
+---
+
+**Success criteria**: All CRUD operations available and reversible (except delete). Project visibility available in a single tool call.
 
 ## User Flows
 
@@ -595,7 +872,7 @@ User: "Create a concept map of my Badiou philosophy notes"
      * "Subject constituted by Fidelity" (found in: "...the Subject emerges through...")
      * "Badiou critiques Deleuze" (found in: "...Badiou's critique of immanence...")
 
-3. Claude calls render_concept_map with discovered analysis:
+3. Claude calls render_interactive_concept_map with discovered analysis:
    {
      "title": "Badiou's Event Philosophy",
      "core_concept": { "label": "Event" },
@@ -607,40 +884,16 @@ User: "Create a concept map of my Badiou philosophy notes"
      "relationships": [
        { "from": "core", "to": "truth", "type": "produces", "strength": 9 },
        { "from": "subject", "to": "fidelity", "type": "constituted by", "strength": 8 }
-     ],
-     "output": { "insert_into_workflowy": "abc123" }
+     ]
    }
 
-4. Tool renders Graphviz visualization and uploads to Dropbox
-5. Concept map inserted as child node with image and summary
+4. Tool renders interactive HTML concept map inline in Claude Desktop
+5. User can zoom, pan, and collapse/expand concept clusters
 
 Key difference from legacy approach:
 - Claude DISCOVERS concepts through understanding, not keyword matching
 - Relationships are semantically meaningful, not pattern-matched
 - No need to provide concepts upfront - Claude finds them
-```
-
-### Flow 4b: Visualize Knowledge Connections (Legacy Keyword-Based)
-
-```
-User: "Create a concept map of my philosophy notes showing how Heidegger, Dewey,
-       phenomenology, and pragmatism relate"
-
-1. User provides the parent node and list of concepts
-2. generate_concept_map scans all children for concept occurrences
-3. Tool extracts relationship labels from context (e.g., "Heidegger critiques pragmatism")
-4. Concepts organized hierarchically based on Workflowy depth:
-   - Major concepts (found in shallower notes)
-   - Detail concepts (found in deeper nested notes)
-5. Graphviz renders hierarchical network with labeled edges
-6. PNG auto-inserted into Workflowy (or saved to Downloads)
-
-Example output structure:
-- Core: "Philosophy Notes" (center)
-- Major: "Heidegger", "Dewey" (connected to core with "includes")
-- Details: "phenomenology", "pragmatism" (connected with "influences", "contrasts with")
-- Cross-links: "Heidegger" → "phenomenology" ("develops"),
-              "phenomenology" ↔ "pragmatism" ("contrasts with")
 ```
 
 ### Flow 5: Large Content Insertion (Automatic Parallelization)
@@ -1327,6 +1580,7 @@ Claude never needs to read or parse the file - server handles everything.
 
 *Not committed, but designed to accommodate:*
 
-- Template system for common content patterns
 - Conflict detection for concurrent edits
 - Offline queue for unreachable API
+- Recurring task support (repeat rules for todos)
+- Cross-outline collaboration (multi-user shared nodes)
