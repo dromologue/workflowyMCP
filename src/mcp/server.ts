@@ -23,7 +23,6 @@ import type {
   WorkflowyNode,
   NodeWithPath,
   RelatedNode,
-  ConceptMapScope,
   ConceptMapNode as LegacyConceptMapNode,
   ConceptMapEdge as LegacyConceptMapEdge,
   CreatedNode,
@@ -87,6 +86,14 @@ import {
   type BatchOperationJobResult,
 } from "../shared/utils/jobQueue.js";
 import { getDefaultRateLimiter } from "../shared/utils/rateLimiter.js";
+import {
+  filterNodesByScope,
+  getSubtreeNodes,
+  buildChildrenIndex,
+  type ScopeType,
+} from "../shared/utils/scope-utils.js";
+import { parseTags, parseNodeTags, nodeHasTag, nodeHasAssignee } from "../shared/utils/tag-parser.js";
+import { parseDueDateFromNode, isOverdue, isDueWithin } from "../shared/utils/date-parser.js";
 
 // Validate configuration on startup
 validateConfig();
@@ -120,81 +127,7 @@ async function getCachedNodes(): Promise<WorkflowyNode[]> {
 // ============================================================================
 // Knowledge Linking Functions
 // ============================================================================
-
-function filterNodesByScope(
-  sourceNode: WorkflowyNode,
-  allNodes: WorkflowyNode[],
-  scope: ConceptMapScope
-): WorkflowyNode[] {
-  if (!Array.isArray(allNodes)) {
-    return [];
-  }
-
-  // Build indexes once - O(n) instead of O(n²) for repeated lookups
-  const nodeMap = new Map<string, WorkflowyNode>();
-  const childrenMap = new Map<string, WorkflowyNode[]>();
-
-  for (const node of allNodes) {
-    nodeMap.set(node.id, node);
-    const parentId = node.parent_id || "root";
-    if (!childrenMap.has(parentId)) {
-      childrenMap.set(parentId, []);
-    }
-    childrenMap.get(parentId)!.push(node);
-  }
-
-  switch (scope) {
-    case "this_node":
-      return [];
-
-    case "children": {
-      // Use index for O(children) instead of O(n × depth)
-      const result: WorkflowyNode[] = [];
-      const collectChildren = (parentId: string, depth = 0) => {
-        if (depth > 100) return;
-        const children = childrenMap.get(parentId) || [];
-        for (const child of children) {
-          result.push(child);
-          collectChildren(child.id, depth + 1);
-        }
-      };
-      collectChildren(sourceNode.id);
-      return result;
-    }
-
-    case "siblings": {
-      if (!sourceNode.parent_id) {
-        // Root-level siblings from index
-        return (childrenMap.get("root") || []).filter((n) => n.id !== sourceNode.id);
-      }
-      return (childrenMap.get(sourceNode.parent_id) || []).filter(
-        (n) => n.id !== sourceNode.id
-      );
-    }
-
-    case "ancestors": {
-      // Use nodeMap for O(1) parent lookups instead of O(n)
-      const ancestors: WorkflowyNode[] = [];
-      let currentId = sourceNode.parent_id;
-      let depth = 0;
-      while (currentId && depth < 100) {
-        const parent = nodeMap.get(currentId);
-        if (parent) {
-          ancestors.push(parent);
-          currentId = parent.parent_id;
-        } else {
-          break;
-        }
-        depth++;
-      }
-      return ancestors;
-    }
-
-    case "all":
-    default:
-      return allNodes.filter((n) => n.id !== sourceNode.id);
-  }
-}
+// filterNodesByScope is now imported from ../shared/utils/scope-utils.js
 
 async function findRelatedNodes(
   sourceNode: WorkflowyNode,
@@ -871,6 +804,13 @@ async function parallelInsertContent(
 
 const searchNodesSchema = z.object({
   query: z.string().describe("Text to search for in node names and notes"),
+  tag: z.string().optional().describe("Filter by #tag (with or without #)"),
+  assignee: z.string().optional().describe("Filter by @person (with or without @)"),
+  status: z.enum(["all", "pending", "completed"]).optional().describe("Filter by completion status"),
+  root_id: z.string().optional().describe("Limit search to a subtree"),
+  scope: z.enum(["this_node", "children", "siblings", "ancestors", "all"]).optional().describe("Scope relative to root_id"),
+  modified_after: z.string().optional().describe("ISO date string — only nodes modified after this date"),
+  modified_before: z.string().optional().describe("ISO date string — only nodes modified before this date"),
 });
 
 const getNodeSchema = z.object({
@@ -1062,6 +1002,89 @@ const submitFileJobSchema = z.object({
   position: z.enum(["top", "bottom"]).optional().describe("Position relative to siblings (default: top)"),
   format: z.enum(["auto", "markdown", "plain"]).optional().describe("File format handling (default: auto)"),
   description: z.string().optional().describe("Optional description for tracking"),
+});
+
+// ============================================================================
+// Task & Knowledge Management Schemas
+// ============================================================================
+
+const getProjectSummarySchema = z.object({
+  node_id: z.string().describe("The ID of the project root node"),
+  include_tags: z.boolean().optional().describe("Include tag frequency counts (default: true)"),
+  recently_modified_days: z.number().optional().describe("Days to consider for recently modified (default: 7)"),
+});
+
+const getRecentChangesSchema = z.object({
+  days: z.number().optional().describe("Number of days to look back (default: 7)"),
+  root_id: z.string().optional().describe("Limit to a subtree"),
+  include_completed: z.boolean().optional().describe("Include completed nodes (default: true)"),
+  limit: z.number().optional().describe("Max results to return (default: 50)"),
+});
+
+const listUpcomingSchema = z.object({
+  days: z.number().optional().describe("Number of days ahead to look (default: 14)"),
+  root_id: z.string().optional().describe("Limit to a subtree"),
+  include_no_due_date: z.boolean().optional().describe("Append incomplete todos without due dates (default: false)"),
+  limit: z.number().optional().describe("Max results to return (default: 50)"),
+});
+
+const listOverdueSchema = z.object({
+  root_id: z.string().optional().describe("Limit to a subtree"),
+  include_completed: z.boolean().optional().describe("Include completed overdue nodes (default: false)"),
+  limit: z.number().optional().describe("Max results to return (default: 50)"),
+});
+
+const findBacklinksSchema = z.object({
+  node_id: z.string().describe("The ID of the target node to find backlinks for"),
+  limit: z.number().optional().describe("Max results to return (default: 50)"),
+});
+
+const duplicateNodeSchema = z.object({
+  node_id: z.string().describe("The ID of the node to duplicate"),
+  target_parent_id: z.string().describe("The ID of the parent to copy into"),
+  position: z.enum(["top", "bottom"]).optional().describe("Position in target parent (default: top)"),
+  include_children: z.boolean().optional().describe("Include descendants (default: true)"),
+  name_prefix: z.string().optional().describe("Prefix to add to the root node name (e.g. 'Copy of ')"),
+});
+
+const createFromTemplateSchema = z.object({
+  template_node_id: z.string().describe("The ID of the template node to copy"),
+  target_parent_id: z.string().describe("The ID of the parent to insert the copy into"),
+  variables: z.record(z.string()).optional().describe("Key-value map for {{variable}} substitution"),
+  position: z.enum(["top", "bottom"]).optional().describe("Position in target parent (default: top)"),
+});
+
+const bulkUpdateSchema = z.object({
+  filter: z.object({
+    query: z.string().optional().describe("Text search filter"),
+    tag: z.string().optional().describe("Filter by #tag"),
+    assignee: z.string().optional().describe("Filter by @person"),
+    status: z.enum(["all", "pending", "completed"]).optional().describe("Filter by completion status"),
+    root_id: z.string().optional().describe("Limit to a subtree"),
+    scope: z.enum(["this_node", "children", "siblings", "ancestors", "all"]).optional().describe("Scope relative to root_id"),
+  }).describe("Criteria to select nodes"),
+  operation: z.discriminatedUnion("type", [
+    z.object({ type: z.literal("complete") }),
+    z.object({ type: z.literal("uncomplete") }),
+    z.object({ type: z.literal("add_tag"), tag: z.string().describe("Tag to add (with or without #)") }),
+    z.object({ type: z.literal("remove_tag"), tag: z.string().describe("Tag to remove (with or without #)") }),
+    z.object({
+      type: z.literal("move"),
+      target_parent_id: z.string().describe("Parent to move nodes into"),
+      position: z.enum(["top", "bottom"]).optional(),
+    }),
+    z.object({ type: z.literal("delete") }),
+  ]).describe("Operation to apply to matched nodes"),
+  dry_run: z.boolean().optional().describe("Preview matches without making changes (default: false)"),
+  limit: z.number().optional().describe("Safety cap on affected nodes (default: 20)"),
+});
+
+const dailyReviewSchema = z.object({
+  root_id: z.string().optional().describe("Limit review to a subtree"),
+  overdue_limit: z.number().optional().describe("Max overdue items to show (default: 10)"),
+  upcoming_days: z.number().optional().describe("Days ahead for upcoming items (default: 7)"),
+  recent_days: z.number().optional().describe("Days back for recent changes (default: 1)"),
+  pending_limit: z.number().optional().describe("Max pending todos to show (default: 20)"),
 });
 
 // ============================================================================
@@ -1340,11 +1363,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "search_nodes",
-        description: "Search for nodes in Workflowy by text. Returns all nodes matching the query in their name or note, with full paths for identification.",
+        description: "Search for nodes in Workflowy by text with optional filters. When filters are applied, returns structured JSON with tags, assignees, and due dates.",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "Text to search for in node names and notes" },
+            tag: { type: "string", description: "Filter by #tag (with or without #)" },
+            assignee: { type: "string", description: "Filter by @person (with or without @)" },
+            status: { type: "string", enum: ["all", "pending", "completed"], description: "Filter by completion status" },
+            root_id: { type: "string", description: "Limit search to a subtree" },
+            scope: { type: "string", enum: ["this_node", "children", "siblings", "ancestors", "all"], description: "Scope relative to root_id" },
+            modified_after: { type: "string", description: "ISO date — only nodes modified after this" },
+            modified_before: { type: "string", description: "ISO date — only nodes modified before this" },
           },
           required: ["query"],
         },
@@ -1872,6 +1902,148 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["file_path", "parent_id"],
         },
       },
+      // ======== Task & Knowledge Management Tools ========
+      {
+        name: "get_project_summary",
+        description: "Get a comprehensive status overview of a project subtree: node counts, todo stats, tag frequencies, assignees, overdue items, and recently modified nodes.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: { type: "string", description: "The ID of the project root node" },
+            include_tags: { type: "boolean", description: "Include tag frequency counts (default: true)" },
+            recently_modified_days: { type: "number", description: "Days to consider for recently modified (default: 7)" },
+          },
+          required: ["node_id"],
+        },
+      },
+      {
+        name: "get_recent_changes",
+        description: "List nodes modified within a time window, sorted by most recent first.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            days: { type: "number", description: "Number of days to look back (default: 7)" },
+            root_id: { type: "string", description: "Limit to a subtree" },
+            include_completed: { type: "boolean", description: "Include completed nodes (default: true)" },
+            limit: { type: "number", description: "Max results (default: 50)" },
+          },
+        },
+      },
+      {
+        name: "list_upcoming",
+        description: "List todos with due dates in the next N days, sorted by urgency (overdue first, then nearest due date).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            days: { type: "number", description: "Days ahead to look (default: 14)" },
+            root_id: { type: "string", description: "Limit to a subtree" },
+            include_no_due_date: { type: "boolean", description: "Append incomplete todos without due dates at end (default: false)" },
+            limit: { type: "number", description: "Max results (default: 50)" },
+          },
+        },
+      },
+      {
+        name: "list_overdue",
+        description: "List all past-due items sorted by most overdue first.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            root_id: { type: "string", description: "Limit to a subtree" },
+            include_completed: { type: "boolean", description: "Include completed overdue nodes (default: false)" },
+            limit: { type: "number", description: "Max results (default: 50)" },
+          },
+        },
+      },
+      {
+        name: "find_backlinks",
+        description: "Find all nodes that contain a Workflowy link to the specified node.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: { type: "string", description: "The ID of the target node" },
+            limit: { type: "number", description: "Max results (default: 50)" },
+          },
+          required: ["node_id"],
+        },
+      },
+      {
+        name: "duplicate_node",
+        description: "Deep-copy a node and its subtree to a new location.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: { type: "string", description: "The ID of the node to duplicate" },
+            target_parent_id: { type: "string", description: "The ID of the parent to copy into" },
+            position: { type: "string", enum: ["top", "bottom"], description: "Position in target parent" },
+            include_children: { type: "boolean", description: "Include descendants (default: true)" },
+            name_prefix: { type: "string", description: "Prefix for the root node name (e.g. 'Copy of ')" },
+          },
+          required: ["node_id", "target_parent_id"],
+        },
+      },
+      {
+        name: "create_from_template",
+        description: "Copy a template subtree with {{variable}} substitution in node names and notes.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            template_node_id: { type: "string", description: "The ID of the template node" },
+            target_parent_id: { type: "string", description: "The ID of the parent to insert into" },
+            variables: { type: "object", description: "Key-value map for {{variable}} substitution", additionalProperties: { type: "string" } },
+            position: { type: "string", enum: ["top", "bottom"], description: "Position in target parent" },
+          },
+          required: ["template_node_id", "target_parent_id"],
+        },
+      },
+      {
+        name: "bulk_update",
+        description: "Apply an operation (complete, uncomplete, add_tag, remove_tag, move, delete) to all nodes matching a filter. Use dry_run to preview.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filter: {
+              type: "object",
+              description: "Criteria to select nodes",
+              properties: {
+                query: { type: "string", description: "Text search" },
+                tag: { type: "string", description: "Filter by #tag" },
+                assignee: { type: "string", description: "Filter by @person" },
+                status: { type: "string", enum: ["all", "pending", "completed"] },
+                root_id: { type: "string", description: "Limit to subtree" },
+                scope: { type: "string", enum: ["this_node", "children", "siblings", "ancestors", "all"] },
+              },
+            },
+            operation: {
+              type: "object",
+              description: "Operation to apply. Must include 'type' field: complete, uncomplete, add_tag, remove_tag, move, delete",
+              properties: {
+                type: { type: "string", enum: ["complete", "uncomplete", "add_tag", "remove_tag", "move", "delete"] },
+                tag: { type: "string", description: "For add_tag/remove_tag" },
+                target_parent_id: { type: "string", description: "For move" },
+                position: { type: "string", enum: ["top", "bottom"], description: "For move" },
+              },
+              required: ["type"],
+            },
+            dry_run: { type: "boolean", description: "Preview without making changes (default: false)" },
+            limit: { type: "number", description: "Safety cap on affected nodes (default: 20)" },
+          },
+          required: ["filter", "operation"],
+        },
+      },
+      {
+        name: "daily_review",
+        description: "One-call daily standup summary: overdue items, upcoming deadlines, recent changes, and top pending todos.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            root_id: { type: "string", description: "Limit review to a subtree" },
+            overdue_limit: { type: "number", description: "Max overdue items (default: 10)" },
+            upcoming_days: { type: "number", description: "Days ahead for upcoming (default: 7)" },
+            recent_days: { type: "number", description: "Days back for recent changes (default: 1)" },
+            pending_limit: { type: "number", description: "Max pending todos (default: 20)" },
+          },
+        },
+      },
     ],
   };
 });
@@ -1882,17 +2054,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     case "search_nodes": {
-      const { query } = searchNodesSchema.parse(args);
+      const { query, tag, assignee, status, root_id, scope, modified_after, modified_before } = searchNodesSchema.parse(args);
       const allNodes = await getCachedNodes();
-      const lowerQuery = query.toLowerCase();
+      const hasFilters = tag || assignee || status || root_id || modified_after || modified_before;
 
-      const matchingNodes = allNodes.filter((node) => {
+      // Step 1: Scope filter
+      let candidates = allNodes;
+      if (root_id) {
+        const rootNode = allNodes.find((n) => n.id === root_id);
+        if (rootNode && scope) {
+          candidates = filterNodesByScope(rootNode, allNodes, scope);
+        } else if (rootNode) {
+          candidates = getSubtreeNodes(root_id, allNodes);
+        }
+      }
+
+      // Step 2: Text query filter
+      const lowerQuery = query.toLowerCase();
+      let results = candidates.filter((node) => {
         const nameMatch = node.name?.toLowerCase().includes(lowerQuery);
         const noteMatch = node.note?.toLowerCase().includes(lowerQuery);
         return nameMatch || noteMatch;
       });
 
-      const nodesWithPaths = buildNodePaths(matchingNodes);
+      // Step 3: Tag filter
+      if (tag) {
+        results = results.filter((node) => nodeHasTag(node, tag));
+      }
+
+      // Step 4: Assignee filter
+      if (assignee) {
+        results = results.filter((node) => nodeHasAssignee(node, assignee));
+      }
+
+      // Step 5: Status filter
+      if (status && status !== "all") {
+        results = results.filter((node) => {
+          const isCompleted = !!node.completedAt;
+          return status === "completed" ? isCompleted : !isCompleted;
+        });
+      }
+
+      // Step 6: Date range filters
+      if (modified_after) {
+        const afterTs = new Date(modified_after).getTime();
+        results = results.filter((node) => node.modifiedAt && node.modifiedAt > afterTs);
+      }
+      if (modified_before) {
+        const beforeTs = new Date(modified_before).getTime();
+        results = results.filter((node) => node.modifiedAt && node.modifiedAt < beforeTs);
+      }
+
+      // Return structured JSON when filters are applied, otherwise legacy text format
+      if (hasFilters) {
+        const nodesWithPaths = buildNodePaths(results);
+        const enriched = nodesWithPaths.map((n) => {
+          const tags = parseNodeTags(n);
+          const dueInfo = parseDueDateFromNode(n);
+          return {
+            id: n.id,
+            name: n.name,
+            path: n.path,
+            completed: !!n.completedAt,
+            tags: tags.tags,
+            assignees: tags.assignees,
+            due_date: dueInfo ? dueInfo.date.toISOString().split("T")[0] : null,
+          };
+        });
+        const filtersApplied: Record<string, string> = {};
+        if (tag) filtersApplied.tag = tag;
+        if (assignee) filtersApplied.assignee = assignee;
+        if (status) filtersApplied.status = status;
+        if (root_id) filtersApplied.root_id = root_id;
+        if (modified_after) filtersApplied.modified_after = modified_after;
+        if (modified_before) filtersApplied.modified_before = modified_before;
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ count: enriched.length, filters_applied: filtersApplied, results: enriched }, null, 2) }],
+        };
+      }
+
+      const nodesWithPaths = buildNodePaths(results);
       return {
         content: [{ type: "text", text: formatNodesForSelection(nodesWithPaths) }],
       };
@@ -3796,6 +4038,605 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }, null, 2),
         }],
       };
+    }
+
+    // ======== Task & Knowledge Management Handlers ========
+
+    case "get_project_summary": {
+      const { node_id, include_tags = true, recently_modified_days = 7 } = getProjectSummarySchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const subtreeNodes = getSubtreeNodes(node_id, allNodes);
+
+      if (subtreeNodes.length === 0) {
+        return { content: [{ type: "text", text: `Node ${node_id} not found` }], isError: true };
+      }
+
+      const rootNode = subtreeNodes[0];
+      const nodesWithPaths = buildNodePaths([rootNode]);
+
+      // Todo stats
+      let todoPending = 0;
+      let todoCompleted = 0;
+      let overdueCount = 0;
+      const now = new Date();
+      const tagCounts: Record<string, number> = {};
+      const assigneeCounts: Record<string, number> = {};
+      let hasDueDates = false;
+
+      const cutoffMs = now.getTime() - recently_modified_days * 24 * 60 * 60 * 1000;
+      const recentlyModified: Array<{ id: string; name: string; modifiedAt: number; path: string }> = [];
+
+      for (const node of subtreeNodes) {
+        // Count todos
+        const isTodo = node.layoutMode === "todo" || /^\[[ x]\]/.test(node.name || "");
+        if (isTodo) {
+          if (node.completedAt) {
+            todoCompleted++;
+          } else {
+            todoPending++;
+          }
+        }
+
+        // Due dates & overdue
+        const dueInfo = parseDueDateFromNode(node);
+        if (dueInfo) {
+          hasDueDates = true;
+          if (!node.completedAt && isOverdue(node, now)) {
+            overdueCount++;
+          }
+        }
+
+        // Tags & assignees
+        if (include_tags) {
+          const parsed = parseNodeTags(node);
+          for (const t of parsed.tags) {
+            tagCounts[`#${t}`] = (tagCounts[`#${t}`] || 0) + 1;
+          }
+          for (const a of parsed.assignees) {
+            assigneeCounts[`@${a}`] = (assigneeCounts[`@${a}`] || 0) + 1;
+          }
+        }
+
+        // Recently modified
+        if (node.modifiedAt && node.modifiedAt > cutoffMs) {
+          recentlyModified.push({ id: node.id, name: node.name || "", modifiedAt: node.modifiedAt, path: "" });
+        }
+      }
+
+      // Build paths for recently modified
+      const recentNodes = subtreeNodes.filter((n) => n.modifiedAt && n.modifiedAt > cutoffMs);
+      const recentWithPaths = buildNodePaths(recentNodes);
+      recentWithPaths.sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0));
+      const recentOutput = recentWithPaths.slice(0, 20).map((n) => ({
+        id: n.id, name: n.name, modifiedAt: n.modifiedAt, path: n.path,
+      }));
+
+      const todoTotal = todoPending + todoCompleted;
+      const summary = {
+        root: { id: rootNode.id, name: rootNode.name, path: nodesWithPaths[0]?.path || "" },
+        stats: {
+          total_nodes: subtreeNodes.length,
+          todo_total: todoTotal,
+          todo_pending: todoPending,
+          todo_completed: todoCompleted,
+          completion_percent: todoTotal > 0 ? Math.round((todoCompleted / todoTotal) * 100) : 0,
+          has_due_dates: hasDueDates,
+          overdue_count: overdueCount,
+        },
+        tags: include_tags ? tagCounts : undefined,
+        assignees: include_tags ? assigneeCounts : undefined,
+        recently_modified: recentOutput,
+      };
+
+      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+    }
+
+    case "get_recent_changes": {
+      const { days = 7, root_id, include_completed = true, limit = 50 } = getRecentChangesSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const now = new Date();
+      const cutoffMs = now.getTime() - days * 24 * 60 * 60 * 1000;
+      const since = new Date(cutoffMs).toISOString();
+
+      let candidates = allNodes;
+      if (root_id) {
+        candidates = getSubtreeNodes(root_id, allNodes);
+      }
+
+      let results = candidates.filter((n) => n.modifiedAt && n.modifiedAt > cutoffMs);
+
+      if (!include_completed) {
+        results = results.filter((n) => !n.completedAt);
+      }
+
+      results.sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0));
+      results = results.slice(0, limit);
+
+      const nodesWithPaths = buildNodePaths(results);
+      const changes = nodesWithPaths.map((n) => ({
+        id: n.id, name: n.name, path: n.path, modifiedAt: n.modifiedAt, completed: !!n.completedAt,
+      }));
+
+      return { content: [{ type: "text", text: JSON.stringify({ since, count: changes.length, changes }, null, 2) }] };
+    }
+
+    case "list_upcoming": {
+      const { days = 14, root_id, include_no_due_date = false, limit = 50 } = listUpcomingSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const cutoff = new Date(today);
+      cutoff.setDate(cutoff.getDate() + days);
+
+      let candidates = allNodes;
+      if (root_id) {
+        candidates = getSubtreeNodes(root_id, allNodes);
+      }
+
+      // Filter to incomplete nodes
+      const incomplete = candidates.filter((n) => !n.completedAt);
+
+      const upcoming: Array<{ node: WorkflowyNode; dueDate: Date; daysUntilDue: number; overdue: boolean }> = [];
+      const noDueDate: WorkflowyNode[] = [];
+
+      for (const node of incomplete) {
+        const dueInfo = parseDueDateFromNode(node);
+        if (dueInfo) {
+          const daysUntil = Math.floor((dueInfo.date.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+          if (dueInfo.date <= cutoff) {
+            upcoming.push({ node, dueDate: dueInfo.date, daysUntilDue: daysUntil, overdue: daysUntil < 0 });
+          }
+        } else if (include_no_due_date) {
+          noDueDate.push(node);
+        }
+      }
+
+      // Sort: overdue first (most overdue first), then by nearest due date
+      upcoming.sort((a, b) => a.dueDate.getTime() - b.dueDate.getTime());
+
+      let allResults: Array<{ node: WorkflowyNode; due_date: string | null; days_until_due: number | null; overdue: boolean }> = upcoming.map((u) => ({
+        node: u.node, due_date: u.dueDate.toISOString().split("T")[0], days_until_due: u.daysUntilDue, overdue: u.overdue,
+      }));
+
+      if (include_no_due_date) {
+        const noDueMapped = noDueDate.map((n) => ({
+          node: n, due_date: null as string | null, days_until_due: null as number | null, overdue: false,
+        }));
+        allResults = [...allResults, ...noDueMapped];
+      }
+
+      allResults = allResults.slice(0, limit);
+      const resultNodes = allResults.map((r) => r.node);
+      const nodesWithPaths = buildNodePaths(resultNodes);
+      const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+      const output = allResults.map((r) => ({
+        id: r.node.id, name: r.node.name, path: pathMap.get(r.node.id) || "",
+        due_date: r.due_date, days_until_due: r.days_until_due, overdue: r.overdue, completed: false,
+      }));
+
+      return { content: [{ type: "text", text: JSON.stringify({ as_of: today.toISOString().split("T")[0], count: output.length, upcoming: output }, null, 2) }] };
+    }
+
+    case "list_overdue": {
+      const { root_id, include_completed = false, limit = 50 } = listOverdueSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+      let candidates = allNodes;
+      if (root_id) {
+        candidates = getSubtreeNodes(root_id, allNodes);
+      }
+
+      const overdue: Array<{ node: WorkflowyNode; dueDate: Date; daysOverdue: number }> = [];
+
+      for (const node of candidates) {
+        if (!include_completed && node.completedAt) continue;
+        const dueInfo = parseDueDateFromNode(node);
+        if (dueInfo && dueInfo.date < today) {
+          const daysOver = Math.floor((today.getTime() - dueInfo.date.getTime()) / (24 * 60 * 60 * 1000));
+          overdue.push({ node, dueDate: dueInfo.date, daysOverdue: daysOver });
+        }
+      }
+
+      // Most overdue first
+      overdue.sort((a, b) => b.daysOverdue - a.daysOverdue);
+      const limited = overdue.slice(0, limit);
+      const resultNodes = limited.map((o) => o.node);
+      const nodesWithPaths = buildNodePaths(resultNodes);
+      const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+      const output = limited.map((o) => ({
+        id: o.node.id, name: o.node.name, path: pathMap.get(o.node.id) || "",
+        due_date: o.dueDate.toISOString().split("T")[0], days_overdue: o.daysOverdue, completed: !!o.node.completedAt,
+      }));
+
+      return { content: [{ type: "text", text: JSON.stringify({ as_of: today.toISOString().split("T")[0], count: output.length, overdue: output }, null, 2) }] };
+    }
+
+    case "find_backlinks": {
+      const { node_id, limit = 50 } = findBacklinksSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const targetNode = allNodes.find((n) => n.id === node_id);
+
+      if (!targetNode) {
+        return { content: [{ type: "text", text: `Node ${node_id} not found` }], isError: true };
+      }
+
+      const backlinks: Array<{ node: WorkflowyNode; link_in: "name" | "note" | "both" }> = [];
+
+      for (const node of allNodes) {
+        if (node.id === node_id) continue;
+        const nameLinks = extractWorkflowyLinks(node.name || "");
+        const noteLinks = extractWorkflowyLinks(node.note || "");
+        const inName = nameLinks.includes(node_id);
+        const inNote = noteLinks.includes(node_id);
+
+        if (inName || inNote) {
+          const link_in = inName && inNote ? "both" : inName ? "name" : "note";
+          backlinks.push({ node, link_in });
+        }
+      }
+
+      const limited = backlinks.slice(0, limit);
+      const resultNodes = limited.map((b) => b.node);
+      const nodesWithPaths = buildNodePaths(resultNodes);
+      const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+      const output = limited.map((b) => ({
+        id: b.node.id, name: b.node.name, path: pathMap.get(b.node.id) || "", link_in: b.link_in,
+      }));
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ target: { id: targetNode.id, name: targetNode.name }, count: output.length, backlinks: output }, null, 2) }],
+      };
+    }
+
+    case "duplicate_node": {
+      const { node_id, target_parent_id, position, include_children = true, name_prefix } = duplicateNodeSchema.parse(args);
+      const allNodes = await getCachedNodes();
+
+      // Get the subtree to copy
+      const subtree = include_children ? getSubtreeNodes(node_id, allNodes) : allNodes.filter((n) => n.id === node_id);
+      if (subtree.length === 0) {
+        return { content: [{ type: "text", text: `Node ${node_id} not found` }], isError: true };
+      }
+
+      // Build parent-child order for sequential creation
+      const childrenIndex = buildChildrenIndex(subtree);
+      const ordered: WorkflowyNode[] = [];
+      const visit = (nodeId: string) => {
+        const node = subtree.find((n) => n.id === nodeId);
+        if (node) ordered.push(node);
+        const children = childrenIndex.get(nodeId) || [];
+        for (const child of children) visit(child.id);
+      };
+      visit(node_id);
+
+      // Create nodes sequentially, mapping old IDs to new IDs
+      const idMap = new Map<string, string>();
+      let nodesCreated = 0;
+
+      startBatch();
+      try {
+        for (const node of ordered) {
+          const parentId = node.id === node_id ? target_parent_id : idMap.get(node.parent_id || "");
+          if (!parentId) continue;
+
+          let nodeName = node.name || "";
+          if (node.id === node_id && name_prefix) {
+            nodeName = name_prefix + nodeName;
+          }
+
+          const body: Record<string, unknown> = { name: nodeName, parent_id: parentId };
+          if (node.note) body.description = node.note;
+          if (position && node.id === node_id) body.position = position;
+
+          const result = await workflowyRequest("/nodes", "POST", body) as { id?: string };
+          if (result?.id) {
+            idMap.set(node.id, result.id);
+            nodesCreated++;
+          }
+        }
+      } finally {
+        endBatch();
+        invalidateCache();
+      }
+
+      const newRootId = idMap.get(node_id) || "";
+      return {
+        content: [{ type: "text", text: JSON.stringify({ success: true, original_id: node_id, new_root_id: newRootId, nodes_created: nodesCreated }, null, 2) }],
+      };
+    }
+
+    case "create_from_template": {
+      const { template_node_id, target_parent_id, variables = {}, position } = createFromTemplateSchema.parse(args);
+      const allNodes = await getCachedNodes();
+
+      const subtree = getSubtreeNodes(template_node_id, allNodes);
+      if (subtree.length === 0) {
+        return { content: [{ type: "text", text: `Template node ${template_node_id} not found` }], isError: true };
+      }
+
+      // Variable substitution helper
+      const substituteVars = (text: string): string => {
+        return text.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+          return key in variables ? variables[key] : match;
+        });
+      };
+
+      // Build order and create
+      const childrenIndex = buildChildrenIndex(subtree);
+      const ordered: WorkflowyNode[] = [];
+      const visit = (nodeId: string) => {
+        const node = subtree.find((n) => n.id === nodeId);
+        if (node) ordered.push(node);
+        const children = childrenIndex.get(nodeId) || [];
+        for (const child of children) visit(child.id);
+      };
+      visit(template_node_id);
+
+      const idMap = new Map<string, string>();
+      let nodesCreated = 0;
+
+      startBatch();
+      try {
+        for (const node of ordered) {
+          const parentId = node.id === template_node_id ? target_parent_id : idMap.get(node.parent_id || "");
+          if (!parentId) continue;
+
+          const body: Record<string, unknown> = {
+            name: substituteVars(node.name || ""),
+            parent_id: parentId,
+          };
+          if (node.note) body.description = substituteVars(node.note);
+          if (position && node.id === template_node_id) body.position = position;
+
+          const result = await workflowyRequest("/nodes", "POST", body) as { id?: string };
+          if (result?.id) {
+            idMap.set(node.id, result.id);
+            nodesCreated++;
+          }
+        }
+      } finally {
+        endBatch();
+        invalidateCache();
+      }
+
+      const newRootId = idMap.get(template_node_id) || "";
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            template_id: template_node_id,
+            new_root_id: newRootId,
+            nodes_created: nodesCreated,
+            variables_applied: Object.keys(variables),
+          }, null, 2),
+        }],
+      };
+    }
+
+    case "bulk_update": {
+      const { filter, operation, dry_run = false, limit = 20 } = bulkUpdateSchema.parse(args);
+      const allNodes = await getCachedNodes();
+
+      // Apply filter pipeline (same as enhanced search_nodes)
+      let candidates = allNodes;
+      if (filter.root_id) {
+        const rootNode = allNodes.find((n) => n.id === filter.root_id);
+        if (rootNode && filter.scope) {
+          candidates = filterNodesByScope(rootNode, allNodes, filter.scope);
+        } else if (filter.root_id) {
+          candidates = getSubtreeNodes(filter.root_id, allNodes);
+        }
+      }
+
+      if (filter.query) {
+        const lq = filter.query.toLowerCase();
+        candidates = candidates.filter((n) => n.name?.toLowerCase().includes(lq) || n.note?.toLowerCase().includes(lq));
+      }
+      if (filter.tag) {
+        candidates = candidates.filter((n) => nodeHasTag(n, filter.tag!));
+      }
+      if (filter.assignee) {
+        candidates = candidates.filter((n) => nodeHasAssignee(n, filter.assignee!));
+      }
+      if (filter.status && filter.status !== "all") {
+        candidates = candidates.filter((n) => {
+          const isCompleted = !!n.completedAt;
+          return filter.status === "completed" ? isCompleted : !isCompleted;
+        });
+      }
+
+      const matchedCount = candidates.length;
+
+      if (matchedCount > limit) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: `Matched ${matchedCount} nodes which exceeds limit of ${limit}. Increase limit or narrow your filter.`,
+            matched_count: matchedCount,
+            limit,
+          }, null, 2) }],
+          isError: true,
+        };
+      }
+
+      if (dry_run) {
+        const nodesWithPaths = buildNodePaths(candidates);
+        const preview = nodesWithPaths.map((n) => ({ id: n.id, name: n.name, path: n.path }));
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            dry_run: true, matched_count: matchedCount, operation: operation.type, nodes_matched: preview,
+          }, null, 2) }],
+        };
+      }
+
+      // Execute operation
+      const affected: Array<{ id: string; name: string }> = [];
+      startBatch();
+      try {
+        for (const node of candidates) {
+          switch (operation.type) {
+            case "complete":
+              await workflowyRequest(`/nodes/${node.id}/complete`, "POST");
+              break;
+            case "uncomplete":
+              await workflowyRequest(`/nodes/${node.id}/uncomplete`, "POST");
+              break;
+            case "add_tag": {
+              const tagToAdd = operation.tag.replace(/^#/, "");
+              const newName = `${node.name || ""} #${tagToAdd}`;
+              await workflowyRequest(`/nodes/${node.id}`, "POST", { name: newName });
+              break;
+            }
+            case "remove_tag": {
+              const tagToRemove = operation.tag.replace(/^#/, "");
+              const tagRegex = new RegExp(`\\s*#${tagToRemove}\\b`, "gi");
+              const cleanedName = (node.name || "").replace(tagRegex, "");
+              const cleanedNote = (node.note || "").replace(tagRegex, "");
+              const body: Record<string, unknown> = { name: cleanedName };
+              if (node.note) body.description = cleanedNote;
+              await workflowyRequest(`/nodes/${node.id}`, "POST", body);
+              break;
+            }
+            case "move": {
+              const moveBody: Record<string, unknown> = { parent_id: operation.target_parent_id };
+              if (operation.position) moveBody.position = operation.position;
+              await workflowyRequest(`/nodes/${node.id}`, "POST", moveBody);
+              break;
+            }
+            case "delete":
+              await workflowyRequest(`/nodes/${node.id}`, "DELETE");
+              break;
+          }
+          affected.push({ id: node.id, name: node.name || "" });
+        }
+      } finally {
+        endBatch();
+        invalidateCache();
+      }
+
+      const nodesWithPaths = buildNodePaths(candidates);
+      const affectedOutput = nodesWithPaths.map((n) => ({ id: n.id, name: n.name, path: n.path }));
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          dry_run: false, matched_count: matchedCount, affected_count: affected.length,
+          operation: operation.type, nodes_affected: affectedOutput,
+        }, null, 2) }],
+      };
+    }
+
+    case "daily_review": {
+      const { root_id, overdue_limit = 10, upcoming_days = 7, recent_days = 1, pending_limit = 20 } = dailyReviewSchema.parse(args);
+      const allNodes = await getCachedNodes();
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+      let candidates = allNodes;
+      if (root_id) {
+        candidates = getSubtreeNodes(root_id, allNodes);
+      }
+
+      // Gather stats in a single pass
+      let pendingTodos = 0;
+      let overdueCount = 0;
+      let dueTodayCount = 0;
+      const recentCutoffMs = now.getTime() - recent_days * 24 * 60 * 60 * 1000;
+      let modifiedTodayCount = 0;
+
+      const overdueItems: Array<{ node: WorkflowyNode; dueDate: Date; daysOverdue: number }> = [];
+      const upcomingItems: Array<{ node: WorkflowyNode; dueDate: Date; daysUntilDue: number }> = [];
+      const recentChanges: WorkflowyNode[] = [];
+      const pendingNodes: WorkflowyNode[] = [];
+
+      const cutoffDate = new Date(today);
+      cutoffDate.setDate(cutoffDate.getDate() + upcoming_days);
+
+      for (const node of candidates) {
+        const isIncomplete = !node.completedAt;
+        const dueInfo = parseDueDateFromNode(node);
+
+        // Pending todos
+        if (isIncomplete) {
+          const isTodo = node.layoutMode === "todo" || /^\[[ x]\]/.test(node.name || "");
+          if (isTodo) {
+            pendingTodos++;
+            pendingNodes.push(node);
+          }
+        }
+
+        // Due date analysis
+        if (dueInfo && isIncomplete) {
+          const daysUntil = Math.floor((dueInfo.date.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+          if (daysUntil < 0) {
+            overdueCount++;
+            overdueItems.push({ node, dueDate: dueInfo.date, daysOverdue: -daysUntil });
+          } else if (daysUntil === 0) {
+            dueTodayCount++;
+            upcomingItems.push({ node, dueDate: dueInfo.date, daysUntilDue: 0 });
+          } else if (dueInfo.date <= cutoffDate) {
+            upcomingItems.push({ node, dueDate: dueInfo.date, daysUntilDue: daysUntil });
+          }
+        }
+
+        // Recent changes
+        if (node.modifiedAt && node.modifiedAt > recentCutoffMs) {
+          modifiedTodayCount++;
+          recentChanges.push(node);
+        }
+      }
+
+      // Sort and limit
+      overdueItems.sort((a, b) => b.daysOverdue - a.daysOverdue);
+      upcomingItems.sort((a, b) => a.dueDate.getTime() - b.dueDate.getTime());
+      recentChanges.sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0));
+
+      const limitedOverdue = overdueItems.slice(0, overdue_limit);
+      const limitedUpcoming = upcomingItems.slice(0, 20);
+      const limitedRecent = recentChanges.slice(0, 20);
+      const limitedPending = pendingNodes.slice(0, pending_limit);
+
+      // Build paths
+      const allResultNodes = [
+        ...limitedOverdue.map((o) => o.node),
+        ...limitedUpcoming.map((u) => u.node),
+        ...limitedRecent,
+        ...limitedPending,
+      ];
+      const nodesWithPaths = buildNodePaths(allResultNodes);
+      const pathMap = new Map(nodesWithPaths.map((n) => [n.id, n.path]));
+
+      const review = {
+        as_of: today.toISOString().split("T")[0],
+        summary: {
+          total_nodes: candidates.length,
+          pending_todos: pendingTodos,
+          overdue_count: overdueCount,
+          due_today: dueTodayCount,
+          modified_today: modifiedTodayCount,
+        },
+        overdue: limitedOverdue.map((o) => ({
+          id: o.node.id, name: o.node.name, path: pathMap.get(o.node.id) || "",
+          due_date: o.dueDate.toISOString().split("T")[0], days_overdue: o.daysOverdue,
+        })),
+        due_soon: limitedUpcoming.map((u) => ({
+          id: u.node.id, name: u.node.name, path: pathMap.get(u.node.id) || "",
+          due_date: u.dueDate.toISOString().split("T")[0], days_until_due: u.daysUntilDue,
+        })),
+        recent_changes: limitedRecent.map((n) => ({
+          id: n.id, name: n.name, path: pathMap.get(n.id) || "",
+          modifiedAt: n.modifiedAt, completed: !!n.completedAt,
+        })),
+        top_pending: limitedPending.map((n) => ({
+          id: n.id, name: n.name, path: pathMap.get(n.id) || "",
+        })),
+      };
+
+      return { content: [{ type: "text", text: JSON.stringify(review, null, 2) }] };
     }
 
     default:

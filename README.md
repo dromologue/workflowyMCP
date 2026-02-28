@@ -1,83 +1,8 @@
-# Concept Mapping with Claude, Workflowy & Dropbox
+# Workflowy MCP Server
 
-A visual concept mapping tool that connects Claude's AI with your Workflowy knowledge base. Generate hierarchical concept maps that reveal relationships between ideas in your notes, automatically hosted via Dropbox and embedded in your outline.
+An MCP server that gives Claude full read/write access to your Workflowy outline. Search, insert, organize, and manage tasks — all through natural language.
 
-## What It Does
-
-**Turn your notes into visual knowledge maps.**
-
-You provide a list of concepts (philosophers, theories, themes, project components) and a Workflowy node to analyze. The tool:
-
-1. Scans your Workflowy content for where those concepts appear
-2. Extracts relationship labels from context ("influences", "contrasts with", "extends")
-3. Organizes concepts hierarchically based on document structure
-4. Generates a visual graph with labeled connections
-5. Uploads to Dropbox and embeds the image in your Workflowy
-
-## Example
-
-```
-You: "Create a concept map of my philosophy notes showing how
-      Heidegger, Dewey, phenomenology, and pragmatism relate"
-
-Claude: Analyzes your notes, finds that:
-        - Heidegger appears in 12 nodes, develops phenomenology
-        - Dewey appears in 8 nodes, central to pragmatism
-        - "phenomenology contrasts with pragmatism" found in context
-
-        → Generates hierarchical map with labeled relationships
-        → Uploads to Dropbox, embeds in your Philosophy node
-```
-
-## The Stack
-
-| Component | Role |
-|-----------|------|
-| **Claude** | AI that understands your request, orchestrates the analysis, interprets results |
-| **Workflowy** | Your knowledge base - the source content being mapped |
-| **Dropbox** | Image hosting - makes concept maps viewable in Workflowy |
-| **Graphviz** | Graph rendering engine (runs locally via WASM) |
-
-## Concept Map Features
-
-### Academic-Style Mapping
-
-Follows Cornell University concept mapping guidelines:
-
-- **Core concept** at center (your main theme)
-- **Hierarchical levels** - major concepts vs. detail concepts based on document depth
-- **Labeled relationships** - shows *how* concepts connect, not just that they do
-- **Visual encoding** - node size = frequency, edge color = relationship type
-
-### Relationship Detection
-
-Automatically extracts relationship types from your content:
-
-| Type | Examples |
-|------|----------|
-| Causal | leads to, causes, results in |
-| Hierarchical | includes, is part of, contains |
-| Comparative | contrasts with, similar to, differs from |
-| Dependency | requires, enables, prevents |
-| Evaluative | supports, opposes, extends, critiques |
-
-### Output
-
-- Square aspect ratio (2000x2000 max) for balanced visual layout
-- 300 DPI for high-resolution display
-- Unicode support (French accents, German umlauts, etc.)
-- Maximum 35 concepts per map (split larger sets into themed groups)
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js v18+
-- [Claude Desktop](https://claude.ai/download)
-- Workflowy account with [API key](https://workflowy.com/api-key)
-- Dropbox account (for image hosting)
-
-### Installation
+## Install
 
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git
@@ -86,25 +11,20 @@ npm install
 npm run build
 ```
 
-### Configuration
+## Configure
 
-Create `.env` in the project root:
+1. Get your API key from [workflowy.com/api-key](https://workflowy.com/api-key)
 
-```bash
-# Required - Workflowy
-WORKFLOWY_USERNAME=your-email@example.com
+2. Create `.env` in the project root:
+
+```
 WORKFLOWY_API_KEY=your-api-key
-
-# Required for concept maps via MCP - Dropbox
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=your-refresh-token
-
-# Optional - for CLI auto concept extraction
-ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
 
-Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+3. Add to Claude Desktop config:
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -117,376 +37,110 @@ Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_deskt
 }
 ```
 
-Restart Claude Desktop.
+4. Restart Claude Desktop.
 
-## Dropbox Setup
+## Tools
 
-Concept maps require Dropbox for image hosting. Without it, images save to `~/Downloads/` instead.
+### Search & Navigate
 
-### 1. Create Dropbox App
+| Tool | What it does |
+|------|-------------|
+| `search_nodes` | Text search with optional tag, assignee, status, and date filters |
+| `find_node` | Look up a node by exact name, returns ID for use with other tools |
+| `get_node` | Get a node by ID |
+| `get_children` | List children of a node |
+| `find_backlinks` | Find all nodes linking to a given node |
 
-1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Create app → Scoped access → Full Dropbox
-3. Name it (e.g., "workflowy-concept-maps")
-4. Copy **App key** and **App secret**
+### Create & Edit
 
-### 2. Set Permissions
+| Tool | What it does |
+|------|-------------|
+| `insert_content` | Insert hierarchical content (auto-parallelizes for large payloads) |
+| `smart_insert` | Search for a target node, then insert content into it |
+| `update_node` | Edit a node's name or note |
+| `move_node` | Move a node to a new parent |
+| `delete_node` | Delete a node |
+| `duplicate_node` | Deep-copy a node and its subtree to a new location |
+| `create_from_template` | Copy a template subtree with `{{variable}}` substitution |
 
-In the Permissions tab, enable:
-- `files.content.write` (upload images)
-- `sharing.write` (create shareable links)
+### Tasks & Todos
 
-Click **Submit**.
+| Tool | What it does |
+|------|-------------|
+| `list_todos` | List todos under a node |
+| `complete_node` / `uncomplete_node` | Toggle completion |
+| `list_upcoming` | Todos due in the next N days, sorted by urgency |
+| `list_overdue` | Past-due items sorted by most overdue first |
+| `bulk_update` | Apply an operation to all nodes matching a filter |
 
-### 3. Authorize
+### Project Management
 
-Open in browser (replace YOUR_APP_KEY):
+| Tool | What it does |
+|------|-------------|
+| `get_project_summary` | Stats, tag counts, assignees, overdue items for a subtree |
+| `get_recent_changes` | Nodes modified within a time window |
+| `daily_review` | One-call standup summary: overdue, upcoming, recent, pending |
+
+### Concept Maps
+
+| Tool | What it does |
+|------|-------------|
+| `get_node_content_for_analysis` | Export subtree content for Claude to analyze |
+| `render_concept_map` | Generate a visual concept map image |
+| `generate_concept_map` | Legacy: combined search + render |
+
+### Files & Bulk
+
+| Tool | What it does |
+|------|-------------|
+| `insert_file` | Insert a file's contents (server reads the file directly) |
+| `convert_markdown_to_workflowy` | Convert markdown to Workflowy's indented format |
+| `batch_operations` | Multiple create/update/delete in one call |
+| `submit_job` / `get_job_status` | Background processing for large workloads |
+
+## Conventions
+
+Tags, assignees, and due dates are parsed from node text:
+
+- **Tags:** `#inbox`, `#review`, `#urgent`
+- **Assignees:** `@alice`, `@bob`
+- **Due dates:** `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15`
+
+## Optional: Dropbox (for concept map images)
+
+Add to `.env`:
+
 ```
-https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=your-refresh-token
 ```
 
-Copy the authorization code.
+Without Dropbox, concept map images save to `~/Downloads/`.
 
-### 4. Get Refresh Token
+## Optional: Anthropic API (for CLI auto-extraction)
+
+```
+ANTHROPIC_API_KEY=sk-ant-your-key
+```
+
+Enables `--auto` mode in the CLI concept map tool.
+
+## CLI Concept Maps
 
 ```bash
-curl -X POST https://api.dropbox.com/oauth2/token \
-  -d code=YOUR_CODE \
-  -d grant_type=authorization_code \
-  -d client_id=YOUR_APP_KEY \
-  -d client_secret=YOUR_APP_SECRET
+npm run concept-map -- --search "Topic" --core "Center" --concepts "A,B,C"
+npm run concept-map -- --search "Topic" --core "Center" --auto
 ```
-
-Add the `refresh_token` from the response to your `.env`.
-
-## Using Concept Maps
-
-### Basic Usage
-
-```
-"Create a concept map of my Research node using these concepts:
- machine learning, neural networks, backpropagation, gradient descent"
-```
-
-### With Scope Control
-
-| Scope | What it searches |
-|-------|------------------|
-| `children` | Only descendants of the node (default) |
-| `all` | Entire Workflowy |
-| `siblings` | Peer nodes only |
-| `ancestors` | Parent chain only |
-
-```
-"Create a concept map for my Project node, only searching its children"
-```
-
-### Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `node_id` | Parent node to analyze |
-| `concepts` | List of terms to map (2-35 required) |
-| `core_concept` | Central theme (defaults to node name) |
-| `scope` | Search scope for analysis |
-| `format` | `png` (default) or `jpeg` |
-| `title` | Custom title for the map |
-
-## CLI Tool
-
-Generate concept maps directly from the command line without Claude Desktop. The CLI can optionally use the Claude API to automatically extract relevant concepts from your content.
-
-### First-Time Setup
-
-On first run, the CLI will prompt for credentials if not configured:
-
-```bash
-npm run concept-map -- --setup
-```
-
-This interactive wizard configures:
-- **Workflowy credentials** (required) - email and API key
-- **Anthropic API key** (optional) - enables `--auto` concept extraction
-- **Dropbox** (optional) - for MCP server image hosting
-
-Credentials are saved to `.env` in the project directory.
-
-### Basic Usage
-
-```bash
-# With manual concepts
-npm run concept-map -- --search "My Notes" --core "Main Topic" \
-  --concepts "concept1,concept2,concept3"
-
-# With Claude auto-extraction
-npm run concept-map -- --search "Philosophy" --core "Event" --auto
-
-# By node ID
-npm run concept-map -- --node-id abc123 --core "Theme" --concepts "a,b,c"
-```
-
-### CLI Options
-
-| Option | Description |
-|--------|-------------|
-| `--setup` | Run interactive credential setup |
-| `-n, --node-id <id>` | Workflowy node ID to analyze |
-| `-s, --search <query>` | Search for node by name |
-| `-c, --core <concept>` | Core concept at map center |
-| `-C, --concepts <list>` | Comma-separated concept list |
-| `-a, --auto` | Use Claude to extract concepts |
-| `-o, --output <file>` | Output filename |
-| `-f, --format <type>` | `png` (default) or `jpeg` |
-| `--no-claude` | Skip Claude, use provided concepts only |
-
-### Examples
-
-```bash
-# Map philosophical concepts under "Conceptual Foundations"
-npm run concept-map -- \
-  --search "Conceptual Foundations" \
-  --core "Event" \
-  --concepts "Being,Truth,Subject,Fidelity,Situation,Spectacle,Ereignis" \
-  --output event-map.png
-
-# Let Claude identify concepts automatically
-npm run concept-map -- \
-  --search "Research Notes" \
-  --core "Machine Learning" \
-  --auto
-
-# Combine manual + auto concepts
-npm run concept-map -- \
-  --node-id 696f787e-0670-43ba-f37b-613d14d4490f \
-  --core "Phenomenology" \
-  --concepts "Husserl,Heidegger,Merleau-Ponty" \
-  --auto
-```
-
-### Claude API Setup (for --auto)
-
-The `--auto` flag uses Claude to intelligently extract concepts from your content. To enable it:
-
-1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
-2. Click **Create Key**
-3. Name it (e.g., "concept-map-cli")
-4. Copy the key (starts with `sk-ant-...`)
-5. Add to your `.env` file:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-```
-
-Without the API key, `--auto` is skipped and only manual concepts are used.
-
-### Output
-
-The CLI saves images to the current directory:
-
-```
-✅ Concept map saved to: /path/to/current/dir/concept-map-event-1234567890.png
-   Size: 451.0 KB
-   Concepts mapped: 12
-   Major: Being, Situation, Spectacle, Truth, Difference, Subject
-   Detail: Rupture, Fidelity, Will to Power, Ereignis
-```
-
-## Additional Tools
-
-The server includes full Workflowy management to support your knowledge work:
-
-### Search & Navigation
-- `find_node` - Fast node lookup by name with duplicate handling (see below)
-- `search_nodes` - Find nodes by text (substring search)
-- `get_node` / `get_children` - Navigate structure
-- `export_all` - Full outline export
-
-### find_node Tool
-
-Fast node lookup that handles duplicates by presenting options for selection. Returns the node ID ready for use with other tools.
-
-**Parameters:**
-| Parameter | Description |
-|-----------|-------------|
-| `name` | The name of the node to find (required) |
-| `match_mode` | `exact` (default), `contains`, or `starts_with` |
-| `selection` | If multiple matches, the 1-based number to select |
-
-**Usage Examples:**
-```
-"Find the node called 'Project Ideas'"
-→ Returns single match with node_id ready to use
-
-"Find the node called 'Ideas'"
-→ Multiple matches: presents numbered options with paths
-→ "Found 3 nodes named 'Ideas'. Which one do you mean?"
-   1. Work > Project Ideas > Ideas (ID: abc123)
-   2. Personal > Ideas (ID: def456)
-   3. Archive > Old Ideas > Ideas (ID: ghi789)
-
-"Find node 'Ideas', selection 2"
-→ Returns the Personal > Ideas node with its ID
-```
-
-### Content Management
-- `insert_content` - **Primary tool** for all node insertion (single, bulk, todos, any size)
-- `convert_markdown_to_workflowy` - Convert markdown to Workflowy format
-- `smart_insert` - Search-and-insert workflow
-- `update_node` / `delete_node` / `move_node` - Node operations
-
-### Todo Management
-- `list_todos` / `complete_node` / `uncomplete_node`
-- Create todos via `insert_content` with `[ ]` or `[x]` syntax
-
-### Knowledge Linking
-- `find_related` - Discover connections via keyword analysis
-- `create_links` - Auto-generate internal links
-
-### File Insertion (Direct File Handoff)
-- `insert_file` - Insert file contents directly (server reads the file)
-- `submit_file_job` - Background file insertion for large files
-
-Claude doesn't need to read or parse files - just provide the path:
-
-```
-"Insert ~/Documents/research.md into my Research node"
-→ Server reads file, detects markdown, converts, and inserts
-```
-
-**Parameters:**
-| Parameter | Description |
-|-----------|-------------|
-| `file_path` | Absolute path to the file |
-| `parent_id` | Target parent node ID |
-| `format` | `auto` (default), `markdown`, or `plain` |
-
-### Async Job Queue (Background Processing)
-
-For large workloads that might hit API rate limits or timeout:
-
-- `submit_job` - Submit large workloads for background processing
-- `get_job_status` - Check job progress
-- `get_job_result` - Get results when complete
-- `list_jobs` - List all jobs
-- `cancel_job` - Cancel a job
-
-```
-"Submit this 500-node document for background insertion"
-→ Returns job_id, processes in background with rate limiting
-
-"Check status of job job-123"
-→ Returns: processing, 65% complete, 325/500 nodes
-```
-
-**Job types:**
-| Type | Use case |
-|------|----------|
-| `insert_content` | Large hierarchical content |
-| `insert_file` | Large file insertion |
-| `batch_operations` | Multiple create/update/delete operations |
-
-### Bulk Operations (for heavy workloads)
-- `analyze_workload` - Estimate time savings from parallel insertion
-- `batch_operations` - Execute multiple operations with controlled concurrency
-
-`insert_content` automatically uses parallel workers for large workloads (≥20 nodes).
-
-**Performance:**
-| Nodes | Single Agent | Parallel | Savings |
-|-------|--------------|----------|---------|
-| 50 | ~10 sec | ~3 sec | 70% |
-| 100 | ~20 sec | ~5 sec | 75% |
-| 200 | ~40 sec | ~9 sec | 78% |
-
-## Troubleshooting
-
-### Concept map fails silently
-- Check concept count (max 35)
-- Verify Dropbox permissions include `sharing.write`
-- Re-authorize if you changed permissions
-
-### "Not permitted to access this endpoint"
-- Missing `sharing.write` permission
-- Must re-authorize after adding permissions
-
-### Images upload but don't appear in Workflowy
-- Check Claude's response for the Dropbox URL
-- Manually add to any node if needed
-
-## Architecture
-
-The project is organized into three distinct layers:
-
-```
-src/
-├── cli/                    # Command-line interface
-│   ├── concept-map.ts      # CLI entry point
-│   └── setup.ts            # Interactive credential wizard
-│
-├── mcp/                    # MCP server for Claude Desktop
-│   └── server.ts           # Tool handlers & server setup
-│
-├── shared/                 # Shared modules (used by both)
-│   ├── api/
-│   │   ├── workflowy.ts    # Workflowy REST client
-│   │   ├── dropbox.ts      # Dropbox image hosting
-│   │   └── retry.ts        # Exponential backoff logic
-│   ├── utils/
-│   │   ├── text-processing.ts   # DOT escaping, parsing
-│   │   ├── keyword-extraction.ts # Relevance scoring
-│   │   ├── cache.ts        # Node caching (30s TTL)
-│   │   ├── node-paths.ts   # Breadcrumb path building
-│   │   ├── orchestrator.ts # Multi-agent insertion coordinator
-│   │   ├── subtree-parser.ts   # Content splitting for parallel processing
-│   │   ├── requestQueue.ts # Batched operations with concurrency control
-│   │   ├── rateLimiter.ts  # Token bucket rate limiting
-│   │   └── jobQueue.ts     # Async job queue for background processing
-│   ├── config/
-│   │   └── environment.ts  # Env vars & validation
-│   └── types/
-│       └── index.ts        # TypeScript interfaces
-│
-└── index.ts                # Entry point (re-exports MCP server)
-```
-
-### Module Responsibilities
-
-| Layer | Purpose | Entry Point |
-|-------|---------|-------------|
-| **CLI** | Standalone concept mapping | `npm run cli` |
-| **MCP** | Claude Desktop integration | `npm run mcp:start` |
-| **Shared** | Common functionality | Imported by both |
 
 ## Development
 
 ```bash
-# Build
-npm run build           # Compile TypeScript
-
-# Test
-npm test                # Run 61 tests
-npm run test:coverage   # With coverage report
-
-# MCP Server
-npm run mcp:start       # Start MCP server
-npm run mcp:dev         # Build + start
-
-# CLI Tool
-npm run cli             # Run concept map CLI
-npm run cli:setup       # Interactive setup wizard
-
-# Aliases (backward compatible)
-npm start               # Same as mcp:start
-npm run concept-map     # Same as cli
+npm run build        # compile TypeScript
+npm test             # run tests
+npm run mcp:dev      # build + start server
 ```
 
 ## License
 
 MIT
-
-## Acknowledgments
-
-- [Anthropic](https://anthropic.com) - Claude and MCP protocol
-- [Workflowy](https://workflowy.com) - Outliner and API
-- [Dropbox](https://dropbox.com) - Image hosting
-- [Graphviz](https://graphviz.org) - Graph visualization
