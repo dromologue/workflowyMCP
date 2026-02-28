@@ -124,7 +124,25 @@ Enables `--auto` mode in the CLI concept map tool.
 
 ## Generating Interactive Concept Maps
 
-Ask Claude to analyze a Workflowy subtree and render an interactive concept map:
+### `/concept-map` skill (recommended)
+
+Install the Claude Code skill for one-command concept map generation:
+
+```bash
+cp -r .claude/skills/concept-map ~/.claude/skills/concept-map
+```
+
+Then in Claude Code:
+
+```
+/concept-map Philosophy
+```
+
+Claude will find the node, read the content, extract concepts and relationships, and render a force-directed interactive map. The HTML file is also saved to `~/Downloads/` — fully self-contained, no server needed.
+
+### Manual prompt
+
+Alternatively, prompt Claude directly:
 
 ```
 Analyze the content under [node name] and create an interactive concept map using render_interactive_concept_map.
@@ -132,7 +150,12 @@ First use get_node_content_for_analysis to read the content, then identify the k
 and render them as an interactive map.
 ```
 
-Claude will extract the content, identify concepts and relationships semantically, and render a zoomable, collapsible HTML concept map inline in the conversation.
+### Interaction
+
+- **Click a major concept** to expand its detail children
+- **Drag any node** to rearrange the layout
+- **Scroll** to zoom, **drag background** to pan
+- **Expand All / Collapse All** buttons in the toolbar
 
 ## CLI Concept Maps
 

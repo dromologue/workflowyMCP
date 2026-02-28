@@ -1,8 +1,8 @@
 ---
 name: concept-map
-description: "Generate an interactive concept map from a Workflowy subtree. Analyzes content semantically and renders a zoomable, collapsible HTML visualization."
+description: Generate an interactive concept map from a Workflowy subtree. Analyzes content semantically and renders a zoomable, collapsible HTML visualization. Use when the user asks for a concept map, mind map, or visual overview of a Workflowy topic.
 argument-hint: [node-name-or-topic]
-disable-model-invocation: true
+allowed-tools: Read, Bash, Glob, Grep, AskUserQuestion
 ---
 
 # Interactive Concept Map Generator

@@ -285,7 +285,7 @@ svg { width: 100%; height: 100%; }
       var majors = graphNodes.filter(function(m) { return m.level === 'major'; });
       var idx = majors.indexOf(n);
       var angle = (2 * Math.PI * idx) / Math.max(majors.length, 1) - Math.PI / 2;
-      var r = Math.min(width, height) * 0.3;
+      var r = Math.min(width, height) * 0.35;
       n.x = cx + r * Math.cos(angle);
       n.y = cy + r * Math.sin(angle);
     } else {
@@ -324,10 +324,10 @@ svg { width: 100%; height: 100%; }
         n1 = nodes[i]; n2 = nodes[j];
         dx = n2.x - n1.x; dy = n2.y - n1.y;
         dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        var minDist = n1.radius + n2.radius + 30;
-        force = -400 * alpha / (dist * dist);
+        var minDist = n1.radius + n2.radius + 80;
+        force = -800 * alpha / (dist * dist);
         // Extra repulsion if overlapping
-        if (dist < minDist) force -= (minDist - dist) * 0.5 * alpha;
+        if (dist < minDist) force -= (minDist - dist) * 0.8 * alpha;
         ex = dx / dist * force; ey = dy / dist * force;
         if (!n1.fx) { n1.vx += ex; n1.vy += ey; }
         if (!n2.fx) { n2.vx -= ex; n2.vy -= ey; }
@@ -341,8 +341,8 @@ svg { width: 100%; height: 100%; }
       if (!n1 || !n2) continue;
       dx = n2.x - n1.x; dy = n2.y - n1.y;
       dist = Math.sqrt(dx * dx + dy * dy) || 1;
-      var idealDist = edge.isParentLink ? 120 : 180;
-      force = (dist - idealDist) * 0.02 * alpha;
+      var idealDist = edge.isParentLink ? 200 : 300;
+      force = (dist - idealDist) * 0.015 * alpha;
       ex = dx / dist * force; ey = dy / dist * force;
       if (!n1.fx) { n1.vx += ex; n1.vy += ey; }
       if (!n2.fx) { n2.vx -= ex; n2.vy -= ey; }
@@ -352,8 +352,8 @@ svg { width: 100%; height: 100%; }
     for (i = 0; i < nodes.length; i++) {
       n1 = nodes[i];
       if (n1.fx) continue;
-      n1.vx += (cx - n1.x) * 0.005 * alpha;
-      n1.vy += (cy - n1.y) * 0.005 * alpha;
+      n1.vx += (cx - n1.x) * 0.003 * alpha;
+      n1.vy += (cy - n1.y) * 0.003 * alpha;
     }
 
     // Apply velocities with damping
