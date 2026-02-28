@@ -38,8 +38,9 @@ describe("generateInteractiveConceptMapHTML", () => {
     expect(html).toContain("My Concept Map");
   });
 
-  it("contains all concept labels", () => {
+  it("embeds node data as JSON with all concept labels", () => {
     const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("graphNodes");
     expect(html).toContain("Central Topic");
     expect(html).toContain("Major One");
     expect(html).toContain("Major Two");
@@ -48,49 +49,61 @@ describe("generateInteractiveConceptMapHTML", () => {
     expect(html).toContain("Detail Gamma");
   });
 
-  it("includes collapse-toggle classes for major concepts with children", () => {
+  it("embeds edge data as JSON", () => {
     const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
-    expect(html).toContain("collapsible");
-    expect(html).toContain("collapse-indicator");
-  });
-
-  it("marks detail nodes with parent data attribute", () => {
-    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
-    expect(html).toContain('data-parent-major="m1"');
-    expect(html).toContain('data-parent-major="m2"');
-  });
-
-  it("includes edge type labels for non-generic relationships", () => {
-    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("graphEdges");
     expect(html).toContain("supports");
     expect(html).toContain("extends");
     expect(html).toContain("requires");
     expect(html).toContain("contrasts with");
   });
 
+  it("includes force simulation code", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("applyForces");
+    expect(html).toContain("simulate");
+    expect(html).toContain("activeNodes");
+  });
+
+  it("includes collapsible class for major nodes with children", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("collapsible");
+    expect(html).toContain("expand-badge");
+  });
+
+  it("marks detail nodes with parent data in JSON", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("parentMajorId");
+    expect(html).toContain('"m1"');
+    expect(html).toContain('"m2"');
+  });
+
   it("uses dashed stroke for contrast edges", () => {
     const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
-    expect(html).toContain('stroke-dasharray="6,3"');
+    // Edge data includes dashed:true for contrast relationships
+    expect(html).toContain('"dashed":true');
   });
 
   it("handles empty relationships", () => {
     const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, []);
     expect(html).toContain("<!DOCTYPE html>");
     expect(html).toContain("Major One");
-    expect(html).not.toContain("<path");
+    // Should still have implicit parent links
+    expect(html).toContain("isParentLink");
   });
 
   it("handles single concept (no majors, no details)", () => {
     const html = generateInteractiveConceptMapHTML("Minimal", coreNode, [], []);
     expect(html).toContain("Central Topic");
-    expect(html).toContain("<circle");
+    expect(html).toContain("graphNodes");
   });
 
   it("escapes HTML in labels", () => {
     const xssCore = { id: "xss", label: '<script>alert("xss")</script>' };
     const html = generateInteractiveConceptMapHTML("Safe", xssCore, [], []);
     expect(html).not.toContain('<script>alert("xss")</script>');
-    expect(html).toContain("&lt;script&gt;");
+    // The label is embedded in JSON, so angle brackets are escaped as unicode
+    expect(html).toContain("\\u003c");
   });
 
   it("includes zoom and pan controls", () => {
@@ -113,5 +126,16 @@ describe("generateInteractiveConceptMapHTML", () => {
     expect(html).toContain("Core concept");
     expect(html).toContain("Major concept");
     expect(html).toContain("Detail concept");
+  });
+
+  it("includes tooltip element", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("tooltip");
+  });
+
+  it("includes drag handling", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
+    expect(html).toContain("isDragging");
+    expect(html).toContain("dragNode");
   });
 });

@@ -3887,7 +3887,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           detail_concepts: concepts.length - majors.length,
           relationships: relationships.length,
         },
-        instructions: "Open the HTML file in a browser to view the interactive concept map with collapsible clusters, zoom/pan, and relationship labels.",
+        instructions: "The concept map HTML file is self-contained (no server needed). Open it in any browser for an interactive force-directed graph. Click major concepts to expand details, drag nodes to rearrange, scroll to zoom, drag background to pan.",
       };
 
       return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
