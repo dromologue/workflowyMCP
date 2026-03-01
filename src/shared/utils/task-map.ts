@@ -53,7 +53,18 @@ export interface TaskMapData {
 // ── Helpers ──
 
 function cleanName(name: string): string {
-  return (name || "").replace(/<[^>]*>/g, "").trim();
+  return (name || "")
+    .replace(/<[^>]*>/g, "")           // strip HTML tags
+    .replace(/&nbsp;/gi, " ")          // HTML entities
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#\d+;/g, "")           // numeric HTML entities
+    .replace(/[\u200B-\u200F\uFEFF]/g, "") // zero-width chars
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // control chars
+    .replace(/\s+/g, " ")             // collapse whitespace
+    .trim();
 }
 
 // ── Core functions ──
