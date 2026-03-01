@@ -89,6 +89,8 @@ import {
 import { parseTags, parseNodeTags, nodeHasTag, nodeHasAssignee } from "../shared/utils/tag-parser.js";
 import { parseDueDateFromNode, isOverdue, isDueWithin } from "../shared/utils/date-parser.js";
 import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
+import { generateTaskMap } from "../shared/utils/task-map.js";
+import { insertConceptMapOutline } from "../cli/concept-map-outline.js";
 import {
   buildGraphStructure,
   calculateDegreeCentrality,
@@ -805,6 +807,16 @@ const analyzeNetworkStructureSchema = z.object({
   relationship_fields: z.array(z.string()).describe("Fields that contain relationship references"),
   node_label_field: z.string().optional().default("id").describe("Field to use as node labels (default: 'id')"),
   include_centrality: z.boolean().optional().default(true).describe("Whether to include centrality analysis (default: true)"),
+});
+
+const generateTaskMapSchema = z.object({
+  max_details_per_tag: z.number().optional().describe("Maximum detail nodes per tag (default: 8)"),
+  detail_sort_by: z.enum(["recency", "name"]).optional().describe("Sort detail nodes by recency or name (default: recency)"),
+  title: z.string().optional().describe("Custom title for the task map (default: 'Task Map')"),
+  exclude_completed: z.boolean().optional().describe("Exclude completed nodes from tag matching (default: false)"),
+  exclude_mentions: z.boolean().optional().describe("Exclude @mention tags, only use #hashtags (default: true)"),
+  insert_outline: z.boolean().optional().describe("Insert a concept map outline into Workflowy under the Tags node (default: false)"),
+  force_outline: z.boolean().optional().describe("Overwrite existing task map outline if one exists (default: false)"),
 });
 
 // State for the last generated interactive map (served via MCP resources)
@@ -1715,6 +1727,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         _meta: {
           ui: {
             resourceUri: "ui://concept-map/interactive",
+          },
+        },
+      },
+      // ── Task Map ──
+      {
+        name: "generate_task_map",
+        description: "Generate an interactive concept map from Workflowy's Tags node. Finds the root-level 'Tags' node, reads its children as #tags and @mentions, searches all nodes for matches, and produces a visual map showing tag relationships via co-occurrence. Optionally inserts an outline into Workflowy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            max_details_per_tag: { type: "number", description: "Maximum detail nodes per tag (default: 8)" },
+            detail_sort_by: { type: "string", enum: ["recency", "name"], description: "Sort order for detail nodes (default: recency)" },
+            title: { type: "string", description: "Custom title (default: 'Task Map')" },
+            exclude_completed: { type: "boolean", description: "Exclude completed nodes (default: false)" },
+            exclude_mentions: { type: "boolean", description: "Exclude @mention tags, only use #hashtags (default: true)" },
+            insert_outline: { type: "boolean", description: "Insert outline into Workflowy under Tags node (default: false)" },
+            force_outline: { type: "boolean", description: "Overwrite existing outline (default: false)" },
           },
         },
       },
@@ -3900,6 +3929,90 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
 
       return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
+    }
+
+    // ── Task Map ──
+
+    case "generate_task_map": {
+      const parsed = generateTaskMapSchema.parse(args);
+      const allNodes = await getCachedNodes();
+
+      const taskMapData = generateTaskMap(allNodes, {
+        maxDetailsPerTag: parsed.max_details_per_tag,
+        detailSortBy: parsed.detail_sort_by,
+        title: parsed.title,
+        excludeCompleted: parsed.exclude_completed,
+        excludeMentions: parsed.exclude_mentions,
+      });
+
+      const coreNode = {
+        id: "core",
+        label: taskMapData.title,
+        workflowyNodeId: taskMapData.tagsNode.id,
+      };
+
+      const html = generateInteractiveConceptMapHTML(
+        taskMapData.title,
+        coreNode,
+        taskMapData.concepts,
+        taskMapData.relationships
+      );
+
+      lastInteractiveMapHTML = html;
+      lastInteractiveMapTitle = taskMapData.title;
+
+      const timestamp = Date.now();
+      const slug = taskMapData.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
+      const downloadsDir = path.join(process.env.HOME || "~", "Downloads");
+      const filePath = path.join(downloadsDir, `task-map-${slug}-${timestamp}.html`);
+      try {
+        fs.writeFileSync(filePath, html);
+      } catch {
+        // Fallback write failure is non-fatal
+      }
+
+      const result: Record<string, unknown> = {
+        success: true,
+        title: taskMapData.title,
+        file_path: filePath,
+        tags_node_id: taskMapData.tagsNode.id,
+        tag_count: taskMapData.tagDefinitions.length,
+        tags: taskMapData.tagDefinitions.map(t => ({
+          label: t.raw,
+          type: t.type,
+          matched_nodes: taskMapData.taggedNodes.filter(
+            tn => tn.matchedTags.some(mt => mt.normalized === t.normalized)
+          ).length,
+        })),
+        stats: {
+          major_concepts: taskMapData.concepts.filter(c => c.level === "major").length,
+          detail_concepts: taskMapData.concepts.filter(c => c.level === "detail").length,
+          relationships: taskMapData.relationships.length,
+          total_tagged_nodes: taskMapData.taggedNodes.length,
+        },
+        instructions: "Task map HTML saved. Open in any browser for interactive visualization. Click tags to expand matching nodes, drag to rearrange, scroll to zoom.",
+      };
+
+      if (parsed.insert_outline) {
+        const nodeIdMap = new Map<string, string>();
+        for (const n of allNodes) {
+          if (n.name) nodeIdMap.set(n.name.toLowerCase(), n.id);
+        }
+        const outlineResult = await insertConceptMapOutline(
+          taskMapData.analysis,
+          taskMapData.tagsNode,
+          allNodes,
+          undefined,
+          nodeIdMap,
+          !!parsed.force_outline
+        );
+        result.outline = {
+          outline_node_id: outlineResult.outlineNodeId,
+          nodes_created: outlineResult.nodesCreated,
+        };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
 
     // ── Graph Analysis Tools ──

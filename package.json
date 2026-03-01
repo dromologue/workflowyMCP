@@ -17,7 +17,8 @@
     "cli:setup": "npx tsx src/cli/concept-map.ts --setup",
 
     "start": "node dist/index.js",
-    "concept-map": "npx tsx src/cli/concept-map.ts"
+    "concept-map": "npx tsx src/cli/concept-map.ts",
+    "task-map": "npx tsx src/cli/task-map.ts"
   },
   "keywords": [
     "mcp",
