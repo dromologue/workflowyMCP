@@ -578,21 +578,34 @@ The `parent_major_id` field groups detail concepts under their parent major conc
 **Interactions**:
 - **Click major concept**: Collapse/expand its detail children (CSS transition animation)
 - **Mouse wheel**: Zoom in/out
-- **Click + drag**: Pan the view
+- **Click + drag background**: Pan the view
+- **Drag node**: Reposition individual node, simulation re-settles
 - **Expand All / Collapse All**: Toolbar buttons
-- **Hover**: Highlight connected edges
+- **Physics button**: Toggle slider panel for force parameters
+- **Hover**: Tooltip with full node label
 - **Reset**: Return to default view
+
+**Physics sliders** (toggle via Physics button):
+- **Charge (repulsion)**: Node-to-node repulsive force (100–3000, default 800)
+- **Link Distance**: Ideal edge length (50–600, default 200)
+- **Center Gravity**: Pull toward center (0.001–0.030, default 0.003)
+- **Damping**: Velocity damping factor (0.10–0.95, default 0.60)
+- **Overlap Repulsion**: Extra push when nodes overlap (0.0–3.0, default 0.8)
+
+Slider interactions are isolated from the SVG container's mouse event handlers — `mousedown` on the slider panel returns early to prevent canvas panning from interfering with slider drag.
 
 **MCP Apps protocol**:
 - Tool declares `_meta.ui.resourceUri: "ui://concept-map/interactive"`
 - Server serves self-contained HTML via `ListResources` and `ReadResource` handlers
 - Claude Desktop renders the HTML in a sandboxed iframe inline in the conversation
 
-**Layout algorithm**:
-- Core concept at center
-- Major concepts evenly distributed on a circle (radius 280)
-- Detail concepts in arcs around their parent major concept (radius 100)
+**Layout algorithm** (force-directed):
+- Core concept pinned at center
+- Major concepts initially placed on a circle (radius ~35% of viewport)
+- Detail concepts initially near their parent major
+- Force simulation: charge repulsion (all pairs), link attraction, center gravity, overlap repulsion
 - Edges drawn as quadratic bezier curves with slight curvature
+- Simulation runs 200 initial iterations, then 150 iterations on any interaction
 
 **Visual encoding** (same as static maps):
 - **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
@@ -606,6 +619,59 @@ The `parent_major_id` field groups detail concepts under their parent major conc
 ```
 
 **Success criteria**: Surface relevant connections user might not have noticed.
+
+**`/concept-map` skill** (Claude Code slash command):
+
+Wraps the two-step workflow (`get_node_content_for_analysis` → `render_interactive_concept_map`) into a single invocation.
+
+Usage: `/concept-map [search-term] [level N]`
+
+- `search-term`: Node name to find in Workflowy
+- `level N` (optional): Maximum depth to traverse (e.g., `level 3` limits to 3 levels of children)
+
+The skill parses arguments for an optional depth specifier (`level N`, `depth N`, or `to level N`), passes it to `get_node_content_for_analysis` as the `depth` parameter, then performs semantic analysis and renders the map.
+
+**CLI tool** (`npm run concept-map`):
+
+Standalone CLI that generates concept maps without requiring the MCP server or Claude Desktop.
+
+| Flag | Description |
+|------|-------------|
+| `--search <query>` | Search for node by name |
+| `--node-id <id>` | Specify node by ID |
+| `--auto` | Use Claude API for semantic concept discovery |
+| `--concepts <list>` | Comma-separated manual concept list |
+| `--depth <N>` | Max child depth to include |
+| `--core <label>` | Override core concept label |
+| `--insert` | Insert outline into Workflowy as sibling node |
+| `--force` | Overwrite existing outline (with `--insert`) |
+| `--output <file>` | Custom output filename |
+
+**Outline insertion** (`--insert` flag):
+
+Creates a structured Workflowy outline as a sibling of the analyzed node:
+
+```
+Concept Map - [Node Name] - Level [N | all levels]
+  note: "Source: [link to analyzed node]"
+
+  [Core Label]
+    note: "[link to source] | Core concept"
+
+  Major Concepts
+    [Major A]
+      note: "[link to WF source node] | Importance: 8/10"
+      [Detail A1]
+        note: "[link to WF source node] | Importance: 5/10"
+
+  Relationships
+    [From] --type--> [To]
+      note: "Strength: 7/10 | [link to from] | [link to to]"
+```
+
+Each concept node's `note` carries a Workflowy internal link (`[label](https://workflowy.com/#/id)`) back to the source node when a mapping exists. Relationship nodes link to the created outline nodes. A backlink is appended to the analyzed node's note, pointing to the outline root.
+
+If an outline with the same name already exists as a sibling, the CLI refuses unless `--force` is passed, which deletes the existing outline first.
 
 ---
 

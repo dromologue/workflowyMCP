@@ -1,207 +1,243 @@
 #!/usr/bin/env node
 /**
- * CLI tool for generating concept maps from Workflowy content
- * Uses Claude API to intelligently extract and relate concepts
+ * CLI tool for generating interactive concept maps from Workflowy content.
+ * Uses Claude API for semantic analysis and generates self-contained HTML.
  *
  * Usage:
- *   npx tsx src/cli/concept-map.ts --node-id <id> --core "Event" --concepts "Being,Truth,Subject"
- *   npx tsx src/cli/concept-map.ts --node-id <id> --core "Event" --auto  # Claude extracts concepts
- *   npx tsx src/cli/concept-map.ts --search "Conceptual Foundations" --core "Event" --auto
- *   npx tsx src/cli/concept-map.ts --setup  # Interactive credential setup
+ *   npm run concept-map -- --search "Topic" --auto
+ *   npm run concept-map -- --search "Topic" --auto --depth 3
+ *   npm run concept-map -- --search "Topic" --auto --depth 3 --insert
+ *   npm run concept-map -- --node-id <id> --auto
+ *   npm run concept-map -- --search "Topic" --core "Center" --concepts "A,B,C"
+ *   npm run concept-map -- --setup
  */
 
 import "dotenv/config";
 import { Command } from "commander";
 import Anthropic from "@anthropic-ai/sdk";
-import { Graphviz } from "@hpcc-js/wasm-graphviz";
-import sharp from "sharp";
 import { writeFileSync } from "fs";
 import { join } from "path";
 import { workflowyRequest } from "../shared/api/workflowy.js";
-import { escapeForDot } from "../shared/utils/text-processing.js";
+import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
+import type { InteractiveConcept, InteractiveRelationship } from "../shared/utils/concept-map-html.js";
 import { ensureCredentials, runSetup } from "./setup.js";
-
-interface WorkflowyNode {
-  id: string;
-  name: string;
-  note?: string;
-  parent_id?: string;
-}
-
-interface ConceptData {
-  id: string;
-  label: string;
-  occurrences: number;
-}
+import { insertConceptMapOutline } from "./concept-map-outline.js";
+import type { WorkflowyNode, ClaudeAnalysis } from "../shared/types/index.js";
 
 const program = new Command();
 
 program
   .name("concept-map")
-  .description("Generate concept maps from Workflowy content using Claude AI")
-  .version("1.0.0")
+  .description("Generate interactive concept maps from Workflowy content using Claude AI")
+  .version("2.0.0")
   .option("-n, --node-id <id>", "Workflowy node ID to analyze")
   .option("-s, --search <query>", "Search for node by name instead of ID")
-  .option("-c, --core <concept>", "Core concept for the map center", "Main Concept")
-  .option("-C, --concepts <list>", "Comma-separated list of concepts to map")
-  .option("-a, --auto", "Use Claude to automatically extract relevant concepts")
-  .option("-o, --output <filename>", "Output filename (default: concept-map-<timestamp>.png)")
-  .option("-f, --format <type>", "Output format: png or jpeg", "png")
-  .option("--no-claude", "Skip Claude analysis, use provided concepts only")
+  .option("-d, --depth <number>", "Maximum depth of children to include (default: unlimited)")
+  .option("-c, --core <concept>", "Core concept label (default: auto-detected)")
+  .option("-C, --concepts <list>", "Comma-separated list of concepts (skips Claude analysis)")
+  .option("-a, --auto", "Use Claude to automatically discover concepts and relationships")
+  .option("-o, --output <filename>", "Output filename (default: concept-map-<slug>-<timestamp>.html)")
+  .option("-i, --insert", "Insert concept map outline as Workflowy nodes (sibling of analyzed node)")
+  .option("--force", "Overwrite existing concept map outline (use with --insert)")
   .option("--setup", "Run interactive credential setup")
   .parse(process.argv);
 
 const options = program.opts();
 
-async function findNodeBySearch(query: string, nodes: WorkflowyNode[]): Promise<WorkflowyNode | null> {
+function findNodeBySearch(query: string, nodes: WorkflowyNode[]): WorkflowyNode | null {
   const lowerQuery = query.toLowerCase();
+  // Strip HTML for comparison
+  const clean = (s: string) => (s || "").replace(/<[^>]*>/g, "").trim().toLowerCase();
 
-  // Exact match first
-  let match = nodes.find(n => n.name?.toLowerCase() === lowerQuery);
+  // Exact match first (ignoring HTML tags)
+  let match = nodes.find(n => clean(n.name) === lowerQuery);
   if (match) return match;
 
-  // Contains match
-  match = nodes.find(n => n.name?.toLowerCase().includes(lowerQuery));
+  // Contains match, but skip "Concept Map - ..." outline nodes
+  match = nodes.find(n => {
+    const name = clean(n.name);
+    if (name.startsWith("concept map - ")) return false;
+    return name.includes(lowerQuery);
+  });
   return match || null;
 }
 
-function getDescendants(parentId: string, nodes: WorkflowyNode[]): WorkflowyNode[] {
+function getDescendants(
+  parentId: string,
+  nodes: WorkflowyNode[],
+  currentDepth: number,
+  maxDepth?: number
+): Array<WorkflowyNode & { depth: number }> {
+  if (maxDepth !== undefined && currentDepth > maxDepth) return [];
   const children = nodes.filter(n => n.parent_id === parentId);
-  const descendants: WorkflowyNode[] = [...children];
+  const result: Array<WorkflowyNode & { depth: number }> = [];
   for (const child of children) {
-    descendants.push(...getDescendants(child.id, nodes));
+    result.push({ ...child, depth: currentDepth });
+    result.push(...getDescendants(child.id, nodes, currentDepth + 1, maxDepth));
   }
-  return descendants;
+  return result;
 }
 
-async function extractConceptsWithClaude(
-  content: string,
-  coreConcept: string
-): Promise<string[]> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("Warning: ANTHROPIC_API_KEY not set, cannot use Claude for concept extraction");
-    return [];
-  }
-
-  const client = new Anthropic({ apiKey });
-
-  console.log("Asking Claude to extract relevant concepts...");
-
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1024,
-    messages: [{
-      role: "user",
-      content: `Analyze this content and extract 15-25 key philosophical/theoretical concepts that relate to "${coreConcept}".
-
-Return ONLY a JSON array of concept names, no explanation. Focus on:
-- Named theories, frameworks, or ideas
-- Technical terms specific to the domain
-- Key thinkers or figures mentioned
-- Core abstractions and their relationships
-
-Content to analyze:
-${content.substring(0, 15000)}
-
-Return format: ["concept1", "concept2", ...]`
-    }]
-  });
-
-  try {
-    const text = response.content[0].type === "text" ? response.content[0].text : "";
-    // Extract JSON array from response
-    const match = text.match(/\[[\s\S]*\]/);
-    if (match) {
-      const concepts = JSON.parse(match[0]) as string[];
-      console.log(`Claude extracted ${concepts.length} concepts`);
-      return concepts;
-    }
-  } catch (e) {
-    console.error("Failed to parse Claude response:", e);
-  }
-  return [];
-}
-
-function generateDotGraph(
-  coreConcept: string,
-  majorConcepts: ConceptData[],
-  detailConcepts: ConceptData[],
-  edges: { from: string; to: string; weight: number }[]
+function buildOutlineContent(
+  root: WorkflowyNode,
+  descendants: Array<WorkflowyNode & { depth: number }>
 ): string {
-  const coreId = "core";
-
-  const lines: string[] = [
-    "digraph ConceptMap {",
-    '  charset="UTF-8";',
-    '  layout=neato;',
-    '  overlap=false;',
-    '  splines=true;',
-    '  sep="+25";',
-    '  ratio=1;',
-    '  size="14,14!";',
-    '  bgcolor="white";',
-    `  label="${escapeForDot(coreConcept)}: Concept Map";`,
-    '  labelloc="t";',
-    '  fontsize=32;',
-    '  fontname="Arial Bold";',
-    "",
-    '  node [shape=box, style="rounded,filled", fontname="Arial"];',
-    "",
-    `  "${coreId}" [label="${escapeForDot(coreConcept)}", fillcolor="#1a5276", fontcolor="white", fontsize=18, penwidth=3, width=2.5, pos="7,7!", pin=true];`,
-    "",
-  ];
-
-  // Major concepts
-  const majorColors = ["#2874a6", "#1e8449", "#b9770e", "#6c3483", "#1abc9c", "#c0392b", "#2980b9", "#27ae60"];
-  majorConcepts.forEach((node, i) => {
-    const color = majorColors[i % majorColors.length];
-    const width = Math.max(1.8, Math.min(1.8 + node.occurrences * 0.05, 2.4));
-    lines.push(`  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="white", fontsize=14, width=${width}];`);
-  });
-
-  // Detail concepts
-  const detailColors = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4", "#f1948a", "#85c1e9", "#82e0aa"];
-  detailConcepts.forEach((node, i) => {
-    const color = detailColors[i % detailColors.length];
-    const width = Math.max(1.2, Math.min(1.2 + node.occurrences * 0.04, 1.8));
-    lines.push(`  "${node.id}" [label="${escapeForDot(node.label)}", fillcolor="${color}", fontcolor="#1a1a1a", fontsize=12, width=${width}];`);
-  });
-
+  const lines: string[] = [`# ${root.name || "Root"}`];
+  if (root.note) lines.push(root.note);
   lines.push("");
 
-  // Add edges
-  const addedEdges = new Set<string>();
-  const significantEdges = edges.filter(e => e.weight >= 1).slice(0, 50);
-
-  for (const edge of significantEdges) {
-    const key = [edge.from, edge.to].sort().join("|||");
-    if (addedEdges.has(key)) continue;
-    addedEdges.add(key);
-
-    const penwidth = Math.min(1 + edge.weight * 0.3, 3);
-    lines.push(`  "${edge.from}" -> "${edge.to}" [penwidth=${penwidth}, color="#566573", dir=none];`);
+  for (const d of descendants) {
+    const indent = "  ".repeat(d.depth);
+    lines.push(`${indent}- ${d.name || "Untitled"}`);
+    if (d.note) {
+      lines.push(`${indent}  ${d.note}`);
+    }
   }
-
-  lines.push("}");
   return lines.join("\n");
 }
 
+async function analyzeWithClaude(
+  content: string,
+  rootName: string,
+  coreLabel?: string,
+  nodeIdMap?: Map<string, string>
+): Promise<ClaudeAnalysis> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY not set. Run with --setup or set the environment variable.");
+  }
+
+  const client = new Anthropic({ apiKey });
+  console.log("Asking Claude to analyze content and discover concepts...");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 4096,
+    messages: [{
+      role: "user",
+      content: `Analyze the following Workflowy content and produce a concept map analysis as JSON.
+
+The root topic is: "${rootName}"
+${coreLabel ? `The core concept should be labeled: "${coreLabel}"` : "Choose the best label for the central concept."}
+
+Identify:
+1. **Major concepts** (5-8): Main themes, categories, or pillars
+2. **Detail concepts** (2-5 per major): Specific ideas or sub-themes under each major
+3. **Relationships** (10-25): Meaningful connections between concepts
+
+For each relationship, use a specific verb phrase:
+- Causal: produces, enables, requires, leads to, depends on
+- Evaluative: critiques, extends, develops, refines, challenges
+- Comparative: contrasts with, differs from, parallels, complements
+- Hierarchical: includes, is a type of, exemplifies, generalizes
+- Influence: influences, shapes, informs, draws from
+
+Prioritize non-obvious connections. Every concept needs at least one relationship.
+
+Return ONLY valid JSON matching this schema:
+{
+  "title": "Descriptive map title",
+  "core_label": "Central concept label",
+  "concepts": [
+    {"id": "kebab-case-id", "label": "Display Label", "level": "major", "importance": 8},
+    {"id": "detail-id", "label": "Detail Label", "level": "detail", "importance": 5, "parent_major_id": "kebab-case-id"}
+  ],
+  "relationships": [
+    {"from": "concept-id", "to": "other-id", "type": "enables", "strength": 7}
+  ]
+}
+
+Content to analyze:
+${content.substring(0, 20000)}`
+    }]
+  });
+
+  const text = response.content[0].type === "text" ? response.content[0].text : "";
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error("Claude did not return valid JSON");
+  }
+  return JSON.parse(jsonMatch[0]) as ClaudeAnalysis;
+}
+
+function buildManualAnalysis(
+  rootName: string,
+  coreLabel: string,
+  conceptNames: string[],
+  descendants: Array<WorkflowyNode & { depth: number }>
+): ClaudeAnalysis {
+  // Split concepts: first 8 are major, rest are detail
+  const majors = conceptNames.slice(0, 8);
+  const details = conceptNames.slice(8, 24);
+
+  const concepts: ClaudeAnalysis["concepts"] = [];
+  for (const name of majors) {
+    concepts.push({
+      id: name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, ""),
+      label: name,
+      level: "major",
+      importance: 6,
+    });
+  }
+  for (const name of details) {
+    const id = name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    concepts.push({
+      id,
+      label: name,
+      level: "detail",
+      importance: 3,
+      parent_major_id: concepts[0]?.id,
+    });
+  }
+
+  // Build co-occurrence relationships
+  const relationships: ClaudeAnalysis["relationships"] = [];
+  const allIds = concepts.map(c => c.id);
+  const conceptLower = conceptNames.map(n => n.toLowerCase());
+
+  for (const node of descendants) {
+    const text = `${node.name || ""} ${node.note || ""}`.toLowerCase();
+    const present: number[] = [];
+    for (let i = 0; i < conceptLower.length; i++) {
+      if (text.includes(conceptLower[i])) present.push(i);
+    }
+    for (let i = 0; i < present.length; i++) {
+      for (let j = i + 1; j < present.length; j++) {
+        const fromId = allIds[present[i]];
+        const toId = allIds[present[j]];
+        if (!fromId || !toId) continue;
+        const existing = relationships.find(
+          r => (r.from === fromId && r.to === toId) || (r.from === toId && r.to === fromId)
+        );
+        if (existing) {
+          existing.strength = Math.min(10, existing.strength + 1);
+        } else {
+          relationships.push({ from: fromId, to: toId, type: "relates to", strength: 3 });
+        }
+      }
+    }
+  }
+
+  return {
+    title: `${rootName}: Concept Map`,
+    core_label: coreLabel,
+    concepts,
+    relationships: relationships.slice(0, 30),
+  };
+}
+
 async function main() {
-  // Handle --setup flag
   if (options.setup) {
     await runSetup();
     return;
   }
 
-  // Ensure credentials are configured (prompts if missing)
   const hasCredentials = await ensureCredentials();
   if (!hasCredentials) {
     console.error("\nRun with --setup to configure credentials");
     process.exit(1);
   }
 
-  // Validate inputs
   if (!options.nodeId && !options.search) {
     console.error("Error: Must provide either --node-id or --search");
     process.exit(1);
@@ -212,6 +248,8 @@ async function main() {
     process.exit(1);
   }
 
+  const maxDepth = options.depth ? parseInt(options.depth, 10) : undefined;
+
   console.log("Fetching nodes from Workflowy...");
   const response = await workflowyRequest("/nodes-export", "GET") as { nodes: WorkflowyNode[] };
   const allNodes = response.nodes;
@@ -219,154 +257,115 @@ async function main() {
 
   // Find target node
   let targetNode: WorkflowyNode | null = null;
-
   if (options.nodeId) {
     targetNode = allNodes.find(n => n.id === options.nodeId) || null;
   } else if (options.search) {
-    targetNode = await findNodeBySearch(options.search, allNodes);
+    targetNode = findNodeBySearch(options.search, allNodes);
   }
 
   if (!targetNode) {
-    console.error(`Error: Could not find node ${options.nodeId || options.search}`);
+    console.error(`Error: Could not find node "${options.nodeId || options.search}"`);
     process.exit(1);
   }
 
   console.log(`Analyzing: "${targetNode.name}" (${targetNode.id})`);
+  if (maxDepth !== undefined) console.log(`Depth limit: ${maxDepth}`);
 
-  // Get descendants
-  const descendants = getDescendants(targetNode.id, allNodes);
+  // Get descendants with depth limit
+  const descendants = getDescendants(targetNode.id, allNodes, 1, maxDepth);
   console.log(`Found ${descendants.length} descendant nodes`);
 
   // Build content for analysis
-  const contentParts = descendants.map(n => `${n.name || ""}\n${n.note || ""}`);
-  const fullContent = contentParts.join("\n\n");
+  const content = buildOutlineContent(targetNode, descendants);
 
-  // Get concepts
-  let concepts: string[] = [];
-
-  if (options.concepts) {
-    concepts = options.concepts.split(",").map((c: string) => c.trim());
+  // Build node ID lookup for Workflowy linking
+  const nodeIdMap = new Map<string, string>();
+  nodeIdMap.set(targetNode.name?.toLowerCase() || "", targetNode.id);
+  for (const d of descendants) {
+    if (d.name) nodeIdMap.set(d.name.toLowerCase(), d.id);
   }
 
-  if (options.auto && options.claude !== false) {
-    const claudeConcepts = await extractConceptsWithClaude(fullContent, options.core);
-    concepts = [...new Set([...concepts, ...claudeConcepts])];
+  // Analyze
+  let analysis: ClaudeAnalysis;
+  if (options.auto) {
+    analysis = await analyzeWithClaude(content, targetNode.name, options.core, nodeIdMap);
+    console.log(`Claude discovered ${analysis.concepts.length} concepts and ${analysis.relationships.length} relationships`);
+  } else {
+    const conceptNames = options.concepts.split(",").map((c: string) => c.trim());
+    analysis = buildManualAnalysis(
+      targetNode.name,
+      options.core || targetNode.name,
+      conceptNames,
+      descendants
+    );
   }
 
-  if (concepts.length < 2) {
-    console.error("Error: Need at least 2 concepts to generate a map");
-    process.exit(1);
-  }
+  // Convert to interactive map format
+  const coreNode = {
+    id: "core",
+    label: analysis.core_label,
+    workflowyNodeId: targetNode.id,
+  };
 
-  console.log(`\nMapping ${concepts.length} concepts: ${concepts.slice(0, 10).join(", ")}${concepts.length > 10 ? "..." : ""}`);
-
-  // Normalize and count occurrences
-  const conceptList = concepts.map(c => ({
-    original: c,
-    lower: c.toLowerCase(),
-    id: c.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "")
+  const concepts: InteractiveConcept[] = analysis.concepts.map(c => ({
+    id: c.id,
+    label: c.label,
+    level: c.level,
+    importance: c.importance,
+    parentMajorId: c.parent_major_id,
+    workflowyNodeId: c.workflowy_node_id || nodeIdMap.get(c.label.toLowerCase()),
   }));
 
-  const conceptOccurrences = new Map<string, number>();
-  for (const c of conceptList) {
-    conceptOccurrences.set(c.lower, 0);
-  }
+  const relationships: InteractiveRelationship[] = analysis.relationships.map(r => ({
+    from: r.from,
+    to: r.to,
+    type: r.type,
+    strength: r.strength,
+  }));
 
-  // Count occurrences
-  for (const node of descendants) {
-    const text = `${node.name || ""} ${node.note || ""}`.toLowerCase();
-    for (const concept of conceptList) {
-      if (text.includes(concept.lower)) {
-        conceptOccurrences.set(concept.lower, (conceptOccurrences.get(concept.lower) || 0) + 1);
-      }
-    }
-  }
+  // Generate HTML
+  console.log("\nGenerating interactive concept map...");
+  const html = generateInteractiveConceptMapHTML(analysis.title, coreNode, concepts, relationships);
 
-  // Filter to concepts with occurrences and sort
-  const foundConcepts = conceptList
-    .filter(c => c.lower !== options.core.toLowerCase())
-    .map(c => ({
-      id: c.id,
-      label: c.original,
-      occurrences: conceptOccurrences.get(c.lower) || 0
-    }))
-    .filter(c => c.occurrences > 0)
-    .sort((a, b) => b.occurrences - a.occurrences);
-
-  console.log(`\nFound ${foundConcepts.length} concepts with occurrences in content`);
-
-  if (foundConcepts.length < 2) {
-    console.error("Error: Not enough concepts found in content");
-    process.exit(1);
-  }
-
-  // Split into major and detail
-  const majorConcepts = foundConcepts.slice(0, 8);
-  const detailConcepts = foundConcepts.slice(8, 16);
-
-  // Build edges
-  const edges: { from: string; to: string; weight: number }[] = [];
-  const coreId = "core";
-
-  // Connect all to core
-  for (const c of [...majorConcepts, ...detailConcepts]) {
-    edges.push({ from: coreId, to: c.id, weight: c.occurrences });
-  }
-
-  // Find co-occurrences
-  for (const node of descendants) {
-    const text = `${node.name || ""} ${node.note || ""}`.toLowerCase();
-    const present = conceptList.filter(c => text.includes(c.lower));
-
-    if (present.length >= 2) {
-      for (let i = 0; i < present.length; i++) {
-        for (let j = i + 1; j < present.length; j++) {
-          const id1 = present[i].id;
-          const id2 = present[j].id;
-          if (id1 === coreId || id2 === coreId) continue;
-
-          const existing = edges.find(e =>
-            (e.from === id1 && e.to === id2) || (e.from === id2 && e.to === id1)
-          );
-          if (existing) {
-            existing.weight++;
-          } else {
-            edges.push({ from: id1, to: id2, weight: 1 });
-          }
-        }
-      }
-    }
-  }
-
-  // Generate graph
-  console.log("\nGenerating concept map...");
-  const dotGraph = generateDotGraph(options.core, majorConcepts, detailConcepts, edges);
-
-  // Render image
-  console.log("Rendering graph...");
-  const graphviz = await Graphviz.load();
-  const svg = graphviz.dot(dotGraph, "svg");
-
-  const format = options.format as "png" | "jpeg";
-  const imageBuffer = await sharp(Buffer.from(svg), { density: 300 })
-    .resize(2000, 2000, { fit: "inside", withoutEnlargement: false })
-    .flatten({ background: "#ffffff" })
-    [format]({ quality: format === "jpeg" ? 95 : undefined })
-    .toBuffer();
-
-  // Save to current directory
+  // Save to ~/Downloads/
   const timestamp = Date.now();
-  const filename = options.output || `concept-map-${options.core.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.${format}`;
-  const outputPath = join(process.cwd(), filename);
+  const slug = analysis.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
+  const downloadsDir = join(process.env.HOME || "~", "Downloads");
+  const filename = options.output || `concept-map-${slug}-${timestamp}.html`;
+  const outputPath = join(downloadsDir, filename);
+  writeFileSync(outputPath, html);
 
-  writeFileSync(outputPath, imageBuffer);
+  const majors = concepts.filter(c => c.level === "major");
+  const details = concepts.filter(c => c.level === "detail");
 
-  console.log(`\n✅ Concept map saved to: ${outputPath}`);
-  console.log(`   Size: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
-  console.log(`   Concepts mapped: ${foundConcepts.length}`);
-  console.log(`   Major: ${majorConcepts.map(c => c.label).join(", ")}`);
-  if (detailConcepts.length > 0) {
-    console.log(`   Detail: ${detailConcepts.map(c => c.label).join(", ")}`);
+  console.log(`\nConcept map saved to: ${outputPath}`);
+  console.log(`  Title: ${analysis.title}`);
+  console.log(`  Major concepts (${majors.length}): ${majors.map(c => c.label).join(", ")}`);
+  console.log(`  Detail concepts (${details.length}): ${details.map(c => c.label).join(", ")}`);
+  console.log(`  Relationships: ${relationships.length}`);
+  console.log(`\nOpen in any browser for interactive force-directed graph.`);
+  console.log(`Click major concepts to expand details, drag to rearrange, scroll to zoom.`);
+
+  // Insert outline into Workflowy if --insert flag is set
+  if (options.insert) {
+    console.log("\nInserting concept map outline into Workflowy...");
+    try {
+      const result = await insertConceptMapOutline(
+        analysis,
+        targetNode,
+        allNodes,
+        maxDepth,
+        nodeIdMap,
+        !!options.force
+      );
+      console.log(`  Created ${result.nodesCreated} nodes`);
+      console.log(`  Outline node: https://workflowy.com/#/${result.outlineNodeId}`);
+      console.log(`  Backlink added to source node`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`  Insert failed: ${message}`);
+      process.exit(1);
+    }
   }
 }
 

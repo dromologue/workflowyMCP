@@ -44,15 +44,19 @@ export async function workflowyRequest(
 }
 
 /**
- * Create a new node
+ * Create a new node.
+ * The Workflowy API returns { item_id: string }, which we normalize to { id: string }.
  */
 export async function createNode(params: {
   name: string;
   note?: string;
   parent_id?: string;
-  priority?: number;
+  position?: "top" | "bottom";
 }): Promise<{ id: string }> {
-  return workflowyRequest("/nodes", "POST", params) as Promise<{ id: string }>;
+  const body = { ...params, position: params.position || "bottom" };
+  const result = await workflowyRequest("/nodes", "POST", body) as Record<string, unknown>;
+  const id = (result.id || result.item_id || result.nodeId) as string;
+  return { id };
 }
 
 /**
@@ -78,11 +82,11 @@ export async function deleteNode(nodeId: string): Promise<unknown> {
 export async function moveNode(
   nodeId: string,
   newParentId: string,
-  priority?: number
+  position: "top" | "bottom" = "bottom"
 ): Promise<unknown> {
   return workflowyRequest(`/nodes/${nodeId}`, "POST", {
     parent_id: newParentId,
-    priority,
+    position,
   });
 }
 

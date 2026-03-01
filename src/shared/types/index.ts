@@ -60,6 +60,30 @@ export interface DropboxUploadResult {
 }
 
 // ============================================================================
+// Concept Map Analysis Types
+// ============================================================================
+
+/** Claude's semantic analysis of content for concept mapping */
+export interface ClaudeAnalysis {
+  title: string;
+  core_label: string;
+  concepts: Array<{
+    id: string;
+    label: string;
+    level: "major" | "detail";
+    importance: number;
+    parent_major_id?: string;
+    workflowy_node_id?: string;
+  }>;
+  relationships: Array<{
+    from: string;
+    to: string;
+    type: string;
+    strength: number;
+  }>;
+}
+
+// ============================================================================
 // LLM-Powered Concept Map Types
 // ============================================================================
 

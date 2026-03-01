@@ -756,6 +756,7 @@ const renderInteractiveConceptMapSchema = z.object({
   core_concept: z.object({
     label: z.string().describe("Label for the central concept"),
     description: z.string().optional().describe("Optional description"),
+    workflowy_node_id: z.string().optional().describe("Workflowy node ID for linking back to source"),
   }),
   concepts: z.array(z.object({
     id: z.string().describe("Unique identifier for this concept"),
@@ -763,6 +764,7 @@ const renderInteractiveConceptMapSchema = z.object({
     level: z.enum(["major", "detail"]).describe("Major concepts form the inner ring; details orbit their parent"),
     importance: z.number().optional().describe("1-10 importance score (affects node size)"),
     parent_major_id: z.string().optional().describe("Which major concept this detail belongs to (for collapse grouping)"),
+    workflowy_node_id: z.string().optional().describe("Workflowy node ID for linking back to source"),
   })),
   relationships: z.array(z.object({
     from: z.string().describe("Source concept ID"),
@@ -1675,6 +1677,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               properties: {
                 label: { type: "string", description: "Label for the central concept" },
                 description: { type: "string", description: "Optional description" },
+                workflowy_node_id: { type: "string", description: "Workflowy node ID for linking back to source" },
               },
               required: ["label"],
             },
@@ -1688,6 +1691,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   level: { type: "string", enum: ["major", "detail"], description: "Major or detail level" },
                   importance: { type: "number", description: "1-10 importance (affects size)" },
                   parent_major_id: { type: "string", description: "Parent major concept ID (for detail nodes)" },
+                  workflowy_node_id: { type: "string", description: "Workflowy node ID for linking back to source" },
                 },
                 required: ["id", "label", "level"],
               },
@@ -3815,7 +3819,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "render_interactive_concept_map": {
       const parsed = renderInteractiveConceptMapSchema.parse(args);
       const coreId = "core";
-      const coreNode = { id: coreId, label: parsed.core_concept.label };
+      const coreNode = {
+        id: coreId,
+        label: parsed.core_concept.label,
+        workflowyNodeId: parsed.core_concept.workflowy_node_id,
+      };
 
       // Build concept list with auto-assignment of unparented details
       const majors = parsed.concepts.filter((c) => c.level === "major");
@@ -3826,6 +3834,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           level: c.level as "major" | "detail",
           importance: c.importance ?? (c.level === "major" ? 6 : 3),
           parentMajorId: c.parent_major_id,
+          workflowyNodeId: c.workflowy_node_id,
         };
 
         // Auto-assign detail concepts without a parent to their most-connected major
