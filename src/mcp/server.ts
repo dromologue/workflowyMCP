@@ -3917,10 +3917,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Fallback write failure is non-fatal
       }
 
+      // Upload to Dropbox
+      let dropboxUrl: string | undefined;
+      if (isDropboxConfigured()) {
+        const dateStr = new Date().toISOString().slice(0, 10);
+        const dropboxFilename = `concept-map-${slug}-${dateStr}.html`;
+        const dropboxResult = await uploadToDropboxPath(html, `/Workflowy/ConceptMaps/${dropboxFilename}`);
+        if (dropboxResult.success && dropboxResult.url) {
+          dropboxUrl = dropboxResult.url;
+        }
+      }
+
+      // Add clickable link node under Tasks node
+      if (dropboxUrl) {
+        const allNodes = await getCachedNodes();
+        const { findTasksNode } = await import("../shared/utils/task-map.js");
+        const tasksNode = findTasksNode(allNodes);
+        if (tasksNode) {
+          const dateStr = new Date().toISOString().slice(0, 10);
+          await workflowyRequest("/nodes", "POST", {
+            name: `<a href="${dropboxUrl}">Concept Map: ${parsed.title} ${dateStr}</a>`,
+            parent_id: tasksNode.id,
+            position: "bottom",
+          });
+        }
+      }
+
       const stats = {
         success: true,
         title: parsed.title,
         file_path: filePath,
+        dropbox_url: dropboxUrl,
         stats: {
           major_concepts: majors.length,
           detail_concepts: concepts.length - majors.length,

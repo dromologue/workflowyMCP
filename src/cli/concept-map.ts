@@ -17,9 +17,11 @@ import { Command } from "commander";
 import Anthropic from "@anthropic-ai/sdk";
 import { writeFileSync } from "fs";
 import { join } from "path";
-import { workflowyRequest } from "../shared/api/workflowy.js";
+import { workflowyRequest, createNode } from "../shared/api/workflowy.js";
 import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
 import type { InteractiveConcept, InteractiveRelationship } from "../shared/utils/concept-map-html.js";
+import { uploadToDropboxPath, isDropboxConfigured } from "../shared/api/dropbox.js";
+import { findTasksNode } from "../shared/utils/task-map.js";
 import { ensureCredentials, runSetup } from "./setup.js";
 import { insertConceptMapOutline } from "./concept-map-outline.js";
 import type { WorkflowyNode, ClaudeAnalysis } from "../shared/types/index.js";
@@ -345,6 +347,30 @@ async function main() {
   console.log(`  Relationships: ${relationships.length}`);
   console.log(`\nOpen in any browser for interactive force-directed graph.`);
   console.log(`Click major concepts to expand details, drag to rearrange, scroll to zoom.`);
+
+  // Upload to Dropbox
+  if (isDropboxConfigured()) {
+    console.log("\nUploading to Dropbox...");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const dropboxFilename = `concept-map-${slug}-${dateStr}.html`;
+    const dropboxPath = `/Workflowy/ConceptMaps/${dropboxFilename}`;
+    const dropboxResult = await uploadToDropboxPath(html, dropboxPath);
+    if (dropboxResult.success && dropboxResult.url) {
+      console.log(`  Dropbox: ${dropboxResult.url}`);
+
+      // Add clickable link under Tasks node
+      const tasksNode = findTasksNode(allNodes);
+      if (tasksNode) {
+        const linkName = `<a href="${dropboxResult.url}">Concept Map: ${analysis.title} ${dateStr}</a>`;
+        await createNode({ name: linkName, parent_id: tasksNode.id });
+        console.log(`  Added link under Tasks node`);
+      }
+    } else {
+      console.error(`  Dropbox upload failed: ${dropboxResult.error}`);
+    }
+  } else {
+    console.log("\nDropbox not configured — skipping upload");
+  }
 
   // Insert outline into Workflowy if --insert flag is set
   if (options.insert) {
