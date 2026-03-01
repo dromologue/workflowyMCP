@@ -128,11 +128,9 @@ async function main() {
     const linkParent = taskMapData.tasksNode || taskMapData.tagsNode;
     const linkParentName = taskMapData.tasksNode ? "Tasks" : "Tags";
     console.log(`\nAdding link to Workflowy (under ${linkParentName} node)...`);
-    const linkName = `Task Map ${dateStr}`;
-    const linkNote = dropboxUrl;
+    const linkName = `<a href="${dropboxUrl}">Task Map ${dateStr}</a>`;
     await createNode({
       name: linkName,
-      note: linkNote,
       parent_id: linkParent.id,
     });
     console.log(`  Added "${linkName}" under ${linkParentName} node`);

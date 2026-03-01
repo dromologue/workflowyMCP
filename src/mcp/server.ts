@@ -3988,8 +3988,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (dropboxUrl) {
         const linkParentId = taskMapData.tasksNode?.id || taskMapData.tagsNode.id;
         await workflowyRequest("/nodes", "POST", {
-          name: `Task Map ${dateStr}`,
-          note: dropboxUrl,
+          name: `<a href="${dropboxUrl}">Task Map ${dateStr}</a>`,
           parent_id: linkParentId,
           position: "bottom",
         });
