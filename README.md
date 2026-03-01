@@ -81,12 +81,13 @@ WORKFLOWY_API_KEY=your-api-key
 | `get_recent_changes` | Nodes modified within a time window |
 | `daily_review` | One-call standup summary: overdue, upcoming, recent, pending |
 
-### Concept Maps
+### Concept Maps & Task Maps
 
 | Tool | What it does |
 |------|-------------|
 | `get_node_content_for_analysis` | Export subtree content for Claude to analyze |
 | `render_interactive_concept_map` | Generate an interactive HTML concept map inline in Claude Desktop |
+| `generate_task_map` | Build a concept map from your Tags node — tags as concepts, matched nodes as details |
 
 ### Graph Analysis
 
@@ -122,32 +123,21 @@ ANTHROPIC_API_KEY=sk-ant-your-key
 
 Enables `--auto` mode in the CLI concept map tool.
 
-## Generating Interactive Concept Maps
+## Concept Maps
 
-### `/concept-map` skill (recommended)
+Generate interactive, zoomable concept maps from any Workflowy subtree. Claude analyzes the content, discovers concepts and relationships, and renders a force-directed HTML visualization.
 
-Install the Claude Code skill for one-command concept map generation:
+### Quick start
 
 ```bash
-cp -r .claude/skills/concept-map ~/.claude/skills/concept-map
-```
-
-Then in Claude Code:
-
-```
+# Via Claude Code skill (recommended)
 /concept-map Philosophy
-```
 
-Claude will find the node, read the content, extract concepts and relationships, and render a force-directed interactive map. The HTML file is also saved to `~/Downloads/` — fully self-contained, no server needed.
+# Via CLI with Claude auto-analysis
+npm run concept-map -- --search "Topic" --auto
 
-### Manual prompt
-
-Alternatively, prompt Claude directly:
-
-```
-Analyze the content under [node name] and create an interactive concept map using render_interactive_concept_map.
-First use get_node_content_for_analysis to read the content, then identify the key concepts and relationships,
-and render them as an interactive map.
+# With depth limit and Workflowy outline insertion
+npm run concept-map -- --search "Topic" --auto --depth 3 --insert
 ```
 
 ### Interaction
@@ -157,12 +147,26 @@ and render them as an interactive map.
 - **Scroll** to zoom, **drag background** to pan
 - **Expand All / Collapse All** buttons in the toolbar
 
-## CLI Concept Maps
+The HTML file is saved to `~/Downloads/` — fully self-contained, no server needed.
+
+## Task Maps
+
+Generate a concept map from your Workflowy Tags node. Finds all `#tag` definitions under the root-level "Tags" node, searches for matching nodes using prefix matching (e.g. `#action_` matches `#action_review`), and visualises tags as major concepts with matched nodes as expandable details.
+
+### Quick start
 
 ```bash
-npm run concept-map -- --search "Topic" --core "Center" --concepts "A,B,C"
-npm run concept-map -- --search "Topic" --core "Center" --auto
+# Generate task map
+npm run task-map
+
+# Exclude completed nodes
+npm run task-map -- --exclude-completed
+
+# Also insert outline into Workflowy and save to Dropbox
+npm run task-map -- --insert
 ```
+
+If Dropbox is configured, the HTML is also uploaded to `/Workflowy/TaskMaps/` and a link node is added under your Tags node in Workflowy.
 
 ## Development
 

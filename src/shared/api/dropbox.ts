@@ -61,11 +61,12 @@ export async function getDropboxAccessToken(): Promise<string | null> {
 }
 
 /**
- * Upload an image to Dropbox and get a shareable link
+ * Upload a file to a Dropbox path and get a shareable link.
+ * Accepts a Buffer or string content.
  */
-export async function uploadToDropbox(
-  imageBuffer: Buffer,
-  filename: string
+export async function uploadToDropboxPath(
+  content: Buffer | string,
+  dropboxPath: string
 ): Promise<DropboxUploadResult> {
   const accessToken = await getDropboxAccessToken();
 
@@ -78,7 +79,8 @@ export async function uploadToDropbox(
   }
 
   try {
-    const uploadPath = `/workflowy/conceptMaps/${filename}`;
+    const uploadPath = dropboxPath;
+    const body = typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
 
     // Upload file to Dropbox
     const uploadResponse = await fetch(
@@ -94,7 +96,7 @@ export async function uploadToDropbox(
             autorename: false,
           }),
         },
-        body: new Uint8Array(imageBuffer),
+        body,
       }
     );
 
@@ -158,4 +160,14 @@ export async function uploadToDropbox(
       error: `Dropbox error: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+/**
+ * Upload an image to Dropbox and get a shareable link
+ */
+export async function uploadToDropbox(
+  imageBuffer: Buffer,
+  filename: string
+): Promise<DropboxUploadResult> {
+  return uploadToDropboxPath(imageBuffer, `/workflowy/conceptMaps/${filename}`);
 }

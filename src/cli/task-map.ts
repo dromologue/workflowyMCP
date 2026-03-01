@@ -15,9 +15,10 @@ import "dotenv/config";
 import { Command } from "commander";
 import { writeFileSync } from "fs";
 import { join } from "path";
-import { workflowyRequest } from "../shared/api/workflowy.js";
+import { workflowyRequest, createNode } from "../shared/api/workflowy.js";
 import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
 import { generateTaskMap } from "../shared/utils/task-map.js";
+import { uploadToDropboxPath, isDropboxConfigured } from "../shared/api/dropbox.js";
 import { insertConceptMapOutline } from "./concept-map-outline.js";
 import { ensureCredentials } from "./setup.js";
 import type { WorkflowyNode } from "../shared/types/index.js";
@@ -92,6 +93,7 @@ async function main() {
 
   // Save to ~/Downloads/
   const timestamp = Date.now();
+  const dateStr = new Date().toISOString().slice(0, 10);
   const slug = taskMapData.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
   const downloadsDir = join(process.env.HOME || "~", "Downloads");
   const filename = options.output || `task-map-${slug}-${timestamp}.html`;
@@ -102,6 +104,37 @@ async function main() {
   console.log(`  Tags: ${majors.map(c => c.label).join(", ")}`);
   console.log(`  Detail nodes: ${details.length}`);
   console.log(`  Relationships: ${taskMapData.relationships.length}`);
+
+  // Upload to Dropbox
+  let dropboxUrl: string | undefined;
+  if (isDropboxConfigured()) {
+    console.log("\nUploading to Dropbox...");
+    const dropboxFilename = `task-map-${dateStr}.html`;
+    const dropboxPath = `/Workflowy/TaskMaps/${dropboxFilename}`;
+    const result = await uploadToDropboxPath(html, dropboxPath);
+    if (result.success && result.url) {
+      dropboxUrl = result.url;
+      console.log(`  Dropbox: ${dropboxUrl}`);
+    } else {
+      console.error(`  Dropbox upload failed: ${result.error}`);
+    }
+  } else {
+    console.log("\nDropbox not configured — skipping upload");
+  }
+
+  // Add link node under Tags in Workflowy
+  if (dropboxUrl) {
+    console.log("\nAdding link to Workflowy...");
+    const linkName = `Task Map ${dateStr}`;
+    const linkNote = dropboxUrl;
+    await createNode({
+      name: linkName,
+      note: linkNote,
+      parent_id: taskMapData.tagsNode.id,
+    });
+    console.log(`  Added "${linkName}" under Tags node`);
+  }
+
   console.log(`\nOpen in any browser for interactive force-directed graph.`);
   console.log(`Click tags to expand matching nodes, drag to rearrange, scroll to zoom.`);
 

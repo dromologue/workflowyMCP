@@ -90,6 +90,7 @@ import { parseTags, parseNodeTags, nodeHasTag, nodeHasAssignee } from "../shared
 import { parseDueDateFromNode, isOverdue, isDueWithin } from "../shared/utils/date-parser.js";
 import { generateInteractiveConceptMapHTML } from "../shared/utils/concept-map-html.js";
 import { generateTaskMap } from "../shared/utils/task-map.js";
+import { uploadToDropboxPath, isDropboxConfigured } from "../shared/api/dropbox.js";
 import { insertConceptMapOutline } from "../cli/concept-map-outline.js";
 import {
   buildGraphStructure,
@@ -3962,6 +3963,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       lastInteractiveMapTitle = taskMapData.title;
 
       const timestamp = Date.now();
+      const dateStr = new Date().toISOString().slice(0, 10);
       const slug = taskMapData.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
       const downloadsDir = path.join(process.env.HOME || "~", "Downloads");
       const filePath = path.join(downloadsDir, `task-map-${slug}-${timestamp}.html`);
@@ -3971,10 +3973,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Fallback write failure is non-fatal
       }
 
+      // Upload to Dropbox
+      let dropboxUrl: string | undefined;
+      if (isDropboxConfigured()) {
+        const dropboxFilename = `task-map-${dateStr}.html`;
+        const dropboxResult = await uploadToDropboxPath(html, `/Workflowy/TaskMaps/${dropboxFilename}`);
+        if (dropboxResult.success && dropboxResult.url) {
+          dropboxUrl = dropboxResult.url;
+        }
+      }
+
+      // Add link node under Tags
+      if (dropboxUrl) {
+        await workflowyRequest("/nodes", "POST", {
+          name: `Task Map ${dateStr}`,
+          note: dropboxUrl,
+          parent_id: taskMapData.tagsNode.id,
+          position: "bottom",
+        });
+      }
+
       const result: Record<string, unknown> = {
         success: true,
         title: taskMapData.title,
         file_path: filePath,
+        dropbox_url: dropboxUrl,
         tags_node_id: taskMapData.tagsNode.id,
         tag_count: taskMapData.tagDefinitions.length,
         tags: taskMapData.tagDefinitions.map(t => ({

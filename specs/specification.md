@@ -643,35 +643,60 @@ Standalone CLI that generates concept maps without requiring the MCP server or C
 | `--concepts <list>` | Comma-separated manual concept list |
 | `--depth <N>` | Max child depth to include |
 | `--core <label>` | Override core concept label |
-| `--insert` | Insert outline into Workflowy as sibling node |
+| `--insert` | Insert outline into Workflowy as child of analyzed node |
 | `--force` | Overwrite existing outline (with `--insert`) |
 | `--output <file>` | Custom output filename |
 
 **Outline insertion** (`--insert` flag):
 
-Creates a structured Workflowy outline as a sibling of the analyzed node:
+Creates a structured Workflowy outline as a child of the analyzed node. Links to source nodes appear as child nodes (not in the note field). No importance or strength scores are included.
 
 ```
 Concept Map - [Node Name] - Level [N | all levels]
-  note: "Source: [link to analyzed node]"
-
   [Core Label]
-    note: "[link to source] | Core concept"
-
+    → link to source node
   Major Concepts
     [Major A]
-      note: "[link to WF source node] | Importance: 8/10"
+      → link to WF source node
       [Detail A1]
-        note: "[link to WF source node] | Importance: 5/10"
-
+        → link to WF source node
   Relationships
     [From] --type--> [To]
-      note: "Strength: 7/10 | [link to from] | [link to to]"
+      → link to from outline node
+      → link to to outline node
 ```
 
-Each concept node's `note` carries a Workflowy internal link (`[label](https://workflowy.com/#/id)`) back to the source node when a mapping exists. Relationship nodes link to the created outline nodes. A backlink is appended to the analyzed node's note, pointing to the outline root.
+If an outline with the same name already exists as a child, the CLI refuses unless `--force` is passed, which deletes the existing outline first.
 
-If an outline with the same name already exists as a sibling, the CLI refuses unless `--force` is passed, which deletes the existing outline first.
+#### Task Maps
+
+**Tool: `generate_task_map`**
+
+Generates an interactive concept map from Workflowy's Tags node. Finds the root-level "Tags" node, reads children as #tag and @mention definitions, searches all nodes for matches using prefix matching (e.g. `#action_` matches `#action_review`), and produces a visual map showing tag relationships via co-occurrence. Saves HTML to `~/Downloads/` and uploads to Dropbox (`/Workflowy/TaskMaps/`), adding a link node under Tags.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_details_per_tag` | number | 8 | Max detail nodes per tag |
+| `detail_sort_by` | "recency" \| "name" | "recency" | Sort order for detail nodes |
+| `title` | string | "Task Map" | Custom title |
+| `exclude_completed` | boolean | false | Exclude completed nodes |
+| `exclude_mentions` | boolean | true | Exclude @mention tags, only use #hashtags |
+| `insert_outline` | boolean | false | Insert outline into Workflowy under Tags |
+| `force_outline` | boolean | false | Overwrite existing outline |
+
+**CLI tool** (`npm run task-map`):
+
+| Flag | Description |
+|------|-------------|
+| `--max-details <N>` | Max detail nodes per tag (default: 8) |
+| `--sort <order>` | Sort details by: recency, name |
+| `--title <title>` | Custom map title |
+| `--exclude-completed` | Exclude completed nodes |
+| `--insert` | Insert outline into Workflowy under Tags node |
+| `--force` | Overwrite existing outline |
+| `--output <file>` | Custom output filename |
+
+Tags become major concepts, matched nodes become detail concepts (capped per tag), and co-occurrence (nodes matching multiple tags) creates relationships between tags. @mentions are excluded by default.
 
 ---
 
