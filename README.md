@@ -1,6 +1,8 @@
 # Workflowy MCP Server
 
-An MCP server that gives Claude full read/write access to your Workflowy outline. Search, insert, organize, and manage tasks — all through natural language.
+An MCP server that gives Claude full read/write access to your Workflowy outline. Search, insert, organize, manage tasks, and generate interactive visualizations — all through natural language.
+
+Works with **Claude Desktop** (MCP tools) and **Claude Code** (CLI + skills).
 
 ## Install
 
@@ -13,6 +15,8 @@ npm run build
 
 ## Configure
 
+### Required: Workflowy API key
+
 1. Get your API key from [workflowy.com/api-key](https://workflowy.com/api-key)
 
 2. Create `.env` in the project root:
@@ -21,7 +25,43 @@ npm run build
 WORKFLOWY_API_KEY=your-api-key
 ```
 
-3. Add to Claude Desktop config:
+### Optional: Anthropic API (for concept map auto-analysis)
+
+```
+ANTHROPIC_API_KEY=sk-ant-your-key
+```
+
+Enables `--auto` mode in the CLI concept map tool, where Claude analyzes content and extracts concepts automatically.
+
+### Optional: Dropbox (for cloud-hosted maps)
+
+When configured, concept maps and task maps are uploaded to Dropbox and a clickable link is added to your Tasks node in Workflowy.
+
+1. Create a Dropbox app at [dropbox.com/developers/apps](https://www.dropbox.com/developers/apps):
+   - Choose **Scoped access**
+   - Choose **Full Dropbox** access
+   - Under **Permissions**, enable `files.content.write` and `sharing.write`
+
+2. Generate a refresh token (the app console provides a short-lived access token; you need a long-lived refresh token):
+   - Use the OAuth 2 flow or the Dropbox API Explorer to obtain a refresh token for your app
+
+3. Add to `.env`:
+
+```
+DROPBOX_APP_KEY=your-app-key
+DROPBOX_APP_SECRET=your-app-secret
+DROPBOX_REFRESH_TOKEN=your-refresh-token
+```
+
+Maps are saved to:
+- **Concept maps:** `/Workflowy/ConceptMaps/`
+- **Task maps:** `/Workflowy/TaskMaps/`
+
+A clickable link to each map is added under your root-level **Tasks** node in Workflowy.
+
+### Claude Desktop setup
+
+Add to your Claude Desktop config:
 
 **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
@@ -37,7 +77,49 @@ WORKFLOWY_API_KEY=your-api-key
 }
 ```
 
-4. Restart Claude Desktop.
+Restart Claude Desktop. All tools below become available as MCP tools that Claude can call directly.
+
+### Claude Code setup
+
+No extra config needed — the CLI tools and skills work directly from the project directory.
+
+To add the skills to Claude Code, copy the skill folders from the repo or create them under `~/.claude/skills/`:
+- `/concept-map` — `/concept-map [topic]` to generate concept maps
+- `/task-map` — `/task-map` to generate task maps
+
+## Usage
+
+### Via Claude Desktop
+
+Ask Claude naturally — it will use the MCP tools:
+
+- "Search my Workflowy for anything tagged #review"
+- "Create a concept map of my Philosophy notes"
+- "Generate a task map from my tags"
+- "What's overdue in my Projects?"
+
+### Via Claude Code
+
+Use the skills:
+
+```bash
+/concept-map Philosophy        # generate concept map from a Workflowy subtree
+/task-map                      # generate task map from Tags node
+/task-map --exclude-completed  # exclude completed nodes
+```
+
+Or use the CLI directly:
+
+```bash
+# Concept maps (requires ANTHROPIC_API_KEY for --auto)
+npm run concept-map -- --search "Topic" --auto
+npm run concept-map -- --search "Topic" --auto --depth 3 --insert
+
+# Task maps
+npm run task-map
+npm run task-map -- --exclude-completed
+npm run task-map -- --insert          # also insert outline into Workflowy
+```
 
 ## Tools
 
@@ -86,7 +168,7 @@ WORKFLOWY_API_KEY=your-api-key
 | Tool | What it does |
 |------|-------------|
 | `get_node_content_for_analysis` | Export subtree content for Claude to analyze |
-| `render_interactive_concept_map` | Generate an interactive HTML concept map inline in Claude Desktop |
+| `render_interactive_concept_map` | Generate an interactive HTML concept map |
 | `generate_task_map` | Build a concept map from your Tags node — tags as concepts, matched nodes as details |
 
 ### Graph Analysis
@@ -115,30 +197,9 @@ Tags, assignees, and due dates are parsed from node text:
 - **Assignees:** `@alice`, `@bob`
 - **Due dates:** `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15`
 
-## Optional: Anthropic API (for CLI auto-extraction)
-
-```
-ANTHROPIC_API_KEY=sk-ant-your-key
-```
-
-Enables `--auto` mode in the CLI concept map tool.
-
 ## Concept Maps
 
 Generate interactive, zoomable concept maps from any Workflowy subtree. Claude analyzes the content, discovers concepts and relationships, and renders a force-directed HTML visualization.
-
-### Quick start
-
-```bash
-# Via Claude Code skill (recommended)
-/concept-map Philosophy
-
-# Via CLI with Claude auto-analysis
-npm run concept-map -- --search "Topic" --auto
-
-# With depth limit and Workflowy outline insertion
-npm run concept-map -- --search "Topic" --auto --depth 3 --insert
-```
 
 ### Interaction
 
@@ -147,26 +208,13 @@ npm run concept-map -- --search "Topic" --auto --depth 3 --insert
 - **Scroll** to zoom, **drag background** to pan
 - **Expand All / Collapse All** buttons in the toolbar
 
-The HTML file is saved to `~/Downloads/` — fully self-contained, no server needed.
+The HTML file is saved to `~/Downloads/` — fully self-contained, no server needed. If Dropbox is configured, it is also uploaded and a clickable link is added to your Tasks node in Workflowy.
 
 ## Task Maps
 
 Generate a concept map from your Workflowy Tags node. Finds all `#tag` definitions under the root-level "Tags" node, searches for matching nodes using prefix matching (e.g. `#action_` matches `#action_review`), and visualises tags as major concepts with matched nodes as expandable details.
 
-### Quick start
-
-```bash
-# Generate task map
-npm run task-map
-
-# Exclude completed nodes
-npm run task-map -- --exclude-completed
-
-# Also insert outline into Workflowy and save to Dropbox
-npm run task-map -- --insert
-```
-
-If Dropbox is configured, the HTML is also uploaded to `/Workflowy/TaskMaps/` and a link node is added under your Tags node in Workflowy.
+If Dropbox is configured, the HTML is uploaded to `/Workflowy/TaskMaps/` and a clickable link is added under your Tasks node in Workflowy.
 
 ## Development
 
