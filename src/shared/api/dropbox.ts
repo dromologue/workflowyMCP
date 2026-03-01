@@ -125,7 +125,7 @@ export async function uploadToDropboxPath(
 
     if (shareResponse.ok) {
       const shareData = (await shareResponse.json()) as { url: string };
-      shareUrl = shareData.url.replace("dl=0", "raw=1");
+      shareUrl = shareData.url;
     } else {
       // Link might already exist, try to get it
       const getResponse = await fetch(
@@ -150,7 +150,7 @@ export async function uploadToDropboxPath(
       if (linksData.links.length === 0) {
         return { success: false, error: "No shareable link found" };
       }
-      shareUrl = linksData.links[0].url.replace("dl=0", "raw=1");
+      shareUrl = linksData.links[0].url;
     }
 
     return { success: true, url: shareUrl };
