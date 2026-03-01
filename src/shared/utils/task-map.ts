@@ -43,6 +43,8 @@ export interface TaskMapOptions {
 export interface TaskMapData {
   title: string;
   tagsNode: WorkflowyNode;
+  /** Root-level Tasks node, if found (for placing links) */
+  tasksNode: WorkflowyNode | null;
   tagDefinitions: TagDefinition[];
   taggedNodes: TaggedNode[];
   concepts: InteractiveConcept[];
@@ -100,6 +102,19 @@ export function findTagsNode(allNodes: WorkflowyNode[]): WorkflowyNode | null {
     if (!isRoot) return false;
     const name = cleanName(n.name).toLowerCase();
     return name === "tags" || name === "#tags";
+  }) || null;
+}
+
+/**
+ * Find the root-level "Tasks" node.
+ */
+export function findTasksNode(allNodes: WorkflowyNode[]): WorkflowyNode | null {
+  const nodeIds = new Set(allNodes.map(n => n.id));
+  return allNodes.find(n => {
+    const isRoot = !n.parent_id || !nodeIds.has(n.parent_id);
+    if (!isRoot) return false;
+    const name = cleanName(n.name).toLowerCase();
+    return name === "tasks" || name === "📋 tasks";
   }) || null;
 }
 
@@ -195,6 +210,7 @@ export function findTaggedNodes(
  */
 export function buildTaskMapData(
   tagsNode: WorkflowyNode,
+  tasksNode: WorkflowyNode | null,
   tagDefinitions: TagDefinition[],
   taggedNodes: TaggedNode[],
   options: TaskMapOptions = {}
@@ -308,6 +324,7 @@ export function buildTaskMapData(
   return {
     title,
     tagsNode,
+    tasksNode,
     tagDefinitions,
     taggedNodes,
     concepts,
@@ -342,6 +359,7 @@ export function generateTaskMap(
     if (n.parent_id === tagsNode.id) excludeIds.add(n.id);
   }
 
+  const tasksNode = findTasksNode(allNodes);
   const taggedNodes = findTaggedNodes(tagDefinitions, allNodes, options, excludeIds);
-  return buildTaskMapData(tagsNode, tagDefinitions, taggedNodes, options);
+  return buildTaskMapData(tagsNode, tasksNode, tagDefinitions, taggedNodes, options);
 }

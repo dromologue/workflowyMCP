@@ -88,7 +88,8 @@ async function main() {
     taskMapData.title,
     coreNode,
     taskMapData.concepts,
-    taskMapData.relationships
+    taskMapData.relationships,
+    { showLegend: false }
   );
 
   // Save to ~/Downloads/
@@ -122,17 +123,19 @@ async function main() {
     console.log("\nDropbox not configured — skipping upload");
   }
 
-  // Add link node under Tags in Workflowy
+  // Add link node under Tasks node in Workflowy
   if (dropboxUrl) {
-    console.log("\nAdding link to Workflowy...");
+    const linkParent = taskMapData.tasksNode || taskMapData.tagsNode;
+    const linkParentName = taskMapData.tasksNode ? "Tasks" : "Tags";
+    console.log(`\nAdding link to Workflowy (under ${linkParentName} node)...`);
     const linkName = `Task Map ${dateStr}`;
     const linkNote = dropboxUrl;
     await createNode({
       name: linkName,
       note: linkNote,
-      parent_id: taskMapData.tagsNode.id,
+      parent_id: linkParent.id,
     });
-    console.log(`  Added "${linkName}" under Tags node`);
+    console.log(`  Added "${linkName}" under ${linkParentName} node`);
   }
 
   console.log(`\nOpen in any browser for interactive force-directed graph.`);

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   findTagsNode,
+  findTasksNode,
   extractTagDefinitions,
   findTaggedNodes,
   buildTaskMapData,
@@ -66,6 +67,37 @@ describe("findTagsNode", () => {
     // Actually: cleanName strips HTML only, so "#Tags" stays. lowercase = "#tags".
     // We check for "tags" or "#tags" — this should match.
     expect(findTagsNode(nodes)?.id).toBe("hash-tags");
+  });
+});
+
+// ── findTasksNode ──
+
+describe("findTasksNode", () => {
+  it("finds root-level Tasks node", () => {
+    const nodes: WorkflowyNode[] = [
+      { id: "tasks-1", name: "Tasks" },
+      { id: "tags-1", name: "Tags" },
+    ];
+    expect(findTasksNode(nodes)?.id).toBe("tasks-1");
+  });
+
+  it("finds Tasks node with emoji prefix", () => {
+    const nodes: WorkflowyNode[] = [
+      { id: "tasks-emoji", name: "📋 Tasks" },
+    ];
+    expect(findTasksNode(nodes)?.id).toBe("tasks-emoji");
+  });
+
+  it("returns null when no Tasks node exists", () => {
+    expect(findTasksNode(mockNodes)).toBeNull();
+  });
+
+  it("ignores non-root Tasks node", () => {
+    const nodes: WorkflowyNode[] = [
+      { id: "root", name: "Root" },
+      { id: "child-tasks", name: "Tasks", parent_id: "root" },
+    ];
+    expect(findTasksNode(nodes)).toBeNull();
   });
 });
 
@@ -187,19 +219,19 @@ describe("buildTaskMapData", () => {
   const tagged = findTaggedNodes(defs, mockNodes);
 
   it("creates one major concept per tag definition", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     const majors = data.concepts.filter(c => c.level === "major");
     expect(majors).toHaveLength(defs.length);
   });
 
   it("creates detail concepts for matched nodes", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     const details = data.concepts.filter(c => c.level === "detail");
     expect(details.length).toBeGreaterThan(0);
   });
 
   it("caps details at maxDetailsPerTag", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged, { maxDetailsPerTag: 1 });
+    const data = buildTaskMapData(tagsNode, null, defs, tagged, { maxDetailsPerTag: 1 });
     // Each tag should have at most 1 detail
     for (const def of defs) {
       const majorId = `tag-${def.normalized}`;
@@ -211,7 +243,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("sorts details by recency by default", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     const inboxDetails = data.concepts.filter(
       c => c.level === "detail" && c.parentMajorId === "tag-inbox"
     );
@@ -220,7 +252,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("sorts details by name when configured", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged, { detailSortBy: "name" });
+    const data = buildTaskMapData(tagsNode, null, defs, tagged, { detailSortBy: "name" });
     const inboxDetails = data.concepts.filter(
       c => c.level === "detail" && c.parentMajorId === "tag-inbox"
     );
@@ -230,7 +262,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("computes co-occurrence relationships", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     // task-3 has #inbox + #review → relationship between tag-inbox and tag-review
     // task-1 has #inbox + @alice → relationship between tag-inbox and tag-alice
     // task-2 has #review + @alice → relationship between tag-review and tag-alice
@@ -238,7 +270,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("sets relationship strength from co-occurrence count", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     // Each pair co-occurs exactly once in our fixture
     for (const rel of data.relationships) {
       expect(rel.strength).toBe(1);
@@ -246,13 +278,13 @@ describe("buildTaskMapData", () => {
   });
 
   it("sets workflowyNodeId on major concepts", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     const inboxMajor = data.concepts.find(c => c.id === "tag-inbox");
     expect(inboxMajor?.workflowyNodeId).toBe("tag-inbox");
   });
 
   it("sets workflowyNodeId on detail concepts", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     const details = data.concepts.filter(c => c.level === "detail");
     for (const d of details) {
       expect(d.workflowyNodeId).toBeDefined();
@@ -260,7 +292,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("produces valid ClaudeAnalysis", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged);
+    const data = buildTaskMapData(tagsNode, null, defs, tagged);
     expect(data.analysis.title).toBe("Task Map");
     expect(data.analysis.core_label).toBe("Task Map");
     expect(data.analysis.concepts.length).toBe(data.concepts.length);
@@ -268,7 +300,7 @@ describe("buildTaskMapData", () => {
   });
 
   it("uses custom title", () => {
-    const data = buildTaskMapData(tagsNode, defs, tagged, { title: "My Tasks" });
+    const data = buildTaskMapData(tagsNode, null, defs, tagged, { title: "My Tasks" });
     expect(data.title).toBe("My Tasks");
     expect(data.analysis.title).toBe("My Tasks");
   });
@@ -280,7 +312,7 @@ describe("buildTaskMapData", () => {
       type: "tag" as const,
       definitionNodeId: "orphan-node",
     }];
-    const data = buildTaskMapData(tagsNode, extraDefs, tagged);
+    const data = buildTaskMapData(tagsNode, null, extraDefs, tagged);
     const orphanMajor = data.concepts.find(c => c.id === "tag-orphan");
     expect(orphanMajor).toBeDefined();
     expect(orphanMajor?.importance).toBe(1);
@@ -333,5 +365,19 @@ describe("generateTaskMap", () => {
       .filter(c => c.level === "detail")
       .map(c => c.workflowyNodeId);
     expect(allDetailIds).not.toContain("task-5");
+  });
+
+  it("returns null tasksNode when no Tasks node exists", () => {
+    const data = generateTaskMap(mockNodes);
+    expect(data.tasksNode).toBeNull();
+  });
+
+  it("populates tasksNode when Tasks node exists", () => {
+    const nodesWithTasks: WorkflowyNode[] = [
+      ...mockNodes,
+      { id: "tasks-root", name: "📋 Tasks" },
+    ];
+    const data = generateTaskMap(nodesWithTasks);
+    expect(data.tasksNode?.id).toBe("tasks-root");
   });
 });

@@ -118,11 +118,17 @@ describe("generateInteractiveConceptMapHTML", () => {
     expect(html).toContain("Collapse All");
   });
 
-  it("includes legend", () => {
+  it("includes legend by default", () => {
     const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships);
     expect(html).toContain("Core concept");
     expect(html).toContain("Major concept");
     expect(html).toContain("Detail concept");
+  });
+
+  it("hides legend when showLegend is false", () => {
+    const html = generateInteractiveConceptMapHTML("Test", coreNode, concepts, relationships, { showLegend: false });
+    expect(html).not.toContain("Core concept");
+    expect(html).not.toContain("Major concept");
   });
 
   it("includes tooltip element", () => {

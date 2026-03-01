@@ -46,11 +46,17 @@ const DETAIL_COLORS = ["#5dade2", "#58d68d", "#f4d03f", "#bb8fce", "#76d7c4"];
 /**
  * Generate a self-contained interactive HTML concept map with force-directed layout.
  */
+export interface ConceptMapHTMLOptions {
+  /** Show the legend panel (default: true) */
+  showLegend?: boolean;
+}
+
 export function generateInteractiveConceptMapHTML(
   title: string,
   coreNode: { id: string; label: string; workflowyNodeId?: string },
   concepts: InteractiveConcept[],
   relationships: InteractiveRelationship[],
+  options?: ConceptMapHTMLOptions,
 ): string {
   const majors = concepts.filter((c) => c.level === "major");
   const details = concepts.filter((c) => c.level === "detail");
@@ -298,12 +304,12 @@ svg { width: 100%; height: 100%; }
     </div>
     <div class="node-popup" id="nodePopup"></div>
     <div class="tooltip" id="tooltip"></div>
-    <div class="legend">
+    ${(options?.showLegend ?? true) ? `<div class="legend">
       <div class="legend-item"><div class="legend-dot" style="background:${CORE_COLOR}"></div> Core concept</div>
       <div class="legend-item"><div class="legend-dot" style="background:${MAJOR_COLORS[0]}"></div> Major concept (click to expand)</div>
       <div class="legend-item"><div class="legend-dot" style="background:${DETAIL_COLORS[0]}"></div> Detail concept</div>
       <div class="legend-item"><div class="legend-line" style="background:#566573"></div> Relationship</div>
-    </div>
+    </div>` : ""}
   </div>
 </div>
 <script>

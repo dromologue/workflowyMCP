@@ -3956,7 +3956,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         taskMapData.title,
         coreNode,
         taskMapData.concepts,
-        taskMapData.relationships
+        taskMapData.relationships,
+        { showLegend: false }
       );
 
       lastInteractiveMapHTML = html;
@@ -3983,12 +3984,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // Add link node under Tags
+      // Add link node under Tasks node (falls back to Tags if no Tasks node)
       if (dropboxUrl) {
+        const linkParentId = taskMapData.tasksNode?.id || taskMapData.tagsNode.id;
         await workflowyRequest("/nodes", "POST", {
           name: `Task Map ${dateStr}`,
           note: dropboxUrl,
-          parent_id: taskMapData.tagsNode.id,
+          parent_id: linkParentId,
           position: "bottom",
         });
       }
