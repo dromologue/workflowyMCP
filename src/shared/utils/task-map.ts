@@ -52,18 +52,38 @@ export interface TaskMapData {
 
 // ── Helpers ──
 
+const HTML_ENTITIES: Record<string, string> = {
+  nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'",
+  ndash: "\u2013", mdash: "\u2014", lsquo: "\u2018", rsquo: "\u2019",
+  ldquo: "\u201C", rdquo: "\u201D", bull: "\u2022", hellip: "\u2026",
+  copy: "\u00A9", reg: "\u00AE", trade: "\u2122", deg: "\u00B0",
+};
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    // Named entities (with or without trailing semicolon)
+    .replace(/&([a-zA-Z]+);?/g, (match, name) => {
+      const decoded = HTML_ENTITIES[name.toLowerCase()];
+      return decoded !== undefined ? decoded : match;
+    })
+    // Numeric entities: &#123; or &#x1F;
+    .replace(/&#x([0-9a-fA-F]+);?/g, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return code > 31 && code < 127 ? String.fromCharCode(code) : "";
+    })
+    .replace(/&#(\d+);?/g, (_, dec) => {
+      const code = parseInt(dec, 10);
+      return code > 31 && code < 127 ? String.fromCharCode(code) : "";
+    });
+}
+
 function cleanName(name: string): string {
-  return (name || "")
-    .replace(/<[^>]*>/g, "")           // strip HTML tags
-    .replace(/&nbsp;/gi, " ")          // HTML entities
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#\d+;/g, "")           // numeric HTML entities
+  return decodeHtmlEntities(
+    (name || "").replace(/<[^>]*>/g, "")  // strip HTML tags
+  )
     .replace(/[\u200B-\u200F\uFEFF]/g, "") // zero-width chars
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // control chars
-    .replace(/\s+/g, " ")             // collapse whitespace
+    .replace(/\s+/g, " ")                  // collapse whitespace
     .trim();
 }
 
