@@ -153,6 +153,9 @@ export async function uploadToDropboxPath(
       shareUrl = linksData.links[0].url;
     }
 
+    // Convert to raw content URL so HTML renders in browser instead of Dropbox preview
+    shareUrl = shareUrl.replace('dl=0', 'raw=1');
+
     return { success: true, url: shareUrl };
   } catch (err) {
     return {
