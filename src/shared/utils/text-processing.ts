@@ -153,3 +153,46 @@ export function validateConceptMapInput(concepts: string[] | undefined): {
 
   return { valid: true };
 }
+
+/**
+ * Check if a string is a valid Workflowy UUID format
+ * Workflowy UUIDs are 36 chars: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ * They use lowercase hex characters (0-9a-f) and dashes
+ */
+export function isValidWorkflowyUUID(id: string): boolean {
+  if (!id || typeof id !== "string") return false;
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(id);
+}
+
+/**
+ * Check if a string looks like a Workflowy URL fragment ID
+ * These are typically 8-16 character alphanumeric sequences without dashes
+ * Examples: "8a462ff90ac6", "01ea986e5748"
+ */
+export function looksLikeWorkflowyFragment(id: string): boolean {
+  if (!id || typeof id !== "string") return false;
+  // Match: 8-16 alphanumeric chars, no dashes
+  return /^[a-z0-9]{8,16}$/i.test(id) && !id.includes("-");
+}
+
+/**
+ * Generate helpful message for users who provide URL fragment IDs
+ */
+export function getNodeIDHelpMessage(providedId: string): string {
+  if (looksLikeWorkflowyFragment(providedId)) {
+    return `It looks like you provided a Workflowy URL fragment ID: "${providedId}"
+
+The MCP server requires the full node UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+
+To get the correct node ID:
+1. Use the find_node tool: search for your node by name
+   → find_node(name: "Your Node Name")
+2. Copy the ID from the response
+3. Use that ID with insert_content, move, or other tools
+
+Why: Workflowy URL fragments (${providedId}) are short hashes for UI shortcuts,
+but the API requires full internal UUIDs (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).`;
+  }
+  return "";
+}

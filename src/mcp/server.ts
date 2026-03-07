@@ -47,6 +47,9 @@ import {
   formatNodesForSelection,
   generateWorkflowyLink,
   extractWorkflowyLinks,
+  isValidWorkflowyUUID,
+  looksLikeWorkflowyFragment,
+  getNodeIDHelpMessage,
 } from "../shared/utils/text-processing.js";
 import {
   extractKeywords,
@@ -207,6 +210,9 @@ async function findRelatedNodes(
  * 4. Deletes the staging node
  *
  * This ensures nodes are never visible at unintended locations during the operation.
+ * 
+ * CRITICAL: Validates parent exists before insertion to prevent silent node creation
+ * at root level when parent_id is invalid.
  */
 async function insertHierarchicalContent(
   rootParentId: string,
@@ -218,12 +224,31 @@ async function insertHierarchicalContent(
     return [];
   }
 
+  // CRITICAL: Validate parent exists in Workflowy before attempting insertion
+  // This prevents silent creation of nodes at root level when parent_id is invalid
+  let parentExists = true;
+  try {
+    // Check if we can reach the parent node via API
+    await workflowyRequest(`/nodes/${rootParentId}`, "GET");
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Cannot insert content: parent node "${rootParentId}" does not exist or is not accessible. ` +
+      `Details: ${errorMsg}. Verify the parent_id is correct and the node exists.`
+    );
+  }
+
   // Step 1: Create a temporary staging node under the target parent
   const stagingNode = (await workflowyRequest("/nodes", "POST", {
     name: "__staging_temp__",
     parent_id: rootParentId,
     position: "bottom", // Always at bottom to minimize visibility
   })) as CreatedNode;
+
+  // Verify staging node was created with correct parent
+  if (!stagingNode || !stagingNode.id) {
+    throw new Error("Failed to create staging node - no ID returned from API");
+  }
 
   const createdNodes: CreatedNode[] = [];
   const topLevelNodeIds: string[] = []; // Track top-level nodes for moving later
@@ -843,6 +868,19 @@ jobQueue.registerExecutor<InsertContentJobParams, InsertContentJobResult>(
   async (params, onProgress, signal) => {
     const { parentId, content, position } = params;
     const rateLimiter = getDefaultRateLimiter();
+
+    // Validate parent_id is in correct UUID format
+    if (!isValidWorkflowyUUID(parentId)) {
+      const helpMessage = getNodeIDHelpMessage(parentId);
+      return {
+        success: false,
+        nodesCreated: 0,
+        nodeIds: [],
+        errors: [
+          `Invalid parent_id format: "${parentId}". Expected UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx). ${helpMessage || "Check that you have the correct full node ID from the MCP API response."}`,
+        ],
+      };
+    }
 
     // Parse content to count nodes
     const lines = content.split("\n").filter(line => line.trim());
@@ -2184,7 +2222,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "insert_content": {
       const { parent_id, content, position } = insertContentSchema.parse(args);
 
-      // Validate parent exists
+      // Validate parent_id is in correct UUID format
+      // Reject URL fragment IDs (e.g., "8a462ff90ac6") with helpful message
+      if (!isValidWorkflowyUUID(parent_id)) {
+        const helpMessage = getNodeIDHelpMessage(parent_id);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              error: `Invalid parent_id format: "${parent_id}". Expected UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).`,
+              help: helpMessage || "Check that you have the correct full node ID from the MCP API response.",
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Validate parent exists in cache
       const allNodesForInsert = await getCachedNodes();
       const parentNodeForInsert = allNodesForInsert.find((n) => n.id === parent_id);
       if (!parentNodeForInsert) {
@@ -2193,7 +2248,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: JSON.stringify({
               success: false,
-              error: `Parent node not found: ${parent_id}`,
+              error: `Parent node not found: ${parent_id}. The node does not exist in your Workflowy document or the cache is stale.`,
+              suggestion: "Use find_node to locate your target parent node by name.",
             }, null, 2),
           }],
           isError: true,

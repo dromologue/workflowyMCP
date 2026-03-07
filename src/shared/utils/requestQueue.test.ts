@@ -158,6 +158,16 @@ describe("RequestQueue", () => {
     });
 
     it("handles move operation", async () => {
+      // Mock must handle both the move (POST) and verification (GET) calls
+      mockApiRequest.mockImplementation((endpoint: string, method: string) => {
+        if (method === "GET" && endpoint === "/nodes/node1") {
+          // Return node with correct parent after move
+          return Promise.resolve({ id: "node1", name: "Test Node", parent_id: "parent2" });
+        }
+        // Default response for POST (move) request
+        return Promise.resolve({ success: true });
+      });
+
       const promise = queue.enqueue({
         type: "move",
         params: { node_id: "node1", parent_id: "parent2" },
@@ -165,9 +175,11 @@ describe("RequestQueue", () => {
       vi.advanceTimersByTime(100);
       await promise;
 
+      // Verify both the move request and the verification GET request were made
       expect(mockApiRequest).toHaveBeenCalledWith("/nodes/node1", "POST", {
         parent_id: "parent2",
       });
+      expect(mockApiRequest).toHaveBeenCalledWith("/nodes/node1", "GET");
     });
 
     it("handles complete operation", async () => {

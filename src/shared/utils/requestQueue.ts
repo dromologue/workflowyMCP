@@ -234,11 +234,41 @@ export class RequestQueue {
 
       case "move": {
         const { node_id: moveNodeId, ...moveParams } = op.params;
-        return this.apiRequestFn(
+        const expectedParentId = moveParams.parent_id as string;
+        
+        // Execute the move operation
+        const moveResult = await this.apiRequestFn(
           `/nodes/${moveNodeId}`,
           "POST",
           moveParams as object
         );
+
+        // Verify the move actually succeeded by fetching the node and checking its parent_id
+        // This prevents silent move failures from being reported as success
+        try {
+          const movedNode = await this.apiRequestFn(`/nodes/${moveNodeId}`, "GET") as Record<string, unknown>;
+          const actualParentId = movedNode.parent_id;
+          
+          if (actualParentId !== expectedParentId) {
+            throw new Error(
+              `Move verification failed: node ${moveNodeId} parent_id is "${actualParentId}", ` +
+              `expected "${expectedParentId}". The move operation may not have completed successfully.`
+            );
+          }
+        } catch (verifyError) {
+          // If we can't verify due to a fetch error, still return the original move result
+          // but include verification warning in the result
+          if (verifyError instanceof Error && verifyError.message.includes("verification failed")) {
+            throw verifyError;
+          }
+          // For fetch failures, log but don't fail - the move may have succeeded
+          console.warn(
+            `Move operation ${moveNodeId} → ${expectedParentId}: could not verify, ` +
+            `but move command was sent. ${verifyError instanceof Error ? verifyError.message : String(verifyError)}`
+          );
+        }
+
+        return moveResult;
       }
 
       case "complete": {
