@@ -8,8 +8,8 @@ pub const CACHE_TTL_SECS: u64 = 30;
 pub const CACHE_MAX_SIZE: usize = 10_000;
 
 // --- Retry ---
-/// Maximum number of retry attempts for API calls
-pub const RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Maximum number of retry attempts for API calls (increased from 3 to handle 429 retry_after waits)
+pub const RETRY_MAX_ATTEMPTS: u32 = 5;
 /// Initial delay between retries (milliseconds)
 pub const RETRY_BASE_DELAY_MS: u64 = 1_000;
 /// Maximum delay between retries (milliseconds)

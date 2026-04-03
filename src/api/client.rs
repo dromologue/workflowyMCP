@@ -1,14 +1,16 @@
 /// Workflowy API client with retry logic and proper error handling
 /// Addresses: path traversal, error context, retry handling
 
-use crate::config::RetryConfig;
+use crate::config::{RetryConfig, RateLimitConfig};
 use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::{WorkflowyNode, CreatedNode};
+use crate::utils::RateLimiter;
 use reqwest::Client;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Type alias for recursive async future (avoids verbose Pin<Box<...>> signatures)
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -18,6 +20,7 @@ pub struct WorkflowyClient {
     base_url: String,
     api_key: String,
     retry_config: RetryConfig,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl WorkflowyClient {
@@ -32,6 +35,7 @@ impl WorkflowyClient {
             base_url,
             api_key,
             retry_config: RetryConfig::default(),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
         })
     }
 
@@ -210,7 +214,8 @@ impl WorkflowyClient {
 
     // --- Low-level request with retry ---
 
-    /// Make a request with automatic retry on retryable errors
+    /// Make a request with rate limiting and automatic retry on retryable errors.
+    /// Respects `retry_after` from 429 responses.
     pub async fn request<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -222,12 +227,21 @@ impl WorkflowyClient {
         loop {
             attempt += 1;
 
+            // Rate limit: wait for a token before each attempt
+            self.rate_limiter.acquire().await;
+
             match self.try_request::<T>(method, endpoint, &body).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     if attempt < self.retry_config.max_attempts && e.is_retryable() {
-                        let delay_ms = self.calculate_backoff(attempt);
-                        debug!(
+                        // Extract retry_after from 429 responses
+                        let delay_ms = if let WorkflowyError::ApiError { status: 429, ref message, .. } = e {
+                            self.parse_retry_after(message)
+                                .unwrap_or_else(|| self.calculate_backoff(attempt))
+                        } else {
+                            self.calculate_backoff(attempt)
+                        };
+                        info!(
                             attempt = attempt,
                             delay_ms = delay_ms,
                             error = %e,
@@ -243,6 +257,15 @@ impl WorkflowyClient {
                 }
             }
         }
+    }
+
+    /// Parse `retry_after` seconds from a 429 response body like `{"error": "...", "retry_after": 26}`
+    fn parse_retry_after(&self, body: &str) -> Option<u64> {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()?
+            .get("retry_after")?
+            .as_u64()
+            .map(|secs| secs * 1000) // convert to milliseconds
     }
 
     async fn try_request<T: serde::de::DeserializeOwned>(
