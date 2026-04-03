@@ -62,6 +62,14 @@ impl WorkflowyError {
         }
     }
 
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal(msg.into())
+    }
+
+    pub fn parse(reason: impl Into<String>) -> Self {
+        Self::ParseError { reason: reason.into() }
+    }
+
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,

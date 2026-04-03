@@ -2,12 +2,16 @@
 /// Addresses: path traversal, error context, retry handling
 
 use crate::config::RetryConfig;
+use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::{WorkflowyNode, CreatedNode};
 use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 use tracing::{debug, warn};
+
+/// Type alias for recursive async future (avoids verbose Pin<Box<...>> signatures)
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub struct WorkflowyClient {
     http_client: Client,
@@ -17,24 +21,24 @@ pub struct WorkflowyClient {
 }
 
 impl WorkflowyClient {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String, api_key: String) -> Result<Self> {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(defaults::HTTP_TIMEOUT_SECS))
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| WorkflowyError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
-        Self {
+        Ok(Self {
             http_client,
             base_url,
             api_key,
             retry_config: RetryConfig::default(),
-        }
+        })
     }
 
     // --- High-level API methods ---
 
-    /// Get all nodes from the workspace
-    pub async fn get_nodes(&self) -> Result<Vec<WorkflowyNode>> {
+    /// Get top-level nodes only (direct children of root)
+    pub async fn get_top_level_nodes(&self) -> Result<Vec<WorkflowyNode>> {
         let response: serde_json::Value = self.request("GET", "/nodes", None).await?;
         let nodes: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
@@ -48,21 +52,85 @@ impl WorkflowyClient {
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
         let endpoint = format!("/nodes/{}", node_id);
         let response: serde_json::Value = self.request("GET", &endpoint, None).await?;
-        serde_json::from_value(response).map_err(|e| WorkflowyError::ParseError {
+        // API wraps single node in {"node": {...}}
+        let node_value = response.get("node").cloned().unwrap_or(response);
+        serde_json::from_value(node_value).map_err(|e| WorkflowyError::ParseError {
             reason: format!("Failed to parse node {}: {}", node_id, e),
         })
     }
 
-    /// Get children of a node
+    /// Get direct children of a node
     pub async fn get_children(&self, node_id: &str) -> Result<Vec<WorkflowyNode>> {
-        let endpoint = format!("/nodes/{}/children", node_id);
+        let endpoint = format!("/nodes?parent_id={}", node_id);
         let response: serde_json::Value = self.request("GET", &endpoint, None).await?;
-        let children: Vec<WorkflowyNode> = serde_json::from_value(
-            response.get("children").cloned().unwrap_or(json!([]))
+        let mut children: Vec<WorkflowyNode> = serde_json::from_value(
+            response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
             reason: format!("Failed to parse children: {}", e),
         })?;
+        // API returns parent_id as null; set it so client-side tree utilities work
+        for child in &mut children {
+            if child.parent_id.is_none() {
+                child.parent_id = Some(node_id.to_string());
+            }
+        }
         Ok(children)
+    }
+
+    /// Recursively fetch a subtree rooted at `root_id` up to `max_depth` levels.
+    /// If `root_id` is None, fetches from the workspace root (top-level nodes).
+    /// When `root_id` is Some, the root node itself is included as the first element.
+    /// Returns a flat Vec of all nodes in the subtree with correct parent_id set.
+    pub async fn get_subtree_recursive(
+        &self,
+        root_id: Option<&str>,
+        max_depth: usize,
+    ) -> Result<Vec<WorkflowyNode>> {
+        let mut all_nodes = Vec::new();
+        match root_id {
+            Some(id) => {
+                // Include the root node itself
+                let root = self.get_node(id).await?;
+                all_nodes.push(root);
+                let children = self.get_children(id).await?;
+                self.fetch_descendants(&children, &mut all_nodes, 0, max_depth).await?;
+            }
+            None => {
+                let top = self.get_top_level_nodes().await?;
+                self.fetch_descendants(&top, &mut all_nodes, 0, max_depth).await?;
+            }
+        }
+        Ok(all_nodes)
+    }
+
+    /// Fetch all nodes in the workspace tree. For large trees (250k+ nodes),
+    /// prefer `get_subtree_recursive` with a specific root and depth limit.
+    pub async fn get_all_nodes(&self) -> Result<Vec<WorkflowyNode>> {
+        self.get_subtree_recursive(None, 10).await
+    }
+
+    /// Recursively fetch descendants, collecting into `out`
+    fn fetch_descendants<'a>(
+        &'a self,
+        nodes: &'a [WorkflowyNode],
+        out: &'a mut Vec<WorkflowyNode>,
+        depth: usize,
+        max_depth: usize,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if depth >= max_depth {
+                out.extend(nodes.iter().cloned());
+                return Ok(());
+            }
+            for node in nodes {
+                out.push(node.clone());
+                let children = self.get_children(&node.id).await?;
+                if !children.is_empty() {
+                    self.fetch_descendants(&children, out, depth + 1, max_depth).await?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Create a new node
@@ -87,8 +155,10 @@ impl WorkflowyClient {
         let id = response
             .get("id")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .ok_or_else(|| WorkflowyError::ParseError {
+                reason: "Response missing 'id' field after node creation".to_owned(),
+            })?
+            .to_owned();
         Ok(CreatedNode {
             id,
             name: name.to_string(),
@@ -296,8 +366,8 @@ pub fn validate_file_path(file_path: &str, allowed_base: &str) -> Result<std::pa
         })?;
         let normalized = canonical_base.join(path);
 
-        let normalized_str = normalized.to_string_lossy().to_string();
-        let canonical_base_str = canonical_base.to_string_lossy().to_string();
+        let normalized_str = normalized.to_string_lossy().into_owned();
+        let canonical_base_str = canonical_base.to_string_lossy().into_owned();
         if !normalized_str.starts_with(&canonical_base_str) {
             return Err(WorkflowyError::InvalidPath {
                 reason: "Path escapes allowed directory".to_string(),

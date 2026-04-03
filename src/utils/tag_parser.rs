@@ -126,16 +126,7 @@ mod tests {
             id: "n1".into(),
             name: "#project @alice".into(),
             description: Some("#review @bob".into()),
-            parent_id: None,
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         };
         let result = parse_node_tags(&node);
         assert_eq!(result.tags, vec!["project", "review"]);
@@ -148,16 +139,7 @@ mod tests {
             id: "n1".into(),
             name: "#urgent @alice".into(),
             description: Some("#urgent @alice more text".into()),
-            parent_id: None,
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         };
         let result = parse_node_tags(&node);
         assert_eq!(result.tags, vec!["urgent"]);

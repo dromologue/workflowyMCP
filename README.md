@@ -44,17 +44,37 @@ Add to your Claude Desktop config:
 **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
+**Option A:** Use `.env` file (recommended) — set `cwd` so the server finds `.env` automatically:
+
 ```json
 {
   "mcpServers": {
     "workflowy": {
-      "command": "/absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server"
+      "command": "/absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server",
+      "cwd": "/absolute/path/to/workflowyMCP"
     }
   }
 }
 ```
 
-Restart Claude Desktop. All tools below become available as MCP tools that Claude can call directly.
+**Option B:** Pass credentials via environment directly:
+
+```json
+{
+  "mcpServers": {
+    "workflowy": {
+      "command": "/absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server",
+      "env": {
+        "WORKFLOWY_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving. All tools below become available as MCP tools that Claude can call directly.
+
+**Note:** For large Workflowy trees (100k+ nodes), search and review tools use a `max_depth` parameter (default: 3-5) to avoid fetching the entire tree. Increase `max_depth` for deeper searches, or use `parent_id`/`root_id` to scope operations to a specific subtree.
 
 ### Claude Code setup
 

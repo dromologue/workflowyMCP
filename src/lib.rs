@@ -4,6 +4,7 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod defaults;
 pub mod error;
 pub mod server;
 pub mod tools;

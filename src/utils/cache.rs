@@ -184,17 +184,7 @@ mod tests {
         let node = WorkflowyNode {
             id: "node1".to_string(),
             name: "test".to_string(),
-            description: None,
-            parent_id: None,
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         };
 
         cache.insert(node.clone());
@@ -209,17 +199,7 @@ mod tests {
         let parent = WorkflowyNode {
             id: "parent".to_string(),
             name: "parent".to_string(),
-            description: None,
-            parent_id: None,
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         };
         cache.insert(parent);
 
@@ -229,17 +209,8 @@ mod tests {
             let child = WorkflowyNode {
                 id: child_id.clone(),
                 name: child_id.clone(),
-                description: None,
                 parent_id: Some("parent".to_string()),
-                last_modified: None,
-                last_modified_user_id: None,
-                completed_at: None,
-                layout_mode: None,
-                color: None,
-                tags: None,
-                assignee: None,
-                children: vec![],
-                shared: false,
+                ..Default::default()
             };
             cache.insert(child);
 
@@ -249,17 +220,8 @@ mod tests {
                 let grandchild = WorkflowyNode {
                     id: grandchild_id.clone(),
                     name: grandchild_id.clone(),
-                    description: None,
                     parent_id: Some(child_id.clone()),
-                    last_modified: None,
-                    last_modified_user_id: None,
-                    completed_at: None,
-                    layout_mode: None,
-                    color: None,
-                    tags: None,
-                    assignee: None,
-                    children: vec![],
-                    shared: false,
+                    ..Default::default()
                 };
                 cache.insert(grandchild);
             }

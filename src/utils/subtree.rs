@@ -58,17 +58,8 @@ mod tests {
         WorkflowyNode {
             id: id.to_string(),
             name: name.to_string(),
-            description: None,
             parent_id: parent_id.map(String::from),
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         }
     }
 

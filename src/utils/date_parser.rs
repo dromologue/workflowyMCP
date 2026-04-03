@@ -181,16 +181,7 @@ mod tests {
             id: "test-id".to_string(),
             name: name.to_string(),
             description: desc.map(String::from),
-            parent_id: None,
-            last_modified: None,
-            last_modified_user_id: None,
-            completed_at: None,
-            layout_mode: None,
-            color: None,
-            tags: None,
-            assignee: None,
-            children: vec![],
-            shared: false,
+            ..Default::default()
         }
     }
 }

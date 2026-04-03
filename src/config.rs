@@ -1,6 +1,7 @@
 /// Configuration and environment variable management
 /// Addresses code review issue: "Incomplete config validation"
 
+use crate::defaults;
 use crate::error::{WorkflowyError, Result};
 use std::env;
 
@@ -40,7 +41,7 @@ pub fn validate_config() -> Result<Config> {
 
     Ok(Config {
         workflowy_api_key,
-        workflowy_base_url: "https://workflowy.com/api/v1".to_string(),
+        workflowy_base_url: defaults::WORKFLOWY_BASE_URL.to_owned(),
         dropbox_config: if dropbox_config_count == 3 {
             Some(DropboxConfig {
                 app_key: dropbox_app_key.unwrap(),
@@ -67,9 +68,9 @@ pub struct DropboxConfig {
     pub refresh_token: String,
 }
 
-/// Cache configuration
-pub const CACHE_TTL_SECS: u64 = 30;
-pub const CACHE_MAX_SIZE: usize = 10000;
+/// Cache configuration — re-exported from defaults for backward compatibility
+pub const CACHE_TTL_SECS: u64 = defaults::CACHE_TTL_SECS;
+pub const CACHE_MAX_SIZE: usize = defaults::CACHE_MAX_SIZE;
 
 /// Retry configuration
 pub struct RetryConfig {
@@ -82,10 +83,10 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
-            base_delay_ms: 1000,
-            max_delay_ms: 10000,
-            retryable_statuses: &[429, 500, 502, 503, 504, 408],
+            max_attempts: defaults::RETRY_MAX_ATTEMPTS,
+            base_delay_ms: defaults::RETRY_BASE_DELAY_MS,
+            max_delay_ms: defaults::RETRY_MAX_DELAY_MS,
+            retryable_statuses: defaults::RETRY_STATUSES,
         }
     }
 }
@@ -103,9 +104,9 @@ pub struct QueueConfig {
 impl Default for QueueConfig {
     fn default() -> Self {
         Self {
-            max_concurrency: 3,
-            batch_delay_ms: 50,
-            max_batch_size: 20,
+            max_concurrency: defaults::QUEUE_MAX_CONCURRENCY,
+            batch_delay_ms: defaults::QUEUE_BATCH_DELAY_MS,
+            max_batch_size: defaults::QUEUE_MAX_BATCH_SIZE,
         }
     }
 }
@@ -121,8 +122,8 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            requests_per_second: 5,
-            burst_size: 10,
+            requests_per_second: defaults::RATE_LIMIT_RPS,
+            burst_size: defaults::RATE_LIMIT_BURST,
         }
     }
 }
@@ -140,9 +141,9 @@ pub struct JobQueueConfig {
 impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
-            completed_job_ttl_secs: 1800,  // 30 minutes
-            max_job_history: 1000,          // Never keep more than 1000 historical jobs
-            cleanup_interval_secs: 60,
+            completed_job_ttl_secs: defaults::JOB_TTL_SECS,
+            max_job_history: defaults::JOB_MAX_HISTORY,
+            cleanup_interval_secs: defaults::JOB_CLEANUP_INTERVAL_SECS,
         }
     }
 }

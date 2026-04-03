@@ -19,16 +19,16 @@ use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::api::WorkflowyClient;
-use crate::types::WorkflowyNode;
-use crate::utils::cache::get_cache;
+use crate::types::{WorkflowyNode, NodeId};
+use crate::utils::cache::NodeCache;
 use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
 use crate::utils::node_paths::{build_node_path_with_map, build_node_map};
-use crate::utils::subtree::{get_subtree_nodes, is_todo, is_completed};
+use crate::utils::subtree::{is_todo, is_completed};
 use crate::utils::tag_parser::parse_node_tags;
 use crate::validation::validate_node_id;
 
 /// Validate a node_id parameter, returning McpError on failure.
-fn check_node_id(id: &str) -> Result<(), McpError> {
+fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     validate_node_id(id).map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
@@ -37,6 +37,7 @@ fn check_node_id(id: &str) -> Result<(), McpError> {
 pub struct WorkflowyMcpServer {
     tool_router: ToolRouter<Self>,
     client: Arc<WorkflowyClient>,
+    cache: Arc<NodeCache>,
 }
 
 // --- Parameter structs ---
@@ -49,14 +50,16 @@ pub struct SearchNodesParams {
     #[schemars(description = "Maximum number of results to return (default: 20)")]
     pub max_results: Option<usize>,
     #[schemars(description = "Parent node ID to scope the search under")]
-    pub parent_id: Option<String>,
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth to search (default: 3). Increase for deeper searches in large trees")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Get a specific node by its ID")]
 pub struct GetNodeParams {
     #[schemars(description = "The UUID of the node to retrieve")]
-    pub node_id: String,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -67,7 +70,7 @@ pub struct CreateNodeParams {
     #[schemars(description = "Optional description/note for the node")]
     pub description: Option<String>,
     #[schemars(description = "Parent node ID. If omitted, creates at root level")]
-    pub parent_id: Option<String>,
+    pub parent_id: Option<NodeId>,
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
     pub priority: Option<i32>,
 }
@@ -76,7 +79,7 @@ pub struct CreateNodeParams {
 #[schemars(description = "Edit an existing node's name or description")]
 pub struct EditNodeParams {
     #[schemars(description = "The UUID of the node to edit")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "New name for the node (leave empty to keep current)")]
     pub name: Option<String>,
     #[schemars(description = "New description for the node (leave empty to keep current)")]
@@ -87,16 +90,16 @@ pub struct EditNodeParams {
 #[schemars(description = "Delete a node from Workflowy")]
 pub struct DeleteNodeParams {
     #[schemars(description = "The UUID of the node to delete")]
-    pub node_id: String,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Move a node to a new parent")]
 pub struct MoveNodeParams {
     #[schemars(description = "The UUID of the node to move")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "The UUID of the new parent node")]
-    pub new_parent_id: String,
+    pub new_parent_id: NodeId,
     #[schemars(description = "Position among siblings in the new parent")]
     pub priority: Option<i32>,
 }
@@ -105,7 +108,7 @@ pub struct MoveNodeParams {
 #[schemars(description = "Get all children of a node")]
 pub struct GetChildrenParams {
     #[schemars(description = "The UUID of the parent node")]
-    pub node_id: String,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -115,13 +118,17 @@ pub struct TagSearchParams {
     pub tag: String,
     #[schemars(description = "Maximum results to return (default: 50)")]
     pub max_results: Option<usize>,
+    #[schemars(description = "Parent node ID to scope the search under")]
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Insert content as hierarchical nodes from indented text")]
 pub struct InsertContentParams {
     #[schemars(description = "Parent node ID to insert content under")]
-    pub parent_id: String,
+    pub parent_id: NodeId,
     #[schemars(description = "Content in 2-space indented text format. Each line becomes a node, indentation creates hierarchy")]
     pub content: String,
 }
@@ -130,7 +137,7 @@ pub struct InsertContentParams {
 #[schemars(description = "Get the full tree under a node")]
 pub struct GetSubtreeParams {
     #[schemars(description = "The UUID of the root node")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "Maximum depth to traverse (default: unlimited)")]
     pub max_depth: Option<usize>,
 }
@@ -144,6 +151,10 @@ pub struct FindNodeParams {
     pub match_mode: Option<String>,
     #[schemars(description = "1-based selection index when multiple matches exist")]
     pub selection: Option<usize>,
+    #[schemars(description = "Parent node ID to scope the search under")]
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -157,13 +168,15 @@ pub struct SmartInsertParams {
     pub selection: Option<usize>,
     #[schemars(description = "Insert position: 'top' or 'bottom' (default: 'bottom')")]
     pub position: Option<String>,
+    #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Daily review: overdue items, upcoming deadlines, and recent changes in one call")]
 pub struct DailyReviewParams {
     #[schemars(description = "Optional root node ID to scope the review")]
-    pub root_id: Option<String>,
+    pub root_id: Option<NodeId>,
     #[schemars(description = "Max overdue items to return (default: 10)")]
     pub overdue_limit: Option<usize>,
     #[schemars(description = "Days ahead to look for upcoming items (default: 7)")]
@@ -172,6 +185,8 @@ pub struct DailyReviewParams {
     pub recent_days: Option<usize>,
     #[schemars(description = "Max pending todos to return (default: 20)")]
     pub pending_limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -180,22 +195,26 @@ pub struct GetRecentChangesParams {
     #[schemars(description = "Number of days to look back (default: 7)")]
     pub days: Option<usize>,
     #[schemars(description = "Optional root node ID to scope the search")]
-    pub root_id: Option<String>,
+    pub root_id: Option<NodeId>,
     #[schemars(description = "Include completed items (default: true)")]
     pub include_completed: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "List overdue items sorted by most overdue first")]
 pub struct ListOverdueParams {
     #[schemars(description = "Optional root node ID to scope the search")]
-    pub root_id: Option<String>,
+    pub root_id: Option<NodeId>,
     #[schemars(description = "Include completed items (default: false)")]
     pub include_completed: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -204,18 +223,20 @@ pub struct ListUpcomingParams {
     #[schemars(description = "Days ahead to look (default: 14)")]
     pub days: Option<usize>,
     #[schemars(description = "Optional root node ID to scope the search")]
-    pub root_id: Option<String>,
+    pub root_id: Option<NodeId>,
     #[schemars(description = "Include items without due dates (default: false)")]
     pub include_no_due_date: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Get project summary with stats, tags, and recent changes")]
 pub struct GetProjectSummaryParams {
     #[schemars(description = "Root node ID of the project")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "Include tag and assignee counts (default: true)")]
     pub include_tags: Option<bool>,
     #[schemars(description = "Days back for recently modified list (default: 7)")]
@@ -226,31 +247,35 @@ pub struct GetProjectSummaryParams {
 #[schemars(description = "Find all nodes that contain a Workflowy link to a given node")]
 pub struct FindBacklinksParams {
     #[schemars(description = "The node ID to find backlinks for")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "Maximum results (default: 50)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "List todo items with optional filtering")]
 pub struct ListTodosParams {
     #[schemars(description = "Parent node ID to scope todos under")]
-    pub parent_id: Option<String>,
+    pub parent_id: Option<NodeId>,
     #[schemars(description = "Filter: 'all', 'pending', or 'completed' (default: 'all')")]
     pub status: Option<String>,
     #[schemars(description = "Optional text search within todos")]
     pub query: Option<String>,
     #[schemars(description = "Maximum results (default: 50)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Deep-copy a node and its subtree to a new location")]
 pub struct DuplicateNodeParams {
     #[schemars(description = "The node ID to duplicate")]
-    pub node_id: String,
+    pub node_id: NodeId,
     #[schemars(description = "Parent node ID for the copy")]
-    pub target_parent_id: String,
+    pub target_parent_id: NodeId,
     #[schemars(description = "Include children (default: true)")]
     pub include_children: Option<bool>,
     #[schemars(description = "Prefix to add to the root node name")]
@@ -261,9 +286,9 @@ pub struct DuplicateNodeParams {
 #[schemars(description = "Copy a template node with {{variable}} substitution")]
 pub struct CreateFromTemplateParams {
     #[schemars(description = "Template node ID to copy from")]
-    pub template_node_id: String,
+    pub template_node_id: NodeId,
     #[schemars(description = "Parent node ID to insert the copy under")]
-    pub target_parent_id: String,
+    pub target_parent_id: NodeId,
     #[schemars(description = "Variables for {{key}} substitution as JSON object")]
     pub variables: Option<std::collections::HashMap<String, String>>,
 }
@@ -276,7 +301,7 @@ pub struct BulkUpdateParams {
     #[schemars(description = "Filter by tag (e.g. 'urgent')")]
     pub tag: Option<String>,
     #[schemars(description = "Root node ID to scope the filter")]
-    pub root_id: Option<String>,
+    pub root_id: Option<NodeId>,
     #[schemars(description = "Status filter: 'all', 'pending', 'completed' (default: 'all')")]
     pub status: Option<String>,
     #[schemars(description = "Operation: 'complete', 'uncomplete', 'delete', 'add_tag', 'remove_tag'")]
@@ -287,6 +312,8 @@ pub struct BulkUpdateParams {
     pub dry_run: Option<bool>,
     #[schemars(description = "Safety limit on affected nodes (default: 20)")]
     pub limit: Option<usize>,
+    #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -303,21 +330,27 @@ pub struct ConvertMarkdownParams {
 #[tool_router]
 impl WorkflowyMcpServer {
     pub fn new(client: Arc<WorkflowyClient>) -> Self {
+        Self::with_cache(client, crate::utils::cache::get_cache())
+    }
+
+    pub fn with_cache(client: Arc<WorkflowyClient>, cache: Arc<NodeCache>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             client,
+            cache,
         }
     }
 
-    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths.")]
+    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. For large trees, use parent_id to scope the search and max_depth to control depth.")]
     async fn search_nodes(
         &self,
         Parameters(params): Parameters<SearchNodesParams>,
     ) -> Result<CallToolResult, McpError> {
         let max_results = params.max_results.unwrap_or(20);
-        info!(query = %params.query, max_results, "Searching nodes");
+        let max_depth = params.max_depth.unwrap_or(3);
+        info!(query = %params.query, max_results, max_depth, "Searching nodes");
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
             Ok(nodes) => {
                 let query_lower = params.query.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
@@ -329,10 +362,7 @@ impl WorkflowyMcpServer {
                             .as_ref()
                             .map(|d| d.to_lowercase().contains(&query_lower))
                             .unwrap_or(false);
-                        let scope_match = params.parent_id.as_ref().map_or(true, |pid| {
-                            n.parent_id.as_ref() == Some(pid)
-                        });
-                        (name_match || desc_match) && scope_match
+                        name_match || desc_match
                     })
                     .collect();
 
@@ -418,7 +448,7 @@ impl WorkflowyMcpServer {
                 );
                 // Invalidate cache for parent
                 if let Some(pid) = &params.parent_id {
-                    get_cache().invalidate_node(pid);
+                    self.cache.invalidate_node(pid);
                 }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
@@ -443,7 +473,7 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(_) => {
-                get_cache().invalidate_node(&params.node_id);
+                self.cache.invalidate_node(&params.node_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Updated node `{}`",
                     params.node_id
@@ -466,7 +496,7 @@ impl WorkflowyMcpServer {
 
         match self.client.delete_node(&params.node_id).await {
             Ok(_) => {
-                get_cache().invalidate_node(&params.node_id);
+                self.cache.invalidate_node(&params.node_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Deleted node `{}`",
                     params.node_id
@@ -494,9 +524,8 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(_) => {
-                let cache = get_cache();
-                cache.invalidate_node(&params.node_id);
-                cache.invalidate_node(&params.new_parent_id);
+                self.cache.invalidate_node(&params.node_id);
+                self.cache.invalidate_node(&params.new_parent_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Moved node `{}` under `{}`",
                     params.node_id, params.new_parent_id
@@ -543,15 +572,16 @@ impl WorkflowyMcpServer {
         }
     }
 
-    #[tool(description = "Search for nodes by tag (e.g. #project, @person). Returns all nodes containing the specified tag.")]
+    #[tool(description = "Search for nodes by tag (e.g. #project, @person). Returns all nodes containing the specified tag. Use parent_id to scope and max_depth to control search depth.")]
     async fn tag_search(
         &self,
         Parameters(params): Parameters<TagSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let max_results = params.max_results.unwrap_or(50);
-        info!(tag = %params.tag, "Tag search");
+        let max_depth = params.max_depth.unwrap_or(3);
+        info!(tag = %params.tag, max_depth, "Tag search");
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
             Ok(nodes) => {
                 let tag_lower = params.tag.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
@@ -621,7 +651,7 @@ impl WorkflowyMcpServer {
         }
 
         // Parent stack: index = indent level, value = node ID at that level
-        let mut parent_stack: Vec<String> = vec![params.parent_id.clone()];
+        let mut parent_stack: Vec<String> = vec![params.parent_id.0.clone()];
         let mut created_count = 0;
 
         for line in &parsed {
@@ -650,7 +680,7 @@ impl WorkflowyMcpServer {
             }
         }
 
-        get_cache().invalidate_node(&params.parent_id);
+        self.cache.invalidate_node(&params.parent_id);
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Inserted {} node(s) under `{}`",
@@ -658,22 +688,29 @@ impl WorkflowyMcpServer {
         ))]))
     }
 
-    #[tool(description = "Get the full subtree under a node, showing the hierarchical structure.")]
+    #[tool(description = "Get the full subtree under a node, showing the hierarchical structure. Use max_depth to limit traversal depth for large trees.")]
     async fn get_subtree(
         &self,
         Parameters(params): Parameters<GetSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!(node_id = %params.node_id, "Getting subtree");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
 
-        match self.client.get_node(&params.node_id).await {
-            Ok(node) => {
-                let json = serde_json::to_string_pretty(&node).map_err(|e| {
+        match self.client.get_subtree_recursive(Some(&params.node_id), max_depth).await {
+            Ok(all_nodes) => {
+                if all_nodes.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        format!("Node `{}` not found or has no descendants", params.node_id)
+                    )]));
+                }
+                let root_name = all_nodes.first().map(|n| n.name.as_str()).unwrap_or("unknown");
+                let json = serde_json::to_string_pretty(&all_nodes).map_err(|e| {
                     McpError::internal_error(format!("Serialization error: {}", e), None)
                 })?;
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Subtree for '{}':\n\n{}",
-                    node.name, json
+                    "Subtree for '{}' ({} nodes):\n\n{}",
+                    root_name, all_nodes.len(), json
                 ))]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -685,15 +722,16 @@ impl WorkflowyMcpServer {
 
     // --- New tools required by wmanage skill ---
 
-    #[tool(description = "Find a node by name. Supports exact, contains, and starts_with match modes. Returns node_id for use with other tools. If multiple matches, returns options for selection.")]
+    #[tool(description = "Find a node by name. Supports exact, contains, and starts_with match modes. Returns node_id for use with other tools. If multiple matches, returns options for selection. Use parent_id to scope and max_depth to control depth.")]
     async fn find_node(
         &self,
         Parameters(params): Parameters<FindNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let match_mode = params.match_mode.as_deref().unwrap_or("exact");
-        info!(name = %params.name, match_mode, "Finding node");
+        let max_depth = params.max_depth.unwrap_or(3);
+        info!(name = %params.name, match_mode, max_depth, "Finding node");
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
             Ok(nodes) => {
                 let search = params.name.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
@@ -764,14 +802,15 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<SmartInsertParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!(query = %params.search_query, "Smart insert");
+        let max_depth = params.max_depth.unwrap_or(3);
+        info!(query = %params.search_query, max_depth, "Smart insert");
 
         let content = params.content.trim();
         if content.is_empty() {
             return Err(McpError::invalid_params("Content cannot be empty".to_string(), None));
         }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(None, max_depth).await {
             Ok(nodes) => {
                 let query = params.search_query.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
@@ -830,7 +869,7 @@ impl WorkflowyMcpServer {
                     }
                 }
 
-                get_cache().invalidate_node(&target_id);
+                self.cache.invalidate_node(&target_id);
 
                 let result = json!({
                     "success": true,
@@ -844,21 +883,18 @@ impl WorkflowyMcpServer {
         }
     }
 
-    #[tool(description = "Daily review: get overdue items, upcoming deadlines, recent changes, and pending todos in one call.")]
+    #[tool(description = "Daily review: get overdue items, upcoming deadlines, recent changes, and pending todos in one call. Use root_id to scope and max_depth to control depth.")]
     async fn daily_review(
         &self,
         Parameters(params): Parameters<DailyReviewParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!("Daily review");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(max_depth, "Daily review");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(rid) = &params.root_id {
-                    get_subtree_nodes(rid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
                 let upcoming_days = params.upcoming_days.unwrap_or(7) as i64;
@@ -963,16 +999,13 @@ impl WorkflowyMcpServer {
         let days = params.days.unwrap_or(7) as i64;
         let include_completed = params.include_completed.unwrap_or(true);
         let limit = params.limit.unwrap_or(50);
-        info!(days, "Getting recent changes");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(days, max_depth, "Getting recent changes");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(rid) = &params.root_id {
-                    get_subtree_nodes(rid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let now_ms = Utc::now().timestamp_millis();
                 let cutoff = now_ms - (days * 86_400_000);
@@ -1016,16 +1049,13 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let include_completed = params.include_completed.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
-        info!("Listing overdue items");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(max_depth, "Listing overdue items");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(rid) = &params.root_id {
-                    get_subtree_nodes(rid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
                 let node_map = build_node_map(&all_nodes);
@@ -1067,16 +1097,13 @@ impl WorkflowyMcpServer {
         let days = params.days.unwrap_or(14) as i64;
         let include_no_due_date = params.include_no_due_date.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
-        info!(days, "Listing upcoming items");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(days, max_depth, "Listing upcoming items");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(rid) = &params.root_id {
-                    get_subtree_nodes(rid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
                 let cutoff = today + chrono::Duration::days(days);
@@ -1143,9 +1170,9 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, "Getting project summary");
         check_node_id(&params.node_id)?;
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
             Ok(all_nodes) => {
-                let subtree = get_subtree_nodes(&params.node_id, &all_nodes);
+                let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(
                         format!("Node '{}' not found or has no subtree", params.node_id), None
@@ -1249,9 +1276,10 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         check_node_id(&params.node_id)?;
         let limit = params.limit.unwrap_or(50);
-        info!(node_id = %params.node_id, "Finding backlinks");
+        let max_depth = params.max_depth.unwrap_or(3);
+        info!(node_id = %params.node_id, max_depth, "Finding backlinks");
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(None, max_depth).await {
             Ok(nodes) => {
                 let node_map = build_node_map(&nodes);
                 let target = node_map.get(params.node_id.as_str());
@@ -1300,16 +1328,13 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(50);
         let status = params.status.as_deref().unwrap_or("all");
-        info!(status, "Listing todos");
+        let max_depth = params.max_depth.unwrap_or(5);
+        info!(status, max_depth, "Listing todos");
         if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(pid) = &params.parent_id {
-                    get_subtree_nodes(pid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
                 let query_lower = params.query.as_ref().map(|q| q.to_lowercase());
@@ -1357,10 +1382,10 @@ impl WorkflowyMcpServer {
         let include_children = params.include_children.unwrap_or(true);
         info!(node_id = %params.node_id, target = %params.target_parent_id, "Duplicating node");
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
             Ok(all_nodes) => {
-                let subtree = if include_children {
-                    get_subtree_nodes(&params.node_id, &all_nodes)
+                let subtree: Vec<&WorkflowyNode> = if include_children {
+                    all_nodes.iter().collect()
                 } else {
                     all_nodes.iter().filter(|n| n.id == params.node_id).collect()
                 };
@@ -1424,7 +1449,7 @@ impl WorkflowyMcpServer {
                             }
                         }
 
-                        get_cache().invalidate_node(&params.target_parent_id);
+                        self.cache.invalidate_node(&params.target_parent_id);
                         let result = json!({
                             "success": true,
                             "original_id": params.node_id,
@@ -1457,9 +1482,9 @@ impl WorkflowyMcpServer {
             }).to_string()
         };
 
-        match self.client.get_nodes().await {
+        match self.client.get_subtree_recursive(Some(&params.template_node_id), 10).await {
             Ok(all_nodes) => {
-                let subtree = get_subtree_nodes(&params.template_node_id, &all_nodes);
+                let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(format!("Template '{}' not found", params.template_node_id), None));
                 }
@@ -1511,7 +1536,7 @@ impl WorkflowyMcpServer {
                             }
                         }
 
-                        get_cache().invalidate_node(&params.target_parent_id);
+                        self.cache.invalidate_node(&params.target_parent_id);
                         let result = json!({
                             "success": true,
                             "template_id": params.template_node_id,
@@ -1550,13 +1575,10 @@ impl WorkflowyMcpServer {
             return Err(McpError::invalid_params("operation_tag required for add_tag/remove_tag".to_string(), None));
         }
 
-        match self.client.get_nodes().await {
+        let max_depth = params.max_depth.unwrap_or(5);
+        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
             Ok(all_nodes) => {
-                let candidates: Vec<&WorkflowyNode> = if let Some(rid) = &params.root_id {
-                    get_subtree_nodes(rid, &all_nodes)
-                } else {
-                    all_nodes.iter().collect()
-                };
+                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
                 let query_lower = params.query.as_ref().map(|q| q.to_lowercase());
@@ -1638,8 +1660,8 @@ impl WorkflowyMcpServer {
                     }
                 }
 
-                if let Some(rid) = &params.root_id { get_cache().invalidate_node(rid); }
-                get_cache().clear();
+                if let Some(rid) = &params.root_id { self.cache.invalidate_node(rid); }
+                self.cache.clear();
 
                 let result = json!({
                     "dry_run": false,
@@ -1993,7 +2015,7 @@ mod tests {
         let client = Arc::new(WorkflowyClient::new(
             "https://workflowy.com/api/v1".to_string(),
             "test-key".to_string(),
-        ));
+        ).unwrap());
         let server = WorkflowyMcpServer::new(client);
         let info = server.get_info();
         assert_eq!(info.server_info.name, "workflowy-mcp-server");
@@ -2008,7 +2030,7 @@ mod tests {
         let client = Arc::new(WorkflowyClient::new(
             "https://workflowy.com/api/v1".to_string(),
             "test-key".to_string(),
-        ));
+        ).unwrap());
         let server = WorkflowyMcpServer::new(client);
 
         let expected_tools = [

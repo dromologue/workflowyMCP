@@ -115,6 +115,35 @@ Optimize for the order listed. Never sacrifice correctness for performance. Pref
 
 ---
 
+## Rust Idioms (Applied)
+
+The following Rust patterns are actively enforced in this codebase:
+
+### Newtype Pattern
+- `NodeId` wraps `String` for type-safe node ID handling across the API boundary
+- Prevents mixing node IDs with arbitrary strings at compile time
+- Implements `Deref<Target=str>`, `AsRef<str>`, `Display`, `From`, `PartialEq<String>`
+
+### Dependency Injection over Global State
+- `NodeCache` is injected into `WorkflowyMcpServer` via `with_cache()` constructor
+- Global `lazy_static` cache remains as convenience default but is not required
+- Enables testing with isolated cache instances
+
+### Centralized Constants
+- All magic numbers live in `src/defaults.rs` (single source of truth)
+- Config structs reference `defaults::*` in their `Default` impls
+- Validation constants re-export from defaults for backward compatibility
+
+### Proper Error Propagation
+- No sentinel values (`unwrap_or("unknown")`) — use `Result` and `?`
+- `WorkflowyClient::new()` returns `Result`, not panicking `.expect()`
+- Helper constructors: `WorkflowyError::internal()`, `WorkflowyError::parse()`
+
+### Type Alias for Complex Types
+- `BoxFuture<'a, T>` alias simplifies recursive async function signatures
+
+---
+
 ## Anti-Patterns to Avoid
 
 - **God objects**: No single module should know about everything
@@ -122,6 +151,8 @@ Optimize for the order listed. Never sacrifice correctness for performance. Pref
 - **Shotgun surgery**: Changes requiring edits across many files
 - **Premature abstraction**: Don't add extension points until needed
 - **Configuration sprawl**: All config in one place, not scattered
+- **Sentinel values**: Never return fake data on error; propagate errors
+- **Panic in library code**: Use `Result` instead of `.expect()` / `.unwrap()`
 
 ---
 

@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Arc::new(WorkflowyClient::new(
         config.workflowy_base_url.clone(),
         config.workflowy_api_key.clone(),
-    ));
+    ).map_err(|e| anyhow::anyhow!("{}", e))?);
 
     // Start MCP server on stdio
     run_server(client).await

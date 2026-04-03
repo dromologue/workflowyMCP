@@ -1,35 +1,25 @@
 /// Input validation utilities for MCP tool parameters.
 /// Addresses: MCP Principle #14 (API Design Fundamentals) and #5 (Security First)
 
+use crate::defaults;
 use crate::error::{WorkflowyError, Result};
+use crate::types::NodeId;
 
-/// Maximum length for text query inputs
-pub const MAX_QUERY_LENGTH: usize = 1000;
-
-/// Maximum length for node name
-pub const MAX_NAME_LENGTH: usize = 5000;
-
-/// Maximum length for node description
-pub const MAX_DESCRIPTION_LENGTH: usize = 50_000;
-
-/// Maximum length for insert_content body
-pub const MAX_CONTENT_LENGTH: usize = 500_000;
-
-/// Hard cap on max_results for any search/list tool
-pub const HARD_MAX_RESULTS: usize = 100;
-
-/// Default max_results when not specified
-pub const DEFAULT_MAX_RESULTS: usize = 20;
-
-/// Maximum response text size in bytes (~50KB)
-pub const MAX_RESPONSE_SIZE: usize = 50_000;
-
-/// Default tool timeout in seconds
-pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
+/// Re-exported from defaults for backward compatibility
+pub const MAX_QUERY_LENGTH: usize = defaults::MAX_QUERY_LENGTH;
+pub const MAX_NAME_LENGTH: usize = defaults::MAX_NAME_LENGTH;
+pub const MAX_DESCRIPTION_LENGTH: usize = defaults::MAX_DESCRIPTION_LENGTH;
+pub const MAX_CONTENT_LENGTH: usize = defaults::MAX_CONTENT_LENGTH;
+pub const HARD_MAX_RESULTS: usize = defaults::HARD_MAX_RESULTS;
+pub const DEFAULT_MAX_RESULTS: usize = defaults::DEFAULT_MAX_RESULTS;
+pub const MAX_RESPONSE_SIZE: usize = defaults::MAX_RESPONSE_SIZE;
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = defaults::DEFAULT_TOOL_TIMEOUT_SECS;
 
 /// Validate that a string looks like a UUID (Workflowy node ID).
 /// Accepts both hyphenated and non-hyphenated UUIDs.
-pub fn validate_node_id(id: &str) -> Result<()> {
+/// Works with both `&str` and `&NodeId` via `AsRef<str>`.
+pub fn validate_node_id(id: impl AsRef<str>) -> Result<()> {
+    let id = id.as_ref();
     // Workflowy uses standard UUID format: 8-4-4-4-12 hex chars
     let stripped = id.replace('-', "");
     if stripped.len() != 32 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -41,6 +31,12 @@ pub fn validate_node_id(id: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Validate and convert a string to a NodeId.
+pub fn validated_node_id(id: impl AsRef<str>) -> Result<NodeId> {
+    validate_node_id(id.as_ref())?;
+    Ok(NodeId::new_unchecked(id.as_ref()))
 }
 
 /// Validate text input: no null bytes, no control characters (except newline/tab), length cap.
@@ -121,6 +117,27 @@ mod tests {
     #[test]
     fn test_invalid_uuid_non_hex() {
         assert!(validate_node_id("550e8400-e29b-41d4-a716-44665544zzzz").is_err());
+    }
+
+    #[test]
+    fn test_validate_node_id_accepts_node_id_type() {
+        use crate::types::NodeId;
+        let id = NodeId::from("550e8400-e29b-41d4-a716-446655440000");
+        assert!(validate_node_id(&id).is_ok());
+    }
+
+    #[test]
+    fn test_validated_node_id_returns_node_id() {
+        let result = validated_node_id("550e8400-e29b-41d4-a716-446655440000");
+        assert!(result.is_ok());
+        let node_id = result.unwrap();
+        assert_eq!(node_id.as_str(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn test_validated_node_id_rejects_invalid() {
+        let result = validated_node_id("not-a-uuid");
+        assert!(result.is_err());
     }
 
     #[test]
