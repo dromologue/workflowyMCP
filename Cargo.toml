@@ -10,10 +10,6 @@ name = "workflowy-mcp-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "concept-map"
-path = "src/cli/concept_map.rs"
-
-[[bin]]
 name = "task-map"
 path = "src/cli/task_map.rs"
 

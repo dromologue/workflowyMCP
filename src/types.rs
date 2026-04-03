@@ -173,12 +173,6 @@ pub struct BatchOperationResult {
 
 /// Types for request/response handling
 #[derive(Debug, Clone)]
-pub struct ConceptMapResult {
-    pub html: String,
-    pub node_count: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct TaskMapResult {
     pub html: String,
     pub task_count: usize,

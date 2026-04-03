@@ -7,50 +7,14 @@ use std::env;
 
 /// Validates all required configuration is present
 pub fn validate_config() -> Result<Config> {
-    // Required variables
     let workflowy_api_key = env::var("WORKFLOWY_API_KEY")
         .map_err(|_| WorkflowyError::ConfigError {
             reason: "WORKFLOWY_API_KEY environment variable is not set".to_string(),
         })?;
 
-    // Optional Dropbox config - must be all or none
-    let dropbox_app_key = env::var("DROPBOX_APP_KEY").ok();
-    let dropbox_app_secret = env::var("DROPBOX_APP_SECRET").ok();
-    let dropbox_refresh_token = env::var("DROPBOX_REFRESH_TOKEN").ok();
-
-    let dropbox_config_count = [&dropbox_app_key, &dropbox_app_secret, &dropbox_refresh_token]
-        .iter()
-        .filter(|v| v.is_some())
-        .count();
-
-    if dropbox_config_count > 0 && dropbox_config_count < 3 {
-        return Err(WorkflowyError::ConfigError {
-            reason:
-                "Dropbox configuration incomplete: need all three (DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN) or none"
-                    .to_string(),
-        });
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        // Ensure secrets aren't logged in production
-        if env::var("RUST_LOG").is_ok() && env::var("RUST_LOG").unwrap().contains("debug") {
-            tracing::warn!("Debug logging enabled; ensure WORKFLOWY_API_KEY is not logged");
-        }
-    }
-
     Ok(Config {
         workflowy_api_key,
         workflowy_base_url: defaults::WORKFLOWY_BASE_URL.to_owned(),
-        dropbox_config: if dropbox_config_count == 3 {
-            Some(DropboxConfig {
-                app_key: dropbox_app_key.unwrap(),
-                app_secret: dropbox_app_secret.unwrap(),
-                refresh_token: dropbox_refresh_token.unwrap(),
-            })
-        } else {
-            None
-        },
     })
 }
 
@@ -58,14 +22,6 @@ pub fn validate_config() -> Result<Config> {
 pub struct Config {
     pub workflowy_api_key: String,
     pub workflowy_base_url: String,
-    pub dropbox_config: Option<DropboxConfig>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DropboxConfig {
-    pub app_key: String,
-    pub app_secret: String,
-    pub refresh_token: String,
 }
 
 /// Cache configuration — re-exported from defaults for backward compatibility

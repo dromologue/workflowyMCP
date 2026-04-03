@@ -11,7 +11,6 @@ pub mod tag_parser;
 pub mod request_queue;
 pub mod orchestrator;
 pub mod text_processing;
-pub mod concept_map;
 pub mod task_map;
 
 pub use cache::get_cache;

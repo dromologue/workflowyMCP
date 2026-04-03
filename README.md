@@ -25,18 +25,6 @@ cargo build --release
 WORKFLOWY_API_KEY=your-api-key
 ```
 
-### Optional: Dropbox (for cloud-hosted maps)
-
-When configured, concept maps are uploaded to Dropbox with clickable links in Workflowy.
-
-```
-DROPBOX_APP_KEY=your-app-key
-DROPBOX_APP_SECRET=your-app-secret
-DROPBOX_REFRESH_TOKEN=your-refresh-token
-```
-
-All three must be set, or none.
-
 ### Claude Desktop setup
 
 Add to your Claude Desktop config:
@@ -136,12 +124,6 @@ Ask Claude naturally — it will use the MCP tools:
 | `get_project_summary` | Stats, tag counts, assignees, overdue items for a subtree |
 | `get_recent_changes` | Nodes modified within a time window |
 
-### Not Yet Ported
-
-Concept mapping (get_node_content_for_analysis, render_interactive_concept_map),
-batch async (batch_operations, submit_job, get_job_status).
-See `specs/tasks.md` for full roadmap.
-
 ## Conventions
 
 Tags, assignees, and due dates are parsed from node text:
@@ -155,7 +137,7 @@ Tags, assignees, and due dates are parsed from node text:
 ```bash
 cargo build              # compile (debug)
 cargo build --release    # compile (optimized)
-cargo test --lib         # run 90 unit tests
+cargo test --lib         # run 106 unit tests
 cargo check              # type-check only
 cargo run --bin workflowy-mcp-server  # start server
 ```

@@ -137,14 +137,6 @@
   - Handles: ATX headers, lists, code blocks, blockquotes, tables, horizontal rules
   - analyze_only mode returns stats without converting
 
-- [ ] **T-123**: Add concept map tools
-  - get_node_content_for_analysis
-  - render_interactive_concept_map (MCP Apps)
-
-- [ ] **T-124**: Add graph analysis tools
-  - analyze_relationships, create_adjacency_matrix
-  - calculate_centrality, analyze_network_structure
-
 ---
 
 ## Phase 3: Infrastructure
@@ -154,10 +146,6 @@
 
 - [ ] **T-131**: Implement orchestrator
   - Multi-worker content insertion for large content
-
-- [ ] **T-132**: Add Dropbox integration
-  - OAuth 2.0 refresh token flow
-  - Image upload for concept maps
 
 - [ ] **T-133**: Add batch_operations / job queue tools
   - submit_job, get_job_status, list_jobs, cancel_job
@@ -180,7 +168,6 @@
   - Module documentation
 
 - [ ] **T-143**: CLI tools
-  - concept_map CLI
   - task_map CLI
 
 ---

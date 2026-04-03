@@ -78,7 +78,6 @@ src/
 |   +-- request_queue.rs      # [STUB] Batch request queue
 |   +-- orchestrator.rs       # [STUB] Multi-worker orchestrator
 |   +-- text_processing.rs    # [STUB] UUID validation
-|   +-- concept_map.rs        # [STUB] Concept map generator
 |   +-- task_map.rs           # [STUB] Task map generator
 +-- tools/
 |   +-- mod.rs
@@ -86,7 +85,6 @@ src/
 |   +-- search.rs             # [STUB] Search tool helpers
 +-- cli/
     +-- mod.rs
-    +-- concept_map.rs        # CLI tool for concept maps [STUB]
     +-- task_map.rs           # CLI tool for task maps [STUB]
 
 tests/
@@ -108,7 +106,6 @@ tests/
 
 | Category | Tools |
 |----------|-------|
-| Concept Mapping | get_node_content_for_analysis, render_interactive_concept_map |
 | Batch & Async | batch_operations, submit_job, get_job_status |
 
 ## Key Design Decisions
@@ -251,11 +248,9 @@ cargo build --release      # Optimized binary (LTO enabled)
 ### Medium Priority
 - [ ] Implement request queue with batching
 - [ ] Implement orchestrator (multi-worker insertion)
-- [ ] Add concept map generation (get_node_content_for_analysis, render_interactive_concept_map)
-- [ ] Add Dropbox integration
 - [ ] Add batch_operations, submit_job, get_job_status
 
 ### Low Priority
-- [ ] CLI tools (concept_map, task_map)
+- [ ] CLI tools (task_map)
 - [ ] Performance optimization
 - [ ] Metrics/monitoring exports

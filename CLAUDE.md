@@ -24,7 +24,7 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 - **`src/defaults.rs`** — Centralized constants for all magic numbers (cache TTL, retry config, validation limits, tree depth defaults).
 - **`src/types.rs`** — Core types including `NodeId` newtype with `Deref<str>`, `AsRef<str>`, `PartialEq<String>`, and `JsonSchema` impls.
 - **`src/utils/`** — Reusable modules: cache (injectable), date/tag parsing, node paths, subtree collection, rate limiter, job queue.
-- **`src/cli/`** — Standalone CLI binaries for concept map and task map generation (stubs).
+- **`src/cli/`** — Standalone CLI binaries (task map generation stub).
 
 ### Request Flow
 
@@ -63,8 +63,6 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 
 ### Known Limitations
 
-- Concept mapping tools not yet ported (get_node_content_for_analysis, render_interactive_concept_map)
-- Batch async tools not yet ported (batch_operations, submit_job, get_job_status)
 - Request queue and orchestrator are stubs
 - bulk_update complete/uncomplete operations are no-ops (API endpoints not modeled yet)
 
@@ -82,7 +80,6 @@ cargo test --lib -- --nocapture            # with stdout
 
 Environment variables loaded from `.env` via dotenv (`src/config.rs`):
 - `WORKFLOWY_API_KEY` (required)
-- `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN` (optional, all-or-none)
 
 ## Key Dependencies
 
