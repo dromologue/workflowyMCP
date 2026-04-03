@@ -6,14 +6,13 @@ use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::{WorkflowyNode, CreatedNode};
 use crate::utils::RateLimiter;
+use futures::future::join_all;
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Type alias for recursive async future (avoids verbose Pin<Box<...>> signatures)
-type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub struct WorkflowyClient {
     http_client: Client,
@@ -113,28 +112,56 @@ impl WorkflowyClient {
         self.get_subtree_recursive(None, 10).await
     }
 
-    /// Recursively fetch descendants, collecting into `out`
-    fn fetch_descendants<'a>(
-        &'a self,
-        nodes: &'a [WorkflowyNode],
-        out: &'a mut Vec<WorkflowyNode>,
-        depth: usize,
+    /// Fetch descendants level-by-level with concurrent children fetches per level.
+    /// Caps total nodes to avoid runaway fetches on large trees.
+    async fn fetch_descendants(
+        &self,
+        initial_nodes: &[WorkflowyNode],
+        out: &mut Vec<WorkflowyNode>,
+        start_depth: usize,
         max_depth: usize,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            if depth >= max_depth {
-                out.extend(nodes.iter().cloned());
+    ) -> Result<()> {
+        const MAX_NODES: usize = 500;
+
+        let mut current_level: Vec<WorkflowyNode> = initial_nodes.to_vec();
+        let mut depth = start_depth;
+
+        while depth < max_depth && !current_level.is_empty() {
+            // Add current level to output
+            out.extend(current_level.iter().cloned());
+            if out.len() >= MAX_NODES {
+                info!(count = out.len(), "Node cap reached, stopping traversal");
                 return Ok(());
             }
-            for node in nodes {
-                out.push(node.clone());
-                let children = self.get_children(&node.id).await?;
-                if !children.is_empty() {
-                    self.fetch_descendants(&children, out, depth + 1, max_depth).await?;
+
+            // Fetch children for all nodes at this level concurrently
+            let futures: Vec<_> = current_level.iter()
+                .map(|node| self.get_children(&node.id))
+                .collect();
+            let results = join_all(futures).await;
+
+            let mut next_level = Vec::new();
+            for result in results {
+                match result {
+                    Ok(children) => next_level.extend(children),
+                    Err(e) => {
+                        warn!(error = %e, "Failed to fetch children, skipping branch");
+                        // Continue with other branches rather than failing entirely
+                    }
                 }
             }
-            Ok(())
-        })
+
+            current_level = next_level;
+            depth += 1;
+        }
+
+        // Add the final level (at max_depth) without fetching their children
+        if !current_level.is_empty() {
+            let remaining = MAX_NODES.saturating_sub(out.len());
+            out.extend(current_level.into_iter().take(remaining));
+        }
+
+        Ok(())
     }
 
     /// Create a new node
