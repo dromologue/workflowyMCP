@@ -6,7 +6,6 @@ use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::{WorkflowyNode, CreatedNode};
 use crate::utils::RateLimiter;
-use futures::future::join_all;
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
@@ -112,7 +111,7 @@ impl WorkflowyClient {
         self.get_subtree_recursive(None, 10).await
     }
 
-    /// Fetch descendants level-by-level with concurrent children fetches per level.
+    /// Fetch descendants level-by-level, sequentially per node (rate-limited).
     /// Caps total nodes to avoid runaway fetches on large trees.
     async fn fetch_descendants(
         &self,
@@ -134,20 +133,18 @@ impl WorkflowyClient {
                 return Ok(());
             }
 
-            // Fetch children for all nodes at this level concurrently
-            let futures: Vec<_> = current_level.iter()
-                .map(|node| self.get_children(&node.id))
-                .collect();
-            let results = join_all(futures).await;
-
+            // Fetch children for each node sequentially (rate limiter gates each call)
             let mut next_level = Vec::new();
-            for result in results {
-                match result {
+            for node in &current_level {
+                match self.get_children(&node.id).await {
                     Ok(children) => next_level.extend(children),
                     Err(e) => {
-                        warn!(error = %e, "Failed to fetch children, skipping branch");
-                        // Continue with other branches rather than failing entirely
+                        warn!(error = %e, node_id = %node.id, "Failed to fetch children, skipping branch");
                     }
+                }
+                if out.len() + next_level.len() >= MAX_NODES {
+                    info!(count = out.len() + next_level.len(), "Node cap approaching, stopping level");
+                    break;
                 }
             }
 
@@ -183,11 +180,13 @@ impl WorkflowyClient {
             body["priority"] = json!(pri);
         }
         let response: serde_json::Value = self.request("POST", "/nodes", Some(body)).await?;
+        // Workflowy API returns "item_id" (not "id") for created nodes
         let id = response
-            .get("id")
+            .get("item_id")
+            .or_else(|| response.get("id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| WorkflowyError::ParseError {
-                reason: "Response missing 'id' field after node creation".to_owned(),
+                reason: format!("Response missing 'item_id' field after node creation: {}", response),
             })?
             .to_owned();
         Ok(CreatedNode {
@@ -198,6 +197,7 @@ impl WorkflowyClient {
     }
 
     /// Edit a node's name or description
+    /// Workflowy API uses POST (not PUT) for updates
     pub async fn edit_node(
         &self,
         node_id: &str,
@@ -212,7 +212,7 @@ impl WorkflowyClient {
             body["description"] = json!(d);
         }
         let endpoint = format!("/nodes/{}", node_id);
-        let _: serde_json::Value = self.request("PUT", &endpoint, Some(body)).await?;
+        let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
         Ok(())
     }
 
@@ -224,6 +224,7 @@ impl WorkflowyClient {
     }
 
     /// Move a node to a new parent
+    /// Workflowy API uses POST (not PUT) for move
     pub async fn move_node(
         &self,
         node_id: &str,
@@ -235,7 +236,7 @@ impl WorkflowyClient {
             body["priority"] = json!(pri);
         }
         let endpoint = format!("/nodes/{}/move", node_id);
-        let _: serde_json::Value = self.request("PUT", &endpoint, Some(body)).await?;
+        let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
         Ok(())
     }
 
@@ -287,12 +288,13 @@ impl WorkflowyClient {
     }
 
     /// Parse `retry_after` seconds from a 429 response body like `{"error": "...", "retry_after": 26}`
+    /// Returns at least 1 second to avoid tight retry loops when retry_after is 0.
     fn parse_retry_after(&self, body: &str) -> Option<u64> {
         serde_json::from_str::<serde_json::Value>(body)
             .ok()?
             .get("retry_after")?
             .as_u64()
-            .map(|secs| secs * 1000) // convert to milliseconds
+            .map(|secs| secs.max(1) * 1000) // convert to ms, minimum 1 second
     }
 
     async fn try_request<T: serde::de::DeserializeOwned>(
