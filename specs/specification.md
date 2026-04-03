@@ -2,6 +2,48 @@
 
 > What the Workflowy MCP Server does and why.
 
+> **Migration Note (2026-04)**: This spec was written for the TypeScript v1 codebase (28+ tools).
+> The Rust v2 rewrite currently implements **17 of those tools**. Sections describing unimplemented
+> features are retained as aspirational requirements. See `implementation-plan.md` for current
+> Rust tool inventory and `tasks.md` for porting status.
+
+## Implemented Tools (Rust v2 — 23 total)
+
+| Category | Tool | Status |
+|----------|------|--------|
+| Search & Navigation | search_nodes | Implemented |
+| Search & Navigation | find_node | Implemented |
+| Search & Navigation | get_node | Implemented |
+| Search & Navigation | list_children | Implemented |
+| Search & Navigation | tag_search | Implemented |
+| Search & Navigation | get_subtree | Implemented |
+| Search & Navigation | find_backlinks | Implemented |
+| Content Creation | create_node | Implemented |
+| Content Creation | insert_content | Implemented (hierarchical) |
+| Content Creation | smart_insert | Implemented |
+| Content Creation | convert_markdown | Implemented |
+| Content Modification | edit_node | Implemented |
+| Content Modification | move_node | Implemented |
+| Content Modification | delete_node | Implemented |
+| Content Modification | duplicate_node | Implemented |
+| Content Modification | create_from_template | Implemented |
+| Content Modification | bulk_update | Implemented |
+| Todo Management | list_todos | Implemented |
+| Due Dates | list_upcoming | Implemented |
+| Due Dates | list_overdue | Implemented |
+| Due Dates | daily_review | Implemented |
+| Project Management | get_project_summary | Implemented |
+| Project Management | get_recent_changes | Implemented |
+
+### Not Yet Ported from TypeScript
+
+batch_operations, submit_job, get_job_status, insert_file,
+render_interactive_concept_map, get_node_content_for_analysis, generate_task_map,
+analyze_relationships, create_adjacency_matrix, calculate_centrality,
+analyze_network_structure
+
+---
+
 ## Overview
 
 The Workflowy MCP Server is a Model Context Protocol server that enables Claude (and other MCP-compatible AI assistants) to read, search, and write to a user's Workflowy outline. It transforms Workflowy into an AI-accessible knowledge base and capture system.

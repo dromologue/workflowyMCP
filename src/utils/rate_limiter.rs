@@ -1,0 +1,142 @@
+/// Token bucket rate limiter
+/// Provides proactive throttling to prevent exceeding API limits
+
+use crate::config::RateLimitConfig;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::debug;
+
+pub struct RateLimiter {
+    #[allow(dead_code)]
+    config: RateLimitConfig,
+    tokens: Arc<Mutex<TokenBucket>>,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_rate: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        let capacity = config.burst_size as f64;
+
+        let bucket = TokenBucket {
+            tokens: capacity,
+            capacity,
+            refill_rate: config.requests_per_second as f64,
+            last_refill: Instant::now(),
+        };
+
+        Self {
+            config,
+            tokens: Arc::new(Mutex::new(bucket)),
+        }
+    }
+
+    /// Acquire a token, waiting if necessary
+    pub async fn acquire(&self) -> () {
+        loop {
+            // Try to acquire without waiting
+            if self.try_acquire() {
+                return;
+            }
+
+            // Calculate how long to wait before retrying
+            let wait_duration = self.calculate_wait_time();
+            tokio::time::sleep(wait_duration).await;
+        }
+    }
+
+    /// Try to acquire without blocking; returns true if successful
+    pub fn try_acquire(&self) -> bool {
+        let mut bucket = self.tokens.lock();
+        bucket.refill();
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            debug!(remaining_tokens = bucket.tokens, "Token acquired");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Calculate how long to wait for a token to become available
+    fn calculate_wait_time(&self) -> Duration {
+        let bucket = self.tokens.lock();
+
+        if bucket.tokens >= 1.0 {
+            Duration::from_millis(0)
+        } else {
+            let tokens_needed = 1.0 - bucket.tokens;
+            let seconds_to_wait = tokens_needed / bucket.refill_rate;
+            Duration::from_secs_f64(seconds_to_wait)
+        }
+    }
+}
+
+impl TokenBucket {
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+
+        let tokens_to_add = elapsed * self.refill_rate;
+        self.tokens = (self.tokens + tokens_to_add).min(self.capacity);
+        self.last_refill = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_token_bucket_limits_rate() {
+        let config = RateLimitConfig {
+            requests_per_second: 2,
+            burst_size: 2,
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Should be able to acquire 2 tokens immediately (burst)
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+
+        // Wait for refill
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(limiter.try_acquire());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_waits_for_token() {
+        let config = RateLimitConfig {
+            requests_per_second: 2,
+            burst_size: 1,
+        };
+        let limiter = Arc::new(RateLimiter::new(config));
+
+        // Acquire the initial token
+        assert!(limiter.try_acquire());
+
+        // Spawn a task that waits for a token
+        let limiter_clone = Arc::clone(&limiter);
+        let start = Instant::now();
+        let handle = tokio::spawn(async move {
+            limiter_clone.acquire().await;
+        });
+
+        // Give it a moment to reach the wait
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Wait for it to complete (should be ~500ms for 2 req/sec)
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed.as_millis() > 400 && elapsed.as_millis() < 700);
+    }
+}

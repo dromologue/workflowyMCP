@@ -4,3 +4,8 @@ dist/
 *.log
 .DS_Store
 coverage/
+target/
+
+# Ignore root .md files except README
+/*.md
+!README.md

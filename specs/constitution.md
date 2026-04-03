@@ -122,10 +122,11 @@ Developer-focused documentation:
 
 ### Technology Stack
 
-- Runtime: Node.js 18+
-- Language: TypeScript (strict mode)
-- MCP SDK: Official `@modelcontextprotocol/sdk`
-- Validation: Zod
+- Language: Rust (2021 edition)
+- Async Runtime: Tokio
+- MCP SDK: rmcp 0.16 (proc macro tool registration)
+- Serialization: serde + schemars (JSON Schema generation)
+- HTTP: reqwest with exponential backoff retry
 - Transport: stdio (Claude Desktop compatible)
 
 ## What We Will NOT Do
