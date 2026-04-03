@@ -185,8 +185,10 @@
 
 | Module | Tests | Status |
 |--------|-------|--------|
-| server.rs (params + info + tool listing) | 33 | Pass |
-| validation.rs | 10 | Pass |
+| server.rs (params + info + tool listing) | 30 | Pass |
+| types.rs (NodeId + API deserialization) | 11 | Pass |
+| validation.rs | 13 | Pass |
+| defaults.rs | 2 | Pass |
 | api/client.rs | 3 | Pass |
 | utils/cache.rs | 2 | Pass |
 | utils/rate_limiter.rs | 2 | Pass |
@@ -195,4 +197,4 @@
 | utils/tag_parser.rs | 11 | Pass |
 | utils/node_paths.rs | 6 | Pass |
 | utils/subtree.rs | 10 | Pass |
-| **Total** | **90** | **All pass** |
+| **Total** | **106** | **All pass** |

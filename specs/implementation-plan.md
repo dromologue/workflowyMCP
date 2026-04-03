@@ -128,7 +128,7 @@ tests/
 
 **Decision**: Parse indentation (2 spaces = 1 level), create nodes with parent references.
 
-**Status**: Currently creates flat nodes. Hierarchy parsing is a TODO.
+**Status**: Implemented. `insert_content` parses 2-space indentation and creates nested node hierarchy via parent_id chaining.
 
 ### ADR-004: Cache Invalidation on Write
 

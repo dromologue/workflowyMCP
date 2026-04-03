@@ -2,10 +2,8 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Migration Note (2026-04)**: This spec was written for the TypeScript v1 codebase (28+ tools).
-> The Rust v2 rewrite currently implements **17 of those tools**. Sections describing unimplemented
-> features are retained as aspirational requirements. See `implementation-plan.md` for current
-> Rust tool inventory and `tasks.md` for porting status.
+> **Updated 2026-04**: Rust v2 implements **23 tools**. Concept mapping, graph analysis,
+> and Dropbox integration have been removed from scope. See `tasks.md` for remaining roadmap.
 
 ## Implemented Tools (Rust v2 — 23 total)
 
@@ -35,12 +33,9 @@
 | Project Management | get_project_summary | Implemented |
 | Project Management | get_recent_changes | Implemented |
 
-### Not Yet Ported from TypeScript
+### Not Yet Implemented
 
-batch_operations, submit_job, get_job_status, insert_file,
-render_interactive_concept_map, get_node_content_for_analysis, generate_task_map,
-analyze_relationships, create_adjacency_matrix, calculate_centrality,
-analyze_network_structure
+batch_operations, submit_job, get_job_status, generate_task_map
 
 ---
 
@@ -219,8 +214,7 @@ Fast node lookup by name that returns the node ID ready for use with other tools
 | Parallel processing | Auto-optimizes for any workload size (1 to 1000+ nodes) |
 | Order preservation | Content appears in same order as provided |
 | Staging node pattern | Prevents nodes from appearing at unintended locations during insertion |
-| **File insertion** | Insert files directly without Claude reading them first |
-| **Async job queue** | Background processing for large workloads with progress tracking |
+| **Async job queue** | Background processing for large workloads with progress tracking (planned) |
 
 **Single entry point for all insertions**:
 
@@ -503,7 +497,6 @@ One-call daily standup summary combining overdue items, upcoming deadlines, rece
 | Find related | Analyze node content, extract keywords, find matching nodes |
 | Create links | Generate Workflowy internal links to related nodes |
 | Auto-discovery | Automatically find relevant connections based on content |
-| **LLM-powered concept map** | Multi-tool workflow for semantic concept discovery |
 
 **Keyword extraction**:
 - Filters common stop words
@@ -516,282 +509,7 @@ One-call daily standup summary combining overdue items, upcoming deadlines, rece
 
 **Link format**: `[Node Title](https://workflowy.com/#/nodeId)`
 
----
-
-#### LLM-Powered Concept Mapping (Recommended)
-
-The LLM-powered approach uses Claude's semantic understanding to discover meaningful conceptual relationships, rather than mechanical keyword matching.
-
-**Two-tool workflow**:
-
-1. **`get_node_content_for_analysis`**: Extracts subtree content formatted for LLM analysis
-2. **`render_interactive_concept_map`**: Renders Claude's discovered concepts and relationships as an interactive HTML map
-
-**Why this approach**:
-- Claude reads and **understands** the content semantically
-- Claude **discovers** concepts through reasoning, not keyword matching
-- Claude identifies **meaningful relationships** from context
-- Relationship labels reflect actual semantic connections ("critiques", "extends", "enables")
-
-**Tool 1: `get_node_content_for_analysis`**
-
-Extracts content from a Workflowy subtree, including linked content.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `node_id` | string | required | Root node to analyze |
-| `depth` | number | unlimited | Maximum depth to traverse |
-| `include_notes` | boolean | true | Include node notes |
-| `max_nodes` | number | 500 | Maximum nodes to return |
-| `follow_links` | boolean | true | Follow internal Workflowy links |
-| `format` | "structured" \| "outline" | "structured" | Output format |
-
-**Link following**: Automatically parses Workflowy internal links (`[text](https://workflowy.com/#/node-id)`) and includes linked content from outside the immediate hierarchy. This enables discovery of cross-references and connections.
-
-**Output (structured format)**:
-```json
-{
-  "root": { "id": "...", "name": "Topic", "note": "..." },
-  "total_nodes": 47,
-  "total_chars": 23456,
-  "truncated": false,
-  "linked_nodes_included": 5,
-  "content": [
-    {
-      "depth": 0,
-      "id": "node1",
-      "name": "Child Topic",
-      "note": "Detailed notes...",
-      "path": "Topic > Child Topic",
-      "links_to": ["node5", "node8"]
-    }
-  ],
-  "linked_content": [
-    {
-      "depth": -1,
-      "id": "node5",
-      "name": "Referenced Topic",
-      "note": "Content from linked node...",
-      "path": "Other Section > Referenced Topic"
-    }
-  ]
-}
-```
-
-**Tool 2: `render_interactive_concept_map`** — see Interactive Concept Maps section below.
-
-**Common relationship types**:
-- `produces`, `enables`, `requires` (causal/dependency)
-- `critiques`, `extends`, `develops` (evaluative)
-- `contrasts with`, `differs from` (comparative)
-- `includes`, `examples of`, `type of` (hierarchical)
-- `influences`, `relates to` (general)
-
----
-
-#### Interactive Concept Maps (MCP Apps)
-
-The interactive approach renders concept maps as collapsible, zoomable HTML visualizations directly inside Claude Desktop, using the MCP Apps protocol.
-
-**Tool: `render_interactive_concept_map`**
-
-Renders an interactive, collapsible concept map as an inline HTML visualization.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `title` | string | yes | Map title |
-| `core_concept` | object | yes | Central concept (`{label, description?}`) |
-| `concepts` | array | yes | Discovered concepts |
-| `relationships` | array | yes | Relationships between concepts |
-
-**Concept structure**:
-```json
-{
-  "id": "truth-procedure",
-  "label": "Truth Procedure",
-  "level": "major",
-  "importance": 8,
-  "parent_major_id": "event"
-}
-```
-
-The `parent_major_id` field groups detail concepts under their parent major concept for collapse/expand behavior. If omitted, detail concepts are auto-assigned to their most-connected major concept.
-
-**Interactions**:
-- **Click major concept**: Collapse/expand its detail children (CSS transition animation)
-- **Mouse wheel**: Zoom in/out
-- **Click + drag background**: Pan the view
-- **Drag node**: Reposition individual node, simulation re-settles
-- **Expand All / Collapse All**: Toolbar buttons
-- **Physics button**: Toggle slider panel for force parameters
-- **Hover**: Tooltip with full node label
-- **Reset**: Return to default view
-
-**Physics sliders** (toggle via Physics button):
-- **Charge (repulsion)**: Node-to-node repulsive force (100–3000, default 800)
-- **Link Distance**: Ideal edge length (50–600, default 200)
-- **Center Gravity**: Pull toward center (0.001–0.030, default 0.003)
-- **Damping**: Velocity damping factor (0.10–0.95, default 0.60)
-- **Overlap Repulsion**: Extra push when nodes overlap (0.0–3.0, default 0.8)
-
-Slider interactions are isolated from the SVG container's mouse event handlers — `mousedown` on the slider panel returns early to prevent canvas panning from interfering with slider drag.
-
-**MCP Apps protocol**:
-- Tool declares `_meta.ui.resourceUri: "ui://concept-map/interactive"`
-- Server serves self-contained HTML via `ListResources` and `ReadResource` handlers
-- Claude Desktop renders the HTML in a sandboxed iframe inline in the conversation
-
-**Layout algorithm** (force-directed):
-- Core concept pinned at center
-- Major concepts initially placed on a circle (radius ~35% of viewport)
-- Detail concepts initially near their parent major
-- Force simulation: charge repulsion (all pairs), link attraction, center gravity, overlap repulsion
-- Edges drawn as quadratic bezier curves with slight curvature
-- Simulation runs 200 initial iterations, then 150 iterations on any interaction
-
-**Visual encoding** (same as static maps):
-- **Node levels**: Core (dark blue, large) → Major (medium colors) → Details (lighter colors, smaller)
-- **Edge colors**: Green = supporting, Red dashed = contrasting, Purple = dependency, Gray = general
-
-**Workflow**:
-```
-1. get_node_content_for_analysis → Extract subtree content
-2. Claude analyzes content semantically
-3. render_interactive_concept_map → Interactive HTML map rendered inline
-```
-
-**Success criteria**: Surface relevant connections user might not have noticed.
-
-**`/concept-map` skill** (Claude Code slash command):
-
-Wraps the two-step workflow (`get_node_content_for_analysis` → `render_interactive_concept_map`) into a single invocation.
-
-Usage: `/concept-map [search-term] [level N]`
-
-- `search-term`: Node name to find in Workflowy
-- `level N` (optional): Maximum depth to traverse (e.g., `level 3` limits to 3 levels of children)
-
-The skill parses arguments for an optional depth specifier (`level N`, `depth N`, or `to level N`), passes it to `get_node_content_for_analysis` as the `depth` parameter, then performs semantic analysis and renders the map.
-
-**CLI tool** (`npm run concept-map`):
-
-Standalone CLI that generates concept maps without requiring the MCP server or Claude Desktop.
-
-| Flag | Description |
-|------|-------------|
-| `--search <query>` | Search for node by name |
-| `--node-id <id>` | Specify node by ID |
-| `--auto` | Use Claude API for semantic concept discovery |
-| `--concepts <list>` | Comma-separated manual concept list |
-| `--depth <N>` | Max child depth to include |
-| `--core <label>` | Override core concept label |
-| `--insert` | Insert outline into Workflowy as child of analyzed node |
-| `--force` | Overwrite existing outline (with `--insert`) |
-| `--output <file>` | Custom output filename |
-
-**Outline insertion** (`--insert` flag):
-
-Creates a structured Workflowy outline as a child of the analyzed node. Links to source nodes appear as child nodes (not in the note field). No importance or strength scores are included.
-
-```
-Concept Map - [Node Name] - Level [N | all levels]
-  [Core Label]
-    → link to source node
-  Major Concepts
-    [Major A]
-      → link to WF source node
-      [Detail A1]
-        → link to WF source node
-  Relationships
-    [From] --type--> [To]
-      → link to from outline node
-      → link to to outline node
-```
-
-If an outline with the same name already exists as a child, the CLI refuses unless `--force` is passed, which deletes the existing outline first.
-
-#### Task Maps
-
-**Tool: `generate_task_map`**
-
-Generates an interactive concept map from Workflowy's Tags node. Finds the root-level "Tags" node, reads children as #tag and @mention definitions, searches all nodes for matches using prefix matching (e.g. `#action_` matches `#action_review`), and produces a visual map showing tag relationships via co-occurrence. Saves HTML to `~/Downloads/` and uploads to Dropbox (`/Workflowy/TaskMaps/`), adding a link node under Tags.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `max_details_per_tag` | number | 8 | Max detail nodes per tag |
-| `detail_sort_by` | "recency" \| "name" | "recency" | Sort order for detail nodes |
-| `title` | string | "Task Map" | Custom title |
-| `exclude_completed` | boolean | false | Exclude completed nodes |
-| `exclude_mentions` | boolean | true | Exclude @mention tags, only use #hashtags |
-| `insert_outline` | boolean | false | Insert outline into Workflowy under Tags |
-| `force_outline` | boolean | false | Overwrite existing outline |
-
-**CLI tool** (`npm run task-map`):
-
-| Flag | Description |
-|------|-------------|
-| `--max-details <N>` | Max detail nodes per tag (default: 8) |
-| `--sort <order>` | Sort details by: recency, name |
-| `--title <title>` | Custom map title |
-| `--exclude-completed` | Exclude completed nodes |
-| `--insert` | Insert outline into Workflowy under Tags node |
-| `--force` | Overwrite existing outline |
-| `--output <file>` | Custom output filename |
-
-Tags become major concepts, matched nodes become detail concepts (capped per tag), and co-occurrence (nodes matching multiple tags) creates relationships between tags. @mentions are excluded by default.
-
----
-
-#### Graph Analysis
-
-Four tools for network/graph analysis. These tools operate on generic data — not tied to Workflowy nodes — making them useful for analyzing any relationship data Claude encounters.
-
-**Tool: `analyze_relationships`**
-
-Extract relationships from data objects and compute graph density.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `data` | array | required | Array of data objects to analyze |
-| `relationship_fields` | string[] | required | Fields containing relationship references |
-| `node_label_field` | string | "id" | Field to use as node labels |
-
-**Tool: `create_adjacency_matrix`**
-
-Build and display an adjacency matrix from explicit relationship pairs.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `relationships` | array | yes | Array of `{from, to, weight}` objects |
-| `vertices` | string[] | yes | Vertex names |
-
-**Tool: `calculate_centrality`**
-
-Calculate centrality measures to identify the most important nodes in a network.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `relationships` | array | required | Array of `{from, to, weight}` objects |
-| `vertices` | string[] | required | Vertex names |
-| `measures` | string[] | ["all"] | Which measures: degree, betweenness, closeness, eigenvector, all |
-| `top_n` | number | 10 | Number of top nodes to show per measure |
-
-**Tool: `analyze_network_structure`**
-
-Combined relationship extraction + centrality analysis in one step. Equivalent to `analyze_relationships` + `calculate_centrality`.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `data` | array | required | Array of data objects to analyze |
-| `relationship_fields` | string[] | required | Fields containing relationship references |
-| `node_label_field` | string | "id" | Field to use as node labels |
-| `include_centrality` | boolean | true | Whether to include centrality analysis |
-
-**Centrality measures**:
-- **Degree**: Number of connections (in + out) normalized by graph size
-- **Betweenness**: How often a node lies on shortest paths between other nodes
-- **Closeness**: Inverse of average distance to all other reachable nodes
-- **Eigenvector**: Importance based on being connected to other important nodes
+_Concept mapping and graph analysis tools have been removed from scope._
 
 ### 6. Content Modification
 
@@ -989,47 +707,7 @@ User: "Mark my weekly review tasks as complete"
 4. Confirmation of completed items
 ```
 
-### Flow 4: Visualize Knowledge Connections (LLM-Powered)
-
-```
-User: "Create a concept map of my Badiou philosophy notes"
-
-1. Claude calls get_node_content_for_analysis to retrieve subtree content
-   - All child nodes with names, notes, paths returned
-   - Internal Workflowy links are followed to include connected content
-
-2. Claude reads and semantically analyzes the content:
-   - Discovers key concepts: Event, Truth, Subject, Fidelity, Situation
-   - Identifies relationships from context:
-     * "Event produces Truth" (found in: "The Event ruptures the situation...")
-     * "Subject constituted by Fidelity" (found in: "...the Subject emerges through...")
-     * "Badiou critiques Deleuze" (found in: "...Badiou's critique of immanence...")
-
-3. Claude calls render_interactive_concept_map with discovered analysis:
-   {
-     "title": "Badiou's Event Philosophy",
-     "core_concept": { "label": "Event" },
-     "concepts": [
-       { "id": "truth", "label": "Truth", "level": "major", "importance": 9 },
-       { "id": "subject", "label": "Subject", "level": "major", "importance": 8 },
-       { "id": "fidelity", "label": "Fidelity", "level": "detail", "importance": 6 }
-     ],
-     "relationships": [
-       { "from": "core", "to": "truth", "type": "produces", "strength": 9 },
-       { "from": "subject", "to": "fidelity", "type": "constituted by", "strength": 8 }
-     ]
-   }
-
-4. Tool renders interactive HTML concept map inline in Claude Desktop
-5. User can zoom, pan, and collapse/expand concept clusters
-
-Key difference from legacy approach:
-- Claude DISCOVERS concepts through understanding, not keyword matching
-- Relationships are semantically meaningful, not pattern-matched
-- No need to provide concepts upfront - Claude finds them
-```
-
-### Flow 5: Large Content Insertion (Automatic Parallelization)
+### Flow 4: Large Content Insertion (Automatic Parallelization)
 
 ```
 User: "Import this research outline into my Project node" (provides 200+ node outline)
@@ -1109,7 +787,7 @@ User: "Import this markdown README into my Documentation node"
 
 **Large dataset optimizations**:
 - Scope filtering uses indexed lookups (O(n) instead of O(n²))
-- Concept map edge building limited to 5,000 nodes and 1,000 edges
+- Tree traversal capped at 500 nodes per request
 - Hierarchical content insertion batches concurrent API calls (up to 10 per batch)
 - Parent-child relationships indexed for O(1) traversal
 
@@ -1581,131 +1259,6 @@ Jobs are retained for 30 minutes after completion.
 ```
 
 **Success criteria**: Insert 500+ nodes without API rate limit errors or timeouts.
-
----
-
-### 10. File Insertion (Direct File Handoff)
-
-**Goal**: Allow Claude to pass file paths directly to the server without reading file contents first.
-
-| Feature | Description |
-|---------|-------------|
-| **Direct file insertion** | Server reads and inserts file contents |
-| **Auto format detection** | Detects markdown from file extension |
-| **Markdown conversion** | Automatically converts .md files |
-| **Background file jobs** | Submit large files for background processing |
-
-**Why use file insertion**:
-- Claude doesn't need to read or parse file contents
-- Server handles format detection and conversion
-- Reduces token usage in conversation
-- Better handling of large files
-
----
-
-#### insert_file Tool
-
-Insert a file's contents into Workflowy. The server reads, converts (if needed), and inserts.
-
-**Parameters**:
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `file_path` | string | yes | Absolute path to the file |
-| `parent_id` | string | yes | Target parent node ID |
-| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
-| `format` | "auto" \| "markdown" \| "plain" | no | How to process the file (default: auto) |
-
-**Format options**:
-- `auto`: Detect from extension (`.md`/`.markdown` → markdown conversion, else plain)
-- `markdown`: Force markdown-to-Workflowy conversion
-- `plain`: Treat as pre-formatted 2-space indented content
-
-**Response**:
-```json
-{
-  "success": true,
-  "message": "Inserted 47 nodes using parallel workers",
-  "nodes": [...],
-  "file": {
-    "name": "research-notes.md",
-    "size": 15234,
-    "format": "markdown",
-    "node_count": 47
-  }
-}
-```
-
----
-
-#### submit_file_job Tool
-
-Submit a large file for background insertion. Use for large files to avoid timeouts.
-
-**Parameters**:
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `file_path` | string | yes | Absolute path to the file |
-| `parent_id` | string | yes | Target parent node ID |
-| `position` | "top" \| "bottom" | no | Position relative to siblings (default: top) |
-| `format` | "auto" \| "markdown" \| "plain" | no | How to process the file (default: auto) |
-| `description` | string | no | Optional description for tracking |
-
-**Response**:
-```json
-{
-  "success": true,
-  "job_id": "job-1234567890-2",
-  "type": "insert_file",
-  "status": "pending",
-  "description": "Insert file 'thesis.md' under 'Research'",
-  "file": {
-    "name": "thesis.md",
-    "size": 245678,
-    "path": "/Users/me/Documents/thesis.md"
-  },
-  "message": "File job submitted for background processing. Use get_job_status to check progress."
-}
-```
-
----
-
-#### File Insertion Workflow
-
-```
-User: "Add my research notes from ~/Documents/research.md to my Research node"
-
-1. Claude calls insert_file:
-   insert_file(
-     file_path: "/Users/me/Documents/research.md",
-     parent_id: "xyz123"
-   )
-
-2. Server automatically:
-   - Reads the file
-   - Detects .md extension → markdown format
-   - Converts markdown to Workflowy format
-   - Inserts using parallel workers
-
-3. Returns result:
-   {
-     "success": true,
-     "file": {"name": "research.md", "format": "markdown", "node_count": 89}
-   }
-
-Claude never needs to read or parse the file - server handles everything.
-```
-
-**For large files** (200+ nodes expected):
-```
-1. Claude calls submit_file_job instead
-2. Server processes in background with rate limiting
-3. Claude checks progress with get_job_status
-4. Gets results with get_job_result when complete
-```
-
-**Success criteria**: Insert file contents without Claude reading the file first.
 
 ---
 

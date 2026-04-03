@@ -83,3 +83,38 @@ impl WorkflowyError {
 }
 
 pub type Result<T> = std::result::Result<T, WorkflowyError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_429() {
+        let err = WorkflowyError::api_error(429, "Rate limited");
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_500() {
+        let err = WorkflowyError::api_error(500, "Server error");
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_is_not_retryable_404() {
+        let err = WorkflowyError::api_error(404, "Not found");
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_internal_helper() {
+        let err = WorkflowyError::internal("test error");
+        assert!(matches!(err, WorkflowyError::Internal(msg) if msg == "test error"));
+    }
+
+    #[test]
+    fn test_parse_helper() {
+        let err = WorkflowyError::parse("bad json");
+        assert!(matches!(err, WorkflowyError::ParseError { reason } if reason == "bad json"));
+    }
+}
