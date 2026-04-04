@@ -59,34 +59,39 @@ Be aware of two classification systems:
 
 The skill maintains a cached table of Workflowy node IDs in the memory file `workflowy_node_links.md`. This avoids repeated `find_node` calls for structural nodes that rarely change.
 
-**Memory file location:** `/Users/dromologue/.claude/projects/-Users-dromologue-code-workflowy-mcp-server/memory/workflowy_node_links.md`
+**Memory file location** (canonical, shared across Claude Code and Claude Desktop):
+
+`/Users/dromologue/code/Dashboard/memory/workflowy_node_links.md`
+
+Symlinks exist in all project memory directories pointing to this canonical file. Any update to this file is visible everywhere.
 
 ### Bootstrap (run BEFORE every command)
 
+**PERFORMANCE RULE: The bootstrap must be fast. Never use `find_node` for structural nodes. Use `search_nodes` with `max_depth:1` as a last resort only.**
+
 1. **Read** the node links memory file using the `Read` tool.
 
-2. **Identify needed nodes** for the current command:
-   - All commands need: Tasks
-   - `daily` also needs: Journal (if checking today's entry), current Weekly priorities node
-   - `weekly` also needs: current Monthly priorities node
-   - `monthly` also needs: previous Monthly priorities node
-   - `capture` also needs: Tags
-   - `triage` also needs: Inbox, Resources, Links
-   - `reading` also needs: Resources, Links
-   - `journal` also needs: Journal
-   - `status` needs only: Tasks
+2. **Identify needed nodes** for the current command — **only load what this command requires**:
+   - `daily`: Tasks + Weekly priorities node
+   - `weekly`: Tasks + Monthly priorities node
+   - `monthly`: Tasks + previous Monthly priorities node
+   - `capture`: Tasks + Tags
+   - `triage`: Tasks + Inbox + Links
+   - `reading`: Tasks + Links + Reading List
+   - `journal`: Tasks + Journal
+   - `status`: Tasks only
 
-3. **Validate** each needed node that has a stored ID:
-   - Call `get_node(stored_id)` for each
-   - If the returned node name matches the expected name → **use this ID** (skip `find_node`)
-   - If the node is not found or the name doesn't match → mark as invalid
+3. **Skip validation if recently verified**: For each needed node that has a stored ID:
+   - If `Last Verified` is **today's date** → **trust it, skip validation entirely** (no API call)
+   - If `Last Verified` is within the last 7 days → **trust it, skip validation** (structural nodes don't move)
+   - If `Last Verified` is older than 7 days or empty → validate via `get_node(stored_id)` (one fast API call per node)
 
-4. **Resolve** any invalid or empty entries:
-   - Call `find_node` for each missing/invalid node
+4. **Resolve missing or invalid entries** (rare — only on first use or after structural changes):
+   - Use `search_nodes(query="node name", max_depth=1, max_results=3)` — this is faster than `find_node` because it doesn't fetch full subtrees
+   - **NEVER use `find_node`** for structural bootstrap — it fetches entire subtrees and is slow
    - Update the memory file with the correct Node ID and today's date as `Last Verified`
-   - Write the updated file back using the `Write` tool (overwrite the whole file, preserving the frontmatter and table format)
 
-5. **First-use population**: If the memory file has no IDs at all, resolve ALL structural nodes (Tasks, Inbox, Tags, Resources, Links, Journal, Reading List) in one pass and write them all.
+5. **First-use population**: If the memory file has few or no IDs, resolve only the nodes needed for the current command (not all 7). Use parallel `search_nodes` calls where possible.
 
 ### Updating Priority Nodes
 
@@ -96,7 +101,7 @@ Whenever the skill **creates** a new priority node (Monthly Priorities, Week of,
 
 ### Validation Rules
 
-- Structural nodes: validate by exact name match (e.g. `get_node` returns a node named "Tasks")
+- Structural nodes: validate by name substring match (node names may contain emoji prefixes like "📋 Tasks")
 - Priority nodes: validate by prefix match (e.g. node name starts with "Monthly Priorities" or "Week of" or "Today —")
 - If a priority node's `Last Verified` date is older than 30 days, treat it as stale and re-resolve
 
