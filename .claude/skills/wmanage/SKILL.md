@@ -2,7 +2,7 @@
 name: wmanage
 description: Day-to-day Workflowy management. Daily/weekly/monthly prioritisation, task capture, inbox triage, project status, reading list management, and journal check-ins. Use when the user wants to plan, review, organise their work, or journal.
 argument-hint: [daily|weekly|monthly|capture|status|triage|reading|journal]
-allowed-tools: Read, Bash, Glob, Grep, AskUserQuestion, WebFetch
+allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__bulk_update
 ---
 
 # Workflowy Day-to-Day Manager
@@ -32,10 +32,9 @@ If the first argument doesn't match any command, treat the entire `$ARGUMENTS` a
 
 The user's Workflowy has this layout:
 
-- **Tasks** (top-level node) — contains level-2 domain nodes:
-  - Office
-  - Home
-  - Reading List
+- **Tasks** (top-level node) — contains level-2 domain/category nodes:
+  - Personal Tasks, Dromologue Tasks, Office Tasks (task domains)
+  - **Reading List** (also under Tasks, used for `/wmanage reading`)
   - (others discovered dynamically via `list_children`)
 - **Inbox** (top-level node) — untriaged links, ideas, items to process
 - **Tags** (top-level node) — tag definitions discovered dynamically
@@ -59,17 +58,58 @@ Be aware of two classification systems:
 
 The skill maintains a cached table of Workflowy node IDs in the memory file `workflowy_node_links.md`. This avoids repeated `find_node` calls for structural nodes that rarely change.
 
-**Memory file location** (canonical, shared across Claude Code and Claude Desktop):
+**Memory file location** — try these paths in order, use the first one found by the `Read` tool:
 
-`/Users/dromologue/code/Dashboard/memory/workflowy_node_links.md`
+1. `.auto-memory/workflowy_node_links.md` (Cowork sessions — relative to session mount)
+2. `$HOME/.claude/memory/workflowy_node_links.md` (global fallback for Claude Code)
 
-Symlinks exist in all project memory directories pointing to this canonical file. Any update to this file is visible everywhere.
+**If ALL reads fail** (file not found in any location): create an empty memory file using the template below at the first writable path. Then run first-use population (step 5 of bootstrap) to discover and populate the user's actual node IDs.
+
+### Memory File Template
+
+When creating or repairing the memory file, use this exact format. All ID fields start empty — the bootstrap populates them by discovering the user's actual Workflowy structure.
+
+```markdown
+---
+name: Workflowy Node Links
+description: Cached Workflowy node IDs for structural nodes — avoids repeated search_nodes calls
+type: reference
+---
+
+## Structural Nodes (rarely change)
+
+| Node Name | Node ID | Last Verified |
+|-----------|---------|---------------|
+| Tasks     |         |               |
+| Inbox     |         |               |
+| Tags      |         |               |
+| Resources |         |               |
+| Links     |         |               |
+| Journal   |         |               |
+| Reading List |      |               |
+
+## Domain Nodes (under Tasks — discovered dynamically)
+
+| Node Name | Node ID | Last Verified |
+|-----------|---------|---------------|
+
+## Priority Nodes (change periodically)
+
+| Node Type | Node Name | Node ID | Last Verified |
+|-----------|-----------|---------|---------------|
+|           |           |         |               |
+```
+
+**Node name matching**: Structural node names in the user's Workflowy may include emoji prefixes (e.g. "📋 Tasks") or hashtags (e.g. "#tags"). When searching, match by substring — e.g. search for "Tasks" and accept any node whose name contains "Tasks" at the top level.
 
 ### Bootstrap (run BEFORE every command)
 
 **PERFORMANCE RULE: The bootstrap must be fast. Never use `find_node` for structural nodes. Use `search_nodes` with `max_depth:1` as a last resort only.**
 
-1. **Read** the node links memory file using the `Read` tool.
+1. **Read** the node links memory file using the `Read` tool, trying each path in the order listed above.
+   - If a file is found and has IDs populated → proceed to step 2.
+   - If a file is found but has empty ID columns → proceed to step 5 (first-use population).
+   - **If no file is found at any path** → create an empty file from the template at the first writable location, then proceed to step 5 (first-use population).
 
 2. **Identify needed nodes** for the current command — **only load what this command requires**:
    - `daily`: Tasks + Weekly priorities node
@@ -134,7 +174,7 @@ Priority nodes are stored in Workflowy so they persist across sessions:
 
 ### Steps
 
-1. **Load weekly context**: Use the cached Weekly priorities node ID from the node links memory file. If no cached ID or validation fails, use `find_node` with `match_mode: "contains"` to find the most recent "Week of" node under Tasks, then update the memory file. Read its children to understand this week's priorities.
+1. **Load weekly context**: Use the cached Weekly priorities node ID from the node links memory file. If no cached ID or validation fails, use `search_nodes(query="Week of", max_depth=2, parent_id=Tasks_ID)` to find the most recent "Week of" node under Tasks, then update the memory file. Read its children to understand this week's priorities.
 
 2. **Get daily review**: Call `daily_review` to get overdue items, upcoming items, and recent changes in one call.
 
@@ -156,7 +196,7 @@ Runs when `/wmanage weekly` is invoked.
 
 ### Steps
 
-1. **Load monthly context**: Use the cached Monthly priorities node ID from the node links memory file. If no cached ID or validation fails, use `find_node` with `match_mode: "contains"` to find the most recent "Monthly Priorities" node under Tasks, then update the memory file. Read its children for this month's themes.
+1. **Load monthly context**: Use the cached Monthly priorities node ID from the node links memory file. If no cached ID or validation fails, use `search_nodes(query="Monthly Priorities", max_depth=2, parent_id=Tasks_ID)` to find the most recent "Monthly Priorities" node under Tasks, then update the memory file. Read its children for this month's themes.
 
 2. **Review the past week**:
    - Call `get_recent_changes` with a 7-day window to see what was modified
@@ -183,7 +223,7 @@ Runs when `/wmanage monthly` is invoked.
 
 1. **Review task domains**: Call `get_project_summary` on the Tasks node (using cached Tasks ID) to get a high-level view of all domains — node counts, todo states, tags, overdue items.
 
-2. **Load previous month**: Use the cached Monthly priorities node ID from the memory file. If no cached ID or validation fails, use `find_node` to find the previous "Monthly Priorities" node. Review what was achieved vs. planned.
+2. **Load previous month**: Use the cached Monthly priorities node ID from the memory file. If no cached ID or validation fails, use `search_nodes(query="Monthly Priorities", max_depth=2, parent_id=Tasks_ID)` to find the previous "Monthly Priorities" node. Review what was achieved vs. planned.
 
 3. **Present themes**: Show the user:
    - Summary of each domain (items count, overdue, tags)
@@ -228,7 +268,7 @@ Runs when `/wmanage status` is invoked.
 
 1. **Get summary**: Call `get_project_summary` on the Tasks node (using cached Tasks ID) to get comprehensive stats.
 
-2. **Load current priorities**: Use the cached Monthly and Weekly priority node IDs from the memory file for context. If missing or invalid, fall back to `find_node` and update the memory file.
+2. **Load current priorities**: Use the cached Monthly and Weekly priority node IDs from the memory file for context. If missing or invalid, fall back to `search_nodes` with the appropriate query and update the memory file.
 
 3. **Present status**: Show the user:
    - Per-domain breakdown (total items, active todos, completed, overdue)
