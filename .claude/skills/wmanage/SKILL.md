@@ -30,16 +30,21 @@ If the first argument doesn't match any command, treat the entire `$ARGUMENTS` a
 
 ## Workflowy Structure
 
-The user's Workflowy has this layout:
+The skill discovers the user's Workflowy structure dynamically on first run. It expects these **structural roles** (names may vary):
 
-- **Tasks** (top-level node) — contains level-2 domain/category nodes:
-  - Personal Tasks, Dromologue Tasks, Office Tasks (task domains)
-  - **Reading List** (also under Tasks, used for `/wmanage reading`)
-  - (others discovered dynamically via `list_children`)
-- **Inbox** (top-level node) — untriaged links, ideas, items to process
-- **Tags** (top-level node) — tag definitions discovered dynamically
-- **Resources** (top-level node) — contains a **Links** node with sub-folders for archiving read/triaged links
-- **Journal** (top-level node) — date-based journal entries, each child is a date node (e.g. "2026-04-03")
+| Role | Description | How Discovered |
+|------|-------------|----------------|
+| Tasks | Top-level container for task domains | `search_nodes` at depth 1 |
+| Inbox | Untriaged items to process | `search_nodes` at depth 1 |
+| Tags | Tag definitions | `search_nodes` at depth 1 |
+| Resources | Reference materials, links archive | `search_nodes` at depth 1 |
+| Links | Sub-folder archive under Resources | `list_children` on Resources |
+| Journal | Date-based journal entries | `search_nodes` at depth 1 |
+| Reading List | Items to read (under Tasks) | `list_children` on Tasks |
+
+**Domain nodes** (task categories under Tasks) are **always discovered dynamically** via `list_children` on the Tasks node. Never hardcode domain names — each user's domains will differ.
+
+If a structural node cannot be found during first-run discovery, ask the user what their equivalent node is called via `AskUserQuestion`, then store the mapping in the memory file.
 
 ### Node Classification
 
@@ -61,9 +66,10 @@ The skill maintains a cached table of Workflowy node IDs in the memory file `wor
 **Memory file location** — try these paths in order, use the first one found by the `Read` tool:
 
 1. `.auto-memory/workflowy_node_links.md` (Cowork sessions — relative to session mount)
-2. `$HOME/.claude/memory/workflowy_node_links.md` (global fallback for Claude Code)
+2. The project memory directory under `$HOME/.claude/projects/*/memory/workflowy_node_links.md` (Claude Code project memory — use `Glob` to find the exact path)
+3. `$HOME/.claude/memory/workflowy_node_links.md` (global fallback)
 
-**If ALL reads fail** (file not found in any location): create an empty memory file using the template below at the first writable path. Then run first-use population (step 5 of bootstrap) to discover and populate the user's actual node IDs.
+**If ALL reads fail** (file not found in any location): create a new memory file using the template below at the first writable path. Then run first-use population (step 5 of bootstrap) to discover and populate the user's actual Workflowy structure via interactive discovery.
 
 ### Memory File Template
 
@@ -131,7 +137,13 @@ type: reference
    - **NEVER use `find_node`** for structural bootstrap — it fetches entire subtrees and is slow
    - Update the memory file with the correct Node ID and today's date as `Last Verified`
 
-5. **First-use population**: If the memory file has few or no IDs, resolve only the nodes needed for the current command (not all 7). Use parallel `search_nodes` calls where possible.
+5. **First-use population**: If the memory file has few or no IDs:
+   - Use `search_nodes(query="node name", max_depth=1, max_results=5)` to find candidates for each needed structural node. Use parallel calls where possible.
+   - If a search returns multiple candidates, or no clear match, present the options to the user via `AskUserQuestion` and ask them to confirm which node serves each structural role.
+   - If no match at all, ask the user what their equivalent node is called (they may use different names or not have all structural nodes).
+   - Discover domain nodes dynamically: once Tasks is resolved, call `list_children` on it and store all child nodes as domains in the Domain Nodes table.
+   - Resolve only the nodes needed for the current command (not all 7 at once) to keep first-run fast.
+   - Update the memory file with all discovered IDs and today's date.
 
 ### Updating Priority Nodes
 
@@ -276,7 +288,7 @@ Runs when `/wmanage status` is invoked.
    - Progress against current monthly/weekly priorities
    - Items needing attention (overdue, tagged #urgent)
 
-4. **Suggest actions**: Based on the status, suggest next steps (e.g. "3 overdue items in Office — consider `/wmanage daily` to reprioritise").
+4. **Suggest actions**: Based on the status, suggest next steps (e.g. "3 overdue items in [domain] — consider `/wmanage daily` to reprioritise").
 
 ---
 
@@ -292,15 +304,15 @@ Runs when `/wmanage triage` is invoked.
 
 3. **Discover domains**: Use the cached Tasks node ID → `list_children` to get available domains.
 
-4. **Discover link folders**: Use the cached Resources and Links node IDs → `list_children` on Links to get available link sub-folders (e.g. "Tech", "Design", "Research"). These are the archive destinations for URL items.
+4. **Discover link folders**: Use the cached Resources and Links node IDs → `list_children` on Links to get available link sub-folders. These are the archive destinations for URL items.
 
 5. **Process each item interactively**: For each Inbox item:
    - Show the item content
    - If it's a URL, briefly describe what it looks like (don't fetch yet — save that for `/wmanage reading`)
    - Suggest a destination based on content and current priorities
    - Ask the user via `AskUserQuestion`:
-     - **If it's a link/URL**: Present the Links sub-folders as options (e.g. "Archive to Links > Tech", "Archive to Links > Research"), plus Move to Reading List, Keep in Inbox, Delete
-     - **If it's a task/idea**: Present task domains (Office, Home, etc.), plus Keep in Inbox, Delete
+     - **If it's a link/URL**: Present the discovered Links sub-folders as archive options, plus Move to Reading List, Keep in Inbox, Delete
+     - **If it's a task/idea**: Present the discovered task domains as options, plus Keep in Inbox, Delete
 
 6. **Execute moves**: For items the user chose to move, use `move_node` to relocate them. Links go to the chosen sub-folder under Resources > Links. Tasks go to the chosen domain under Tasks (set as todo type).
 
