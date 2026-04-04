@@ -55,6 +55,53 @@ Be aware of two classification systems:
 
 ---
 
+## Node Link Management
+
+The skill maintains a cached table of Workflowy node IDs in the memory file `workflowy_node_links.md`. This avoids repeated `find_node` calls for structural nodes that rarely change.
+
+**Memory file location:** `/Users/dromologue/.claude/projects/-Users-dromologue-code-workflowy-mcp-server/memory/workflowy_node_links.md`
+
+### Bootstrap (run BEFORE every command)
+
+1. **Read** the node links memory file using the `Read` tool.
+
+2. **Identify needed nodes** for the current command:
+   - All commands need: Tasks
+   - `daily` also needs: Journal (if checking today's entry), current Weekly priorities node
+   - `weekly` also needs: current Monthly priorities node
+   - `monthly` also needs: previous Monthly priorities node
+   - `capture` also needs: Tags
+   - `triage` also needs: Inbox, Resources, Links
+   - `reading` also needs: Resources, Links
+   - `journal` also needs: Journal
+   - `status` needs only: Tasks
+
+3. **Validate** each needed node that has a stored ID:
+   - Call `get_node(stored_id)` for each
+   - If the returned node name matches the expected name → **use this ID** (skip `find_node`)
+   - If the node is not found or the name doesn't match → mark as invalid
+
+4. **Resolve** any invalid or empty entries:
+   - Call `find_node` for each missing/invalid node
+   - Update the memory file with the correct Node ID and today's date as `Last Verified`
+   - Write the updated file back using the `Write` tool (overwrite the whole file, preserving the frontmatter and table format)
+
+5. **First-use population**: If the memory file has no IDs at all, resolve ALL structural nodes (Tasks, Inbox, Tags, Resources, Links, Journal, Reading List) in one pass and write them all.
+
+### Updating Priority Nodes
+
+Whenever the skill **creates** a new priority node (Monthly Priorities, Week of, Today) or **discovers** one via search:
+- Update the Priority Nodes table in the memory file with the node's name, ID, and today's date
+- Replace any previous entry of the same type (e.g. old "Week of" entry gets overwritten by the new one)
+
+### Validation Rules
+
+- Structural nodes: validate by exact name match (e.g. `get_node` returns a node named "Tasks")
+- Priority nodes: validate by prefix match (e.g. node name starts with "Monthly Priorities" or "Week of" or "Today —")
+- If a priority node's `Last Verified` date is older than 30 days, treat it as stale and re-resolve
+
+---
+
 ## Prioritisation Cascade
 
 The three time-horizon commands form a cascade. Each level reads the one above it for context:
@@ -82,7 +129,7 @@ Priority nodes are stored in Workflowy so they persist across sessions:
 
 ### Steps
 
-1. **Load weekly context**: Use `find_node` with `match_mode: "contains"` to find the most recent "Week of" node under Tasks. Read its children to understand this week's priorities.
+1. **Load weekly context**: Use the cached Weekly priorities node ID from the node links memory file. If no cached ID or validation fails, use `find_node` with `match_mode: "contains"` to find the most recent "Week of" node under Tasks, then update the memory file. Read its children to understand this week's priorities.
 
 2. **Get daily review**: Call `daily_review` to get overdue items, upcoming items, and recent changes in one call.
 
@@ -94,7 +141,7 @@ Priority nodes are stored in Workflowy so they persist across sessions:
 
 4. **Ask for today's focus**: Present the most important items and ask the user to confirm 1-3 focus items for today. Use `AskUserQuestion` with the top candidates as options.
 
-5. **Optionally insert**: If the user wants, insert a "Today — [YYYY-MM-DD]" node under Tasks with the chosen focus items as todo-type children.
+5. **Optionally insert**: If the user wants, insert a "Today — [YYYY-MM-DD]" node under Tasks (using cached Tasks ID) with the chosen focus items as todo-type children. Update the Today entry in the Priority Nodes table of the memory file.
 
 ---
 
@@ -104,7 +151,7 @@ Runs when `/wmanage weekly` is invoked.
 
 ### Steps
 
-1. **Load monthly context**: Use `find_node` with `match_mode: "contains"` to find the most recent "Monthly Priorities" node under Tasks. Read its children for this month's themes.
+1. **Load monthly context**: Use the cached Monthly priorities node ID from the node links memory file. If no cached ID or validation fails, use `find_node` with `match_mode: "contains"` to find the most recent "Monthly Priorities" node under Tasks, then update the memory file. Read its children for this month's themes.
 
 2. **Review the past week**:
    - Call `get_recent_changes` with a 7-day window to see what was modified
@@ -119,7 +166,7 @@ Runs when `/wmanage weekly` is invoked.
 
 4. **Set weekly focus**: Ask the user to choose 3-5 focus items for the coming week, informed by monthly priorities. Use `AskUserQuestion`.
 
-5. **Insert**: Create a "Week of [YYYY-MM-DD]" node under Tasks with the chosen priorities as todo-type children. Include any carried-over items from the previous week.
+5. **Insert**: Create a "Week of [YYYY-MM-DD]" node under Tasks (using cached Tasks ID) with the chosen priorities as todo-type children. Include any carried-over items from the previous week. Update the Weekly entry in the Priority Nodes table of the memory file with the new node's ID.
 
 ---
 
@@ -129,9 +176,9 @@ Runs when `/wmanage monthly` is invoked.
 
 ### Steps
 
-1. **Review task domains**: Call `get_project_summary` on the Tasks node to get a high-level view of all domains — node counts, todo states, tags, overdue items.
+1. **Review task domains**: Call `get_project_summary` on the Tasks node (using cached Tasks ID) to get a high-level view of all domains — node counts, todo states, tags, overdue items.
 
-2. **Load previous month**: Use `find_node` to find the previous "Monthly Priorities" node. Review what was achieved vs. planned.
+2. **Load previous month**: Use the cached Monthly priorities node ID from the memory file. If no cached ID or validation fails, use `find_node` to find the previous "Monthly Priorities" node. Review what was achieved vs. planned.
 
 3. **Present themes**: Show the user:
    - Summary of each domain (items count, overdue, tags)
@@ -140,7 +187,7 @@ Runs when `/wmanage monthly` is invoked.
 
 4. **Set monthly priorities**: Ask the user to define 3-5 monthly priorities (themes or big rocks). Use `AskUserQuestion`.
 
-5. **Insert**: Create a "Monthly Priorities — [Month Year]" node under Tasks with the priorities as children. Each priority can have sub-items for specific deliverables.
+5. **Insert**: Create a "Monthly Priorities — [Month Year]" node under Tasks (using cached Tasks ID) with the priorities as children. Each priority can have sub-items for specific deliverables. Update the Monthly entry in the Priority Nodes table of the memory file with the new node's ID.
 
 ---
 
@@ -154,13 +201,13 @@ Runs when `/wmanage capture` is invoked. Remaining arguments after `capture` are
    - If two+ words and the first word looks like a category name → treat first word as category, rest as task
    - If unclear → treat everything as the task description and ask for category
 
-2. **Discover domains**: Call `find_node("Tasks")` then `list_children` to get all level-2 domain nodes.
+2. **Discover domains**: Use the cached Tasks node ID, then `list_children` to get all level-2 domain nodes.
 
 3. **Match category**:
    - If category argument given, fuzzy-match it to a domain name (case-insensitive, partial match OK)
    - If no category or no match, present the domains to the user via `AskUserQuestion` and ask which one
 
-4. **Discover tags** (optional): Call `find_node("Tags")` → `list_children` to get available tags. Ask the user if they want to apply any tags to the new task.
+4. **Discover tags** (optional): Use the cached Tags node ID → `list_children` to get available tags. Ask the user if they want to apply any tags to the new task.
 
 5. **Create the task**: Use `insert_content` or `smart_insert` to add the task under the chosen domain. Set it as a **Workflowy todo type**. Include any tags in the node name or note.
 
@@ -174,9 +221,9 @@ Runs when `/wmanage status` is invoked.
 
 ### Steps
 
-1. **Get summary**: Call `get_project_summary` on the Tasks node to get comprehensive stats.
+1. **Get summary**: Call `get_project_summary` on the Tasks node (using cached Tasks ID) to get comprehensive stats.
 
-2. **Load current priorities**: Find the most recent Monthly and Weekly priority nodes for context.
+2. **Load current priorities**: Use the cached Monthly and Weekly priority node IDs from the memory file for context. If missing or invalid, fall back to `find_node` and update the memory file.
 
 3. **Present status**: Show the user:
    - Per-domain breakdown (total items, active todos, completed, overdue)
@@ -194,13 +241,13 @@ Runs when `/wmanage triage` is invoked.
 
 ### Steps
 
-1. **Load Inbox**: Call `find_node("Inbox")` then `list_children` to get all items.
+1. **Load Inbox**: Use the cached Inbox node ID, then `list_children` to get all items.
 
-2. **Load context**: Read current monthly/weekly priorities to inform triage decisions.
+2. **Load context**: Use cached Monthly/Weekly priority node IDs to inform triage decisions.
 
-3. **Discover domains**: Call `list_children` on Tasks to get available domains.
+3. **Discover domains**: Use the cached Tasks node ID → `list_children` to get available domains.
 
-4. **Discover link folders**: Call `find_node("Resources")` → `find_node("Links")` under it → `list_children` to get available link sub-folders (e.g. "Tech", "Design", "Research"). These are the archive destinations for URL items.
+4. **Discover link folders**: Use the cached Resources and Links node IDs → `list_children` on Links to get available link sub-folders (e.g. "Tech", "Design", "Research"). These are the archive destinations for URL items.
 
 5. **Process each item interactively**: For each Inbox item:
    - Show the item content
@@ -224,9 +271,9 @@ Runs when `/wmanage reading` is invoked.
 
 ### Steps
 
-1. **Load Reading List**: Call `find_node("Reading List")` then `list_children` to get all items.
+1. **Load Reading List**: Use the cached Reading List node ID, then `list_children` to get all items.
 
-2. **Load priorities**: Read current monthly/weekly priorities for relevance scoring.
+2. **Load priorities**: Use cached Monthly/Weekly priority node IDs for relevance scoring.
 
 3. **Fetch and summarise**: For each item that looks like a URL:
    - Use `WebFetch` to retrieve the page content
@@ -240,7 +287,7 @@ Runs when `/wmanage reading` is invoked.
    - Relevance to current priorities (and why)
    - Suggested priority: Read Now / Read This Week / Someday / Archive
 
-5. **Discover link folders**: Call `find_node("Resources")` → `find_node("Links")` under it → `list_children` to get available link archive sub-folders.
+5. **Discover link folders**: Use cached Resources and Links node IDs → `list_children` on Links to get available link archive sub-folders.
 
 6. **Ask for actions**: For each item, use `AskUserQuestion` to let user choose:
    - **Read Now** — keep on Reading List, mark high priority
@@ -259,7 +306,7 @@ Runs when `/wmanage journal` is invoked.
 
 ### Steps
 
-1. **Find the Journal node**: Call `find_node("Journal")` to locate the top-level Journal node.
+1. **Find the Journal node**: Use the cached Journal node ID from the node links memory file.
 
 2. **Check for today's entry**: Call `list_children` on the Journal node and look for a child matching today's date (format: `YYYY-MM-DD`, e.g. "2026-04-03").
 
