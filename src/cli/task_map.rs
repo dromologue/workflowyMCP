@@ -1,5 +1,5 @@
-/// Task map CLI tool
-/// Generates task maps from Workflowy tags
+//! Task map CLI tool.
+//! Generates task maps from Workflowy tags.
 
 use clap::Parser;
 use workflowy_mcp_server::error::Result;

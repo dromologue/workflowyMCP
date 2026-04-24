@@ -1,5 +1,5 @@
-/// Integration test: Insert a test bullet into Workflowy inbox
-/// This test uses the REAL Workflowy API - not mocked
+//! Integration test: Insert a test bullet into Workflowy inbox.
+//! This test uses the REAL Workflowy API - not mocked.
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -32,7 +32,7 @@ async fn main() {
     });
 
     let response = client
-        .post(&format!("{}/nodes", base_url))
+        .post(format!("{}/nodes", base_url))
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&create_body)
         .send()

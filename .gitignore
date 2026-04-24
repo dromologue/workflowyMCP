@@ -6,6 +6,9 @@ dist/
 coverage/
 target/
 
+# Claude Code skills live in ~/.claude/skills/, not in the repo.
+.claude/skills/
+
 # Ignore root .md files except README
 /*.md
 !README.md

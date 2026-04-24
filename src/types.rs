@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(node.last_modified, Some(1772305834));
         // "createdAt" maps to "created_at" via serde alias
         assert_eq!(node.created_at, Some(1765373200));
-        assert_eq!(node.completed, false);
+        assert!(!node.completed);
         assert_eq!(node.priority, Some(5900));
         // Nested data
         let data = node.data.unwrap();
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(node.name, "Test");
         assert_eq!(node.description, None);
         assert_eq!(node.last_modified, None);
-        assert_eq!(node.completed, false);
+        assert!(!node.completed);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         });
 
         let node: WorkflowyNode = serde_json::from_value(api_json).unwrap();
-        assert_eq!(node.completed, true);
+        assert!(node.completed);
         assert_eq!(node.completed_at, Some(1700000000));
     }
 }

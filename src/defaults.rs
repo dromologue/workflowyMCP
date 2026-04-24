@@ -1,5 +1,5 @@
-/// Centralized default values and constants for the Workflowy MCP server.
-/// All magic numbers belong here so they're easy to find and tune.
+//! Centralized default values and constants for the Workflowy MCP server.
+//! All magic numbers belong here so they're easy to find and tune.
 
 // --- Cache ---
 /// How long cached nodes remain valid (seconds)
@@ -64,6 +64,9 @@ pub const DEFAULT_SEARCH_DEPTH: usize = 3;
 pub const DEFAULT_REVIEW_DEPTH: usize = 5;
 /// Maximum recursion depth for subtree fetching
 pub const MAX_TREE_DEPTH: usize = 10;
+/// Hard cap on nodes returned by a single subtree fetch.
+/// Callers receive a `truncated` flag whenever this cap is hit.
+pub const MAX_SUBTREE_NODES: usize = 10_000;
 
 // --- API ---
 /// Workflowy API base URL
@@ -76,7 +79,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_defaults_are_reasonable() {
+        // Defence-in-depth: catch a careless edit that sets a bad default.
         assert!(CACHE_TTL_SECS > 0 && CACHE_TTL_SECS <= 300);
         assert!(RETRY_MAX_ATTEMPTS >= 1 && RETRY_MAX_ATTEMPTS <= 10);
         assert!(RATE_LIMIT_RPS >= 1);

@@ -1,4 +1,4 @@
-/// Subtree collection and todo detection utilities
+//! Subtree collection and todo detection utilities.
 
 use std::collections::HashMap;
 use crate::types::WorkflowyNode;

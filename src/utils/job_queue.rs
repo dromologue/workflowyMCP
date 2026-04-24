@@ -1,5 +1,5 @@
-/// Background job queue for long-running operations
-/// Addresses: "Job queue timeouts", "Memory leak on job history"
+//! Background job queue for long-running operations.
+//! Addresses: "Job queue timeouts", "Memory leak on job history".
 
 use crate::config::JobQueueConfig;
 use crate::error::{Result, WorkflowyError};

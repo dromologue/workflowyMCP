@@ -1,5 +1,5 @@
-/// Due date extraction from node text
-/// Parses due:YYYY-MM-DD, #due-YYYY-MM-DD, and bare YYYY-MM-DD patterns
+//! Due date extraction from node text.
+//! Parses due:YYYY-MM-DD, #due-YYYY-MM-DD, and bare YYYY-MM-DD patterns.
 
 use chrono::NaiveDate;
 use regex::Regex;

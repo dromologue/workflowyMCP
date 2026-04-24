@@ -1,4 +1,4 @@
-/// API module exports
+//! API module exports
 pub mod client;
 
-pub use client::WorkflowyClient;
+pub use client::{SubtreeFetch, WorkflowyClient};

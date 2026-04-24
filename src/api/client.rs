@@ -1,5 +1,5 @@
-/// Workflowy API client with retry logic and proper error handling
-/// Addresses: path traversal, error context, retry handling
+//! Workflowy API client with retry logic and proper error handling
+//! Addresses: path traversal, error context, retry handling
 
 use crate::config::{RetryConfig, RateLimitConfig};
 use crate::defaults;
@@ -12,6 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Result of a subtree fetch. `truncated` is true when the node cap was hit
+/// and `nodes` therefore reflects a partial view of the tree.
+#[derive(Debug, Clone)]
+pub struct SubtreeFetch {
+    pub nodes: Vec<WorkflowyNode>,
+    pub truncated: bool,
+    pub limit: usize,
+}
 
 pub struct WorkflowyClient {
     http_client: Client,
@@ -82,59 +90,71 @@ impl WorkflowyClient {
     /// Recursively fetch a subtree rooted at `root_id` up to `max_depth` levels.
     /// If `root_id` is None, fetches from the workspace root (top-level nodes).
     /// When `root_id` is Some, the root node itself is included as the first element.
-    /// Returns a flat Vec of all nodes in the subtree with correct parent_id set.
+    /// Returns a [`SubtreeFetch`] with the flat node list and a `truncated` flag
+    /// indicating whether the [`defaults::MAX_SUBTREE_NODES`] cap was hit.
     pub async fn get_subtree_recursive(
         &self,
         root_id: Option<&str>,
         max_depth: usize,
-    ) -> Result<Vec<WorkflowyNode>> {
+    ) -> Result<SubtreeFetch> {
+        self.get_subtree_with_limit(root_id, max_depth, defaults::MAX_SUBTREE_NODES).await
+    }
+
+    /// Same as [`get_subtree_recursive`] but with an explicit node-count cap.
+    /// Exposed mainly for tests; callers that honour the default should use
+    /// [`get_subtree_recursive`].
+    pub async fn get_subtree_with_limit(
+        &self,
+        root_id: Option<&str>,
+        max_depth: usize,
+        node_limit: usize,
+    ) -> Result<SubtreeFetch> {
         let mut all_nodes = Vec::new();
-        match root_id {
+        let truncated = match root_id {
             Some(id) => {
-                // Include the root node itself
                 let root = self.get_node(id).await?;
                 all_nodes.push(root);
                 let children = self.get_children(id).await?;
-                self.fetch_descendants(&children, &mut all_nodes, 0, max_depth).await?;
+                self.fetch_descendants(&children, &mut all_nodes, 0, max_depth, node_limit).await?
             }
             None => {
                 let top = self.get_top_level_nodes().await?;
-                self.fetch_descendants(&top, &mut all_nodes, 0, max_depth).await?;
+                self.fetch_descendants(&top, &mut all_nodes, 0, max_depth, node_limit).await?
             }
-        }
-        Ok(all_nodes)
+        };
+        Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit })
     }
 
     /// Fetch all nodes in the workspace tree. For large trees (250k+ nodes),
     /// prefer `get_subtree_recursive` with a specific root and depth limit.
-    pub async fn get_all_nodes(&self) -> Result<Vec<WorkflowyNode>> {
-        self.get_subtree_recursive(None, 10).await
+    pub async fn get_all_nodes(&self) -> Result<SubtreeFetch> {
+        self.get_subtree_recursive(None, defaults::MAX_TREE_DEPTH).await
     }
 
     /// Fetch descendants level-by-level, sequentially per node (rate-limited).
-    /// Caps total nodes to avoid runaway fetches on large trees.
+    /// Caps total nodes at `node_limit` to avoid runaway fetches on large trees.
+    /// Returns `true` if the cap was hit and traversal stopped early.
     async fn fetch_descendants(
         &self,
         initial_nodes: &[WorkflowyNode],
         out: &mut Vec<WorkflowyNode>,
         start_depth: usize,
         max_depth: usize,
-    ) -> Result<()> {
-        const MAX_NODES: usize = 500;
-
+        node_limit: usize,
+    ) -> Result<bool> {
         let mut current_level: Vec<WorkflowyNode> = initial_nodes.to_vec();
         let mut depth = start_depth;
 
         while depth < max_depth && !current_level.is_empty() {
-            // Add current level to output
             out.extend(current_level.iter().cloned());
-            if out.len() >= MAX_NODES {
-                info!(count = out.len(), "Node cap reached, stopping traversal");
-                return Ok(());
+            if out.len() >= node_limit {
+                out.truncate(node_limit);
+                warn!(limit = node_limit, "Node cap reached, subtree truncated");
+                return Ok(true);
             }
 
-            // Fetch children for each node sequentially (rate limiter gates each call)
             let mut next_level = Vec::new();
+            let mut level_truncated = false;
             for node in &current_level {
                 match self.get_children(&node.id).await {
                     Ok(children) => next_level.extend(children),
@@ -142,23 +162,36 @@ impl WorkflowyClient {
                         warn!(error = %e, node_id = %node.id, "Failed to fetch children, skipping branch");
                     }
                 }
-                if out.len() + next_level.len() >= MAX_NODES {
-                    info!(count = out.len() + next_level.len(), "Node cap approaching, stopping level");
+                if out.len() + next_level.len() >= node_limit {
+                    level_truncated = true;
                     break;
                 }
             }
 
             current_level = next_level;
             depth += 1;
+
+            if level_truncated {
+                let remaining = node_limit.saturating_sub(out.len());
+                out.extend(current_level.into_iter().take(remaining));
+                warn!(limit = node_limit, "Node cap reached during level fetch, subtree truncated");
+                return Ok(true);
+            }
         }
 
-        // Add the final level (at max_depth) without fetching their children
-        if !current_level.is_empty() {
-            let remaining = MAX_NODES.saturating_sub(out.len());
+        // If we stopped because we hit max_depth, the final level's children
+        // were not fetched; that is expected and is not a node-limit truncation.
+        if !current_level.is_empty() && out.len() + current_level.len() > node_limit {
+            let remaining = node_limit.saturating_sub(out.len());
             out.extend(current_level.into_iter().take(remaining));
+            warn!(limit = node_limit, "Node cap reached on final level, subtree truncated");
+            return Ok(true);
+        }
+        if !current_level.is_empty() {
+            out.extend(current_level);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Create a new node
@@ -328,7 +361,7 @@ impl WorkflowyClient {
         let response = req
             .send()
             .await
-            .map_err(|e| WorkflowyError::HttpError(e))?;
+            .map_err(WorkflowyError::HttpError)?;
 
         let status = response.status();
 
@@ -336,7 +369,7 @@ impl WorkflowyClient {
             response
                 .json::<T>()
                 .await
-                .map_err(|e| WorkflowyError::HttpError(e))
+                .map_err(WorkflowyError::HttpError)
         } else {
             let error_text = response
                 .text()
@@ -434,6 +467,11 @@ pub fn validate_file_path(file_path: &str, allowed_base: &str) -> Result<std::pa
 mod tests {
     use super::*;
 
+    fn test_client() -> WorkflowyClient {
+        WorkflowyClient::new("http://invalid.local".to_string(), "test".to_string())
+            .expect("client builds")
+    }
+
     #[test]
     fn test_path_traversal_rejection() {
         let result = validate_file_path("../../etc/passwd", "/home/user");
@@ -451,5 +489,56 @@ mod tests {
         let tmpdir = std::env::temp_dir();
         let result = validate_file_path("file.txt", tmpdir.to_str().unwrap());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_calculate_backoff_grows_and_caps() {
+        let client = test_client();
+        let one = client.calculate_backoff(1);
+        let two = client.calculate_backoff(2);
+        let three = client.calculate_backoff(3);
+        // Allow 10% jitter in either direction.
+        assert!((800..=1200).contains(&one), "attempt 1 = {one}");
+        assert!((1800..=2200).contains(&two), "attempt 2 = {two}");
+        assert!((3600..=4400).contains(&three), "attempt 3 = {three}");
+        // Large attempt counts must not exceed the configured cap + jitter.
+        let capped = client.calculate_backoff(20);
+        assert!(
+            capped <= defaults::RETRY_MAX_DELAY_MS + (defaults::RETRY_MAX_DELAY_MS / 10) + 1,
+            "capped backoff = {capped}",
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_extracts_seconds() {
+        let client = test_client();
+        let body = r#"{"error":"rate limited","retry_after":26}"#;
+        assert_eq!(client.parse_retry_after(body), Some(26_000));
+    }
+
+    #[test]
+    fn test_parse_retry_after_minimum_one_second() {
+        let client = test_client();
+        // A zero retry_after should be clamped to 1s to avoid tight retry loops.
+        let body = r#"{"retry_after":0}"#;
+        assert_eq!(client.parse_retry_after(body), Some(1_000));
+    }
+
+    #[test]
+    fn test_parse_retry_after_missing_field() {
+        let client = test_client();
+        assert_eq!(client.parse_retry_after("{}"), None);
+        assert_eq!(client.parse_retry_after("not json"), None);
+    }
+
+    #[test]
+    fn test_subtree_fetch_clone_and_debug() {
+        // Guard that the public type remains trivially cloneable and printable,
+        // since callers pattern-match on it across tool handlers.
+        let fetch = SubtreeFetch { nodes: Vec::new(), truncated: true, limit: 10_000 };
+        let cloned = fetch.clone();
+        assert!(cloned.truncated);
+        assert_eq!(cloned.limit, 10_000);
+        assert!(format!("{:?}", cloned).contains("SubtreeFetch"));
     }
 }

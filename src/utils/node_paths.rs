@@ -1,5 +1,5 @@
-/// Path building for node display
-/// Builds hierarchical paths by following parent_id chains
+//! Path building for node display.
+//! Builds hierarchical paths by following parent_id chains.
 
 use std::collections::HashMap;
 use crate::types::WorkflowyNode;

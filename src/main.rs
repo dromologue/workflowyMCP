@@ -1,4 +1,4 @@
-/// MCP Server entry point
+//! MCP Server entry point.
 
 use std::sync::Arc;
 use workflowy_mcp_server::{

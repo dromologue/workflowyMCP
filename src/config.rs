@@ -1,5 +1,5 @@
-/// Configuration and environment variable management
-/// Addresses code review issue: "Incomplete config validation"
+//! Configuration and environment variable management.
+//! Addresses code review issue: "Incomplete config validation".
 
 use crate::defaults;
 use crate::error::{WorkflowyError, Result};

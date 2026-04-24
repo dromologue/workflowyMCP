@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                  # compile (debug)
 cargo build --release        # compile (optimized, LTO)
-cargo test --lib             # run all 90+ unit tests
+cargo test --lib             # run all 122 unit tests
 cargo test                   # run all tests (unit + integration)
 cargo run --bin workflowy-mcp-server  # start MCP server
 cargo check                  # type-check without building
@@ -20,7 +20,7 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 ### Module Structure
 
 - **`src/server.rs`** — MCP tool_router with 23 tool handlers. `#[tool]` proc macros register tools; serde + schemars validate inputs via `Parameters<T>` wrapper. Uses `NodeId` newtype for all node ID parameters.
-- **`src/api/client.rs`** — Workflowy API client with exponential backoff retry. `get_subtree_recursive()` fetches tree level-by-level via `/nodes?parent_id=` with configurable depth limit (crucial for 250k+ node trees).
+- **`src/api/client.rs`** — Workflowy API client with exponential backoff retry. `get_subtree_recursive()` fetches tree level-by-level via `/nodes?parent_id=` with configurable depth limit (crucial for 250k+ node trees). Returns `SubtreeFetch { nodes, truncated, limit }`; when the `MAX_SUBTREE_NODES` cap (10 000 by default, `defaults.rs`) is hit the flag is surfaced in every tool response so callers can narrow the scope.
 - **`src/defaults.rs`** — Centralized constants for all magic numbers (cache TTL, retry config, validation limits, tree depth defaults).
 - **`src/types.rs`** — Core types including `NodeId` newtype with `Deref<str>`, `AsRef<str>`, `PartialEq<String>`, and `JsonSchema` impls.
 - **`src/utils/`** — Reusable modules: cache (injectable), date/tag parsing, node paths, subtree collection, rate limiter, job queue.
@@ -63,15 +63,15 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 
 ### Known Limitations
 
-- Request queue and orchestrator are stubs
-- bulk_update complete/uncomplete operations are no-ops (API endpoints not modeled yet)
+- `bulk_update` `complete` / `uncomplete` are rejected at the handler boundary — the Workflowy completion endpoints are not yet modelled in the client. Tag-based workflows are the interim substitute.
+- Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000). Tools surface a `truncated` flag when the cap is hit; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
 
 ## Testing
 
 Unit tests use `#[cfg(test)]` modules alongside source. No live API calls in unit tests. Integration test in `tests/live_insert.rs` requires `WORKFLOWY_API_KEY`.
 
 ```bash
-cargo test --lib                           # unit tests only (106 tests)
+cargo test --lib                           # unit tests only (122 tests)
 cargo test --lib -- test_name              # run specific test
 cargo test --lib -- --nocapture            # with stdout
 ```

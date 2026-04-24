@@ -1,5 +1,5 @@
-/// Input validation utilities for MCP tool parameters.
-/// Addresses: MCP Principle #14 (API Design Fundamentals) and #5 (Security First)
+//! Input validation utilities for MCP tool parameters.
+//! Addresses: MCP Principle #14 (API Design Fundamentals) and #5 (Security First).
 
 use crate::defaults;
 use crate::error::{WorkflowyError, Result};

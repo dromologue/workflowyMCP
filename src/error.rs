@@ -1,5 +1,5 @@
-/// Custom error types for the MCP server
-/// Addresses code review issue: "Incomplete error context"
+//! Custom error types for the MCP server.
+//! Addresses code review issue: "Incomplete error context".
 
 use thiserror::Error;
 

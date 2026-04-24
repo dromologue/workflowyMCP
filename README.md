@@ -2,7 +2,7 @@
 
 A Rust MCP server that gives Claude full read/write access to your Workflowy outline. Search, insert, organize, manage tasks, and track deadlines — all through natural language.
 
-Works with **Claude Desktop** (MCP tools) and **Claude Code** (CLI + skills).
+Works with **Claude Desktop** and **Claude Code** as an MCP server.
 
 ## Prerequisites
 
@@ -67,30 +67,19 @@ Add to your Claude Desktop config:
 
 Restart Claude Desktop after saving. The 23 tools listed below become available immediately.
 
-**Large trees (100k+ nodes):** Search and review tools use a `max_depth` parameter (default: 3–5) to avoid fetching the entire tree. Increase `max_depth` for deeper searches, or use `parent_id`/`root_id` to scope operations to a subtree.
+**Large trees (100k+ nodes):** Search and review tools use a `max_depth` parameter (default: 3–5) to avoid fetching the entire tree. Subtree fetches also cap at 10 000 nodes; every tool response includes a `truncated` flag (and a `truncation_limit`) when that cap is hit, so you can narrow with `parent_id`/`root_id` or reduce `max_depth`. `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view to avoid partial copies or partial deletes.
 
-### 3. Claude Code (skill)
+### 3. Claude Code
 
-The repo includes a `/wmanage` skill for day-to-day Workflowy management directly from Claude Code.
-
-**Install the skill** by registering the MCP server with Claude Code:
-
-```bash
-# From the project directory
-claude mcp add workflowy -- ./target/release/workflowy-mcp-server
-```
-
-Or, if you prefer to point at the absolute path:
+Register the MCP server with Claude Code so its 23 tools appear in every session:
 
 ```bash
 claude mcp add workflowy -- /absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server
 ```
 
-The `/wmanage` skill is automatically available when Claude Code is run from the project directory (it lives at `.claude/skills/wmanage/SKILL.md`). To use it from other directories, copy the `.claude/skills/wmanage/` folder into that project's `.claude/skills/` directory.
+Verify with `claude mcp list` — the entry should report `✓ Connected`.
 
 ## Usage
-
-### Via Claude Desktop (MCP tools)
 
 Ask Claude naturally — it will use the MCP tools:
 
@@ -98,26 +87,6 @@ Ask Claude naturally — it will use the MCP tools:
 - "What's overdue in my Projects?"
 - "Add a task to Office: Review Q2 budget"
 - "Give me a daily review of my tasks"
-
-### Via Claude Code (`/wmanage` skill)
-
-The `/wmanage` skill provides structured commands for daily work management:
-
-```
-/wmanage              # Daily prioritisation (default)
-/wmanage daily        # Same as above
-/wmanage weekly       # Weekly review and planning
-/wmanage monthly      # Monthly themes and goals
-/wmanage capture      # Quick task capture (e.g. /wmanage capture office Review Q2 budget)
-/wmanage status       # Project status overview
-/wmanage triage       # Process Inbox items interactively
-/wmanage reading      # Prioritise and summarise reading list items
-/wmanage journal      # Daily journal check-in
-```
-
-**Prioritisation cascade:** Monthly priorities inform weekly planning, which informs daily focus. Run `/wmanage monthly` first to establish your priorities, then use `/wmanage weekly` and `/wmanage daily` for ongoing planning.
-
-**Expected Workflowy structure:** The skill expects top-level nodes named Tasks, Inbox, Tags, Resources (with a Links sub-node), and Journal. It discovers domains (Office, Home, etc.) dynamically as children of the Tasks node.
 
 ## Tools (23 implemented)
 
@@ -146,7 +115,7 @@ The `/wmanage` skill provides structured commands for daily work management:
 | `delete_node` | Delete a node |
 | `duplicate_node` | Deep-copy a node and its subtree |
 | `create_from_template` | Copy template with `{{variable}}` substitution |
-| `bulk_update` | Apply operations to filtered nodes (with dry_run mode) |
+| `bulk_update` | Apply `delete`, `add_tag`, or `remove_tag` to filtered nodes (with `dry_run` mode). `complete` / `uncomplete` are not yet supported. |
 
 ### Todos & Scheduling
 
@@ -177,7 +146,7 @@ Tags, assignees, and due dates are parsed from node text:
 ```bash
 cargo build              # compile (debug)
 cargo build --release    # compile (optimized)
-cargo test --lib         # run 106 unit tests
+cargo test --lib         # run 122 unit tests
 cargo check              # type-check only
 cargo run --bin workflowy-mcp-server  # start server
 ```

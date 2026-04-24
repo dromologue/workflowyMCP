@@ -1,5 +1,5 @@
-/// Workflowy MCP Server in Rust
-/// Built with rmcp for proper MCP protocol support
+//! Workflowy MCP Server in Rust
+//! Built with rmcp for proper MCP protocol support
 
 pub mod api;
 pub mod cli;
@@ -7,7 +7,6 @@ pub mod config;
 pub mod defaults;
 pub mod error;
 pub mod server;
-pub mod tools;
 pub mod types;
 pub mod utils;
 pub mod validation;

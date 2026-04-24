@@ -1,5 +1,5 @@
-/// Tag and assignee extraction from node text
-/// Parses #tags and @mentions
+//! Tag and assignee extraction from node text.
+//! Parses #tags and @mentions.
 
 use regex::Regex;
 use lazy_static::lazy_static;

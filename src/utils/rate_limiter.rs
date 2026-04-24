@@ -1,5 +1,5 @@
-/// Token bucket rate limiter
-/// Provides proactive throttling to prevent exceeding API limits
+//! Token bucket rate limiter
+//! Provides proactive throttling to prevent exceeding API limits.
 
 use crate::config::RateLimitConfig;
 use parking_lot::Mutex;
@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+/// Smallest wait we will ever sleep before retrying, to avoid tight loops when
+/// two tasks wake near-simultaneously and race for the next token.
+const MIN_WAIT: Duration = Duration::from_micros(500);
+
 pub struct RateLimiter {
-    #[allow(dead_code)]
-    config: RateLimitConfig,
     tokens: Arc<Mutex<TokenBucket>>,
 }
 
@@ -32,49 +34,40 @@ impl RateLimiter {
         };
 
         Self {
-            config,
             tokens: Arc::new(Mutex::new(bucket)),
         }
     }
 
-    /// Acquire a token, waiting if necessary
-    pub async fn acquire(&self) -> () {
+    /// Acquire a token, waiting if necessary.
+    pub async fn acquire(&self) {
         loop {
-            // Try to acquire without waiting
-            if self.try_acquire() {
-                return;
+            match self.try_consume_or_wait() {
+                Ok(()) => return,
+                Err(wait) => tokio::time::sleep(wait.max(MIN_WAIT)).await,
             }
-
-            // Calculate how long to wait before retrying
-            let wait_duration = self.calculate_wait_time();
-            tokio::time::sleep(wait_duration).await;
         }
     }
 
-    /// Try to acquire without blocking; returns true if successful
+    /// Try to acquire a token without blocking; returns true on success.
     pub fn try_acquire(&self) -> bool {
+        self.try_consume_or_wait().is_ok()
+    }
+
+    /// Single locked critical section: refill, attempt consume, and if we
+    /// cannot, compute the wait for the next token. Returning this in one
+    /// call avoids taking the mutex twice per failed acquire.
+    fn try_consume_or_wait(&self) -> Result<(), Duration> {
         let mut bucket = self.tokens.lock();
         bucket.refill();
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             debug!(remaining_tokens = bucket.tokens, "Token acquired");
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Calculate how long to wait for a token to become available
-    fn calculate_wait_time(&self) -> Duration {
-        let bucket = self.tokens.lock();
-
-        if bucket.tokens >= 1.0 {
-            Duration::from_millis(0)
+            Ok(())
         } else {
             let tokens_needed = 1.0 - bucket.tokens;
             let seconds_to_wait = tokens_needed / bucket.refill_rate;
-            Duration::from_secs_f64(seconds_to_wait)
+            Err(Duration::from_secs_f64(seconds_to_wait))
         }
     }
 }
@@ -138,5 +131,22 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() > 400 && elapsed.as_millis() < 700);
+    }
+
+    #[tokio::test]
+    async fn test_single_lock_per_failed_acquire() {
+        // Regression guard: try_consume_or_wait should never take the lock
+        // twice. We can't observe the lock directly, but we can at least
+        // exercise the failure path to prove it returns a finite wait.
+        let config = RateLimitConfig { requests_per_second: 1, burst_size: 1 };
+        let limiter = RateLimiter::new(config);
+        assert!(limiter.try_acquire());
+        match limiter.try_consume_or_wait() {
+            Ok(()) => panic!("bucket should be empty"),
+            Err(wait) => {
+                assert!(wait > Duration::from_millis(0));
+                assert!(wait <= Duration::from_secs(2));
+            }
+        }
     }
 }

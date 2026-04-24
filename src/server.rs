@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::api::WorkflowyClient;
+use crate::api::{SubtreeFetch, WorkflowyClient};
 use crate::types::{WorkflowyNode, NodeId};
 use crate::utils::cache::NodeCache;
 use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
@@ -30,6 +30,20 @@ use crate::validation::validate_node_id;
 /// Validate a node_id parameter, returning McpError on failure.
 fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     validate_node_id(id).map_err(|e| McpError::invalid_params(e.to_string(), None))
+}
+
+/// Build a truncation warning string for text responses. Empty when the fetch
+/// was complete; otherwise announces the cap so the caller knows results may
+/// be partial.
+fn truncation_banner(truncated: bool, limit: usize) -> String {
+    if truncated {
+        format!(
+            "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.\n\n",
+            limit
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// The main MCP server struct
@@ -351,7 +365,7 @@ impl WorkflowyMcpServer {
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
 
         match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(nodes) => {
+            Ok(SubtreeFetch { nodes, truncated, limit }) => {
                 let query_lower = params.query.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
                     .iter()
@@ -368,7 +382,7 @@ impl WorkflowyMcpServer {
 
                 results.truncate(max_results);
 
-                let result_text = if results.is_empty() {
+                let body = if results.is_empty() {
                     format!("No nodes found matching '{}'", params.query)
                 } else {
                     let items: Vec<String> = results
@@ -394,6 +408,7 @@ impl WorkflowyMcpServer {
                     )
                 };
 
+                let result_text = format!("{}{}", truncation_banner(truncated, limit), body);
                 Ok(CallToolResult::success(vec![Content::text(result_text)]))
             }
             Err(e) => {
@@ -582,7 +597,7 @@ impl WorkflowyMcpServer {
         info!(tag = %params.tag, max_depth, "Tag search");
 
         match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(nodes) => {
+            Ok(SubtreeFetch { nodes, truncated, limit }) => {
                 let tag_lower = params.tag.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
                     .iter()
@@ -604,10 +619,11 @@ impl WorkflowyMcpServer {
 
                 results.truncate(max_results);
 
+                let banner = truncation_banner(truncated, limit);
                 if results.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "No nodes found with tag '{}'",
-                        params.tag
+                        "{}No nodes found with tag '{}'",
+                        banner, params.tag
                     ))]))
                 } else {
                     let items: Vec<String> = results
@@ -615,7 +631,8 @@ impl WorkflowyMcpServer {
                         .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
                         .collect();
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Found {} node(s) with tag '{}':\n\n{}",
+                        "{}Found {} node(s) with tag '{}':\n\n{}",
+                        banner,
                         results.len(),
                         params.tag,
                         items.join("\n")
@@ -698,7 +715,7 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
 
         match self.client.get_subtree_recursive(Some(&params.node_id), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit }) => {
                 if all_nodes.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
                         format!("Node `{}` not found or has no descendants", params.node_id)
@@ -709,7 +726,8 @@ impl WorkflowyMcpServer {
                     McpError::internal_error(format!("Serialization error: {}", e), None)
                 })?;
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Subtree for '{}' ({} nodes):\n\n{}",
+                    "{}Subtree for '{}' ({} nodes):\n\n{}",
+                    truncation_banner(truncated, limit),
                     root_name, all_nodes.len(), json
                 ))]))
             }
@@ -732,7 +750,7 @@ impl WorkflowyMcpServer {
         info!(name = %params.name, match_mode, max_depth, "Finding node");
 
         match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(nodes) => {
+            Ok(SubtreeFetch { nodes, truncated, limit }) => {
                 let search = params.name.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
                     let name = n.name.to_lowercase();
@@ -748,6 +766,8 @@ impl WorkflowyMcpServer {
                 if matches.is_empty() {
                     let result = json!({
                         "found": false,
+                        "truncated": truncated,
+                        "truncation_limit": limit,
                         "message": format!("No nodes found matching '{}' (mode: {}). Try match_mode: 'contains'.", params.name, match_mode)
                     });
                     Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
@@ -762,6 +782,8 @@ impl WorkflowyMcpServer {
                     let path = build_node_path_with_map(&node.id, &node_map);
                     let result = json!({
                         "found": true,
+                        "truncated": truncated,
+                        "truncation_limit": limit,
                         "node_id": node.id,
                         "name": node.name,
                         "path": path,
@@ -786,6 +808,8 @@ impl WorkflowyMcpServer {
                     let result = json!({
                         "found": false,
                         "multiple_matches": true,
+                        "truncated": truncated,
+                        "truncation_limit": limit,
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches for '{}'. Use selection parameter to choose.", matches.len(), params.name)
@@ -811,7 +835,7 @@ impl WorkflowyMcpServer {
         }
 
         match self.client.get_subtree_recursive(None, max_depth).await {
-            Ok(nodes) => {
+            Ok(SubtreeFetch { nodes, truncated, limit }) => {
                 let query = params.search_query.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
                     let in_name = n.name.to_lowercase().contains(&query);
@@ -822,9 +846,12 @@ impl WorkflowyMcpServer {
                 }).collect();
 
                 if matches.is_empty() {
-                    return Err(McpError::invalid_params(
-                        format!("No nodes found matching '{}'", params.search_query), None
-                    ));
+                    let hint = if truncated {
+                        format!("No nodes found matching '{}' (subtree truncated at {} nodes — narrow search or raise cap)", params.search_query, limit)
+                    } else {
+                        format!("No nodes found matching '{}'", params.search_query)
+                    };
+                    return Err(McpError::invalid_params(hint, None));
                 }
 
                 if matches.len() > 1 && params.selection.is_none() {
@@ -835,6 +862,8 @@ impl WorkflowyMcpServer {
                     }).collect();
                     let result = json!({
                         "multiple_matches": true,
+                        "truncated": truncated,
+                        "truncation_limit": limit,
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches. Use selection parameter to choose.", matches.len())
@@ -873,6 +902,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "success": true,
+                    "truncated": truncated,
+                    "truncation_limit": limit,
                     "created_count": created_count,
                     "target": { "id": target_id, "name": target_name },
                     "message": format!("Inserted {} node(s) under '{}'", created_count, target_name)
@@ -893,7 +924,7 @@ impl WorkflowyMcpServer {
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
         match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -973,6 +1004,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "as_of": today.to_string(),
+                    "truncated": truncated,
+                    "truncation_limit": limit,
                     "summary": {
                         "total_nodes": total,
                         "pending_todos": pending_count,
@@ -1004,7 +1037,7 @@ impl WorkflowyMcpServer {
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
         match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let now_ms = Utc::now().timestamp_millis();
@@ -1033,6 +1066,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "since": since.to_string(),
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "count": items.len(),
                     "changes": items
                 });
@@ -1054,7 +1089,7 @@ impl WorkflowyMcpServer {
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
         match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -1080,6 +1115,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "as_of": today.to_string(),
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "count": items.len(),
                     "overdue": items
                 });
@@ -1102,7 +1139,7 @@ impl WorkflowyMcpServer {
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
         match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -1151,6 +1188,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "as_of": today.to_string(),
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "count": items.len(),
                     "upcoming": items
                 });
@@ -1171,7 +1210,7 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
 
         match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(
@@ -1244,6 +1283,8 @@ impl WorkflowyMcpServer {
 
                 let mut result = json!({
                     "root": { "id": root.id, "name": root.name, "path": root_path },
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "stats": {
                         "total_nodes": total,
                         "todo_total": todo_total,
@@ -1280,16 +1321,18 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, max_depth, "Finding backlinks");
 
         match self.client.get_subtree_recursive(None, max_depth).await {
-            Ok(nodes) => {
+            Ok(SubtreeFetch { nodes, truncated, limit: node_limit }) => {
                 let node_map = build_node_map(&nodes);
                 let target = node_map.get(params.node_id.as_str());
                 let target_name = target.map(|n| n.name.as_str()).unwrap_or("unknown");
 
-                // Match workflowy.com links containing the target node ID
+                // Match workflowy.com links containing the target node ID.
+                // `regex::escape` guarantees a valid pattern, so the Regex::new
+                // call below cannot fail.
                 let link_re = Regex::new(&format!(
                     r"https?://workflowy\.com/#/{}",
                     regex::escape(&params.node_id)
-                )).unwrap();
+                )).expect("escaped pattern is always valid regex");
 
                 let mut backlinks: Vec<serde_json::Value> = Vec::new();
                 for node in &nodes {
@@ -1312,6 +1355,8 @@ impl WorkflowyMcpServer {
 
                 let result = json!({
                     "target": { "id": params.node_id, "name": target_name },
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "count": backlinks.len(),
                     "backlinks": backlinks
                 });
@@ -1333,7 +1378,7 @@ impl WorkflowyMcpServer {
         if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
 
         match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
@@ -1365,7 +1410,12 @@ impl WorkflowyMcpServer {
                     if todos.len() >= limit { break; }
                 }
 
-                let result = json!({ "count": todos.len(), "todos": todos });
+                let result = json!({
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
+                    "count": todos.len(),
+                    "todos": todos,
+                });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
@@ -1383,7 +1433,16 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, target = %params.target_parent_id, "Duplicating node");
 
         match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+                if truncated {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Cannot duplicate: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
+                            node_limit
+                        ),
+                        None,
+                    ));
+                }
                 let subtree: Vec<&WorkflowyNode> = if include_children {
                     all_nodes.iter().collect()
                 } else {
@@ -1475,7 +1534,7 @@ impl WorkflowyMcpServer {
         let vars = params.variables.unwrap_or_default();
         info!(template = %params.template_node_id, "Creating from template");
 
-        let var_re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
+        let var_re = Regex::new(r"\{\{(\w+)\}\}").expect("static template-variable pattern is valid");
         let substitute = |text: &str| -> String {
             var_re.replace_all(text, |caps: &regex::Captures| {
                 vars.get(&caps[1]).cloned().unwrap_or_else(|| caps[0].to_string())
@@ -1483,7 +1542,16 @@ impl WorkflowyMcpServer {
         };
 
         match self.client.get_subtree_recursive(Some(&params.template_node_id), 10).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+                if truncated {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Cannot instantiate template: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
+                            node_limit
+                        ),
+                        None,
+                    ));
+                }
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(format!("Template '{}' not found", params.template_node_id), None));
@@ -1553,7 +1621,7 @@ impl WorkflowyMcpServer {
         }
     }
 
-    #[tool(description = "Apply an operation to all nodes matching a filter. Supports complete, uncomplete, delete, add_tag, remove_tag. Use dry_run to preview.")]
+    #[tool(description = "Apply an operation to all nodes matching a filter. Supports delete, add_tag, remove_tag. Use dry_run to preview. Note: complete/uncomplete are not yet implemented and will be rejected.")]
     async fn bulk_update(
         &self,
         Parameters(params): Parameters<BulkUpdateParams>,
@@ -1564,8 +1632,19 @@ impl WorkflowyMcpServer {
         info!(operation = %params.operation, dry_run, "Bulk update");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        // Validate operation
-        let valid_ops = ["complete", "uncomplete", "delete", "add_tag", "remove_tag"];
+        // Validate operation. complete/uncomplete are rejected up front because
+        // the Workflowy completion endpoints are not yet modelled in the client
+        // and silently returning success would be a data-integrity trap.
+        let valid_ops = ["delete", "add_tag", "remove_tag"];
+        if params.operation == "complete" || params.operation == "uncomplete" {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Operation '{}' is not yet supported: the Workflowy completion endpoints are not modelled. Use a tag-based workflow until completion is wired up.",
+                    params.operation,
+                ),
+                None,
+            ));
+        }
         if !valid_ops.contains(&params.operation.as_str()) {
             return Err(McpError::invalid_params(
                 format!("Invalid operation '{}'. Must be one of: {}", params.operation, valid_ops.join(", ")), None
@@ -1577,7 +1656,19 @@ impl WorkflowyMcpServer {
 
         let max_depth = params.max_depth.unwrap_or(5);
         match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(all_nodes) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+                // Refuse destructive bulk ops on a truncated view — we would
+                // otherwise delete only a partial match set silently.
+                if truncated && params.operation == "delete" && !dry_run {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Refusing to bulk-delete against a truncated subtree (capped at {} nodes). Narrow with root_id or reduce max_depth.",
+                            node_limit
+                        ),
+                        None,
+                    ));
+                }
+
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
@@ -1620,6 +1711,8 @@ impl WorkflowyMcpServer {
                     }).collect();
                     let result = json!({
                         "dry_run": true,
+                        "truncated": truncated,
+                        "truncation_limit": node_limit,
                         "matched_count": items.len(),
                         "operation": params.operation,
                         "nodes_matched": items
@@ -1630,26 +1723,24 @@ impl WorkflowyMcpServer {
                 // Execute operations
                 let mut affected = 0;
                 let mut affected_nodes: Vec<serde_json::Value> = Vec::new();
+                // Collect parent IDs of mutated nodes so we can invalidate them
+                // precisely instead of nuking the whole cache.
+                let mut touched_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
 
                 for node in &matched {
                     let success = match params.operation.as_str() {
                         "delete" => self.client.delete_node(&node.id).await.is_ok(),
                         "add_tag" => {
-                            let tag = params.operation_tag.as_ref().unwrap();
+                            let tag = params.operation_tag.as_ref().expect("validated non-None above");
                             let new_name = format!("{} #{}", node.name, tag.trim_start_matches('#'));
                             self.client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
                         }
                         "remove_tag" => {
-                            let tag = params.operation_tag.as_ref().unwrap().trim_start_matches('#');
-                            let tag_re = Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(tag))).unwrap();
+                            let tag = params.operation_tag.as_ref().expect("validated non-None above").trim_start_matches('#');
+                            let tag_re = Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(tag)))
+                                .expect("escaped pattern is always valid regex");
                             let new_name = tag_re.replace_all(&node.name, "").to_string();
                             self.client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
-                        }
-                        // complete/uncomplete: edit node name to toggle checkbox
-                        "complete" | "uncomplete" => {
-                            // For now, we mark completion via name prefix since Workflowy API
-                            // complete/uncomplete endpoints aren't modeled in our client yet
-                            true // No-op until we add complete/uncomplete API endpoints
                         }
                         _ => false,
                     };
@@ -1657,14 +1748,27 @@ impl WorkflowyMcpServer {
                         affected += 1;
                         let path = build_node_path_with_map(&node.id, &node_map);
                         affected_nodes.push(json!({ "id": node.id, "name": node.name, "path": path }));
+                        self.cache.invalidate_node(&node.id);
+                        if let Some(pid) = &node.parent_id {
+                            touched_parents.insert(pid.clone());
+                        }
                     }
                 }
 
-                if let Some(rid) = &params.root_id { self.cache.invalidate_node(rid); }
-                self.cache.clear();
+                // Targeted cache invalidation: touch each mutated node's parent
+                // (so its children listing refreshes) plus the scoped root if
+                // the caller provided one. No global cache wipe.
+                for pid in &touched_parents {
+                    self.cache.invalidate_node(pid);
+                }
+                if let Some(rid) = &params.root_id {
+                    self.cache.invalidate_subtree(rid);
+                }
 
                 let result = json!({
                     "dry_run": false,
+                    "truncated": truncated,
+                    "truncation_limit": node_limit,
                     "matched_count": matched.len(),
                     "affected_count": affected,
                     "operation": params.operation,
@@ -2287,5 +2391,90 @@ mod tests {
         })).unwrap();
         assert_eq!(params.markdown, "Just text");
         assert_eq!(params.analyze_only, None);
+    }
+
+    // --- Truncation banner ---
+
+    #[test]
+    fn test_truncation_banner_silent_when_complete() {
+        assert_eq!(truncation_banner(false, 10_000), "");
+    }
+
+    #[test]
+    fn test_truncation_banner_announces_limit() {
+        let banner = truncation_banner(true, 10_000);
+        assert!(banner.contains("truncated"));
+        assert!(banner.contains("10000"));
+        assert!(banner.ends_with("\n\n"));
+    }
+
+    // --- bulk_update: complete/uncomplete must be rejected ---
+
+    fn new_test_server() -> WorkflowyMcpServer {
+        let client = Arc::new(WorkflowyClient::new(
+            "http://invalid.local".to_string(),
+            "test-key".to_string(),
+        ).unwrap());
+        WorkflowyMcpServer::new(client)
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_rejects_complete() {
+        let server = new_test_server();
+        let params = BulkUpdateParams {
+            root_id: None,
+            operation: "complete".to_string(),
+            query: None,
+            tag: None,
+            status: None,
+            operation_tag: None,
+            dry_run: Some(true),
+            limit: Some(1),
+            max_depth: None,
+        };
+        let result = server.bulk_update(Parameters(params)).await;
+        let err = result.expect_err("complete must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("not yet supported"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_rejects_uncomplete() {
+        let server = new_test_server();
+        let params = BulkUpdateParams {
+            root_id: None,
+            operation: "uncomplete".to_string(),
+            query: None,
+            tag: None,
+            status: None,
+            operation_tag: None,
+            dry_run: Some(true),
+            limit: Some(1),
+            max_depth: None,
+        };
+        let result = server.bulk_update(Parameters(params)).await;
+        let err = result.expect_err("uncomplete must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("not yet supported"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_rejects_unknown_operation() {
+        let server = new_test_server();
+        let params = BulkUpdateParams {
+            root_id: None,
+            operation: "nuke".to_string(),
+            query: None,
+            tag: None,
+            status: None,
+            operation_tag: None,
+            dry_run: Some(true),
+            limit: Some(1),
+            max_depth: None,
+        };
+        let result = server.bulk_update(Parameters(params)).await;
+        let err = result.expect_err("unknown operations must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("invalid operation"), "got: {msg}");
     }
 }

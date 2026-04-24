@@ -1,5 +1,5 @@
-/// Node cache with TTL and efficient subtree invalidation
-/// Addresses: "Cache O(n²) subtree invalidation" → now O(n)
+//! Node cache with TTL and efficient subtree invalidation.
+//! Addresses: "Cache O(n²) subtree invalidation" → now O(n).
 
 use crate::config::CACHE_TTL_SECS;
 use crate::types::{ChildrenIndex, CacheEntry, WorkflowyNode};
@@ -46,7 +46,7 @@ impl NodeCache {
             let mut index = self.children_index.write();
             index
                 .entry(parent_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(node.id.clone());
         }
 
@@ -139,7 +139,7 @@ impl NodeCache {
             if let Some(parent_id) = &node.parent_id {
                 index
                     .entry(parent_id.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(node.id.clone());
             }
         }
