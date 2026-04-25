@@ -9,6 +9,10 @@ target/
 # Claude Code skills live in ~/.claude/skills/, not in the repo.
 .claude/skills/
 
+# wflow eval suite — behavioural tests for a separate skill, pulled
+# in by tooling but not intended to be tracked here.
+Evals/
+
 # Ignore root .md files except README
 /*.md
 !README.md
