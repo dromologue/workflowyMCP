@@ -949,8 +949,12 @@ impl WorkflowyMcpServer {
         let max_results = params.max_results.unwrap_or(20);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
+        let resolved_parent = match &params.parent_id {
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(fetch) => {
                 let banner = truncation_banner_from_fetch(&fetch);
                 let query_lower = params.query.to_lowercase();
@@ -1075,11 +1079,14 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_node", params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
-        if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
+        let resolved_parent = match &params.parent_id {
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            None => None,
+        };
 
         match self
             .client
-            .create_node(&params.name, params.description.as_deref(), params.parent_id.as_deref(), params.priority)
+            .create_node(&params.name, params.description.as_deref(), resolved_parent.as_deref(), params.priority)
             .await
         {
             Ok(created) => {
@@ -1088,7 +1095,7 @@ impl WorkflowyMcpServer {
                     params.name, created.id
                 );
                 // Invalidate cache for parent
-                if let Some(pid) = &params.parent_id {
+                if let Some(pid) = &resolved_parent {
                     self.cache.invalidate_node(pid);
                 }
                 // Seed the name index so subsequent lookups see the new node
@@ -1097,7 +1104,7 @@ impl WorkflowyMcpServer {
                     id: created.id.clone(),
                     name: params.name.clone(),
                     description: params.description.clone(),
-                    parent_id: params.parent_id.as_deref().map(|s| s.to_string()),
+                    parent_id: resolved_parent.clone(),
                     ..Default::default()
                 }]);
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -1330,6 +1337,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
         check_node_id(&params.parent_id)?;
+        let resolved_parent = self.resolve_node_ref(&params.parent_id)?;
 
         // Parse indented lines
         struct ParsedLine<'a> { text: &'a str, indent: usize }
@@ -1345,7 +1353,7 @@ impl WorkflowyMcpServer {
         }
 
         // Parent stack: index = indent level, value = node ID at that level
-        let mut parent_stack: Vec<String> = vec![params.parent_id.0.clone()];
+        let mut parent_stack: Vec<String> = vec![resolved_parent.clone()];
         let mut created_count = 0;
 
         for line in &parsed {
@@ -1374,11 +1382,11 @@ impl WorkflowyMcpServer {
             }
         }
 
-        self.cache.invalidate_node(&params.parent_id);
+        self.cache.invalidate_node(&resolved_parent);
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Inserted {} node(s) under `{}`",
-            created_count, params.parent_id
+            created_count, resolved_parent
         ))]))
         })
     }
@@ -1392,8 +1400,9 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.walk_subtree(Some(&params.node_id), max_depth).await {
+        match self.walk_subtree(Some(&resolved), max_depth).await {
             Ok(fetch) => {
                 if fetch.nodes.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
@@ -1431,15 +1440,16 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(3);
         let use_index = params.use_index.unwrap_or(false);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
-        if let Some(pid) = &params.parent_id {
-            check_node_id(pid)?;
-        }
+        let resolved_parent = match &params.parent_id {
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            None => None,
+        };
         info!(name = %params.name, match_mode, max_depth, use_index, allow_root_scan, "Finding node");
 
         // Refuse unscoped walks by default so a caller that forgot `parent_id`
         // cannot blow the client timeout on a 250k-node tree. Index-backed
         // lookups are exempt because they don't touch the API.
-        if params.parent_id.is_none() && !allow_root_scan && !use_index {
+        if resolved_parent.is_none() && !allow_root_scan && !use_index {
             return Err(McpError::invalid_params(
                 "find_node refuses to scan from the workspace root by default. Pass parent_id to scope the search, set allow_root_scan=true to opt in, or set use_index=true to serve from the opportunistic name index.".to_string(),
                 None,
@@ -1451,7 +1461,7 @@ impl WorkflowyMcpServer {
         // results, to preserve the contract above.
         if use_index && self.name_index.is_populated() {
             let hits = self.name_index.lookup(&params.name, match_mode);
-            let hits: Vec<_> = if let Some(parent) = params.parent_id.as_deref() {
+            let hits: Vec<_> = if let Some(parent) = resolved_parent.as_deref() {
                 hits.into_iter()
                     .filter(|e| e.parent_id.as_deref() == Some(parent))
                     .collect()
@@ -1464,7 +1474,7 @@ impl WorkflowyMcpServer {
             // allow_root_scan=true and index empty -> fall through to live walk.
         }
 
-        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(fetch) => {
                 let search = params.name.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = fetch.nodes.iter().filter(|n| {
@@ -1715,9 +1725,12 @@ impl WorkflowyMcpServer {
         record_op!(self, "daily_review", params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Daily review");
-        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
@@ -1830,9 +1843,12 @@ impl WorkflowyMcpServer {
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Getting recent changes");
-        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
@@ -1884,9 +1900,12 @@ impl WorkflowyMcpServer {
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Listing overdue items");
-        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
@@ -1936,9 +1955,12 @@ impl WorkflowyMcpServer {
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Listing upcoming items");
-        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
@@ -2010,8 +2032,9 @@ impl WorkflowyMcpServer {
         let recent_days = params.recently_modified_days.unwrap_or(7) as i64;
         info!(node_id = %params.node_id, "Getting project summary");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.walk_subtree(Some(&params.node_id), 10).await {
+        match self.walk_subtree(Some(&resolved), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
@@ -2025,7 +2048,7 @@ impl WorkflowyMcpServer {
                 let recent_cutoff = now_ms - (recent_days * 86_400_000);
                 let node_map = build_node_map(&all_nodes);
 
-                let root = subtree.iter().find(|n| n.id == params.node_id).unwrap();
+                let root = subtree.iter().find(|n| n.id == resolved).unwrap();
                 let root_path = build_node_path_with_map(&root.id, &node_map);
 
                 let mut total = 0usize;
@@ -2120,14 +2143,15 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "find_backlinks", params, {
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
-        info!(node_id = %params.node_id, max_depth, "Finding backlinks");
+        info!(node_id = %resolved, max_depth, "Finding backlinks");
 
         match self.walk_subtree(None, max_depth).await {
             Ok(SubtreeFetch { nodes, truncated, limit: node_limit, .. }) => {
                 let node_map = build_node_map(&nodes);
-                let target = node_map.get(params.node_id.as_str());
+                let target = node_map.get(resolved.as_str());
                 let target_name = target.map(|n| n.name.as_str()).unwrap_or("unknown");
 
                 // Match workflowy.com links containing the target node ID.
@@ -2135,12 +2159,12 @@ impl WorkflowyMcpServer {
                 // call below cannot fail.
                 let link_re = Regex::new(&format!(
                     r"https?://workflowy\.com/#/{}",
-                    regex::escape(&params.node_id)
+                    regex::escape(&resolved)
                 )).expect("escaped pattern is always valid regex");
 
                 let mut backlinks: Vec<serde_json::Value> = Vec::new();
                 for node in &nodes {
-                    if node.id == params.node_id { continue; }
+                    if node.id == resolved { continue; }
                     let in_name = link_re.is_match(&node.name);
                     let in_desc = node.description.as_ref().map(|d| link_re.is_match(d)).unwrap_or(false);
                     if in_name || in_desc {
@@ -2158,7 +2182,7 @@ impl WorkflowyMcpServer {
                 }
 
                 let result = json!({
-                    "target": { "id": params.node_id, "name": target_name },
+                    "target": { "id": resolved, "name": target_name },
                     "truncated": truncated,
                     "truncation_limit": node_limit,
                     "count": backlinks.len(),
@@ -2181,9 +2205,12 @@ impl WorkflowyMcpServer {
         let status = params.status.as_deref().unwrap_or("all");
         let max_depth = params.max_depth.unwrap_or(5);
         info!(status, max_depth, "Listing todos");
-        if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
+        let resolved_parent = match &params.parent_id {
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            None => None,
+        };
 
-        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
@@ -2237,10 +2264,12 @@ impl WorkflowyMcpServer {
         record_op!(self, "duplicate_node", params, {
         check_node_id(&params.node_id)?;
         check_node_id(&params.target_parent_id)?;
+        let resolved_node = self.resolve_node_ref(&params.node_id)?;
+        let resolved_target = self.resolve_node_ref(&params.target_parent_id)?;
         let include_children = params.include_children.unwrap_or(true);
-        info!(node_id = %params.node_id, target = %params.target_parent_id, "Duplicating node");
+        info!(node_id = %resolved_node, target = %resolved_target, "Duplicating node");
 
-        match self.walk_subtree(Some(&params.node_id), 10).await {
+        match self.walk_subtree(Some(&resolved_node), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
@@ -2254,7 +2283,7 @@ impl WorkflowyMcpServer {
                 let subtree: Vec<&WorkflowyNode> = if include_children {
                     all_nodes.iter().collect()
                 } else {
-                    all_nodes.iter().filter(|n| n.id == params.node_id).collect()
+                    all_nodes.iter().filter(|n| n.id == resolved_node).collect()
                 };
 
                 if subtree.is_empty() {
@@ -2266,14 +2295,14 @@ impl WorkflowyMcpServer {
                 let mut created_count = 0;
 
                 // Process root first
-                let root = subtree.iter().find(|n| n.id == params.node_id).unwrap();
+                let root = subtree.iter().find(|n| n.id == resolved_node).unwrap();
                 let root_name = if let Some(prefix) = &params.name_prefix {
                     format!("{}{}", prefix, root.name)
                 } else {
                     root.name.clone()
                 };
 
-                match self.client.create_node(&root_name, root.description.as_deref(), Some(&params.target_parent_id), None).await {
+                match self.client.create_node(&root_name, root.description.as_deref(), Some(&resolved_target), None).await {
                     Ok(created) => {
                         id_map.insert(root.id.clone(), created.id.clone());
                         created_count += 1;
@@ -2316,10 +2345,10 @@ impl WorkflowyMcpServer {
                             }
                         }
 
-                        self.cache.invalidate_node(&params.target_parent_id);
+                        self.cache.invalidate_node(&resolved_target);
                         let result = json!({
                             "success": true,
-                            "original_id": params.node_id,
+                            "original_id": resolved_node,
                             "new_root_id": created.id,
                             "nodes_created": created_count
                         });
@@ -2341,8 +2370,10 @@ impl WorkflowyMcpServer {
         record_op!(self, "create_from_template", params, {
         check_node_id(&params.template_node_id)?;
         check_node_id(&params.target_parent_id)?;
+        let resolved_template = self.resolve_node_ref(&params.template_node_id)?;
+        let resolved_target = self.resolve_node_ref(&params.target_parent_id)?;
         let vars = params.variables.unwrap_or_default();
-        info!(template = %params.template_node_id, "Creating from template");
+        info!(template = %resolved_template, "Creating from template");
 
         let var_re = Regex::new(r"\{\{(\w+)\}\}").expect("static template-variable pattern is valid");
         let substitute = |text: &str| -> String {
@@ -2351,7 +2382,7 @@ impl WorkflowyMcpServer {
             }).to_string()
         };
 
-        match self.walk_subtree(Some(&params.template_node_id), 10).await {
+        match self.walk_subtree(Some(&resolved_template), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
@@ -2371,11 +2402,11 @@ impl WorkflowyMcpServer {
                 let mut created_count = 0;
                 let applied_vars: Vec<&String> = vars.keys().collect();
 
-                let root = subtree.iter().find(|n| n.id == params.template_node_id).unwrap();
+                let root = subtree.iter().find(|n| n.id == resolved_template).unwrap();
                 let root_name = substitute(&root.name);
                 let root_desc = root.description.as_ref().map(|d| substitute(d));
 
-                match self.client.create_node(&root_name, root_desc.as_deref(), Some(&params.target_parent_id), None).await {
+                match self.client.create_node(&root_name, root_desc.as_deref(), Some(&resolved_target), None).await {
                     Ok(created) => {
                         let new_root_id = created.id.clone();
                         id_map.insert(root.id.clone(), created.id);
@@ -2414,10 +2445,10 @@ impl WorkflowyMcpServer {
                             }
                         }
 
-                        self.cache.invalidate_node(&params.target_parent_id);
+                        self.cache.invalidate_node(&resolved_target);
                         let result = json!({
                             "success": true,
-                            "template_id": params.template_node_id,
+                            "template_id": resolved_template,
                             "new_root_id": new_root_id,
                             "nodes_created": created_count,
                             "variables_applied": applied_vars
@@ -2442,7 +2473,10 @@ impl WorkflowyMcpServer {
         let limit = params.limit.unwrap_or(20);
         let status = params.status.as_deref().unwrap_or("all");
         info!(operation = %params.operation, dry_run, "Bulk update");
-        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
 
         // Validate operation. complete/uncomplete are rejected up front because
         // the Workflowy completion endpoints are not yet modelled in the client
@@ -2467,7 +2501,7 @@ impl WorkflowyMcpServer {
         }
 
         let max_depth = params.max_depth.unwrap_or(5);
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 // Refuse destructive bulk ops on a truncated view — we would
                 // otherwise delete only a partial match set silently.
@@ -2574,7 +2608,7 @@ impl WorkflowyMcpServer {
                 for pid in &touched_parents {
                     self.cache.invalidate_node(pid);
                 }
-                if let Some(rid) = &params.root_id {
+                if let Some(rid) = &resolved_root {
                     self.cache.invalidate_subtree(rid);
                 }
 
@@ -2862,18 +2896,19 @@ impl WorkflowyMcpServer {
         record_op!(self, "build_name_index", params, {
         let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
-        if let Some(rid) = &params.root_id {
-            check_node_id(rid)?;
-        }
-        if params.root_id.is_none() && !allow_root_scan {
+        let resolved_root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            None => None,
+        };
+        if resolved_root.is_none() && !allow_root_scan {
             return Err(McpError::invalid_params(
                 "build_name_index refuses an unscoped walk by default. Pass root_id to scope it, or set allow_root_scan=true to accept a full walk (bounded by the subtree-fetch budget).".to_string(),
                 None,
             ));
         }
-        info!(root_id = ?params.root_id, max_depth, allow_root_scan, "Building name index");
+        info!(root_id = ?resolved_root, max_depth, allow_root_scan, "Building name index");
 
-        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+        match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, elapsed_ms, .. }) => {
                 let result = json!({
                     "status": if truncated { "partial" } else { "ok" },
@@ -4085,6 +4120,71 @@ mod tests {
         // But garbage still rejects.
         assert!(check_node_id("garbage").is_err());
         assert!(check_node_id("").is_err());
+    }
+
+    /// Regression for the post-c471a49 gap: every handler that took a
+    /// node/parent/root id called check_node_id (which the fix widened to
+    /// accept short hashes) but a long tail of handlers forgot to also
+    /// pipe the value through resolve_node_ref. The raw 8-char hash then
+    /// landed at the upstream API and 404'd. This test exercises one
+    /// representative handler from each "scoping" pattern (Optional
+    /// root_id, Optional parent_id, required node_id) and asserts that a
+    /// short hash NOT in the name index produces the resolver-side error
+    /// rather than reaching the HTTP layer with a raw short hash.
+    #[tokio::test]
+    async fn handlers_route_root_and_parent_short_hashes_through_resolver() {
+        let server = new_test_server();
+        let unindexed = "ffffffffffff"; // 12-char hex, never ingested
+
+        // Optional root_id: list_overdue, list_upcoming, daily_review,
+        // get_recent_changes, bulk_update, build_name_index, list_todos.
+        let err = server
+            .list_overdue(Parameters(ListOverdueParams {
+                root_id: Some(NodeId::from(unindexed)),
+                include_completed: None,
+                limit: None,
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "list_overdue: expected resolver-side error, got: {msg}"
+        );
+
+        // Optional parent_id: list_todos exercises the same pattern via
+        // a different param name.
+        let err = server
+            .list_todos(Parameters(ListTodosParams {
+                parent_id: Some(NodeId::from(unindexed)),
+                status: None,
+                query: None,
+                limit: None,
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "list_todos: expected resolver-side error, got: {msg}"
+        );
+
+        // Required node_id: get_project_summary, find_backlinks,
+        // get_subtree, duplicate_node, create_from_template all use this.
+        let err = server
+            .get_subtree(Parameters(GetSubtreeParams {
+                node_id: NodeId::from(unindexed),
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "get_subtree: expected resolver-side error, got: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -273,6 +273,44 @@
     invalidation. 206 unit tests passing.
   - First Evals run captured in `Evals/results/run-20260425T194943Z.json`.
 
+- [x] **T-161 (Eval-driven 2026-04-25, follow-up to T-160)**: thread
+      short-hash resolution through every handler
+  - **Bug discovered live.** T-160 widened the handler-boundary
+    validator (`check_node_id`) to accept 8-char prefixes, but a long
+    tail of handlers called only the validator and never piped the
+    value through `resolve_node_ref`. The raw short hash then landed
+    at the upstream API and 404'd. Caught when calling
+    `list_overdue(root_id="c1ef1ad5")` against a healthy server.
+  - **Affected handlers (all fixed):** `create_node` (parent_id),
+    `insert_content` (parent_id), `search_nodes` (parent_id, was also
+    missing the boundary check), `get_subtree`, `find_node`
+    (parent_id), `daily_review` (root_id), `get_recent_changes`
+    (root_id), `list_overdue` (root_id), `list_upcoming` (root_id),
+    `list_todos` (parent_id), `get_project_summary`, `find_backlinks`,
+    `duplicate_node` (both ids), `create_from_template` (both ids),
+    `bulk_update` (root_id, plus the post-walk cache invalidation),
+    `build_name_index` (root_id).
+  - **Pattern.** Introduced `let resolved_<x> = match &params.<x> {
+    Some(v) => { check_node_id(v)?; Some(self.resolve_node_ref(v)?) }
+    None => None };` for optionals; `let resolved =
+    self.resolve_node_ref(&params.<x>)?;` for required ids. All
+    downstream uses (walk_subtree, cache invalidation, equality checks
+    against API-returned UUIDs, link regex pattern, JSON response
+    fields) now use the resolved value.
+  - **Regression test.**
+    `handlers_route_root_and_parent_short_hashes_through_resolver`
+    exercises one representative handler from each scoping pattern
+    (Optional root_id via `list_overdue`, Optional parent_id via
+    `list_todos`, required node_id via `get_subtree`). Uses an
+    unindexed 12-char hex hash as input and asserts the error message
+    surfaces a resolver-side miss ("name index" / "short-hash"),
+    proving resolution ran before any HTTP attempt. Would have failed
+    against the pre-fix code with a connection error instead. 207 unit
+    tests passing.
+  - **Specs changed:** none (the language in `specs/specification.md`
+    property 6 already names the three accepted node-ref forms; the
+    bug was in handler implementation, not contract).
+
 - [x] **T-159 (Brief 2026-04-25)**: Transient-failure brief
   - **Pattern A (per-ID failures)**: added
     `WorkflowyClient::get_node_with_propagation_retry` and
