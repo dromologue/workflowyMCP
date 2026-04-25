@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit:
+    name: unit + proptest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Type-check
+        run: cargo check --all-targets
+      - name: Unit tests (lib)
+        run: cargo test --lib --no-fail-fast
+      - name: Property tests
+        run: cargo test --test proptest_node_id
+
+  acceptance:
+    name: scripted-session (sandbox)
+    runs-on: ubuntu-latest
+    # Only runs on push to main, since it talks to a real Workflowy
+    # account. Fork PRs cannot read the secret, so the job is a no-op
+    # there.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run scripted session against sandbox
+        env:
+          WORKFLOWY_TEST_API_KEY: ${{ secrets.WORKFLOWY_TEST_API_KEY }}
+          WORKFLOWY_TEST_PARENT_ID: ${{ secrets.WORKFLOWY_TEST_PARENT_ID }}
+        run: |
+          if [ -z "$WORKFLOWY_TEST_API_KEY" ]; then
+            echo "::warning::WORKFLOWY_TEST_API_KEY not set; skipping acceptance run"
+            exit 0
+          fi
+          cargo test --test scripted_session -- --ignored --nocapture

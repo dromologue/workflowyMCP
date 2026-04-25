@@ -17,11 +17,13 @@ with: code + tests + commit + tick the box here.
 - Pass 2: complete
 - Pass 3: complete
 - Pass 4: complete
-- Pass 5: complete (192 tests passing)
-- Pass 6: not started
-- Pass 7: not started
+- Pass 5: complete
+- Pass 6: complete (mirror stub; 5 nice-to-haves shipped)
+- Pass 7: complete (proptest in CI; scripted session ready, requires sandbox secret)
 
-Last touched: 2026-04-25 (Passes 4 + 5 implemented).
+199 unit tests + 5 property tests passing.
+
+Last touched: 2026-04-25 (Passes 6 + 7 implemented; brief fully addressed).
 
 ---
 

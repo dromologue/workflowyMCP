@@ -2,10 +2,11 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Updated 2026-04 (post-Pass-5)**: Rust v2 implements **30 tools**. Concept mapping, graph analysis,
-> and Dropbox integration have been removed from scope. See `tasks.md` for remaining roadmap.
+> **Updated 2026-04 (post-Pass-7)**: Rust v2 implements **36 tools** (30 from Pass 5 + 6 from Pass 6).
+> Concept mapping, graph analysis, and Dropbox integration have been removed from scope.
+> See `tasks.md` for remaining roadmap.
 
-## Implemented Tools (Rust v2 — 30 total)
+## Implemented Tools (Rust v2 — 36 total)
 
 | Category | Tool | Status |
 |----------|------|--------|
@@ -39,12 +40,20 @@
 | Diagnostics & Ops | cancel_all | Implemented |
 | Diagnostics & Ops | build_name_index | Implemented |
 | Diagnostics & Ops | get_recent_tool_calls | Implemented (in-memory ring buffer, default 1024 entries) |
+| API Expansion | path_of | Implemented (chain get_node from leaf to root) |
+| API Expansion | bulk_tag | Implemented (tag many nodes by ID, parallel) |
+| API Expansion | since | Implemented (single get_node + timestamp comparison) |
+| API Expansion | find_by_tag_and_path | Implemented (tag ∩ hierarchical path filter) |
+| API Expansion | export_subtree | Implemented (OPML / Markdown / JSON) |
+| API Expansion | create_mirror | **Stub** — returns explanatory error; Workflowy's REST API does not expose mirror creation |
 
-### Not Yet Implemented
+### Not Implemented
 
-create_mirror (requires upstream mirror API support — see Pass 6).
-Tracked in `tasks.md` and the multi-pass plan at
-`tasks/reliability-and-ergonomics.md`.
+True native mirrors require upstream Workflowy API support that does
+not exist as of 2026-04. The `create_mirror` tool is a stub that
+returns an informative error so callers don't silently fall back to
+the `mirror_of: <uuid>` note convention. Tracked in
+`tasks/reliability-and-ergonomics.md` (T-157).
 
 ---
 

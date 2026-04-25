@@ -38,6 +38,7 @@ sha2 = "0.10"
 [dev-dependencies]
 pretty_assertions = "1.4"
 tokio-test = "0.4"
+proptest = "1.4"
 
 [profile.release]
 opt-level = 3

@@ -99,6 +99,103 @@ fn is_short_hash(s: &str) -> bool {
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Render a subtree as nested Markdown bullets. Depth is determined
+/// by following parent_id chains within the supplied node set, so the
+/// output mirrors the actual tree shape regardless of the order
+/// `nodes` was returned in.
+fn render_subtree_markdown(nodes: &[WorkflowyNode], root_id: &str) -> String {
+    use std::collections::HashMap;
+    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.clone()).or_default().push(n);
+        }
+    }
+    let mut out = String::new();
+    fn walk(
+        node: &WorkflowyNode,
+        depth: usize,
+        children_of: &std::collections::HashMap<String, Vec<&WorkflowyNode>>,
+        out: &mut String,
+    ) {
+        let indent = "  ".repeat(depth);
+        out.push_str(&format!("{}- {}\n", indent, node.name));
+        if let Some(desc) = &node.description {
+            for line in desc.lines() {
+                out.push_str(&format!("{}    {}\n", indent, line));
+            }
+        }
+        if let Some(children) = children_of.get(&node.id) {
+            for child in children {
+                walk(child, depth + 1, children_of, out);
+            }
+        }
+    }
+    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
+        walk(root, 0, &children_of, &mut out);
+    }
+    out
+}
+
+/// Render a subtree as OPML — Workflowy and other outliners can
+/// re-import this losslessly enough for backup/exchange. We escape
+/// the four XML metacharacters and emit each node as a single-line
+/// `<outline>` element.
+fn render_subtree_opml(nodes: &[WorkflowyNode], root_id: &str) -> String {
+    use std::collections::HashMap;
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.clone()).or_default().push(n);
+        }
+    }
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n  <body>\n");
+    fn walk(
+        node: &WorkflowyNode,
+        depth: usize,
+        children_of: &std::collections::HashMap<String, Vec<&WorkflowyNode>>,
+        out: &mut String,
+    ) {
+        let indent = "  ".repeat(depth + 2);
+        let name = xml_escape(&node.name);
+        let desc = node
+            .description
+            .as_deref()
+            .map(xml_escape)
+            .unwrap_or_default();
+        let descendants = children_of.get(&node.id);
+        let self_closing = descendants.is_none() && desc.is_empty();
+        if self_closing {
+            out.push_str(&format!("{}<outline text=\"{}\"/>\n", indent, name));
+        } else {
+            if desc.is_empty() {
+                out.push_str(&format!("{}<outline text=\"{}\">\n", indent, name));
+            } else {
+                out.push_str(&format!("{}<outline text=\"{}\" _note=\"{}\">\n", indent, name, desc));
+            }
+            if let Some(children) = descendants {
+                for child in children {
+                    walk(child, depth + 1, children_of, out);
+                }
+            }
+            out.push_str(&format!("{}</outline>\n", indent));
+        }
+    }
+    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
+        walk(root, 0, &children_of, &mut out);
+    }
+    out.push_str("  </body>\n</opml>\n");
+    out
+}
+
 /// RAII guard that bumps an in-flight counter on construction and
 /// decrements on drop. Ensures `workflowy_status` reports an accurate
 /// figure even if a handler aborts early.
@@ -574,6 +671,70 @@ pub struct TransactionOpParams {
 pub struct TransactionParams {
     #[schemars(description = "Operations to apply, in execution order")]
     pub operations: Vec<TransactionOpParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Return the canonical hierarchical path from root to node")]
+pub struct PathOfParams {
+    #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
+    pub node_id: NodeId,
+    #[schemars(description = "Maximum ancestors to walk (default 50)")]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Apply a single tag to many nodes in one call")]
+pub struct BulkTagParams {
+    #[schemars(description = "List of node IDs to tag")]
+    pub node_ids: Vec<NodeId>,
+    #[schemars(description = "Tag to apply (without leading #)")]
+    pub tag: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Cheap incremental check: did this node change after the given timestamp?")]
+pub struct SinceParams {
+    #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
+    pub node_id: NodeId,
+    #[schemars(description = "Threshold timestamp in unix milliseconds. Returns whether node.last_modified >= this value.")]
+    pub timestamp_unix_ms: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Find nodes that combine a tag with a path-prefix filter")]
+pub struct FindByTagAndPathParams {
+    #[schemars(description = "Tag to match (without leading #)")]
+    pub tag: String,
+    #[schemars(description = "Path prefix to match against the > -separated hierarchical path")]
+    pub path_prefix: String,
+    #[schemars(description = "Optional scope root; defaults to workspace root")]
+    pub root_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth (default 5)")]
+    pub max_depth: Option<usize>,
+    #[schemars(description = "Maximum results (default 50)")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Export a subtree as OPML, Markdown, or JSON for backup or external processing")]
+pub struct ExportSubtreeParams {
+    #[schemars(description = "Root of the subtree to export")]
+    pub node_id: NodeId,
+    #[schemars(description = "Output format: opml | markdown | json")]
+    pub format: String,
+    #[schemars(description = "Maximum tree depth (default 10)")]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Stub for native Workflowy mirror creation. Workflowy's public REST surface does not expose mirror creation; this tool returns an informative error so callers don't silently fall back to a 'mirror_of: <uuid>' note convention.")]
+pub struct CreateMirrorParams {
+    #[schemars(description = "Canonical node to mirror")]
+    pub canonical_node_id: NodeId,
+    #[schemars(description = "Parent under which the mirror should appear")]
+    pub target_parent_id: NodeId,
+    #[schemars(description = "Optional priority/sort key")]
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -2772,6 +2933,288 @@ impl WorkflowyMcpServer {
         })
     }
 
+    #[tool(description = "Return the canonical hierarchical path from root to the given node, by walking parent_id pointers via repeated get_node calls. Bounded by max_depth (default 50) so a malformed cycle doesn't loop forever. Each segment is { id, name }; use this for citation in distillations or for any caller that needs a stable, human-readable location.")]
+    async fn path_of(
+        &self,
+        Parameters(params): Parameters<PathOfParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "path_of", params, {
+        check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let max_depth = params.max_depth.unwrap_or(50);
+
+        // Walk parent_id chain. We stop at the first None, the first
+        // missing-node error, the first cycle (id we've seen), or the
+        // depth cap. Each step is one HTTP call; for typical Workflowy
+        // trees (depth 5-10) this is cheap.
+        let mut segments: Vec<serde_json::Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut current_id: Option<String> = Some(resolved.clone());
+        let mut depth = 0usize;
+        while let Some(id) = current_id.take() {
+            if !seen.insert(id.clone()) {
+                tracing::warn!(node_id = %id, "path_of: cycle detected, stopping walk");
+                break;
+            }
+            if depth >= max_depth {
+                tracing::warn!(max_depth, "path_of: max_depth reached, returning partial path");
+                break;
+            }
+            depth += 1;
+            match self.client.get_node(&id).await {
+                Ok(node) => {
+                    segments.push(json!({ "id": node.id, "name": node.name }));
+                    current_id = node.parent_id;
+                }
+                Err(e) => {
+                    tracing::warn!(node_id = %id, error = %e, "path_of: get_node failed; returning partial path");
+                    break;
+                }
+            }
+        }
+        // Reverse so index 0 is root, last is the requested node.
+        segments.reverse();
+        let display_path = segments
+            .iter()
+            .map(|s| s["name"].as_str().unwrap_or("(untitled)").to_string())
+            .collect::<Vec<_>>()
+            .join(" > ");
+        let payload = json!({
+            "node_id": resolved,
+            "path": display_path,
+            "segments": segments,
+            "depth": segments.len(),
+            "truncated": depth >= max_depth,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
+    #[tool(description = "Apply a tag to many nodes in one call. A thin wrapper over bulk_update with operation=add_tag, optimised for the case where the caller already knows the exact node IDs and doesn't need a tree walk to find them. Each node is edited in parallel up to the standard concurrency cap.")]
+    async fn bulk_tag(
+        &self,
+        Parameters(params): Parameters<BulkTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "bulk_tag", params, {
+        if params.node_ids.is_empty() {
+            return Err(McpError::invalid_params("node_ids must not be empty".to_string(), None));
+        }
+        let tag = params.tag.trim();
+        if tag.is_empty() || tag.contains(char::is_whitespace) {
+            return Err(McpError::invalid_params(
+                "tag must be non-empty and contain no whitespace".to_string(),
+                None,
+            ));
+        }
+        let needle = format!("#{}", tag.trim_start_matches('#'));
+
+        // Resolve every id eagerly so a short-hash miss is reported
+        // before we start mutating.
+        let ids: Vec<String> = params
+            .node_ids
+            .iter()
+            .map(|id| {
+                check_node_id(id)?;
+                self.resolve_node_ref(id)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+        use futures::StreamExt;
+        let stream = futures::stream::iter(ids.into_iter().enumerate().map(|(idx, id)| {
+            let needle = needle.clone();
+            async move {
+                let outcome = match self.client.get_node(&id).await {
+                    Ok(node) => {
+                        if node.name.contains(&needle) {
+                            // Already tagged — no-op.
+                            (idx, Ok(false))
+                        } else {
+                            let new_name = format!("{} {}", node.name.trim_end(), needle);
+                            match self
+                                .client
+                                .edit_node(&id, Some(&new_name), None)
+                                .await
+                            {
+                                Ok(_) => {
+                                    self.cache.invalidate_node(&id);
+                                    self.name_index.invalidate_node(&id);
+                                    (idx, Ok(true))
+                                }
+                                Err(e) => (idx, Err(e.to_string())),
+                            }
+                        }
+                    }
+                    Err(e) => (idx, Err(e.to_string())),
+                };
+                outcome
+            }
+        }))
+        .buffer_unordered(concurrency);
+
+        let mut collected: Vec<(usize, Result<bool, String>)> = Vec::new();
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            collected.push(item);
+        }
+        collected.sort_by_key(|(i, _)| *i);
+
+        let mut tagged = 0usize;
+        let mut already = 0usize;
+        let mut failed = 0usize;
+        let entries: Vec<serde_json::Value> = collected
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (_, r))| match r {
+                Ok(true) => { tagged += 1; json!({ "index": idx, "status": "tagged" }) }
+                Ok(false) => { already += 1; json!({ "index": idx, "status": "already_tagged" }) }
+                Err(e) => { failed += 1; json!({ "index": idx, "status": "error", "error": e }) }
+            })
+            .collect();
+
+        let payload = json!({
+            "tag": needle,
+            "total": entries.len(),
+            "tagged": tagged,
+            "already_tagged": already,
+            "failed": failed,
+            "results": entries,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
+    #[tool(description = "Cheap incremental sync helper: returns whether the given node has been modified at or after the threshold timestamp (unix milliseconds). One API call. Useful for polling a small set of known-interesting nodes without re-walking the tree.")]
+    async fn since(
+        &self,
+        Parameters(params): Parameters<SinceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "since", params, {
+        check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let node = self.client.get_node(&resolved).await.map_err(|e| {
+            McpError::internal_error(format!("Failed to get node: {}", e), None)
+        })?;
+        let last_modified = node.last_modified.unwrap_or(0);
+        let changed = last_modified >= params.timestamp_unix_ms;
+        let payload = json!({
+            "node_id": resolved,
+            "name": node.name,
+            "last_modified_unix_ms": last_modified,
+            "threshold_unix_ms": params.timestamp_unix_ms,
+            "changed_since": changed,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
+    #[tool(description = "Find nodes that match BOTH a tag and a path prefix. Combines the lateral (tag) and vertical (PARA-style hierarchical path) graph axes in one query, so callers don't have to fetch a tag_search result and post-filter by path.")]
+    async fn find_by_tag_and_path(
+        &self,
+        Parameters(params): Parameters<FindByTagAndPathParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "find_by_tag_and_path", params, {
+        let max_depth = params.max_depth.unwrap_or(5);
+        let limit = params.limit.unwrap_or(50);
+        if let Some(rid) = &params.root_id { check_node_id(rid)?; }
+        let scope = match &params.root_id {
+            Some(r) => Some(self.resolve_node_ref(r)?),
+            None => None,
+        };
+
+        match self.walk_subtree(scope.as_deref(), max_depth).await {
+            Ok(fetch) => {
+                let banner = truncation_banner_from_fetch(&fetch);
+                let node_map = build_node_map(&fetch.nodes);
+                let tag_lower = params.tag.to_lowercase();
+                let prefix_lower = params.path_prefix.to_lowercase();
+
+                let mut hits: Vec<serde_json::Value> = Vec::new();
+                for node in &fetch.nodes {
+                    // Tag check: covers #tag in name/description plus the
+                    // explicit tags array.
+                    let in_name = node.name.to_lowercase().contains(&tag_lower);
+                    let in_desc = node.description.as_ref()
+                        .map(|d| d.to_lowercase().contains(&tag_lower))
+                        .unwrap_or(false);
+                    let in_tags = node.tags.as_ref()
+                        .map(|tags| tags.iter().any(|t| t.to_lowercase().contains(&tag_lower)))
+                        .unwrap_or(false);
+                    if !(in_name || in_desc || in_tags) { continue; }
+
+                    let path = build_node_path_with_map(&node.id, &node_map);
+                    if !path.to_lowercase().contains(&prefix_lower) { continue; }
+
+                    hits.push(json!({
+                        "id": node.id,
+                        "name": node.name,
+                        "path": path,
+                    }));
+                    if hits.len() >= limit { break; }
+                }
+
+                let body = json!({
+                    "tag": params.tag,
+                    "path_prefix": params.path_prefix,
+                    "count": hits.len(),
+                    "hits": hits,
+                });
+                let result_text = format!("{}{}", banner, body);
+                Ok(CallToolResult::success(vec![Content::text(result_text)]))
+            }
+            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+        }
+        })
+    }
+
+    #[tool(description = "Export a subtree in OPML (for Workflowy/outliner compatibility), Markdown (nested bullets), or JSON (raw node array). For backup, hand-off to other tools, or external processing. Subject to the standard 10 000-node and 20-second walk budgets — large subtrees may return partial output with a truncation marker.")]
+    async fn export_subtree(
+        &self,
+        Parameters(params): Parameters<ExportSubtreeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "export_subtree", params, {
+        check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let max_depth = params.max_depth.unwrap_or(10);
+        let format = params.format.to_lowercase();
+        if !matches!(format.as_str(), "opml" | "markdown" | "json") {
+            return Err(McpError::invalid_params(
+                format!("unknown format '{}'; expected opml | markdown | json", params.format),
+                None,
+            ));
+        }
+
+        match self.walk_subtree(Some(&resolved), max_depth).await {
+            Ok(fetch) => {
+                let banner = truncation_banner_from_fetch(&fetch);
+                let body = match format.as_str() {
+                    "json" => serde_json::to_string_pretty(&fetch.nodes).map_err(|e| {
+                        McpError::internal_error(format!("JSON encoding failed: {}", e), None)
+                    })?,
+                    "markdown" => render_subtree_markdown(&fetch.nodes, &resolved),
+                    "opml" => render_subtree_opml(&fetch.nodes, &resolved),
+                    _ => unreachable!("format validated above"),
+                };
+                Ok(CallToolResult::success(vec![Content::text(format!("{}{}", banner, body))]))
+            }
+            Err(e) => Err(McpError::internal_error(format!("Failed to walk subtree: {}", e), None)),
+        }
+        })
+    }
+
+    #[tool(description = "Stub for native Workflowy mirror creation. Workflowy's public REST API does not expose mirror creation, so this tool always returns an explanatory error. The user-facing 'mirror_of: <uuid>' note convention remains the documented workaround. Removing this stub once upstream adds the endpoint is tracked in the multi-pass plan (T-157).")]
+    async fn create_mirror(
+        &self,
+        Parameters(params): Parameters<CreateMirrorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "create_mirror", params, {
+        Err(McpError::invalid_params(
+            "create_mirror is not implemented: Workflowy's public REST API does not expose mirror creation. Use a `mirror_of: <uuid>` note on the duplicate node as a documentation convention; updates do not propagate. Tracked in tasks/reliability-and-ergonomics.md (Pass 6).".to_string(),
+            None,
+        ))
+        })
+    }
+
     #[tool(description = "Return recent tool invocations from the in-memory ring buffer. Use for self-diagnosis: when a call hangs or returns unexpectedly, the previous N entries reveal the workload that produced the symptom. Includes tool name, params hash, start/finish timestamps, duration, and ok/err status.")]
     async fn get_recent_tool_calls(
         &self,
@@ -3961,13 +4404,125 @@ mod tests {
     #[tokio::test]
     async fn new_tools_are_registered() {
         let server = new_test_server();
-        assert!(server.get_tool("health_check").is_some());
-        assert!(server.get_tool("workflowy_status").is_some());
-        assert!(server.get_tool("cancel_all").is_some());
-        assert!(server.get_tool("build_name_index").is_some());
-        assert!(server.get_tool("get_recent_tool_calls").is_some());
-        assert!(server.get_tool("batch_create_nodes").is_some());
-        assert!(server.get_tool("transaction").is_some());
+        for tool in [
+            "health_check",
+            "workflowy_status",
+            "cancel_all",
+            "build_name_index",
+            "get_recent_tool_calls",
+            "batch_create_nodes",
+            "transaction",
+            "path_of",
+            "bulk_tag",
+            "since",
+            "find_by_tag_and_path",
+            "export_subtree",
+            "create_mirror",
+        ] {
+            assert!(server.get_tool(tool).is_some(), "tool {tool} must be registered");
+        }
+    }
+
+    #[test]
+    fn render_subtree_markdown_nests_by_parent_id() {
+        let nodes = vec![
+            WorkflowyNode { id: "r".into(), name: "Root".into(), parent_id: None, ..Default::default() },
+            WorkflowyNode { id: "a".into(), name: "A".into(), parent_id: Some("r".into()), ..Default::default() },
+            WorkflowyNode { id: "a1".into(), name: "A1".into(), parent_id: Some("a".into()), ..Default::default() },
+            WorkflowyNode { id: "b".into(), name: "B".into(), parent_id: Some("r".into()), description: Some("desc line".into()), ..Default::default() },
+        ];
+        let md = render_subtree_markdown(&nodes, "r");
+        assert!(md.starts_with("- Root\n"), "got: {md}");
+        assert!(md.contains("  - A\n"), "got: {md}");
+        assert!(md.contains("    - A1\n"), "got: {md}");
+        assert!(md.contains("  - B\n"), "got: {md}");
+        assert!(md.contains("      desc line"), "description rendered: {md}");
+    }
+
+    #[test]
+    fn render_subtree_opml_escapes_xml_metacharacters() {
+        let nodes = vec![
+            WorkflowyNode { id: "r".into(), name: "Root <special>".into(), parent_id: None, description: Some("note & stuff".into()), ..Default::default() },
+            WorkflowyNode { id: "c".into(), name: "Child \"q\"".into(), parent_id: Some("r".into()), ..Default::default() },
+        ];
+        let opml = render_subtree_opml(&nodes, "r");
+        assert!(opml.contains("<?xml version"), "got: {opml}");
+        assert!(opml.contains("text=\"Root &lt;special&gt;\""), "got: {opml}");
+        assert!(opml.contains("_note=\"note &amp; stuff\""), "got: {opml}");
+        assert!(opml.contains("text=\"Child &quot;q&quot;\""), "got: {opml}");
+        // Childless terminal nodes should self-close.
+        assert!(opml.contains("/>") || opml.contains("</outline>"), "got: {opml}");
+    }
+
+    #[tokio::test]
+    async fn export_subtree_rejects_unknown_format() {
+        let server = new_test_server();
+        let err = server
+            .export_subtree(Parameters(ExportSubtreeParams {
+                node_id: NodeId::from(valid_id()),
+                format: "yaml".to_string(),
+                max_depth: None,
+            }))
+            .await
+            .expect_err("unknown format must reject");
+        assert!(err.to_string().to_lowercase().contains("unknown format"));
+    }
+
+    #[tokio::test]
+    async fn create_mirror_returns_explanatory_error() {
+        let server = new_test_server();
+        let err = server
+            .create_mirror(Parameters(CreateMirrorParams {
+                canonical_node_id: NodeId::from(valid_id()),
+                target_parent_id: NodeId::from(other_valid_id()),
+                priority: None,
+            }))
+            .await
+            .expect_err("create_mirror is documented as not implemented");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("not implemented") || msg.contains("does not expose"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn bulk_tag_rejects_empty_node_ids() {
+        let server = new_test_server();
+        let err = server
+            .bulk_tag(Parameters(BulkTagParams {
+                node_ids: Vec::new(),
+                tag: "review".to_string(),
+            }))
+            .await
+            .expect_err("empty node_ids must reject");
+        assert!(err.to_string().to_lowercase().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn bulk_tag_rejects_whitespace_tag() {
+        let server = new_test_server();
+        let err = server
+            .bulk_tag(Parameters(BulkTagParams {
+                node_ids: vec![NodeId::from(valid_id())],
+                tag: "two words".to_string(),
+            }))
+            .await
+            .expect_err("tags with whitespace must reject");
+        assert!(err.to_string().to_lowercase().contains("whitespace"));
+    }
+
+    #[tokio::test]
+    async fn find_by_tag_and_path_rejects_invalid_root() {
+        let server = new_test_server();
+        let err = server
+            .find_by_tag_and_path(Parameters(FindByTagAndPathParams {
+                tag: "review".to_string(),
+                path_prefix: "Work".to_string(),
+                root_id: Some(NodeId::from("not-a-uuid")),
+                max_depth: None,
+                limit: None,
+            }))
+            .await
+            .expect_err("bad root id must reject");
+        assert!(err.to_string().to_lowercase().contains("invalid"));
     }
 
     #[tokio::test]

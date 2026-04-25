@@ -1,0 +1,365 @@
+{
+  "skill_name": "wflow",
+  "schema_notes": "Extends skill-creator schema with `group`, `safety`, and `notes` fields. `safety` controls execution mode: `read_only` runs live, `requires_sandbox` confines writes to the test sandbox node (see README), `plan_only` asks Claude to describe its approach without executing tool calls.",
+  "sandbox": {
+    "workflowy_node_name": "Test Sandbox",
+    "workflowy_parent": "Distillations / Test Sandbox",
+    "setup_instruction": "Before running write tests, ensure a node named 'Test Sandbox' exists under Distillations (7e351f77). Tests in `requires_sandbox` mode must scope all writes to descendants of this node and prefix newly created nodes with [test:<id>] for easy cleanup.",
+    "cleanup": "After a run, archive or delete the Test Sandbox subtree to reset state."
+  },
+  "evals": [
+    {
+      "id": 1,
+      "group": "A. Workflow Triggering",
+      "safety": "read_only",
+      "prompt": "morning review",
+      "expected_output": "A concise daily briefing pulling tasks, reMarkable activity, journal entries, and open distillation threads.",
+      "expectations": [
+        "The transcript shows a Workflowy task query under node c1ef1ad5 — either tag_search for #TODO or #action_, or list_children on Tasks.",
+        "The transcript shows a check on @Boss for escalations.",
+        "The transcript shows reMarkable activity retrieval via remarkable_browse or remarkable_recent.",
+        "The transcript shows a read of recent entries under Journal node e79844f6.",
+        "The transcript shows a check of session logs under Distillations 7e351f77 for any open syntheses from the previous session.",
+        "The final response is a synthesised briefing organised by priority — not a raw paste of tool outputs."
+      ]
+    },
+    {
+      "id": 2,
+      "group": "A. Workflow Triggering",
+      "safety": "read_only",
+      "prompt": "triage my reading list",
+      "expected_output": "Per-item proposals to route Reading List entries into the right pillar / theme nodes, with cross-references against reMarkable and existing distillations.",
+      "expectations": [
+        "The transcript reads children of Reading List node b97b5593, then drills into Reading WIP children.",
+        "The transcript also includes Inbox links (per the recent updates note in user memory) — not just Reading List items.",
+        "Each proposal names a target Link node (How we Lead 67219b30, How we Decide dcbf6dfa, How we Learn cd5c2bb8, How we Build 741ff6e0) or a Theme node (AI b8e87609, Ethics 7d3e5f97, General Tech 8933039c, LifeHacks 594a9b57).",
+        "The transcript shows remarkable_search calls to flag items already on reMarkable as PDFs or EPUBs.",
+        "The transcript shows search_nodes scoped under Distillations 7e351f77 to flag already-distilled sources.",
+        "Moves are presented for confirmation, not executed unilaterally.",
+        "Items that are actions rather than reading are flagged for routing into Tasks instead."
+      ]
+    },
+    {
+      "id": 3,
+      "group": "A. Workflow Triggering",
+      "safety": "requires_sandbox",
+      "prompt": "extract notes from my '2026 notes' notebook on reMarkable and distil into atomic notes",
+      "expected_output": "Source MOC under Test Sandbox holding atomic notes derived from OCR'd handwritten pages, with mirrors into the relevant pillar.",
+      "expectations": [
+        "The transcript uses remarkable_image with include_ocr=true (handwritten notebook — remarkable_read would error).",
+        "Pages are processed iteratively, not via a single bulk call.",
+        "Each highlight or annotation is reformulated as a single-claim sentence — not pasted as a verbatim quote.",
+        "A source MOC node is created (or reused) under Distillations / Test Sandbox naming the source.",
+        "Atomic notes are inserted under the source MOC and mirrored into a pillar's distillation node, with the mirror description prefixed 'mirror_of:' and the canonical node ID.",
+        "A session log entry is appended under Distillations / Session logs / [today's date], scoped to the Test Sandbox for this run."
+      ]
+    },
+    {
+      "id": 4,
+      "group": "A. Workflow Triggering",
+      "safety": "read_only",
+      "prompt": "what do I have on Cynefin across my notes?",
+      "expected_output": "A unified view organised by pillar then by source, with distillations / raw sources / reMarkable separated.",
+      "expectations": [
+        "The transcript runs search_nodes with max_depth >= 5 across the full Workflowy tree.",
+        "The transcript runs a second search_nodes scoped under Distillations 7e351f77.",
+        "The transcript runs remarkable_search for 'Cynefin' and a follow-up remarkable_search with a grep keyword.",
+        "The transcript checks at least one pillar MOC (How we Lead 67219b30 or How we Decide dcbf6dfa) for relevant entries.",
+        "The transcript calls find_backlinks on at least one canonical node to surface mirror relationships.",
+        "Output is structured by pillar, then by source, with clear separation of distillations / Workflowy raw sources / reMarkable sources.",
+        "The response offers to write a fresh distillation if contradictions or gaps are visible."
+      ]
+    },
+    {
+      "id": 5,
+      "group": "A. Workflow Triggering",
+      "safety": "requires_sandbox",
+      "prompt": "[Preceded by a chat that produced a synthesis comparing Wardley Mapping to Cynefin as complementary sense-making tools] save this synthesis",
+      "expected_output": "Atomic notes under the relevant pillar's distillation node within Test Sandbox, with mirrors and a session log entry.",
+      "expectations": [
+        "The synthesis is decomposed into multiple atomic notes — not pasted as a single block.",
+        "Each atomic note name is a complete claim sentence that stands alone.",
+        "Each atomic note description contains source attribution (this chat, capture date).",
+        "Claude either correctly infers the canonical pillar or asks when the choice is ambiguous.",
+        "Mirror nodes' descriptions begin with 'mirror_of:' followed by the canonical node ID.",
+        "Because the synthesis spans pillars, an entry is created under Distillations / Cross-pillar concept maps.",
+        "A session log entry is appended under Distillations / Session logs / [today's date]."
+      ]
+    },
+    {
+      "id": 6,
+      "group": "A. Workflow Triggering",
+      "safety": "requires_sandbox",
+      "prompt": "extract tasks from my 'Daily to-dos' notebook on reMarkable",
+      "expected_output": "Confirmed action items inserted under Tasks (or Test Sandbox tasks), tagged appropriately.",
+      "expectations": [
+        "The transcript uses remarkable_image with include_ocr=true on the Daily to-dos notebook.",
+        "Extracted candidates are presented for confirmation before any insertion.",
+        "Confirmed tasks are created under Workflowy Tasks node c1ef1ad5 (or Test Sandbox equivalent).",
+        "Tasks receive #TODO and where the OCR makes delegation clear, an @person tag.",
+        "Items that read as insights rather than actions are routed via Synthesis Capture (workflow 5) instead of being inserted as tasks."
+      ]
+    },
+    {
+      "id": 7,
+      "group": "A. Workflow Triggering",
+      "safety": "requires_sandbox",
+      "prompt": "file this link: https://martinfowler.com/articles/microservices.html",
+      "expected_output": "Link filed under Link How we Build, with title, and a follow-up offer to distil now or later.",
+      "expectations": [
+        "The transcript identifies microservices/architecture content and routes to How we Build (Link node 741ff6e0).",
+        "Before filing, Claude fetches the page or otherwise titles the URL — the raw URL is not filed naked.",
+        "After filing, Claude asks whether to read the article and produce a distillation now, or just file.",
+        "If a distillation is requested, content is placed under How we Build distillations and mirrored into Theme General Tech 8933039c."
+      ]
+    },
+    {
+      "id": 8,
+      "group": "A. Workflow Triggering",
+      "safety": "requires_sandbox",
+      "prompt": "write a journal entry for today",
+      "expected_output": "Dated entry under Journal pulling today's tasks, reading, and session log context, in a format consistent with prior entries.",
+      "expectations": [
+        "A new dated entry is created under Journal node e79844f6 (or Test Sandbox equivalent).",
+        "The transcript reads today's completed tasks, recent reMarkable activity, and today's session log from Distillations.",
+        "The entry's format is consistent with at least one prior journal entry — Claude reads a recent entry first to match style.",
+        "Claude offers to lift any insight-bearing journal content into Distillations as atomic notes."
+      ]
+    },
+    {
+      "id": 9,
+      "group": "B. Atomic Note Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "Capture this insight: Cynefin distinguishes complicated from complex by causality, not difficulty; this matters because complicated problems yield to expert analysis while complex problems require probe-sense-respond; many leadership failures come from applying complicated-domain methods inside complex domains.",
+      "expected_output": "Three sibling atomic notes, each a single complete-sentence claim.",
+      "expectations": [
+        "The output is exactly three sibling atomic notes — not one node with all three claims.",
+        "Each node name is a complete sentence stating a single claim.",
+        "Each node has source attribution (this chat, capture date) in its description, not its name.",
+        "Tags applied at point of capture — at minimum #complexity, with #leadership and #decision where relevant.",
+        "The notes land under the canonical pillar (How we Decide), with appropriate mirrors into How we Lead because all three claims touch leadership."
+      ]
+    },
+    {
+      "id": 10,
+      "group": "B. Atomic Note Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: DORA's four key metrics measure software delivery performance — deployment frequency, lead time for changes, change failure rate, and mean time to restore.",
+      "expected_output": "A single atomic note under How we Build, even though the claim enumerates four sub-items.",
+      "expectations": [
+        "The output is one atomic note — not four (the claim is 'DORA's four metrics measure delivery performance', the list is supporting detail, not separate claims).",
+        "The node name is a complete sentence.",
+        "Tagged #devops, #architecture, or #engineering-practice.",
+        "Routed to How we Build pillar; theme General Tech mirror is acceptable but not required."
+      ]
+    },
+    {
+      "id": 11,
+      "group": "B. Atomic Note Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: Forsgren's research extends Drift into Failure to engineering practice — high-performing teams have organisational designs that resist drift, not just better tools.",
+      "expected_output": "An atomic note under How we Build that backlinks to the existing Drift into Failure canonical node and is mirrored across pillars.",
+      "expectations": [
+        "Before creating the note, the transcript searches existing Distillations for a canonical 'Drift into Failure' node.",
+        "The new note's description contains a Workflowy backlink to that canonical node (or the transcript notes that one was not found and asks the user).",
+        "The new note is canonical under How we Build distillations.",
+        "Because it touches Drift into Failure, mirrors are created in How we Lead and How we Decide distillations, with an entry under Cross-pillar concept maps."
+      ]
+    },
+    {
+      "id": 12,
+      "group": "C. Mirror and MOC Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "[After a chat establishing how Snowden's Cynefin chaotic-domain guidance maps onto Dekker's Drift into Failure account of accident causation] save this synthesis",
+      "expected_output": "Canonical notes in one pillar, mirrors in the other, plus a Cross-pillar concept maps entry.",
+      "expectations": [
+        "Canonical atomic notes are created in one pillar — Lead or Decide — not duplicated across both.",
+        "Mirror nodes exist in the other pillar with descriptions that begin 'mirror_of:' followed by the canonical UUID.",
+        "An entry is added under Distillations / Cross-pillar concept maps capturing the Cynefin-Dekker connection.",
+        "Tags include at least #safety, #complexity, and #leadership.",
+        "If the synthesis touches Drift into Failure (which it does), Claude follows the user-memory rule of mirroring across Lead + Decide and adding to Cross-pillar concept maps."
+      ]
+    },
+    {
+      "id": 13,
+      "group": "C. Mirror and MOC Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: 'Bounded contexts in DDD are the unit of model autonomy — sharing a model across contexts creates implicit coupling that breaks under change.' Source: Evans, 2003.",
+      "expected_output": "A single-pillar note under How we Build, no spurious cross-pillar mirrors.",
+      "expectations": [
+        "The note lands under How we Build distillations.",
+        "It is NOT mirrored into Lead, Decide, or Learn — the claim is a single-pillar engineering claim.",
+        "A mirror into Theme General Tech 8933039c is acceptable but not required.",
+        "No entry is created under Cross-pillar concept maps.",
+        "The note's description contains the Evans citation."
+      ]
+    },
+    {
+      "id": 14,
+      "group": "C. Mirror and MOC Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "I'm starting to capture notes from Skelton and Pais' Team Topologies. Set up a source MOC.",
+      "expected_output": "A new source MOC node under Distillations / How we Build — distillations dedicated to Team Topologies.",
+      "expectations": [
+        "A node is created under Distillations / How we Build — distillations named 'Team Topologies — MOC' or equivalent.",
+        "The MOC node description identifies the book, authors, and year.",
+        "The transcript explains that future atomic notes from this book will be inserted as children of the MOC and mirrored into pillars/themes as appropriate.",
+        "Theme node General Tech and pillar How we Build are referenced as expected mirror targets."
+      ]
+    },
+    {
+      "id": 15,
+      "group": "D. Routing",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: 'Event-driven architectures decouple producers and consumers in time and space, but introduce eventual consistency as a first-class system property.' Source: Vernon, Implementing DDD.",
+      "expected_output": "Routed to How we Build with appropriate engineering tags.",
+      "expectations": [
+        "Routed to How we Build pillar — not Lead, Learn, or Decide.",
+        "Tag #architecture or equivalent applied.",
+        "Mirror into Theme General Tech 8933039c is acceptable.",
+        "Source attribution names Vernon and the book."
+      ]
+    },
+    {
+      "id": 16,
+      "group": "D. Routing",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: 'Cynefin's chaotic domain demands action before sense-making — the discipline is to act, then sense, then respond, in that order.'",
+      "expected_output": "Canonical under How we Decide with mirror into How we Lead.",
+      "expectations": [
+        "Routed to How we Decide pillar canonically.",
+        "Tags #complexity and #decision applied.",
+        "Mirror into How we Lead created (Cynefin is leadership-relevant).",
+        "Entry added under Cross-pillar concept maps."
+      ]
+    },
+    {
+      "id": 17,
+      "group": "D. Routing",
+      "safety": "plan_only",
+      "prompt": "Capture: 'Psychological safety is the strongest predictor of high-performing teams.' Source: Edmondson.",
+      "expected_output": "Either Claude proposes a primary pillar with explicit acknowledgement of ambiguity, or asks the user to choose.",
+      "expectations": [
+        "Claude recognises this could canonically sit in How we Lead (culture) or How we Learn (team development).",
+        "Claude either asks the user explicitly which pillar should be canonical, or proposes one (Lead) and flags the alternative (Learn) as a mirror — making the ambiguity visible.",
+        "Claude does NOT silently pick a pillar without surfacing the choice.",
+        "The Edmondson source is correctly attributed."
+      ]
+    },
+    {
+      "id": 18,
+      "group": "E. Cross-System",
+      "safety": "read_only",
+      "prompt": "I'm thinking about reading 'Accelerate' by Forsgren, Humble, Kim. Have I already covered it, or should I file the link?",
+      "expected_output": "A duplication check across Distillations and reMarkable before any filing.",
+      "expectations": [
+        "Claude searches Distillations 7e351f77 for 'Accelerate' and 'Forsgren'.",
+        "Claude searches reMarkable via remarkable_search for the title.",
+        "If existing distillations are found, Claude reports them and asks whether to revisit existing notes versus filing the link afresh.",
+        "If nothing is found, Claude proceeds with Link Management (workflow 7) routed to How we Build."
+      ]
+    },
+    {
+      "id": 19,
+      "group": "E. Cross-System",
+      "safety": "requires_sandbox",
+      "prompt": "Capture: 'Tightly coupled microservices can outperform loosely coupled ones in the early phase of a startup, because integration cost of decoupling exceeds the cost of co-evolution.'",
+      "expected_output": "A note that surfaces the contradiction with prior coupling claims and tags both for revisit.",
+      "expectations": [
+        "Before creating the note, Claude searches existing Distillations for prior claims about microservice coupling.",
+        "If a contradicting prior note exists, Claude flags the contradiction explicitly in its response.",
+        "The new note is tagged #revisit, and Claude proposes tagging the prior note #revisit too (with user confirmation).",
+        "An entry under Distillations / Cross-pillar concept maps captures the tension."
+      ]
+    },
+    {
+      "id": 20,
+      "group": "F. Tool Reliability",
+      "safety": "read_only",
+      "prompt": "extract pages 1-3 from my '2026 notes' notebook on reMarkable",
+      "expected_output": "Correct tool routing for handwritten content.",
+      "expectations": [
+        "Claude uses remarkable_image with include_ocr=true — NOT remarkable_read.",
+        "Pages are processed iteratively (one or a small batch at a time), not via a single bulk call.",
+        "If Claude initially attempts remarkable_read and gets an error, it recognises the error and switches to remarkable_image without giving up."
+      ]
+    },
+    {
+      "id": 21,
+      "group": "F. Tool Reliability",
+      "safety": "plan_only",
+      "prompt": "Move the 'DDD Bounded Contexts' note from Resources to Distillations / How we Build — distillations. Treat the first move_node attempt as failing with a stale-ID error and describe how you'd recover.",
+      "expected_output": "A retry pattern that refreshes parent children before the second attempt.",
+      "expectations": [
+        "Claude's plan retries move_node 2-3 times on failure rather than abandoning after one attempt.",
+        "Between retries, Claude calls list_children on the source parent to refresh node IDs — explicitly noting that stale IDs are the most common cause of move_node failure.",
+        "After three failed attempts, the plan has Claude report the failure and ask the user before further attempts rather than looping indefinitely."
+      ]
+    },
+    {
+      "id": 22,
+      "group": "F. Tool Reliability",
+      "safety": "plan_only",
+      "prompt": "[Test condition: reMarkable MCP endpoints are timing out, including remarkable_status itself] extract notes from my Tasks notebook on reMarkable",
+      "expected_output": "Diagnostic-first approach with restart guidance when the server itself is down.",
+      "expectations": [
+        "Claude calls remarkable_status as a diagnostic before retrying any other endpoint.",
+        "When remarkable_status itself times out, Claude tells the user the MCP server process appears to be down and recommends a restart — rather than retrying other endpoints indefinitely.",
+        "Claude does not invent a workaround that bypasses reMarkable (e.g., asking the user to manually transcribe their notebook) without first making the server-down diagnosis explicit."
+      ]
+    },
+    {
+      "id": 23,
+      "group": "G. End-of-Session Discipline",
+      "safety": "plan_only",
+      "prompt": "[Preceded by a 20-message chat that produced a substantive comparison between Wardley Mapping and the Cynefin framework, ending with the user saying] thanks, that was useful",
+      "expected_output": "Proactive offer to capture the synthesis, without nagging if declined.",
+      "expectations": [
+        "Before closing, Claude proactively offers to distil the synthesis into atomic notes under Distillations.",
+        "The offer references workflow 5 (Synthesis Capture) — explicit about what would be created (canonical notes, pillar, mirrors, session log).",
+        "If the user declined the offer in a hypothetical follow-up, Claude would move on without re-asking.",
+        "Claude also runs the end-of-session checklist mentally: any new sources to file? any tasks generated? any contradictions surfaced?"
+      ]
+    },
+    {
+      "id": 24,
+      "group": "G. End-of-Session Discipline",
+      "safety": "requires_sandbox",
+      "prompt": "I should follow up with Athena about the data architecture review next week.",
+      "expected_output": "An offer to capture the follow-up as a Workflowy task with delegation tag.",
+      "expectations": [
+        "Claude offers to capture the follow-up as a Workflowy task — does not just acknowledge conversationally.",
+        "On confirmation, the task is created under Tasks node c1ef1ad5 (or Test Sandbox equivalent).",
+        "Tags include #TODO and @Athena.",
+        "The description captures temporal context (next week) and the topic (data architecture review)."
+      ]
+    },
+    {
+      "id": 25,
+      "group": "H. Negative / Sanity",
+      "safety": "read_only",
+      "prompt": "What's the capital of France?",
+      "expected_output": "A direct factual answer with no skill invocation and no MCP tool calls.",
+      "expectations": [
+        "The transcript shows zero Workflowy tool calls.",
+        "The transcript shows zero reMarkable tool calls.",
+        "Claude answers directly: Paris.",
+        "No nodes are created, no session log entry is written, no end-of-session checklist is run."
+      ]
+    },
+    {
+      "id": 26,
+      "group": "H. Negative / Sanity",
+      "safety": "requires_sandbox",
+      "prompt": "Capture this rough thought, mark it as work-in-progress: maybe Cynefin's complicated quadrant overlaps with Snowden's later 'liminal' work?",
+      "expected_output": "The note is captured but marked as draft, and is not propagated through the mirror discipline.",
+      "expectations": [
+        "The note is created with the user's text as a single atomic node — Claude does NOT decompose it (the user explicitly framed it as a rough thought).",
+        "Tags include #wip and/or #draft.",
+        "The note is NOT mirrored into pillars or themes despite touching complexity (mirror discipline excludes #wip and #draft).",
+        "No entry is created under Cross-pillar concept maps.",
+        "The note is placed under Temp Working d56bd8d4 OR under Distillations with explicit #wip — not in a canonical distillation node."
+      ]
+    }
+  ]
+}

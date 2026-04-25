@@ -231,8 +231,40 @@
     rollback. Inverse for create=delete, edit=restore-prev,
     move=un-move; delete is non-invertible by design.
 
-- [ ] **T-157 (Pass 6)**: Mirror primitives + API expansion
-- [ ] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
+- [x] **T-157 (Pass 6)**: API expansion (mirror documented as stub)
+  - `create_mirror` is a stub returning an explanatory error: the
+    public Workflowy REST API does not expose mirror creation, so
+    delivering this tool would silently lie. Stub keeps the MCP
+    surface honest and gives callers a clear next-step pointer.
+  - `path_of` walks parent_id chain via repeated get_node; bounded by
+    max_depth (default 50) to defend against malformed cycles.
+    Returns ordered segments root→leaf and a printable `A > B > C`
+    string for citation use.
+  - `bulk_tag` accepts an explicit ID list and parallel-applies a tag
+    by reading each node, appending `#tag` to the name if not present,
+    and editing. Bounded concurrency, per-op status reporting.
+  - `since` is a single get_node + timestamp comparison — cheap
+    incremental sync helper for clients that want to poll a known
+    set of nodes.
+  - `find_by_tag_and_path` walks a subtree once and filters for nodes
+    whose tag matches AND whose computed hierarchical path contains
+    the prefix. Honours subtree budgets (truncation banner).
+  - `export_subtree` walks once and emits OPML, Markdown nested
+    bullets, or JSON. XML metacharacters escaped in OPML; descriptions
+    preserved.
+
+- [x] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
+  - `tests/proptest_node_id.rs`: 5 property tests over hyphenated /
+    unhyphenated UUID strings, garbage strings (no panics), and
+    `null` deserialisation (always rejected at the serde layer).
+  - `tests/scripted_session.rs`: ignored-by-default integration test
+    matching the brief's definition of done — drives a 30-op
+    distillation-style session 10 times under a 30 s/run budget.
+    Requires `WORKFLOWY_TEST_API_KEY` and `WORKFLOWY_TEST_PARENT_ID`.
+  - `.github/workflows/test.yml`: CI runs `cargo check`, the lib
+    tests, and the proptest on every push and PR. The acceptance job
+    runs the scripted session against the sandbox secret on push to
+    `main` only.
 
 ---
 
