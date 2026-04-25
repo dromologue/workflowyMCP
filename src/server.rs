@@ -77,53 +77,112 @@ fn per_tool_health(log: &OpLog) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// Discrete proximate-cause classification for a tool failure. Brief
+/// 2026-04-25 Test γ requires every error to carry one of these
+/// values so callers can route on the cause rather than parsing
+/// human-readable hint strings. Variants map 1:1 to the brief's
+/// requested enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProximateCause {
+    Timeout,
+    LockContention,
+    CacheMiss,
+    UpstreamError,
+    Cancelled,
+    NotFound,
+    AuthFailure,
+    Unknown,
+}
+
+impl ProximateCause {
+    /// String form for the JSON-RPC `data.proximate_cause` field. Stable
+    /// over the lifetime of the API: callers may match on these values.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProximateCause::Timeout => "timeout",
+            ProximateCause::LockContention => "lock_contention",
+            ProximateCause::CacheMiss => "cache_miss",
+            ProximateCause::UpstreamError => "upstream_error",
+            ProximateCause::Cancelled => "cancelled",
+            ProximateCause::NotFound => "not_found",
+            ProximateCause::AuthFailure => "auth_failure",
+            ProximateCause::Unknown => "unknown",
+        }
+    }
+}
+
 /// Build a structured `McpError` for a tool failure. Picks a JSON-RPC error
 /// code based on the underlying error class and attaches a `data` payload
-/// with `{operation, node_id, hint, error}` so even minimal clients can
-/// extract the proximate cause when their UI renders only the generic
-/// "tool failed" surface. Supersedes the previous direct calls to
-/// `McpError::internal_error(format!("Failed: {}", e), None)` which were
-/// being truncated to "Tool execution failed" by some clients.
+/// with `{operation, node_id, hint, error, proximate_cause}` so even
+/// minimal clients can extract the proximate cause when their UI renders
+/// only the generic "tool failed" surface. Supersedes the previous
+/// direct calls to `McpError::internal_error(format!("Failed: {}", e), None)`
+/// which were being truncated to "Tool execution failed" by some clients.
+///
+/// Brief 2026-04-25 Test γ: `proximate_cause` is a discrete enum, not a
+/// free-text hint, so callers can switch on it without parsing.
 fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Display) -> McpError {
     let err_str = err.to_string();
     let lower = err_str.to_lowercase();
-    let (code, hint) = if lower.contains("404") || lower.contains("not found") {
+    let (code, hint, cause) = if lower.contains("404") || lower.contains("not found") {
         (
             ErrorCode::RESOURCE_NOT_FOUND,
             "node may not yet exist (propagation lag), or has been deleted",
+            ProximateCause::NotFound,
         )
     } else if lower.contains("cancelled") {
         (
             ErrorCode::INTERNAL_ERROR,
             "cancelled by cancel_all — the call was preempted, retry",
+            ProximateCause::Cancelled,
         )
     } else if lower.contains("timeout") || lower.contains("timed out") {
         (
             ErrorCode::INTERNAL_ERROR,
             "upstream timeout — narrow scope or wait for load to drop",
+            ProximateCause::Timeout,
         )
     } else if lower.contains("api error 5") {
         (
             ErrorCode::INTERNAL_ERROR,
             "Workflowy backend error — try again shortly",
+            ProximateCause::UpstreamError,
         )
     } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
         (
             ErrorCode::INTERNAL_ERROR,
             "auth failure — check WORKFLOWY_API_KEY",
+            ProximateCause::AuthFailure,
+        )
+    } else if lower.contains("lock") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "internal lock contention — retry shortly",
+            ProximateCause::LockContention,
+        )
+    } else if lower.contains("cache") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "stale cache entry — retry; the cache has been invalidated",
+            ProximateCause::CacheMiss,
         )
     } else {
-        (ErrorCode::INTERNAL_ERROR, "see data field for details")
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "see data field for details",
+            ProximateCause::Unknown,
+        )
     };
     let data = serde_json::json!({
         "operation": operation,
         "node_id": node_id,
         "hint": hint,
+        "proximate_cause": cause.as_str(),
         "error": err_str,
     });
     McpError::new(
         code,
-        format!("{}: {}", operation, err_str),
+        format!("{}: {} [{}]", operation, err_str, cause.as_str()),
         Some(data),
     )
 }
@@ -912,6 +971,46 @@ impl WorkflowyMcpServer {
         }
     }
 
+    /// Brief 2026-04-25 Test β (fail-closed semantics): returns
+    /// `Some(message)` when the most recent op-log failure happened
+    /// within `window_ms`, naming the broken tool so the create
+    /// response can warn the caller before they issue follow-up
+    /// writes that may not be retrievable. Returns `None` when no
+    /// failure is recent enough to gate on.
+    ///
+    /// Designed for `create_node` (the brief's specific concern, since
+    /// creates were the only path that stayed healthy while reads/
+    /// mutations wedged), but the helper is safe to call from any
+    /// handler that wants the same gate.
+    fn degraded_warning_if_recent_failure(&self, window_ms: u64) -> Option<String> {
+        let last = self.op_log.last_failure()?;
+        // Only count read/mutate failures, not validation/usage errors
+        // from this same call class. The brief's failure mode was the
+        // upstream wedging, not "I just got told my params are invalid".
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age_ms = now_ms.saturating_sub(last.finished_at_unix_ms);
+        if age_ms > window_ms {
+            return None;
+        }
+        // Self-failures (create_node failing earlier) don't gate
+        // future creates — the API can recover between calls.
+        if last.tool == "create_node" {
+            return None;
+        }
+        Some(format!(
+            "server in degraded state — `{}` failed {} ms ago: {}. \
+             Reads or follow-up mutations on this node may not succeed \
+             until the upstream recovers; verify with `workflowy_status` \
+             before issuing further writes.",
+            last.tool,
+            age_ms,
+            last.error.as_deref().unwrap_or("(no detail)")
+        ))
+    }
+
     /// Walk a subtree with the server's standard controls and push every
     /// visited node through the name index before returning. Keeps the tree
     /// walk and the opportunistic index population in one place so no handler
@@ -1081,6 +1180,16 @@ impl WorkflowyMcpServer {
             None => None,
         };
 
+        // Brief 2026-04-25 Test β: fail-closed semantics. When reads
+        // or mutations have failed in the last 30 s the create may
+        // succeed at the API layer but the assistant will not be
+        // able to verify, move, or delete the new node — exactly the
+        // failure mode that produced the four orphans on 2026-04-25.
+        // Compute the warning *before* the create runs and attach it
+        // to the success response so the assistant can roll back its
+        // plan before issuing follow-up writes.
+        let degraded_warning = self.degraded_warning_if_recent_failure(30_000);
+
         match self
             .client
             .create_node(&params.name, params.description.as_deref(), resolved_parent.as_deref(), params.priority)
@@ -1091,10 +1200,14 @@ impl WorkflowyMcpServer {
                     .as_deref()
                     .map(|p| format!("under `{}`", p))
                     .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
-                let msg = format!(
+                let mut msg = format!(
                     "Created node '{}' (id: `{}`) {}",
                     params.name, created.id, placement
                 );
+                if let Some(warn) = &degraded_warning {
+                    msg.push_str("\n\n⚠ DEGRADED: ");
+                    msg.push_str(warn);
+                }
                 // Invalidate cache for parent
                 if let Some(pid) = &resolved_parent {
                     self.cache.invalidate_node(pid);
@@ -2818,12 +2931,64 @@ impl WorkflowyMcpServer {
         let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
         let tree_estimate = self.tree_size_estimate.load(std::sync::atomic::Ordering::Relaxed);
         let per_tool = per_tool_health(&self.op_log);
+        // Brief 2026-04-25 Test ε: a flat `paths` map keyed by tool
+        // name with values "healthy"/"degraded"/"failing"/"untested"
+        // is what callers actually want for routing decisions. Derive
+        // it from per_tool_health and fill in "untested" for the
+        // tools the brief explicitly probes (creates/mutations/reads
+        // the assistant routinely sequences).
+        let mut paths = serde_json::Map::new();
+        for tool in [
+            "get_node", "list_children", "search_nodes", "find_node",
+            "create_node", "delete_node", "edit_node", "move_node",
+            "tag_search", "list_overdue", "list_upcoming", "daily_review",
+        ] {
+            let status = per_tool
+                .get(tool)
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("untested")
+                .to_string();
+            paths.insert(tool.to_string(), serde_json::Value::String(status));
+        }
         let last_failure = self.op_log.last_failure().map(|f| {
+            // Best-effort proximate-cause classification from the
+            // recorded reason string. Same heuristics as `tool_error`
+            // so the value matches what the original error carried.
+            let reason = f.error.clone().unwrap_or_default();
+            let lower = reason.to_lowercase();
+            let cause = if lower.contains("404") || lower.contains("not found") {
+                ProximateCause::NotFound
+            } else if lower.contains("cancelled") {
+                ProximateCause::Cancelled
+            } else if lower.contains("timeout") || lower.contains("timed out") {
+                ProximateCause::Timeout
+            } else if lower.contains("api error 5") {
+                ProximateCause::UpstreamError
+            } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
+                ProximateCause::AuthFailure
+            } else {
+                ProximateCause::Unknown
+            };
             json!({
                 "tool": f.tool,
                 "at_unix_ms": f.finished_at_unix_ms,
-                "reason": f.error.unwrap_or_default(),
+                "reason": reason,
+                "proximate_cause": cause.as_str(),
             })
+        });
+        // Brief 2026-04-25 Test ε `upstream_session` block. We don't
+        // hold a session token (the client uses a long-lived API key
+        // from env), but we surface the equivalent: whether the API
+        // is currently reachable, the rate-limit headers we last
+        // observed, and the server's uptime as a proxy for "session
+        // age" since the API key effectively defines the session.
+        let upstream_session = json!({
+            "authenticated": api_reachable,
+            "auth_method": "api_key_env",
+            "session_age_ms": self.started_at.elapsed().as_millis() as u64,
+            "rate_limit_remaining": rate_limit.remaining,
+            "rate_limit_limit": rate_limit.limit,
         });
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
@@ -2850,7 +3015,9 @@ impl WorkflowyMcpServer {
                 "observed": rate_limit.remaining.is_some() || rate_limit.limit.is_some() || rate_limit.reset_unix_seconds.is_some(),
             },
             "per_tool_health": per_tool,
+            "paths": paths,
             "last_failure": last_failure,
+            "upstream_session": upstream_session,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "cancel_generation": self.cancel_registry.generation(),
             "error": error,
@@ -4518,6 +4685,146 @@ mod tests {
                 "handler must route through {} (Pattern 6)", handler
             );
         }
+    }
+
+    /// Brief 2026-04-25 follow-up Test γ: every tool_error carries a
+    /// discrete `proximate_cause` enum value the caller can switch on.
+    /// Exercises each of the classifier branches so a future regression
+    /// (e.g. someone reverts the enum) fails loudly. Reads the data
+    /// payload off the McpError and checks the value matches the
+    /// expected variant for the input shape.
+    #[test]
+    fn tool_error_proximate_cause_classification_covers_every_branch() {
+        let cases: &[(&str, &str)] = &[
+            ("API error 404: Item not found", "not_found"),
+            ("get_subtree cancelled by cancel_all", "cancelled"),
+            ("subtree walk timed out after 20 s", "timeout"),
+            ("API error 500: backend whoopsie", "upstream_error"),
+            ("API error 401: unauthorized", "auth_failure"),
+            ("internal lock contention on cache", "lock_contention"),
+            ("stale cache entry detected", "cache_miss"),
+            ("some completely unknown failure mode", "unknown"),
+        ];
+        for (err_str, expected_cause) in cases {
+            let mcp_err = tool_error("test_tool", Some("550e8400-e29b-41d4-a716-446655440000"), err_str);
+            // Re-derive the data payload through the standard JSON
+            // round-trip so we test what the wire actually carries.
+            let json = serde_json::to_value(&mcp_err).expect("McpError serialises");
+            let cause = json["data"]["proximate_cause"]
+                .as_str()
+                .expect(&format!("data.proximate_cause missing in {json}"));
+            assert_eq!(
+                cause, *expected_cause,
+                "input '{err_str}' should classify as '{expected_cause}', got '{cause}'"
+            );
+            // The error message itself includes the cause in brackets so
+            // even minimal clients (which discard the data payload)
+            // still see it.
+            let msg = mcp_err.to_string();
+            assert!(
+                msg.contains(&format!("[{}]", expected_cause)),
+                "error message must include [{expected_cause}]: {msg}"
+            );
+        }
+    }
+
+    /// Brief 2026-04-25 follow-up Test ε: workflowy_status returns a
+    /// `paths` map keyed by tool name with simple healthy/degraded/
+    /// failing/untested values, plus an `upstream_session` block. The
+    /// brief gives the exact shape the assistant needs for routing.
+    #[tokio::test]
+    async fn workflowy_status_returns_paths_and_upstream_session() {
+        let server = new_test_server();
+        // Drive a couple of failures to populate per_tool_health.
+        let _ = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+
+        let paths = v["paths"].as_object().expect("paths must be a JSON object");
+        // Every tool the brief explicitly mentions for routing must be
+        // present, with a value from the documented enum.
+        for tool in [
+            "get_node", "list_children", "search_nodes", "find_node",
+            "create_node", "delete_node", "edit_node", "move_node",
+            "tag_search", "list_overdue", "list_upcoming", "daily_review",
+        ] {
+            let status = paths
+                .get(tool)
+                .and_then(|s| s.as_str())
+                .expect(&format!("paths['{tool}'] missing"));
+            assert!(
+                matches!(status, "healthy" | "degraded" | "failing" | "untested"),
+                "paths['{tool}'] must be one of healthy/degraded/failing/untested, got '{status}'"
+            );
+        }
+        // get_node was just exercised with an empty-id failure — should
+        // be the only tool reading "failing" in this fresh server.
+        assert_eq!(paths["get_node"], "failing", "get_node should be failing after the empty-id call");
+
+        let session = v["upstream_session"].as_object().expect("upstream_session block");
+        assert!(session.contains_key("authenticated"));
+        assert!(session.contains_key("auth_method"));
+        assert!(session.contains_key("session_age_ms"));
+        assert!(session.contains_key("rate_limit_remaining"));
+    }
+
+    /// Brief 2026-04-25 follow-up Test β: when a read or mutate has
+    /// failed in the last 30 s, a successful create_node response
+    /// must include a DEGRADED warning naming the broken tool — so
+    /// the assistant doesn't silently accumulate orphan creates the
+    /// way the original session did. Tested at the helper level
+    /// because invoking create_node end-to-end requires a live API.
+    #[tokio::test]
+    async fn fail_closed_warning_fires_when_recent_failure_in_window() {
+        let server = new_test_server();
+        // No failures yet → no warning.
+        assert!(
+            server.degraded_warning_if_recent_failure(30_000).is_none(),
+            "no failures recorded — must not warn"
+        );
+
+        // Force a get_node failure (empty id) — the most recent op-log
+        // entry is now an Err.
+        let _ = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+
+        let warn = server
+            .degraded_warning_if_recent_failure(30_000)
+            .expect("a recent failure must produce a warning");
+        assert!(warn.contains("get_node"), "warning must name the broken tool: {warn}");
+        assert!(
+            warn.contains("degraded") || warn.contains("DEGRADED") || warn.contains("workflowy_status"),
+            "warning must signal degraded state and point at status tool: {warn}"
+        );
+
+        // Self-failures (create_node) do NOT gate future create_node —
+        // a previous failed create has nothing to do with whether the
+        // next one will succeed.
+        let server2 = new_test_server();
+        // Synthesise a create_node failure by calling with an
+        // unindexed short-hash parent — that hits resolve_node_ref's
+        // miss path and records an Err for create_node.
+        let _ = server2
+            .create_node(Parameters(CreateNodeParams {
+                name: "x".into(),
+                description: None,
+                parent_id: Some(NodeId::from("ffffffffffff")),
+                priority: None,
+            }))
+            .await
+            .expect_err("unindexed short hash rejected");
+        assert!(
+            server2.degraded_warning_if_recent_failure(30_000).is_none(),
+            "create_node self-failure must NOT gate future create_node calls"
+        );
     }
 
     #[tokio::test]

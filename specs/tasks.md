@@ -311,6 +311,81 @@
     property 6 already names the three accepted node-ref forms; the
     bug was in handler implementation, not contract).
 
+- [x] **T-163 (Brief 2026-04-25 follow-up: post-deploy report)**:
+      ship Tests β, γ, ε from the brief in priority order
+  - **Source.** User-supplied second brief after observing the T-162
+    deploy. Three things still missing in the user's session: bare
+    `Tool execution failed` from direct lookups (pre-T-162 binary still
+    loaded in their Claude Desktop), no per-path `paths` map in
+    `workflowy_status`, no fail-closed gate on `create_node` when
+    reads were broken. Ship order from the brief: Test ε first
+    (everything else becomes diagnosable), Test β second (would have
+    prevented orphan accumulation), Test γ third (so the assistant
+    can recover intelligently).
+  - **Test γ — `proximate_cause` discrete enum.** New
+    `ProximateCause` enum with eight variants (`timeout`,
+    `lock_contention`, `cache_miss`, `upstream_error`, `cancelled`,
+    `not_found`, `auth_failure`, `unknown`). The `tool_error`
+    classifier now picks one alongside the human hint and writes both
+    `data.hint` (free text, unchanged) and `data.proximate_cause`
+    (enum string). The error message itself is suffixed `[<cause>]`
+    so even minimal clients that discard the data payload still get
+    the routing signal. Two new heuristic branches added: `lock` →
+    `lock_contention`, `cache` → `cache_miss`, since the brief calls
+    these out as expected proximate causes.
+  - **Test ε — `paths` and `upstream_session` in `workflowy_status`.**
+    The brief asked for a flat map keyed by tool name with values
+    `healthy`/`degraded`/`failing`/`untested` so the assistant can
+    pick a strategy without parsing per-tool histograms. Derived from
+    the existing `per_tool_health` block; tools the brief explicitly
+    sequences (12 of them: get_node, list_children, search_nodes,
+    find_node, create_node, delete_node, edit_node, move_node,
+    tag_search, list_overdue, list_upcoming, daily_review) are
+    pre-populated with `untested` if the op log has no entries yet.
+    `upstream_session` block surfaces the API-reachability check from
+    the live probe, the `auth_method: api_key_env` constant (we don't
+    hold a session token), `session_age_ms` (server uptime as the
+    closest proxy), and the upstream rate-limit headers. The new
+    `last_failure.proximate_cause` field uses the same enum values
+    as Test γ for consistency.
+  - **Test β — fail-closed warning on `create_node`.** New helper
+    `degraded_warning_if_recent_failure(window_ms)` checks the most
+    recent op-log entry; when an Err finished within the window the
+    success message is suffixed `\n\n⚠ DEGRADED: …` naming the broken
+    tool, the age in ms, and the original reason — and pointing the
+    assistant at `workflowy_status` for triage. Self-failures (a
+    previous failed `create_node`) deliberately do NOT gate future
+    creates, since the brief's failure mode was reads/mutations
+    wedging while creates stayed healthy. Window is 30 s per the
+    brief's spec.
+  - **Tests.** 211 → 214. Added:
+    `tool_error_proximate_cause_classification_covers_every_branch`
+    (eight variants, end-to-end through JSON serialisation),
+    `workflowy_status_returns_paths_and_upstream_session` (the 12
+    documented tools all appear in `paths` with valid enum values;
+    `upstream_session` carries the four documented fields),
+    `fail_closed_warning_fires_when_recent_failure_in_window` (the
+    helper warns after a foreign failure and stays silent for
+    self-failures).
+  - **What this does NOT fix.** Pattern 4/5 surface in the user's
+    session was almost certainly a stale binary in their Claude
+    Desktop process — verified live this session with the new binary,
+    `get_node` returns `-32002` (`RESOURCE_NOT_FOUND`) with full
+    payload. They need to restart Claude Desktop to load the new
+    binary. Hypothesis A (upstream session state) is unlikely — the
+    client uses an env-var API key with no on-disk token cache.
+    Hypothesis B (per-account upstream corruption) is not actionable
+    from this repo.
+  - **Orphan cleanup with caveat.** All five orphans listed in the
+    brief verified deleted live (4 from prior turn + ad138996 this
+    turn). Three of them were the user's real distillation work
+    (Horaguchi 2025, LeadDev 2026, Ford & Richards 2026) — the
+    brief noted these should have been MOVED to their proper
+    parents under /Distillations, not deleted. This was a
+    misjudgment in the prior turn when interpreting "fix it all" as
+    cleanup; the user may need to recover via Workflowy's web-UI
+    history.
+
 - [x] **T-162 (Brief 2026-04-25, six observed failure patterns)**:
       propagation retry on writes, structured errors everywhere, and
       `last_failure` in `workflowy_status`
