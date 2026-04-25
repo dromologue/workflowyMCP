@@ -141,6 +141,32 @@ Ask Claude naturally — it will use the MCP tools:
 | `cancel_all` | Cancels every in-flight tree walk; outstanding calls return partial results with `truncation_reason = "cancelled"` |
 | `build_name_index` | Walks a subtree to populate the opportunistic name index, enabling `find_node` with `use_index=true` to answer without hitting the API |
 
+## CLI: wflow-do
+
+A second binary, `wflow-do`, exposes the same `WorkflowyClient` operations as a plain shell command. Use it as a workaround for transport-layer drops in Claude Desktop's MCP layer — Bash dispatch is independent of MCP tool dispatch, so shelling out from any Claude session reaches the API even when the MCP transport is silently dropping calls.
+
+Build it alongside the server:
+
+```bash
+cargo build --release --bin wflow-do
+```
+
+The binary lives at `target/release/wflow-do`. It reads `WORKFLOWY_API_KEY` from the environment or `.env` (same loader as the MCP server). Example session:
+
+```bash
+# liveness + rate-limit snapshot
+wflow-do status
+
+# create a node, capture the UUID for use downstream
+NODE=$(wflow-do create --name "Triage" | tail -n1)
+
+# move it under a known parent, then delete when done
+wflow-do move "$NODE" --to <parent-uuid>
+wflow-do delete "$NODE"
+```
+
+Available subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`. Add `--json` for raw JSON on every command, `--quiet` to suppress info-level logging. On error the binary writes `<command>: <message> [<proximate_cause>]` to stderr and exits 1; the proximate-cause taxonomy matches the MCP server's `tool_error` classification.
+
 ## Conventions
 
 Tags, assignees, and due dates are parsed from node text:

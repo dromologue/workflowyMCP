@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "task-map"
 path = "src/cli/task_map.rs"
 
+[[bin]]
+name = "wflow-do"
+path = "src/bin/wflow_do.rs"
+
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
