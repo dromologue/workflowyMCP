@@ -778,6 +778,103 @@ impl WorkflowyClient {
         Ok(())
     }
 
+    /// Delete a node tolerating propagation lag (Pattern 6 from the
+    /// 2026-04-25 brief). Same retry policy as
+    /// [`Self::get_node_with_propagation_retry`]: 3 attempts with
+    /// 200/400/800 ms backoff on 404 only. Workflowy occasionally
+    /// returns a UUID via a parent's children listing or a fresh
+    /// `create_node` response before the node is deletable directly;
+    /// without this retry the caller sees `Tool execution failed` and
+    /// is left with an unrecoverable orphan.
+    pub async fn delete_node_with_propagation_retry(&self, node_id: &str) -> Result<()> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.delete_node(node_id).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "delete_node 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Edit-with-retry counterpart to
+    /// [`Self::delete_node_with_propagation_retry`]. Same policy: 404 on
+    /// the target node may mean upstream hasn't propagated a recent
+    /// create yet.
+    pub async fn edit_node_with_propagation_retry(
+        &self,
+        node_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.edit_node(node_id, name, description).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "edit_node 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Move-with-retry counterpart. Routes 404s on either the moved
+    /// node or the new parent through the propagation-retry loop;
+    /// parent-related 4xx still goes through the existing
+    /// refresh-and-retry path inside [`Self::move_node`] itself, so
+    /// both kinds of upstream lag are covered.
+    pub async fn move_node_with_propagation_retry(
+        &self,
+        node_id: &str,
+        new_parent_id: &str,
+        priority: Option<i32>,
+    ) -> Result<()> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.move_node(node_id, new_parent_id, priority).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        new_parent_id = %new_parent_id,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "move_node 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Move a node to a new parent.
     ///
     /// Workflowy uses POST (not PUT) for move. On a parent-related 4xx

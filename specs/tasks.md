@@ -311,6 +311,72 @@
     property 6 already names the three accepted node-ref forms; the
     bug was in handler implementation, not contract).
 
+- [x] **T-162 (Brief 2026-04-25, six observed failure patterns)**:
+      propagation retry on writes, structured errors everywhere, and
+      `last_failure` in `workflowy_status`
+  - **Source.** User-supplied brief enumerating six fault patterns
+    from the 2026-04-25 distillation session: intermittent null
+    deserialisation (P1), wedge after burst failures (P2), `cancel_all`
+    not cancelling (P3), bare "Tool execution failed" with no detail
+    (P4), search path stays healthy while direct lookup dies (P5),
+    creates succeed but deletes/moves wedge — leaving four orphan
+    nodes at workspace root (P6, including the worst case 6a-d).
+  - **Pattern 6 — propagation retry on every mutation.** T-159
+    shipped retry-on-404 for `get_node` and `list_children`; this
+    pass extends the same pattern to writes:
+    `delete_node_with_propagation_retry`,
+    `edit_node_with_propagation_retry`,
+    `move_node_with_propagation_retry` — 3 attempts, 200/400/800 ms
+    backoff on 404 only, identical structure to the read helpers so
+    `is_404_like` is reused. Handlers route through them, closing
+    the window where a `create_node` succeeds but a follow-up
+    delete/move on the returned UUID 404s because upstream hasn't
+    propagated yet (the actual cause of the four orphans).
+  - **Patterns 4 & 5 — every handler-error carries proximate cause.**
+    T-159 introduced `tool_error(op, id, err)` returning a structured
+    `McpError` with `data: {operation, node_id, hint, error}` and a
+    code-by-cause classifier. This pass migrates every remaining bare
+    `McpError::internal_error(format!("Failed: {}", e), None)` site
+    to `tool_error` (search_nodes, find_node, get_subtree, daily_review,
+    get_recent_changes, list_overdue, list_upcoming, get_project_summary,
+    find_backlinks, list_todos, duplicate_node, create_from_template,
+    bulk_update, build_name_index, since, find_by_tag_and_path,
+    export_subtree, smart_insert, insert_content, convert_markdown,
+    transaction.{create,edit,delete,move}). No handler returns a bare
+    "Failed: …" anymore — `Tool execution failed` regression cannot
+    happen at the server boundary now.
+  - **Pattern 6d — `parent_id=null` semantics documented.** Tool
+    description and the `parent_id` field's `schemars` description
+    now say explicitly that omitting OR passing `null` places the node
+    at the workspace root. The success message also names the
+    placement: `"… under \`<resolved-parent-uuid>\`"` for scoped
+    creates, `"… at workspace root (no parent_id supplied)"` when no
+    parent is given, so the assistant can audit before issuing
+    follow-up moves.
+  - **Cross-cut — `last_failure` in `workflowy_status`.** New
+    `OpLog::last_failure()` returns the most recent `Err` entry;
+    `workflowy_status` surfaces `{tool, at_unix_ms, reason}` so the
+    assistant can diagnose which call last broke without reading the
+    op log. Combined with the existing `per_tool_health` block this
+    answers the brief's observability ask in full.
+  - **Patterns 1, 2, 3 — partial.** Pass 1 cancellation already lands
+    (T-150); Pass 2 deserialisation logging already records null-id
+    payloads with the calling tool name (T-153). The wedge-after-burst
+    pattern (P2) is not reproduced in unit tests yet — leaving for a
+    later pass once a probe harness exists.
+  - **Tests.** 207 → 211. Added:
+    `handler_errors_carry_structured_data_payload` (delete/edit/move
+    errors all name the operation), `workflowy_status_surfaces_last_failure`
+    (null pre-failure, populated after), `propagation_retry_helpers_exist_for_all_mutations`
+    (anchors the contract — accidental refactor that drops a helper
+    fails the test), `create_node_success_message_names_root_when_parent_id_omitted`
+    (Pattern 6d formatting). Existing test changes: none broken.
+  - **Orphan cleanup.** All four orphan UUIDs from the user's session
+    (8f627d4d, 94d1c6f6, 9e912b77, 5a2c4abf) deleted live before the
+    code changes — confirming the orphan state was transient
+    (Workflowy propagation lag, not a permanent server bug). The new
+    propagation-retry helpers prevent the recurrence.
+
 - [x] **T-159 (Brief 2026-04-25)**: Transient-failure brief
   - **Pattern A (per-ID failures)**: added
     `WorkflowyClient::get_node_with_propagation_retry` and

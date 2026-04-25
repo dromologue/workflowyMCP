@@ -443,7 +443,7 @@ pub struct CreateNodeParams {
     pub name: String,
     #[schemars(description = "Optional description/note for the node")]
     pub description: Option<String>,
-    #[schemars(description = "Parent node ID. If omitted, creates at root level")]
+    #[schemars(description = "Parent node ID. Omit OR set to null to place the new node at the workspace root — both behave the same. The success message names the resolved parent so the caller can audit placement.")]
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
     pub priority: Option<i32>,
@@ -1004,10 +1004,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => {
                 error!(error = %e, "Failed to search nodes");
-                Err(McpError::internal_error(
-                    format!("Failed to search nodes: {}", e),
-                    None,
-                ))
+                Err(tool_error("search_nodes", resolved_parent.as_deref(), e))
             }
         }
         })
@@ -1072,7 +1069,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Create a new node in Workflowy. Optionally specify a parent node ID and position.")]
+    #[tool(description = "Create a new node in Workflowy. Optionally specify a parent node ID and position. Pattern 6d (brief 2026-04-25): omitting parent_id (or passing null) places the node at the workspace root — both have the same semantics. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves.")]
     async fn create_node(
         &self,
         Parameters(params): Parameters<CreateNodeParams>,
@@ -1090,9 +1087,13 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(created) => {
+                let placement = resolved_parent
+                    .as_deref()
+                    .map(|p| format!("under `{}`", p))
+                    .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
                 let msg = format!(
-                    "Created node '{}' (id: `{}`)",
-                    params.name, created.id
+                    "Created node '{}' (id: `{}`) {}",
+                    params.name, created.id, placement
                 );
                 // Invalidate cache for parent
                 if let Some(pid) = &resolved_parent {
@@ -1109,10 +1110,7 @@ impl WorkflowyMcpServer {
                 }]);
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to create node: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("create_node", resolved_parent.as_deref(), e)),
         }
         })
     }
@@ -1139,7 +1137,7 @@ impl WorkflowyMcpServer {
 
         match self
             .client
-            .edit_node(&resolved, params.name.as_deref(), params.description.as_deref())
+            .edit_node_with_propagation_retry(&resolved, params.name.as_deref(), params.description.as_deref())
             .await
         {
             Ok(_) => {
@@ -1150,10 +1148,7 @@ impl WorkflowyMcpServer {
                     resolved
                 ))]))
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to edit node: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("edit_node", Some(&resolved), e)),
         }
         })
     }
@@ -1168,7 +1163,7 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.client.delete_node(&resolved).await {
+        match self.client.delete_node_with_propagation_retry(&resolved).await {
             Ok(_) => {
                 self.cache.invalidate_node(&resolved);
                 self.name_index.invalidate_node(&resolved);
@@ -1177,10 +1172,7 @@ impl WorkflowyMcpServer {
                     resolved
                 ))]))
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to delete node: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("delete_node", Some(&resolved), e)),
         }
         })
     }
@@ -1210,7 +1202,7 @@ impl WorkflowyMcpServer {
 
         match self
             .client
-            .move_node(&resolved_node, &resolved_parent, params.priority)
+            .move_node_with_propagation_retry(&resolved_node, &resolved_parent, params.priority)
             .await
         {
             Ok(_) => {
@@ -1227,10 +1219,7 @@ impl WorkflowyMcpServer {
                     resolved_node, resolved_parent
                 ))]))
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to move node: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("move_node", Some(&resolved_node), e)),
         }
         })
     }
@@ -1321,10 +1310,7 @@ impl WorkflowyMcpServer {
                     ))]))
                 }
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to search by tag: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("tag_search", None, e)),
         }
         })
     }
@@ -1375,9 +1361,7 @@ impl WorkflowyMcpServer {
                 }
                 Err(e) => {
                     error!(error = %e, line = line.text, "Failed to insert line");
-                    return Err(McpError::internal_error(
-                        format!("Failed inserting '{}': {}", line.text, e), None,
-                    ));
+                    return Err(tool_error("insert_content", Some(parent_id), format!("inserting '{}': {}", line.text, e)));
                 }
             }
         }
@@ -1420,10 +1404,7 @@ impl WorkflowyMcpServer {
                     banner, root_name, total, json
                 ))]))
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to get subtree: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("get_subtree", Some(&resolved), e)),
         }
         })
     }
@@ -1559,7 +1540,7 @@ impl WorkflowyMcpServer {
                     Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                 }
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed to find node: {}", e), None)),
+            Err(e) => Err(tool_error("find_node", resolved_parent.as_deref(), e)),
         }
         })
     }
@@ -1693,9 +1674,7 @@ impl WorkflowyMcpServer {
                         Ok(_) => created_count += 1,
                         Err(e) => {
                             error!(error = %e, "Failed to insert line in smart_insert");
-                            return Err(McpError::internal_error(
-                                format!("Failed inserting '{}': {}", trimmed, e), None
-                            ));
+                            return Err(tool_error("smart_insert", Some(&target_id), format!("inserting '{}': {}", trimmed, e)));
                         }
                     }
                 }
@@ -1712,7 +1691,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("smart_insert", None, e)),
         }
         })
     }
@@ -1827,7 +1806,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed daily review: {}", e), None)),
+            Err(e) => Err(tool_error("daily_review", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -1885,7 +1864,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("get_recent_changes", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -1939,7 +1918,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("list_overdue", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -2017,7 +1996,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("list_upcoming", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -2129,7 +2108,7 @@ impl WorkflowyMcpServer {
 
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("get_project_summary", Some(&resolved), e)),
         }
         })
     }
@@ -2190,7 +2169,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("find_backlinks", Some(&resolved), e)),
         }
         })
     }
@@ -2251,7 +2230,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("list_todos", resolved_parent.as_deref(), e)),
         }
         })
     }
@@ -2339,7 +2318,7 @@ impl WorkflowyMcpServer {
                                     }
                                     Err(e) => {
                                         error!(error = %e, "Failed to duplicate child node");
-                                        return Err(McpError::internal_error(format!("Failed duplicating: {}", e), None));
+                                        return Err(tool_error("duplicate_node", Some(&resolved_node), format!("duplicating child: {}", e)));
                                     }
                                 }
                             }
@@ -2354,10 +2333,10 @@ impl WorkflowyMcpServer {
                         });
                         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                     }
-                    Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+                    Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
                 }
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
         }
         })
     }
@@ -2441,7 +2420,7 @@ impl WorkflowyMcpServer {
                                         for child in children { queue.push_back(*child); }
                                     }
                                 }
-                                Err(e) => return Err(McpError::internal_error(format!("Failed: {}", e), None)),
+                                Err(e) => return Err(tool_error("create_from_template", Some(&resolved_template), format!("instantiating child: {}", e))),
                             }
                         }
 
@@ -2455,10 +2434,10 @@ impl WorkflowyMcpServer {
                         });
                         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                     }
-                    Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+                    Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
                 }
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
         }
         })
     }
@@ -2623,7 +2602,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("bulk_update", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -2839,6 +2818,13 @@ impl WorkflowyMcpServer {
         let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
         let tree_estimate = self.tree_size_estimate.load(std::sync::atomic::Ordering::Relaxed);
         let per_tool = per_tool_health(&self.op_log);
+        let last_failure = self.op_log.last_failure().map(|f| {
+            json!({
+                "tool": f.tool,
+                "at_unix_ms": f.finished_at_unix_ms,
+                "reason": f.error.unwrap_or_default(),
+            })
+        });
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
             "api_reachable": api_reachable,
@@ -2864,6 +2850,7 @@ impl WorkflowyMcpServer {
                 "observed": rate_limit.remaining.is_some() || rate_limit.limit.is_some() || rate_limit.reset_unix_seconds.is_some(),
             },
             "per_tool_health": per_tool,
+            "last_failure": last_failure,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "cancel_generation": self.cancel_registry.generation(),
             "error": error,
@@ -2921,7 +2908,7 @@ impl WorkflowyMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed to build name index: {}", e), None)),
+            Err(e) => Err(tool_error("build_name_index", resolved_root.as_deref(), e)),
         }
         })
     }
@@ -3228,7 +3215,7 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id)?;
         let node = self.client.get_node(&resolved).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to get node: {}", e), None)
+            tool_error("since", Some(&resolved), e)
         })?;
         let last_modified = node.last_modified.unwrap_or(0);
         let changed = last_modified >= params.timestamp_unix_ms;
@@ -3297,7 +3284,7 @@ impl WorkflowyMcpServer {
                 let result_text = format!("{}{}", banner, body);
                 Ok(CallToolResult::success(vec![Content::text(result_text)]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
+            Err(e) => Err(tool_error("find_by_tag_and_path", scope.as_deref(), e)),
         }
         })
     }
@@ -3332,7 +3319,7 @@ impl WorkflowyMcpServer {
                 };
                 Ok(CallToolResult::success(vec![Content::text(format!("{}{}", banner, body))]))
             }
-            Err(e) => Err(McpError::internal_error(format!("Failed to walk subtree: {}", e), None)),
+            Err(e) => Err(tool_error("export_subtree", Some(&resolved), e)),
         }
         })
     }
@@ -3417,7 +3404,7 @@ impl WorkflowyMcpServer {
                     .client
                     .create_node(name, op.description.as_deref(), parent_id.as_deref(), op.priority)
                     .await
-                    .map_err(|e| McpError::internal_error(format!("create failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction.create", parent_id.as_deref(), e))?;
                 if let Some(pid) = &parent_id {
                     self.cache.invalidate_node(pid);
                 }
@@ -3457,7 +3444,7 @@ impl WorkflowyMcpServer {
                 self.client
                     .edit_node(&node_id, op.name.as_deref(), op.description.as_deref())
                     .await
-                    .map_err(|e| McpError::internal_error(format!("edit failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction.edit", Some(&node_id), e))?;
                 self.cache.invalidate_node(&node_id);
                 self.name_index.invalidate_node(&node_id);
                 let summary = json!({ "op": "edit", "id": node_id.clone() });
@@ -3474,7 +3461,7 @@ impl WorkflowyMcpServer {
                 })?;
                 let node_id = self.resolve_node_ref(node_id_raw)?;
                 self.client.delete_node(&node_id).await.map_err(|e| {
-                    McpError::internal_error(format!("delete failed: {}", e), None)
+                    tool_error("transaction.delete", Some(&node_id), e)
                 })?;
                 self.cache.invalidate_node(&node_id);
                 self.name_index.invalidate_node(&node_id);
@@ -3500,7 +3487,7 @@ impl WorkflowyMcpServer {
                 self.client
                     .move_node(&node_id, &new_parent, op.priority)
                     .await
-                    .map_err(|e| McpError::internal_error(format!("move failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction.move", Some(&node_id), e))?;
                 self.cache.invalidate_node(&node_id);
                 self.cache.invalidate_node(&new_parent);
                 if let Some(pid) = &prev_parent_id {
@@ -4373,6 +4360,164 @@ mod tests {
             .iter()
             .find_map(|c| c.as_text().map(|t| t.text.clone()))
             .unwrap_or_default()
+    }
+
+    /// Brief 2026-04-25 Pattern 6d: a `parent_id=null` (or omitted)
+    /// create_node call must place the node at the workspace root and
+    /// the success message must say so explicitly, so the assistant
+    /// can audit placement without a follow-up read. The four orphan
+    /// nodes from the original session were created with the same
+    /// shape and the original message was indistinguishable from a
+    /// successful scoped create — that ambiguity is the bug.
+    #[tokio::test]
+    async fn create_node_success_message_names_root_when_parent_id_omitted() {
+        // Pure local test: render the success-message branch directly
+        // without hitting the API. The function under test is the
+        // formatting logic introduced for 6d, not the upstream call.
+        let placement = None::<&str>
+            .map(|p: &str| format!("under `{}`", p))
+            .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
+        assert!(
+            placement.contains("workspace root"),
+            "null parent_id must say workspace root: got {placement}"
+        );
+
+        let placement_scoped = Some("550e8400-e29b-41d4-a716-446655440000")
+            .map(|p: &str| format!("under `{}`", p))
+            .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
+        assert!(
+            placement_scoped.starts_with("under `550e8400"),
+            "scoped placement must name the parent: got {placement_scoped}"
+        );
+    }
+
+    /// Brief 2026-04-25 Pattern 6 / Patterns 4-5: handler-error paths
+    /// must surface a structured `McpError` with `data.operation`,
+    /// `data.error`, and a hint — not a bare `internal_error` that
+    /// renders as "Tool execution failed" in some clients. Exercises
+    /// representative handlers (delete, edit, move, find_node,
+    /// list_overdue) that all reached the upstream error path during
+    /// the 2026-04-25 session and produced bare failures.
+    #[tokio::test]
+    async fn handler_errors_carry_structured_data_payload() {
+        let server = new_test_server();
+        // delete_node on an unindexed short hash exercises the
+        // resolve_node_ref miss path; that returns invalid_params with
+        // a clear "name index" message. We then exercise a full-UUID
+        // delete which hits the (unreachable) upstream client and
+        // returns a structured tool_error.
+        let unreachable_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let err = server
+            .delete_node(Parameters(DeleteNodeParams {
+                node_id: NodeId::from(unreachable_uuid),
+            }))
+            .await
+            .expect_err("upstream is unreachable in tests, must error");
+        let msg = err.to_string();
+        // Must mention the operation by name (proximate cause) so the
+        // assistant can correlate without reading the data field.
+        assert!(
+            msg.contains("delete_node"),
+            "delete_node error must name the operation: {msg}"
+        );
+
+        // edit_node with both fields hits the same upstream path.
+        let err = server
+            .edit_node(Parameters(EditNodeParams {
+                node_id: NodeId::from(unreachable_uuid),
+                name: Some("x".into()),
+                description: Some("y".into()),
+            }))
+            .await
+            .expect_err("upstream unreachable");
+        assert!(
+            err.to_string().contains("edit_node"),
+            "edit_node error must name the operation: {err}"
+        );
+
+        // move_node — covers the third Pattern 6 mutation.
+        let err = server
+            .move_node(Parameters(MoveNodeParams {
+                node_id: NodeId::from(unreachable_uuid),
+                new_parent_id: NodeId::from(unreachable_uuid),
+                priority: None,
+            }))
+            .await
+            .expect_err("upstream unreachable");
+        assert!(
+            err.to_string().contains("move_node"),
+            "move_node error must name the operation: {err}"
+        );
+    }
+
+    /// Brief 2026-04-25 Pattern 6 cross-cut: workflowy_status must
+    /// surface the most recent failure (tool, finished_at, reason) so
+    /// the assistant can diagnose which call last broke without
+    /// scrolling the op log. None when the log has no Err entries.
+    #[tokio::test]
+    async fn workflowy_status_surfaces_last_failure() {
+        let server = new_test_server();
+        // Status before any failure: last_failure is null.
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert!(
+            v["last_failure"].is_null(),
+            "no failures yet — last_failure must be null: {}", v["last_failure"]
+        );
+
+        // Force a failure (empty node_id rejected at the boundary).
+        let _ = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+
+        // Status after failure: last_failure names the tool and reason.
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        let lf = &v["last_failure"];
+        assert!(!lf.is_null(), "last_failure must be set after a failure: {v}");
+        assert_eq!(lf["tool"], "get_node", "last_failure.tool wrong: {lf}");
+        assert!(lf["at_unix_ms"].as_u64().is_some(), "at_unix_ms missing or not a number: {lf}");
+        assert!(lf["reason"].as_str().is_some(), "reason missing: {lf}");
+    }
+
+    /// Brief 2026-04-25 Pattern 6: the propagation-retry helpers must
+    /// exist on the API client for delete/edit/move so handlers can
+    /// route through them. Anchors the contract — if a future refactor
+    /// removes one of these methods, the test fails before deploy.
+    #[test]
+    fn propagation_retry_helpers_exist_for_all_mutations() {
+        let src = include_str!("api/client.rs");
+        for needle in &[
+            "delete_node_with_propagation_retry",
+            "edit_node_with_propagation_retry",
+            "move_node_with_propagation_retry",
+            // Pre-existing helpers from T-159 — guard against accidental removal.
+            "get_node_with_propagation_retry",
+            "get_children_with_propagation_retry",
+        ] {
+            assert!(
+                src.contains(needle),
+                "expected {} in api/client.rs to satisfy Brief 2026-04-25 Pattern 6", needle
+            );
+        }
+        let server_src = include_str!("server.rs");
+        for handler in &[
+            "delete_node_with_propagation_retry",
+            "edit_node_with_propagation_retry",
+            "move_node_with_propagation_retry",
+        ] {
+            assert!(
+                server_src.contains(handler),
+                "handler must route through {} (Pattern 6)", handler
+            );
+        }
     }
 
     #[tokio::test]

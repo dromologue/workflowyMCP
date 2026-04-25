@@ -132,6 +132,19 @@ impl OpLog {
             .collect()
     }
 
+    /// Most recent failure across all tools, if any. `workflowy_status`
+    /// surfaces this so callers can see which mutation last broke without
+    /// scrolling through the full op log. None when no `Err` entries have
+    /// been recorded since startup.
+    pub fn last_failure(&self) -> Option<OpLogEntry> {
+        let guard = self.inner.entries.read();
+        guard
+            .iter()
+            .rev()
+            .find(|e| matches!(e.status, OpStatus::Err))
+            .cloned()
+    }
+
     pub fn len(&self) -> usize {
         self.inner.entries.read().len()
     }
