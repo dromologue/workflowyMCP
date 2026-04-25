@@ -65,13 +65,13 @@ Add to your Claude Desktop config:
 }
 ```
 
-Restart Claude Desktop after saving. The 23 tools listed below become available immediately.
+Restart Claude Desktop after saving. The 26 tools listed below become available immediately.
 
-**Large trees (100k+ nodes):** Search and review tools use a `max_depth` parameter (default: 3–5) to avoid fetching the entire tree. Subtree fetches also cap at 10 000 nodes; every tool response includes a `truncated` flag (and a `truncation_limit`) when that cap is hit, so you can narrow with `parent_id`/`root_id` or reduce `max_depth`. `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view to avoid partial copies or partial deletes.
+**Large trees (100k+ nodes):** Search and review tools use a `max_depth` parameter (default: 3–5) to avoid fetching the entire tree. Subtree fetches also cap at 10 000 nodes **and** at a 20-second wall-clock budget; every tool response includes a `truncated` flag with a `truncation_reason` (`node_limit`, `timeout`, or `cancelled`) when either fires, so you can narrow with `parent_id`/`root_id` or reduce `max_depth`. `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view to avoid partial copies or partial deletes. Use `health_check` as a sub-second liveness probe before kicking off larger calls, `cancel_all` to abort in-flight walks, and `build_name_index` to populate the cached name index so `find_node` with `use_index=true` answers without hitting the API.
 
 ### 3. Claude Code
 
-Register the MCP server with Claude Code so its 23 tools appear in every session:
+Register the MCP server with Claude Code so its 26 tools appear in every session:
 
 ```bash
 claude mcp add workflowy -- /absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server
@@ -88,7 +88,7 @@ Ask Claude naturally — it will use the MCP tools:
 - "Add a task to Office: Review Q2 budget"
 - "Give me a daily review of my tasks"
 
-## Tools (23 implemented)
+## Tools (26 implemented)
 
 ### Search & Navigate
 
@@ -133,6 +133,14 @@ Ask Claude naturally — it will use the MCP tools:
 | `get_project_summary` | Stats, tag counts, assignees, overdue items for a subtree |
 | `get_recent_changes` | Nodes modified within a time window |
 
+### Diagnostics & Ops
+
+| Tool | What it does |
+|------|-------------|
+| `health_check` | Sub-second liveness probe: confirms API reachability and reports cache + name-index sizes |
+| `cancel_all` | Cancels every in-flight tree walk; outstanding calls return partial results with `truncation_reason = "cancelled"` |
+| `build_name_index` | Walks a subtree to populate the opportunistic name index, enabling `find_node` with `use_index=true` to answer without hitting the API |
+
 ## Conventions
 
 Tags, assignees, and due dates are parsed from node text:
@@ -146,7 +154,7 @@ Tags, assignees, and due dates are parsed from node text:
 ```bash
 cargo build              # compile (debug)
 cargo build --release    # compile (optimized)
-cargo test --lib         # run 122 unit tests
+cargo test --lib         # run 159 unit tests
 cargo check              # type-check only
 cargo run --bin workflowy-mcp-server  # start server
 ```
