@@ -1168,7 +1168,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Create a new node in Workflowy. Optionally specify a parent node ID and position. Pattern 6d (brief 2026-04-25): omitting parent_id (or passing null) places the node at the workspace root — both have the same semantics. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves.")]
+    #[tool(description = "Create a new node in Workflowy. PREFER passing `parent_id` directly to the destination over the create-then-move pattern: a single create with parent_id has half the failure surface of create-at-root + move (verified 2026-04-25 — a created-at-root MOC was stranded for hours when follow-up move calls were dropped at the transport layer). Pattern 6d (brief 2026-04-25): omitting parent_id (or passing null) places the node at the workspace root — both have the same semantics. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves. When reads/mutations have failed in the last 30 s the success message is suffixed `⚠ DEGRADED: …` — do NOT chain follow-up writes on the new UUID until `workflowy_status` confirms the previously-failing tool is back to `healthy`.")]
     async fn create_node(
         &self,
         Parameters(params): Parameters<CreateNodeParams>,
