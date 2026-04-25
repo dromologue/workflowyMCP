@@ -2,6 +2,7 @@
 //! Provides proactive throttling to prevent exceeding API limits.
 
 use crate::config::RateLimitConfig;
+use crate::utils::cancel::CancelGuard;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +11,13 @@ use tracing::debug;
 /// Smallest wait we will ever sleep before retrying, to avoid tight loops when
 /// two tasks wake near-simultaneously and race for the next token.
 const MIN_WAIT: Duration = Duration::from_micros(500);
+
+/// Largest single sleep slice when waiting for a token under cancellation.
+/// Bounds the worst-case latency between a `cancel_all` call and the cancelled
+/// waiter actually returning. Picked at 50 ms because that is well under any
+/// human-perceptible delay and the rate limiter never holds tokens for longer
+/// than a second under the default config.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct RateLimiter {
     tokens: Arc<Mutex<TokenBucket>>,
@@ -44,6 +52,29 @@ impl RateLimiter {
             match self.try_consume_or_wait() {
                 Ok(()) => return,
                 Err(wait) => tokio::time::sleep(wait.max(MIN_WAIT)).await,
+            }
+        }
+    }
+
+    /// Acquire a token, waiting if necessary, but bail out if `guard` flips to
+    /// cancelled while we're waiting. Returns `true` on a successful acquire,
+    /// `false` if cancellation observed before a token was available.
+    ///
+    /// Long sleeps are sliced into [`CANCEL_POLL_INTERVAL`]-sized pieces so a
+    /// `cancel_all` call propagates within ~50 ms regardless of how full the
+    /// bucket is. Without slicing, a queued waiter would hold the cancellation
+    /// off until its full computed wait elapsed.
+    pub async fn acquire_cancellable(&self, guard: &CancelGuard) -> bool {
+        loop {
+            if guard.is_cancelled() {
+                return false;
+            }
+            match self.try_consume_or_wait() {
+                Ok(()) => return true,
+                Err(wait) => {
+                    let slice = wait.max(MIN_WAIT).min(CANCEL_POLL_INTERVAL);
+                    tokio::time::sleep(slice).await;
+                }
             }
         }
     }
@@ -131,6 +162,50 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() > 400 && elapsed.as_millis() < 700);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_cancellable_returns_false_when_cancelled_mid_wait() {
+        use crate::utils::cancel::CancelRegistry;
+
+        // Burst of 1, refill at 1/s — second waiter must sleep ~1s for a token.
+        let config = RateLimitConfig { requests_per_second: 1, burst_size: 1 };
+        let limiter = Arc::new(RateLimiter::new(config));
+        assert!(limiter.try_acquire(), "first token should be available");
+
+        let registry = CancelRegistry::new();
+        let guard = registry.guard();
+        let limiter_clone = Arc::clone(&limiter);
+
+        let start = Instant::now();
+        let waiter = tokio::spawn(async move { limiter_clone.acquire_cancellable(&guard).await });
+
+        // Give the waiter a moment to enter its sleep slice, then cancel.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("cancellable waiter must return within 500 ms")
+            .expect("task should not panic");
+        assert!(!result, "cancelled acquire must report failure");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "cancellation must preempt the long sleep, elapsed = {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_cancellable_succeeds_when_token_available() {
+        use crate::utils::cancel::CancelRegistry;
+
+        let config = RateLimitConfig { requests_per_second: 10, burst_size: 5 };
+        let limiter = RateLimiter::new(config);
+        let registry = CancelRegistry::new();
+        let guard = registry.guard();
+
+        assert!(limiter.acquire_cancellable(&guard).await);
     }
 
     #[tokio::test]

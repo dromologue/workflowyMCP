@@ -96,7 +96,7 @@ Ask Claude naturally — it will use the MCP tools:
 |------|-------------|
 | `search_nodes` | Text search in node names and descriptions |
 | `find_node` | Look up a node by name (exact, contains, or starts_with match modes) |
-| `get_node` | Get a node by ID |
+| `get_node` | Get a node by ID, plus a depth-1 listing of its direct children |
 | `list_children` | List children of a node |
 | `tag_search` | Search by tag (`#tag` or `@person`) in names, descriptions, and tags |
 | `get_subtree` | Get the full tree under a node |

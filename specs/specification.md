@@ -2,16 +2,16 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Updated 2026-04**: Rust v2 implements **23 tools**. Concept mapping, graph analysis,
+> **Updated 2026-04**: Rust v2 implements **26 tools**. Concept mapping, graph analysis,
 > and Dropbox integration have been removed from scope. See `tasks.md` for remaining roadmap.
 
-## Implemented Tools (Rust v2 — 23 total)
+## Implemented Tools (Rust v2 — 26 total)
 
 | Category | Tool | Status |
 |----------|------|--------|
 | Search & Navigation | search_nodes | Implemented |
 | Search & Navigation | find_node | Implemented |
-| Search & Navigation | get_node | Implemented |
+| Search & Navigation | get_node | Implemented (returns parent + depth-1 children) |
 | Search & Navigation | list_children | Implemented |
 | Search & Navigation | tag_search | Implemented |
 | Search & Navigation | get_subtree | Implemented |
@@ -32,10 +32,38 @@
 | Due Dates | daily_review | Implemented |
 | Project Management | get_project_summary | Implemented |
 | Project Management | get_recent_changes | Implemented |
+| Diagnostics & Ops | health_check | Implemented |
+| Diagnostics & Ops | cancel_all | Implemented |
+| Diagnostics & Ops | build_name_index | Implemented |
 
 ### Not Yet Implemented
 
-batch_operations, submit_job, get_job_status, generate_task_map
+batch_create_nodes, transaction, create_mirror, workflowy_status,
+get_recent_tool_calls. Tracked in `tasks.md` and the multi-pass plan at
+`tasks/reliability-and-ergonomics.md`.
+
+---
+
+## Reliability Properties (Pass 1, 2026-04)
+
+The server enforces three guarantees that callers can rely on without
+re-implementing them:
+
+1. **Cancellation preempts in-flight work.** A `cancel_all` call signals
+   the shared cancel registry; outstanding tree walks observe the flag at
+   their next checkpoint **and** inside the rate-limiter wait, the HTTP
+   send (via `tokio::select!`), and the inter-attempt backoff sleep. A
+   walk that would otherwise have spent minutes draining queued requests
+   returns within ~50 ms of the cancel call. Cancelled walks return
+   `truncation_reason = "cancelled"` with whatever was collected.
+2. **Truncation is locatable.** Every truncated response includes a
+   `truncated_at_node_id` (and, in text-mode banners, a hierarchical
+   `Walk stopped at: …` path) naming the parent whose subtree was not
+   fully drained. Callers can re-scope precisely instead of guessing.
+3. **`get_node` and `list_children` agree.** `get_node` now returns both
+   the requested node and its depth-1 children, matching what
+   `list_children` would return for the same ID. The two endpoints can no
+   longer disagree on what a node's children are.
 
 ---
 

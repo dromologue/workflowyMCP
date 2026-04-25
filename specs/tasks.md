@@ -152,6 +152,45 @@
 
 ---
 
+## Phase 5: Reliability & Ergonomics
+
+*Multi-pass plan in `tasks/reliability-and-ergonomics.md`. Source: brief
+2026-04-25 covering brief tracks P1–P5.*
+
+- [x] **T-150 (Pass 1)**: Cancellation that actually preempts
+  - `RateLimiter::acquire_cancellable` slices long sleeps so a `cancel_all`
+    propagates within ~50 ms (was: bound by full computed wait).
+  - `request_cancellable` / `try_request_cancellable` race the in-flight
+    HTTP send against a cancellation poll via `tokio::select!`; backoff
+    sleeps are also cancellation-aware.
+  - Cancel guards thread from `FetchControls` through `get_node_cancellable`,
+    `get_children_cancellable`, `get_top_level_nodes_cancellable`, and into
+    every per-level fetch in `fetch_descendants`.
+  - `WorkflowyError::Cancelled` is a first-class error variant.
+
+- [x] **T-151 (Pass 1)**: Truncation banner names the unfinished branch
+  - `SubtreeFetch.truncated_at_node_id` captures the parent whose subtree
+    was cut short.
+  - `truncation_banner_from_fetch` renders a hierarchical
+    `Walk stopped at: A > B > C` suffix in every text-mode response.
+  - JSON responses (`find_node`) carry `truncated_at_path`.
+
+- [x] **T-152 (Pass 1)**: `get_node` returns depth-1 children
+  - Removes the disagreement with `list_children` (which previously
+    returned the actual children while `get_node` always returned `[]`).
+  - One extra parallel HTTP call; failures degrade to empty children with
+    a warn log.
+
+- [ ] **T-153 (Pass 2)**: Deserialisation diagnostics + `workflowy_status`
+- [ ] **T-154 (Pass 3)**: Operation log + `get_recent_tool_calls`
+- [ ] **T-155 (Pass 4)**: Authoritative name index + short-hash IDs
+- [ ] **T-156 (Pass 5)**: Heavy-workflow primitives (batch / transaction /
+  edit_node hardening / move_node retry)
+- [ ] **T-157 (Pass 6)**: Mirror primitives + API expansion
+- [ ] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
+
+---
+
 ## Phase 4: Quality & Documentation
 
 - [ ] **T-140**: Add integration tests with mock HTTP server
@@ -183,18 +222,16 @@
 
 ## Test Coverage
 
-| Module | Tests | Status |
-|--------|-------|--------|
-| server.rs (params + info + tool listing) | 30 | Pass |
-| types.rs (NodeId + API deserialization) | 11 | Pass |
-| validation.rs | 13 | Pass |
-| defaults.rs | 2 | Pass |
-| api/client.rs | 3 | Pass |
-| utils/cache.rs | 2 | Pass |
-| utils/rate_limiter.rs | 2 | Pass |
-| utils/job_queue.rs | 2 | Pass |
-| utils/date_parser.rs | 14 | Pass |
-| utils/tag_parser.rs | 11 | Pass |
-| utils/node_paths.rs | 6 | Pass |
-| utils/subtree.rs | 10 | Pass |
-| **Total** | **106** | **All pass** |
+Counts grow across passes; check `cargo test --lib` for the live total.
+Snapshot at end of Pass 1: **166** unit tests, all passing. Notable
+additions in Pass 1:
+
+- `utils/rate_limiter`: cancellable-acquire returns false when cancelled
+  mid-wait; succeeds when token available without cancellation.
+- `api/client`: scoped pre-cancelled walk reports the requested root as
+  the truncation anchor.
+- `server`: `truncation_banner_from_fetch` renders the unfinished-branch
+  path; falls silent when the walk completed; omits the path when no
+  anchor is known.
+- `server`: `get_node` rejects empty IDs at the handler boundary (still
+  enforced even though it now also fans out to children).

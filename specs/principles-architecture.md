@@ -142,6 +142,26 @@ The following Rust patterns are actively enforced in this codebase:
 ### Type Alias for Complex Types
 - `BoxFuture<'a, T>` alias simplifies recursive async function signatures
 
+### Cancellation Propagation Contract
+- Long-running tree walks are cooperatively cancellable via the shared
+  `CancelRegistry` (a generation counter; see `utils/cancel.rs`).
+- Cancellation must be observable inside *every* awaitable inside the walk:
+  the rate-limiter wait (`acquire_cancellable`), the in-flight HTTP send
+  (raced via `tokio::select!` in `try_request_cancellable`), and the
+  inter-attempt backoff sleep (`sleep_cancellable`).
+- Adding a new long-running operation to the request pipeline requires
+  threading a `CancelGuard` through it. Skipping this regresses the
+  reliability invariant that `cancel_all` frees the shared `RateLimiter`
+  within ~50 ms.
+
+### Truncation Locatability
+- Every partial subtree fetch carries `truncated_at_node_id` naming the
+  parent whose subtree was cut short. Banner helpers
+  (`truncation_banner_from_fetch`) resolve that against the fetched
+  nodes to display a hierarchical path. New tools that surface
+  truncation must reuse this helper rather than rolling their own
+  message — divergent banners erode the caller's ability to re-scope.
+
 ---
 
 ## Anti-Patterns to Avoid

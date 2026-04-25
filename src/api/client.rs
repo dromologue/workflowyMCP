@@ -13,6 +13,41 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Poll a [`CancelGuard`] until it flips to cancelled. Used inside
+/// `tokio::select!` to race against an in-flight HTTP send, so a `cancel_all`
+/// drops the connection within ~50 ms instead of waiting for the request to
+/// complete on its own. Pulls outside the request module so the rate limiter
+/// uses the same poll cadence.
+async fn wait_for_cancel(guard: &CancelGuard) {
+    use std::time::Duration;
+    loop {
+        if guard.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Sleep with cancellation support. Returns `true` if the full duration
+/// elapsed, `false` if cancellation was observed mid-sleep. Used for the
+/// inter-attempt backoff so a cancel during retry-wait doesn't pin the
+/// task for `retry_after` seconds.
+async fn sleep_cancellable(duration: std::time::Duration, cancel: Option<&CancelGuard>) -> bool {
+    match cancel {
+        Some(g) => {
+            tokio::select! {
+                biased;
+                _ = wait_for_cancel(g) => false,
+                _ = tokio::time::sleep(duration) => true,
+            }
+        }
+        None => {
+            tokio::time::sleep(duration).await;
+            true
+        }
+    }
+}
+
 /// Why a subtree fetch returned partial data, when it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationReason {
@@ -34,6 +69,28 @@ impl TruncationReason {
     }
 }
 
+/// Internal return from [`WorkflowyClient::fetch_descendants`]. Carries both
+/// the truncation reason (if any) and the parent node ID whose subtree was
+/// not fully drained, so the outer call can surface a path to the caller.
+#[derive(Debug, Clone, Default)]
+struct TruncationOutcome {
+    reason: Option<TruncationReason>,
+    truncated_at_node_id: Option<String>,
+}
+
+impl TruncationOutcome {
+    fn complete() -> Self {
+        Self::default()
+    }
+
+    fn stopped(reason: TruncationReason, anchor: Option<String>) -> Self {
+        Self {
+            reason: Some(reason),
+            truncated_at_node_id: anchor,
+        }
+    }
+}
+
 /// Result of a subtree fetch. `truncated` is true when the walk stopped
 /// early; `truncation_reason` explains why.
 #[derive(Debug, Clone)]
@@ -44,6 +101,11 @@ pub struct SubtreeFetch {
     pub truncation_reason: Option<TruncationReason>,
     /// Wall-clock duration of the walk.
     pub elapsed_ms: u64,
+    /// When truncated mid-level, the ID of the parent whose children walk was
+    /// cut short. Callers can resolve this against `nodes` to display a path
+    /// so the next call can re-scope intelligently. `None` when the walk
+    /// completed or when truncation fired before any level was started.
+    pub truncated_at_node_id: Option<String>,
 }
 
 /// Optional controls for a subtree walk: deadline budget and a cancellation
@@ -111,7 +173,17 @@ impl WorkflowyClient {
 
     /// Get top-level nodes only (direct children of root)
     pub async fn get_top_level_nodes(&self) -> Result<Vec<WorkflowyNode>> {
-        let response: serde_json::Value = self.request("GET", "/nodes", None).await?;
+        self.get_top_level_nodes_cancellable(None).await
+    }
+
+    /// Cancellable variant. Pass `Some(guard)` so a `cancel_all` interrupts the
+    /// rate-limit wait and the in-flight HTTP request rather than waiting for a
+    /// checkpoint.
+    pub async fn get_top_level_nodes_cancellable(
+        &self,
+        cancel: Option<&CancelGuard>,
+    ) -> Result<Vec<WorkflowyNode>> {
+        let response: serde_json::Value = self.request_cancellable("GET", "/nodes", None, cancel).await?;
         let nodes: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
@@ -122,8 +194,16 @@ impl WorkflowyClient {
 
     /// Get a single node by ID
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
+        self.get_node_cancellable(node_id, None).await
+    }
+
+    pub async fn get_node_cancellable(
+        &self,
+        node_id: &str,
+        cancel: Option<&CancelGuard>,
+    ) -> Result<WorkflowyNode> {
         let endpoint = format!("/nodes/{}", node_id);
-        let response: serde_json::Value = self.request("GET", &endpoint, None).await?;
+        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel).await?;
         // API wraps single node in {"node": {...}}
         let node_value = response.get("node").cloned().unwrap_or(response);
         serde_json::from_value(node_value).map_err(|e| WorkflowyError::ParseError {
@@ -133,8 +213,16 @@ impl WorkflowyClient {
 
     /// Get direct children of a node
     pub async fn get_children(&self, node_id: &str) -> Result<Vec<WorkflowyNode>> {
+        self.get_children_cancellable(node_id, None).await
+    }
+
+    pub async fn get_children_cancellable(
+        &self,
+        node_id: &str,
+        cancel: Option<&CancelGuard>,
+    ) -> Result<Vec<WorkflowyNode>> {
         let endpoint = format!("/nodes?parent_id={}", node_id);
-        let response: serde_json::Value = self.request("GET", &endpoint, None).await?;
+        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel).await?;
         let mut children: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
@@ -188,7 +276,7 @@ impl WorkflowyClient {
     ) -> Result<SubtreeFetch> {
         let started = Instant::now();
         let mut all_nodes = Vec::new();
-        let reason: Option<TruncationReason>;
+        let outcome: TruncationOutcome;
 
         // Bail early if cancellation/deadline already fired before we made a request.
         if let Some(status) = controls.status() {
@@ -198,13 +286,29 @@ impl WorkflowyClient {
                 limit: node_limit,
                 truncation_reason: Some(status),
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                // If the caller scoped to a specific root, surface it as the
+                // anchor so the banner can still display a path even when no
+                // nodes were fetched.
+                truncated_at_node_id: root_id.map(str::to_string),
             });
         }
 
+        let cancel_ref = controls.cancel.as_ref();
+
         match root_id {
             Some(id) => {
-                match self.get_node(id).await {
+                match self.get_node_cancellable(id, cancel_ref).await {
                     Ok(root) => all_nodes.push(root),
+                    Err(WorkflowyError::Cancelled) => {
+                        return Ok(SubtreeFetch {
+                            nodes: all_nodes,
+                            truncated: true,
+                            limit: node_limit,
+                            truncation_reason: Some(TruncationReason::Cancelled),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            truncated_at_node_id: Some(id.to_string()),
+                        });
+                    }
                     Err(e) => return Err(e),
                 }
                 if all_nodes.len() >= node_limit {
@@ -214,27 +318,37 @@ impl WorkflowyClient {
                         limit: node_limit,
                         truncation_reason: Some(TruncationReason::NodeLimit),
                         elapsed_ms: started.elapsed().as_millis() as u64,
+                        truncated_at_node_id: Some(id.to_string()),
                     });
                 }
                 if let Some(status) = controls.status() {
-                    reason = Some(status);
+                    outcome = TruncationOutcome::stopped(status, Some(id.to_string()));
                 } else {
-                    match self.get_children(id).await {
+                    match self.get_children_cancellable(id, cancel_ref).await {
                         Ok(children) => {
-                            reason = self
+                            outcome = self
                                 .fetch_descendants(&children, &mut all_nodes, 0, max_depth, node_limit, &controls)
                                 .await?;
+                        }
+                        Err(WorkflowyError::Cancelled) => {
+                            outcome = TruncationOutcome::stopped(
+                                TruncationReason::Cancelled,
+                                Some(id.to_string()),
+                            );
                         }
                         Err(e) => return Err(e),
                     }
                 }
             }
             None => {
-                match self.get_top_level_nodes().await {
+                match self.get_top_level_nodes_cancellable(cancel_ref).await {
                     Ok(top) => {
-                        reason = self
+                        outcome = self
                             .fetch_descendants(&top, &mut all_nodes, 0, max_depth, node_limit, &controls)
                             .await?;
+                    }
+                    Err(WorkflowyError::Cancelled) => {
+                        outcome = TruncationOutcome::stopped(TruncationReason::Cancelled, None);
                     }
                     Err(e) => return Err(e),
                 }
@@ -243,10 +357,11 @@ impl WorkflowyClient {
 
         Ok(SubtreeFetch {
             nodes: all_nodes,
-            truncated: reason.is_some(),
+            truncated: outcome.reason.is_some(),
             limit: node_limit,
-            truncation_reason: reason,
+            truncation_reason: outcome.reason,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            truncated_at_node_id: outcome.truncated_at_node_id,
         })
     }
 
@@ -259,8 +374,10 @@ impl WorkflowyClient {
     /// Fetch descendants level-by-level, parallelising per-level child fetches
     /// up to [`defaults::SUBTREE_FETCH_CONCURRENCY`]. The rate-limiter serialises
     /// each HTTP call internally, so this parallelism eliminates RTT stalls
-    /// without exceeding the sustained rate. Returns the truncation reason,
-    /// if any.
+    /// without exceeding the sustained rate. Returns the truncation reason
+    /// and, when truncation fired mid-level, the parent node ID whose
+    /// children were not fully drained — callers can resolve that against
+    /// `out` to display a path.
     async fn fetch_descendants(
         &self,
         initial_nodes: &[WorkflowyNode],
@@ -269,29 +386,38 @@ impl WorkflowyClient {
         max_depth: usize,
         node_limit: usize,
         controls: &FetchControls,
-    ) -> Result<Option<TruncationReason>> {
+    ) -> Result<TruncationOutcome> {
         let mut current_level: Vec<WorkflowyNode> = initial_nodes.to_vec();
         let mut depth = start_depth;
+        let cancel_ref = controls.cancel.as_ref();
 
         while depth < max_depth && !current_level.is_empty() {
             // Accumulate this level before descending. If it blows the cap,
-            // record a node-limit truncation and stop.
-            for node in current_level.iter() {
+            // record a node-limit truncation and stop. The first node we
+            // could not fit is the truncation anchor — caller can show its
+            // parent path to make the cut visible.
+            for (idx, node) in current_level.iter().enumerate() {
                 if out.len() >= node_limit {
                     warn!(limit = node_limit, "Node cap reached, subtree truncated");
-                    return Ok(Some(TruncationReason::NodeLimit));
+                    return Ok(TruncationOutcome::stopped(
+                        TruncationReason::NodeLimit,
+                        current_level.get(idx).and_then(|n| n.parent_id.clone()),
+                    ));
                 }
                 out.push(node.clone());
             }
 
             if let Some(status) = controls.status() {
-                return Ok(Some(status));
+                return Ok(TruncationOutcome::stopped(
+                    status,
+                    current_level.first().and_then(|n| n.parent_id.clone()),
+                ));
             }
 
             let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
             let ids: Vec<String> = current_level.iter().map(|n| n.id.clone()).collect();
             let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
-                let res = self.get_children(&id).await;
+                let res = self.get_children_cancellable(&id, cancel_ref).await;
                 (id, res)
             }))
             .buffer_unordered(concurrency);
@@ -300,9 +426,20 @@ impl WorkflowyClient {
 
             let mut next_level: Vec<WorkflowyNode> = Vec::new();
             let mut stop: Option<TruncationReason> = None;
+            // Track which parents we have *not* yet drained, so when we stop
+            // mid-level we can name the first unfinished branch.
+            let mut pending_parents: std::collections::HashSet<String> =
+                current_level.iter().map(|n| n.id.clone()).collect();
+            let mut last_unfinished: Option<String> = None;
             while let Some((id, res)) = fetches.next().await {
+                pending_parents.remove(&id);
                 match res {
                     Ok(children) => next_level.extend(children),
+                    Err(WorkflowyError::Cancelled) => {
+                        stop = Some(TruncationReason::Cancelled);
+                        last_unfinished = Some(id);
+                        break;
+                    }
                     Err(e) => warn!(error = %e, node_id = %id, "Failed to fetch children, skipping branch"),
                 }
                 if out.len() + next_level.len() >= node_limit {
@@ -322,7 +459,10 @@ impl WorkflowyClient {
                 if reason == TruncationReason::NodeLimit {
                     warn!(limit = node_limit, "Node cap reached during level fetch, subtree truncated");
                 }
-                return Ok(Some(reason));
+                let truncated_at = last_unfinished
+                    .or_else(|| pending_parents.into_iter().next())
+                    .or_else(|| current_level.first().map(|n| n.id.clone()));
+                return Ok(TruncationOutcome::stopped(reason, truncated_at));
             }
 
             current_level = next_level;
@@ -334,14 +474,15 @@ impl WorkflowyClient {
         if !current_level.is_empty() {
             let remaining = node_limit.saturating_sub(out.len());
             if current_level.len() > remaining {
+                let anchor = current_level.get(remaining).and_then(|n| n.parent_id.clone());
                 out.extend(current_level.into_iter().take(remaining));
                 warn!(limit = node_limit, "Node cap reached on final level, subtree truncated");
-                return Ok(Some(TruncationReason::NodeLimit));
+                return Ok(TruncationOutcome::stopped(TruncationReason::NodeLimit, anchor));
             }
             out.extend(current_level);
         }
 
-        Ok(None)
+        Ok(TruncationOutcome::complete())
     }
 
     /// Create a new node
@@ -433,16 +574,48 @@ impl WorkflowyClient {
         endpoint: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
+        self.request_cancellable(method, endpoint, body, None).await
+    }
+
+    /// Cancellable variant. When `cancel` is `Some`, cancellation interrupts:
+    /// (a) the rate-limiter wait,
+    /// (b) the in-flight HTTP send,
+    /// (c) the inter-attempt backoff sleep.
+    /// In each case the function returns [`WorkflowyError::Cancelled`] without
+    /// holding tokens or workers, so a `cancel_all` actually frees the shared
+    /// `RateLimiter` for new tool calls.
+    pub async fn request_cancellable<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: Option<serde_json::Value>,
+        cancel: Option<&CancelGuard>,
+    ) -> Result<T> {
         let mut attempt = 0;
 
         loop {
             attempt += 1;
 
-            // Rate limit: wait for a token before each attempt
-            self.rate_limiter.acquire().await;
+            if let Some(g) = cancel {
+                if g.is_cancelled() {
+                    return Err(WorkflowyError::Cancelled);
+                }
+            }
 
-            match self.try_request::<T>(method, endpoint, &body).await {
+            // Rate limit: wait for a token, but bail if cancellation flips
+            // while we are queued behind earlier waiters.
+            match cancel {
+                Some(g) => {
+                    if !self.rate_limiter.acquire_cancellable(g).await {
+                        return Err(WorkflowyError::Cancelled);
+                    }
+                }
+                None => self.rate_limiter.acquire().await,
+            }
+
+            match self.try_request_cancellable::<T>(method, endpoint, &body, cancel).await {
                 Ok(result) => return Ok(result),
+                Err(WorkflowyError::Cancelled) => return Err(WorkflowyError::Cancelled),
                 Err(e) => {
                     if attempt < self.retry_config.max_attempts && e.is_retryable() {
                         // Extract retry_after from 429 responses
@@ -458,7 +631,9 @@ impl WorkflowyClient {
                             error = %e,
                             "Retrying request after backoff"
                         );
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        if !sleep_cancellable(Duration::from_millis(delay_ms), cancel).await {
+                            return Err(WorkflowyError::Cancelled);
+                        }
                     } else {
                         return Err(WorkflowyError::RetryExhausted {
                             attempts: attempt,
@@ -480,11 +655,12 @@ impl WorkflowyClient {
             .map(|secs| secs.max(1) * 1000) // convert to ms, minimum 1 second
     }
 
-    async fn try_request<T: serde::de::DeserializeOwned>(
+    async fn try_request_cancellable<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         endpoint: &str,
         body: &Option<serde_json::Value>,
+        cancel: Option<&CancelGuard>,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(url = %url, method = method, "Making API request");
@@ -508,10 +684,18 @@ impl WorkflowyClient {
             req = req.json(body_value);
         }
 
-        let response = req
-            .send()
-            .await
-            .map_err(WorkflowyError::HttpError)?;
+        // Race the in-flight HTTP send against a cancellation poll. Dropping
+        // the send future cleanly cancels the underlying connection in reqwest.
+        let response = match cancel {
+            Some(g) => {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(g) => return Err(WorkflowyError::Cancelled),
+                    res = req.send() => res.map_err(WorkflowyError::HttpError)?,
+                }
+            }
+            None => req.send().await.map_err(WorkflowyError::HttpError)?,
+        };
 
         let status = response.status();
 
@@ -691,6 +875,7 @@ mod tests {
             limit: 10_000,
             truncation_reason: Some(TruncationReason::NodeLimit),
             elapsed_ms: 5,
+            truncated_at_node_id: Some("anchor-123".to_string()),
         };
         let cloned = fetch.clone();
         assert!(cloned.truncated);
@@ -769,5 +954,25 @@ mod tests {
         assert!(fetch.truncated);
         assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
         assert!(fetch.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_subtree_with_root_pre_cancelled_returns_anchor() {
+        // When cancellation fires before the first HTTP call against a scoped
+        // walk, the truncation anchor should still be the requested root so
+        // the caller can render a meaningful path.
+        use crate::utils::CancelRegistry;
+        let client = test_client();
+        let registry = CancelRegistry::new();
+        let guard = registry.guard();
+        registry.cancel_all();
+        let controls = FetchControls::default().and_cancel(guard);
+        let fetch = client
+            .get_subtree_with_controls(Some("root-id"), 3, 100, controls)
+            .await
+            .expect("cancelled guard should return Ok(partial)");
+        assert!(fetch.truncated);
+        assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
+        assert_eq!(fetch.truncated_at_node_id.as_deref(), Some("root-id"));
     }
 }

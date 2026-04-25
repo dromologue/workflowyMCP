@@ -49,6 +49,9 @@ pub enum WorkflowyError {
     #[error("Timeout")]
     Timeout,
 
+    #[error("Cancelled")]
+    Cancelled,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

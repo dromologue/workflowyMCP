@@ -38,34 +38,71 @@ fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     validate_node_id(id).map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
-/// Build a truncation warning string for text responses. Empty when the fetch
-/// was complete; otherwise announces the cap and the reason so the caller
-/// knows whether to narrow the scope, raise the budget, or retry.
+/// Test-only shorthand: build a banner without a path. Production callers go
+/// through [`truncation_banner_from_fetch`].
+#[cfg(test)]
 fn truncation_banner(truncated: bool, limit: usize) -> String {
     truncation_banner_with_reason(truncated, limit, None)
 }
 
+#[cfg(test)]
 fn truncation_banner_with_reason(
     truncated: bool,
     limit: usize,
     reason: Option<TruncationReason>,
 ) -> String {
+    truncation_banner_full(truncated, limit, reason, None)
+}
+
+/// Full truncation banner including the path of the unfinished subtree, when
+/// known. Callers that have a `SubtreeFetch` to hand should prefer
+/// [`truncation_banner_from_fetch`] so the path computation is centralised.
+fn truncation_banner_full(
+    truncated: bool,
+    limit: usize,
+    reason: Option<TruncationReason>,
+    truncated_at_path: Option<&str>,
+) -> String {
     if !truncated {
         return String::new();
     }
+    let suffix = match truncated_at_path {
+        Some(path) if !path.is_empty() => format!(" Walk stopped at: {}.", path),
+        _ => String::new(),
+    };
     match reason {
         Some(TruncationReason::Timeout) => format!(
-            "⚠ subtree walk timed out before completion (budget {} ms). Results below reflect whatever was collected — retry with narrower parent_id/max_depth or raise the budget.\n\n",
+            "⚠ subtree walk timed out before completion (budget {} ms). Results below reflect whatever was collected — retry with narrower parent_id/max_depth or raise the budget.{}\n\n",
             defaults::SUBTREE_FETCH_TIMEOUT_MS,
+            suffix,
         ),
-        Some(TruncationReason::Cancelled) => {
-            "⚠ subtree walk was cancelled; results below are partial.\n\n".to_string()
-        }
+        Some(TruncationReason::Cancelled) => format!(
+            "⚠ subtree walk was cancelled; results below are partial.{}\n\n",
+            suffix,
+        ),
         _ => format!(
-            "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.\n\n",
-            limit
+            "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.{}\n\n",
+            limit, suffix,
         ),
     }
+}
+
+/// Convenience: produce a banner from a [`SubtreeFetch`], resolving the
+/// `truncated_at_node_id` against the fetched nodes to display a path.
+fn truncation_banner_from_fetch(fetch: &SubtreeFetch) -> String {
+    let path = fetch
+        .truncated_at_node_id
+        .as_deref()
+        .map(|id| {
+            crate::utils::node_paths::build_node_path(id, &fetch.nodes)
+        })
+        .filter(|p| !p.is_empty());
+    truncation_banner_full(
+        fetch.truncated,
+        fetch.limit,
+        fetch.truncation_reason,
+        path.as_deref(),
+    )
 }
 
 /// The main MCP server struct
@@ -448,9 +485,10 @@ impl WorkflowyMcpServer {
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
 
         match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
+            Ok(fetch) => {
+                let banner = truncation_banner_from_fetch(&fetch);
                 let query_lower = params.query.to_lowercase();
-                let mut results: Vec<&WorkflowyNode> = nodes
+                let mut results: Vec<&WorkflowyNode> = fetch.nodes
                     .iter()
                     .filter(|n| {
                         let name_match = n.name.to_lowercase().contains(&query_lower);
@@ -491,7 +529,7 @@ impl WorkflowyMcpServer {
                     )
                 };
 
-                let result_text = format!("{}{}", truncation_banner(truncated, limit), body);
+                let result_text = format!("{}{}", banner, body);
                 Ok(CallToolResult::success(vec![Content::text(result_text)]))
             }
             Err(e) => {
@@ -504,7 +542,7 @@ impl WorkflowyMcpServer {
         }
     }
 
-    #[tool(description = "Get a specific Workflowy node by its ID. Returns the node's full details including name, description, tags, and children.")]
+    #[tool(description = "Get a specific Workflowy node by its ID. Returns the node's full details (name, description, tags) plus a depth-1 listing of its direct children — matching what list_children would return for the same ID. The children listing costs one extra HTTP call; use list_children directly when you don't need the parent metadata.")]
     async fn get_node(
         &self,
         Parameters(params): Parameters<GetNodeParams>,
@@ -512,18 +550,52 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, "Getting node");
         check_node_id(&params.node_id)?;
 
-        match self.client.get_node(&params.node_id).await {
-            Ok(node) => {
-                let json = serde_json::to_string_pretty(&node).map_err(|e| {
-                    McpError::internal_error(format!("Serialization error: {}", e), None)
-                })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+        // Fetch the node and its direct children in parallel — they are
+        // independent API calls, and previously `get_node` returned an empty
+        // `children: []` field that disagreed with `list_children`. Surfacing
+        // the children alongside the parent removes that footgun without
+        // forcing callers to make a second tool call.
+        let node_fut = self.client.get_node(&params.node_id);
+        let children_fut = self.client.get_children(&params.node_id);
+        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
+
+        let node = match node_res {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    format!("Failed to get node {}: {}", params.node_id, e),
+                    None,
+                ));
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to get node {}: {}", params.node_id, e),
-                None,
-            )),
+        };
+
+        // Children fetch is best-effort — surface the parent even if the
+        // children call failed (e.g. node has no children, or a transient
+        // error on the listing endpoint). The error is logged so the caller
+        // can correlate against the empty list.
+        let children: Vec<WorkflowyNode> = match children_res {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(node_id = %params.node_id, error = %e, "get_node: child fetch failed; returning parent with empty children");
+                Vec::new()
+            }
+        };
+
+        // Feed the name index opportunistically — every fetched node is a
+        // free index entry.
+        if !children.is_empty() {
+            self.name_index.ingest(&children);
         }
+        self.name_index.ingest(std::slice::from_ref(&node));
+
+        let payload = json!({
+            "node": node,
+            "children": children,
+        });
+        let json = serde_json::to_string_pretty(&payload).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(description = "Create a new node in Workflowy. Optionally specify a parent node ID and position.")]
@@ -718,9 +790,10 @@ impl WorkflowyMcpServer {
         info!(tag = %params.tag, max_depth, "Tag search");
 
         match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
+            Ok(fetch) => {
+                let banner = truncation_banner_from_fetch(&fetch);
                 let tag_lower = params.tag.to_lowercase();
-                let mut results: Vec<&WorkflowyNode> = nodes
+                let mut results: Vec<&WorkflowyNode> = fetch.nodes
                     .iter()
                     .filter(|n| {
                         let in_name = n.name.to_lowercase().contains(&tag_lower);
@@ -739,8 +812,6 @@ impl WorkflowyMcpServer {
                     .collect();
 
                 results.truncate(max_results);
-
-                let banner = truncation_banner(truncated, limit);
                 if results.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
                         "{}No nodes found with tag '{}'",
@@ -836,20 +907,21 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
 
         match self.walk_subtree(Some(&params.node_id), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, .. }) => {
-                if all_nodes.is_empty() {
+            Ok(fetch) => {
+                if fetch.nodes.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
                         format!("Node `{}` not found or has no descendants", params.node_id)
                     )]));
                 }
-                let root_name = all_nodes.first().map(|n| n.name.as_str()).unwrap_or("unknown");
-                let json = serde_json::to_string_pretty(&all_nodes).map_err(|e| {
+                let banner = truncation_banner_from_fetch(&fetch);
+                let root_name = fetch.nodes.first().map(|n| n.name.as_str()).unwrap_or("unknown").to_string();
+                let total = fetch.nodes.len();
+                let json = serde_json::to_string_pretty(&fetch.nodes).map_err(|e| {
                     McpError::internal_error(format!("Serialization error: {}", e), None)
                 })?;
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "{}Subtree for '{}' ({} nodes):\n\n{}",
-                    truncation_banner(truncated, limit),
-                    root_name, all_nodes.len(), json
+                    banner, root_name, total, json
                 ))]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -904,9 +976,9 @@ impl WorkflowyMcpServer {
         }
 
         match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, .. }) => {
+            Ok(fetch) => {
                 let search = params.name.to_lowercase();
-                let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
+                let matches: Vec<&WorkflowyNode> = fetch.nodes.iter().filter(|n| {
                     let name = n.name.to_lowercase();
                     match match_mode {
                         "contains" => name.contains(&search),
@@ -915,8 +987,14 @@ impl WorkflowyMcpServer {
                     }
                 }).collect();
 
-                let node_map = build_node_map(&nodes);
-                let banner = truncation_banner_with_reason(truncated, limit, truncation_reason);
+                let node_map = build_node_map(&fetch.nodes);
+                let banner = truncation_banner_from_fetch(&fetch);
+                let truncated_at_path = fetch.truncated_at_node_id.as_deref().map(|id| {
+                    build_node_path_with_map(id, &node_map)
+                });
+                let truncated = fetch.truncated;
+                let limit = fetch.limit;
+                let truncation_reason = fetch.truncation_reason;
 
                 if matches.is_empty() {
                     let mut result = json!({
@@ -924,6 +1002,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncated_at_path": truncated_at_path,
                         "banner": banner,
                         "message": format!("No nodes found matching '{}' (mode: {}). Try match_mode: 'contains'.", params.name, match_mode)
                     });
@@ -945,6 +1024,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncated_at_path": truncated_at_path,
                         "node_id": node.id,
                         "name": node.name,
                         "path": path,
@@ -972,6 +1052,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncated_at_path": truncated_at_path,
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches for '{}'. Use selection parameter to choose.", matches.len(), params.name)
@@ -2221,7 +2302,7 @@ impl WorkflowyMcpServer {
         info!(root_id = ?params.root_id, max_depth, allow_root_scan, "Building name index");
 
         match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, elapsed_ms }) => {
+            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, elapsed_ms, .. }) => {
                 let result = json!({
                     "status": if truncated { "partial" } else { "ok" },
                     "nodes_indexed": nodes.len(),
@@ -2728,6 +2809,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_node_handler_returns_invalid_id_error() {
+        // Sanity: get_node still validates IDs at the handler boundary even
+        // though the handler now also fetches children. An empty ID must be
+        // rejected before any HTTP call.
+        let server = new_test_server();
+        let params = GetNodeParams { node_id: NodeId::from("") };
+        let err = server
+            .get_node(Parameters(params))
+            .await
+            .expect_err("empty node_id must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("node_id") || msg.contains("invalid"), "got: {msg}");
+    }
+
+    #[tokio::test]
     async fn test_bulk_update_rejects_complete() {
         let server = new_test_server();
         let params = BulkUpdateParams {
@@ -2830,6 +2926,62 @@ mod tests {
         let banner =
             truncation_banner_with_reason(true, 10_000, Some(TruncationReason::Cancelled));
         assert!(banner.contains("cancelled"), "banner: {banner}");
+    }
+
+    #[test]
+    fn truncation_banner_from_fetch_includes_path_when_truncated_at_known_node() {
+        // Build a small synthetic subtree where truncation fires at a known
+        // node, and confirm the banner names the unfinished branch by path.
+        let nodes = vec![
+            WorkflowyNode { id: "a".into(), name: "Work".into(), parent_id: None, ..Default::default() },
+            WorkflowyNode { id: "b".into(), name: "Projects".into(), parent_id: Some("a".into()), ..Default::default() },
+            WorkflowyNode { id: "c".into(), name: "Customer Engagements".into(), parent_id: Some("b".into()), ..Default::default() },
+        ];
+        let fetch = SubtreeFetch {
+            nodes,
+            truncated: true,
+            limit: 10_000,
+            truncation_reason: Some(TruncationReason::NodeLimit),
+            elapsed_ms: 12,
+            truncated_at_node_id: Some("c".into()),
+        };
+        let banner = truncation_banner_from_fetch(&fetch);
+        assert!(banner.contains("Walk stopped at:"), "banner: {banner}");
+        assert!(
+            banner.contains("Work > Projects > Customer Engagements"),
+            "banner missing full path: {banner}"
+        );
+    }
+
+    #[test]
+    fn truncation_banner_from_fetch_omits_path_when_anchor_unknown() {
+        let fetch = SubtreeFetch {
+            nodes: Vec::new(),
+            truncated: true,
+            limit: 10_000,
+            truncation_reason: Some(TruncationReason::Timeout),
+            elapsed_ms: 20_001,
+            truncated_at_node_id: None,
+        };
+        let banner = truncation_banner_from_fetch(&fetch);
+        assert!(banner.contains("timed out"), "banner: {banner}");
+        assert!(
+            !banner.contains("Walk stopped at:"),
+            "no path should appear when anchor is unknown: {banner}"
+        );
+    }
+
+    #[test]
+    fn truncation_banner_from_fetch_silent_when_complete() {
+        let fetch = SubtreeFetch {
+            nodes: Vec::new(),
+            truncated: false,
+            limit: 10_000,
+            truncation_reason: None,
+            elapsed_ms: 5,
+            truncated_at_node_id: None,
+        };
+        assert_eq!(truncation_banner_from_fetch(&fetch), "");
     }
 
     #[tokio::test]
