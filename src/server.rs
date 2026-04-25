@@ -3443,33 +3443,51 @@ impl ServerHandler for WorkflowyMcpServer {
                 ..Default::default()
             },
             instructions: Some(
-                "I manage Workflowy content. Available operations:
-- search_nodes: Search by text query
-- find_node: Find node by name (exact/contains/starts_with). Requires parent_id or allow_root_scan=true; set use_index=true for cached fast path.
-- get_node: Get a specific node by ID
+                "I manage Workflowy content. Node IDs accept either full UUIDs or 12-char short hashes (the trailing 12 hex of a UUID, as used in Workflowy URLs).
+
+Search & Navigation:
+- search_nodes: Search by text query (use parent_id + max_depth to scope on large trees)
+- find_node: Find by name (exact/contains/starts_with). Requires parent_id or allow_root_scan=true; set use_index=true for the cached fast path.
+- get_node: Fetch a node plus a depth-1 listing of its direct children
 - list_children: List children of a node
-- get_subtree: Get the full tree under a node (bounded by timeout + node cap; see truncation_reason)
+- get_subtree: Full tree under a node (bounded by timeout + node cap; see truncation_reason and truncated_at_path)
+- tag_search: Search by tag (#tag or @person)
+- find_backlinks: Find nodes linking to a given node
+- find_by_tag_and_path: Tag intersected with a hierarchical path prefix
+- path_of: Canonical root→node path (segments + display string)
+
+Content creation & editing:
 - create_node: Create a new node
-- edit_node: Edit a node's name or description (at least one must be provided)
+- batch_create_nodes: Pipelined batch creator with per-op status (not transactional)
+- transaction: Sequential create/edit/delete/move with best-effort rollback
+- edit_node: Edit name and/or description (at least one required; combined updates split into two POSTs to dodge upstream field-loss bug)
 - delete_node: Delete a node
-- move_node: Move a node to a new parent (invalidates old and new parent)
+- move_node: Move with retry-on-stale-parent (refreshes parent listing on 4xx then retries once)
 - insert_content: Insert hierarchical content from indented text
 - smart_insert: Search + insert in one call
-- tag_search: Search by tag (#tag or @person)
-- daily_review: Overdue, upcoming, recent changes summary
-- get_recent_changes: Recently modified nodes
-- list_overdue: Past-due items
-- list_upcoming: Upcoming deadlines
-- get_project_summary: Project stats, tags, assignees
-- find_backlinks: Find nodes linking to a given node
-- list_todos: List todo items with filtering
+- bulk_update: Apply operations to filtered nodes (with dry_run)
+- bulk_tag: Apply one tag to many node IDs in parallel
 - duplicate_node: Deep-copy a node subtree
 - create_from_template: Copy template with {{variable}} substitution
-- bulk_update: Apply operations to filtered nodes (with dry_run)
 - convert_markdown: Convert markdown to Workflowy format
+- export_subtree: Export as OPML | Markdown | JSON
+- create_mirror: STUB — Workflowy's REST API does not expose mirror creation; returns an explanatory error
+
+Todos & scheduling:
+- daily_review: Overdue + upcoming + recent + pending in one call
+- list_todos / list_overdue / list_upcoming
+- get_recent_changes: Nodes modified in the last N days
+- since: Cheap incremental check — has this node changed since a timestamp?
+
+Project & summary:
+- get_project_summary: Stats, tag counts, assignees
+
+Diagnostics & ops:
+- workflowy_status: Extended liveness — in_flight_walks, last_request_ms, tree_size_estimate, upstream rate-limit headers (preferred over health_check when deciding to launch a heavy query)
 - health_check: Sub-second API + cache + index diagnostic
-- cancel_all: Cancel in-flight tree walks so partial results return immediately
-- build_name_index: Populate the opportunistic name index for fast find_node lookups"
+- cancel_all: Cancel in-flight tree walks; preempts the rate-limiter and HTTP send within ~50ms
+- build_name_index: Populate the opportunistic name index for fast find_node lookups
+- get_recent_tool_calls: Per-call ring-buffer log (tool, params hash, duration, ok/err) for self-diagnosis"
                     .to_string(),
             ),
         }
