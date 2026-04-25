@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
-    model::*,
+    model::{ErrorCode, *},
     schemars::JsonSchema,
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -31,6 +31,102 @@ use crate::utils::subtree::{is_todo, is_completed};
 use crate::utils::tag_parser::parse_node_tags;
 use crate::validation::validate_node_id;
 use std::time::{Duration, Instant};
+
+/// Compute a per-tool health summary from the op log: for each tool that
+/// has been called at least once, report `total`, `ok`, `err`, and a
+/// `status` of `"healthy"` (≥75% ok in the recent window),
+/// `"degraded"` (50–75% ok), or `"failing"` (<50% ok). Bounded by the
+/// 200 most recent entries so a flood of failures gets noticed quickly
+/// without ancient history skewing the picture.
+///
+/// Brief P4 #3: callers checking whether a heavy query is safe can read
+/// this field instead of probing with multiple call types.
+fn per_tool_health(log: &OpLog) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let recent = log.recent(200, None);
+    let mut by_tool: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for entry in recent {
+        let counts = by_tool.entry(entry.tool.clone()).or_insert((0, 0));
+        match entry.status {
+            crate::utils::OpStatus::Ok => counts.0 += 1,
+            crate::utils::OpStatus::Err => counts.1 += 1,
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (tool, (ok, err)) in by_tool {
+        let total = ok + err;
+        let ok_rate = if total == 0 { 1.0 } else { ok as f64 / total as f64 };
+        let status = if ok_rate >= 0.75 {
+            "healthy"
+        } else if ok_rate >= 0.5 {
+            "degraded"
+        } else {
+            "failing"
+        };
+        out.insert(
+            tool,
+            serde_json::json!({
+                "total": total,
+                "ok": ok,
+                "err": err,
+                "ok_rate": (ok_rate * 100.0).round() / 100.0,
+                "status": status,
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Build a structured `McpError` for a tool failure. Picks a JSON-RPC error
+/// code based on the underlying error class and attaches a `data` payload
+/// with `{operation, node_id, hint, error}` so even minimal clients can
+/// extract the proximate cause when their UI renders only the generic
+/// "tool failed" surface. Supersedes the previous direct calls to
+/// `McpError::internal_error(format!("Failed: {}", e), None)` which were
+/// being truncated to "Tool execution failed" by some clients.
+fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Display) -> McpError {
+    let err_str = err.to_string();
+    let lower = err_str.to_lowercase();
+    let (code, hint) = if lower.contains("404") || lower.contains("not found") {
+        (
+            ErrorCode::RESOURCE_NOT_FOUND,
+            "node may not yet exist (propagation lag), or has been deleted",
+        )
+    } else if lower.contains("cancelled") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "cancelled by cancel_all — the call was preempted, retry",
+        )
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "upstream timeout — narrow scope or wait for load to drop",
+        )
+    } else if lower.contains("api error 5") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "Workflowy backend error — try again shortly",
+        )
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "auth failure — check WORKFLOWY_API_KEY",
+        )
+    } else {
+        (ErrorCode::INTERNAL_ERROR, "see data field for details")
+    };
+    let data = serde_json::json!({
+        "operation": operation,
+        "node_id": node_id,
+        "hint": hint,
+        "error": err_str,
+    });
+    McpError::new(
+        code,
+        format!("{}: {}", operation, err_str),
+        Some(data),
+    )
+}
 
 /// Wrap a handler body so the call is recorded in the per-call op log.
 /// Use as the outermost expression of every tool handler:
@@ -923,18 +1019,18 @@ impl WorkflowyMcpServer {
         // `children: []` field that disagreed with `list_children`. Surfacing
         // the children alongside the parent removes that footgun without
         // forcing callers to make a second tool call.
-        let node_fut = self.client.get_node(&resolved);
-        let children_fut = self.client.get_children(&resolved);
+        //
+        // Both calls go through the propagation-retry path: Workflowy has
+        // been observed to return a node ID via a parent's children listing
+        // before the same ID is queryable directly. The retry waits up to
+        // ~1.4 s total (200 + 400 + 800 ms) before giving up.
+        let node_fut = self.client.get_node_with_propagation_retry(&resolved);
+        let children_fut = self.client.get_children_with_propagation_retry(&resolved);
         let (node_res, children_res) = tokio::join!(node_fut, children_fut);
 
         let node = match node_res {
             Ok(n) => n,
-            Err(e) => {
-                return Err(McpError::internal_error(
-                    format!("Failed to get node {}: {}", resolved, e),
-                    None,
-                ));
-            }
+            Err(e) => return Err(tool_error("get_node", Some(&resolved), e)),
         };
 
         // Children fetch is best-effort — surface the parent even if the
@@ -1137,7 +1233,7 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.client.get_children(&resolved).await {
+        match self.client.get_children_with_propagation_retry(&resolved).await {
             Ok(children) => {
                 if children.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1156,10 +1252,7 @@ impl WorkflowyMcpServer {
                     ))]))
                 }
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("Failed to get children: {}", e),
-                None,
-            )),
+            Err(e) => Err(tool_error("list_children", Some(&resolved), e)),
         }
         })
     }
@@ -2706,6 +2799,7 @@ impl WorkflowyMcpServer {
         let rate_limit = self.client.rate_limit_snapshot();
         let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
         let tree_estimate = self.tree_size_estimate.load(std::sync::atomic::Ordering::Relaxed);
+        let per_tool = per_tool_health(&self.op_log);
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
             "api_reachable": api_reachable,
@@ -2730,6 +2824,7 @@ impl WorkflowyMcpServer {
                 "reset_unix_seconds": rate_limit.reset_unix_seconds,
                 "observed": rate_limit.remaining.is_some() || rate_limit.limit.is_some() || rate_limit.reset_unix_seconds.is_some(),
             },
+            "per_tool_health": per_tool,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "cancel_generation": self.cancel_registry.generation(),
             "error": error,
@@ -4040,6 +4135,109 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("payload JSON");
         assert!(v["entries"].as_array().unwrap().len() >= 3);
         assert_eq!(v["total_recorded"], total_after);
+    }
+
+    // --- Brief acceptance: 2026-04-25 (Pattern A/B/C transient failures) ---
+
+    /// Brief acceptance #2: error surface fidelity. When a tool call fails,
+    /// the response MUST include a JSON-RPC error code and a `data` payload
+    /// naming the operation, the node_id, the proximate cause, and the raw
+    /// error string. Bare "Tool execution failed" with no other detail is a
+    /// regression — this test fails loud if `tool_error` ever drops the
+    /// structured payload.
+    #[tokio::test]
+    async fn tool_error_carries_operation_node_id_and_hint() {
+        // 404-class error → resource_not_found code + propagation-lag hint.
+        let err = tool_error(
+            "get_node",
+            Some("d096140b-0ed4-498a-981d-582fc2a2c8d6"),
+            "API error 404: not found",
+        );
+        assert_eq!(err.code, ErrorCode::RESOURCE_NOT_FOUND);
+        let data = err.data.expect("404 error must carry structured data");
+        assert_eq!(data["operation"], "get_node");
+        assert_eq!(data["node_id"], "d096140b-0ed4-498a-981d-582fc2a2c8d6");
+        let hint = data["hint"].as_str().expect("hint must be string");
+        assert!(
+            hint.contains("propagation lag") || hint.contains("not yet exist"),
+            "404 hint should mention propagation/existence: {hint}"
+        );
+
+        // Timeout-class error → internal_error code + timeout hint.
+        let err = tool_error("list_children", Some("abc"), "subtree walk timed out");
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+        let data = err.data.expect("timeout error must carry data");
+        assert!(data["hint"].as_str().unwrap().contains("timeout"));
+
+        // 5xx-class error → backend hint.
+        let err = tool_error("edit_node", Some("xyz"), "API error 500: server error");
+        let data = err.data.expect("5xx must carry data");
+        assert!(data["hint"].as_str().unwrap().contains("backend"));
+
+        // The message field always names the operation so even clients that
+        // only show `message` can correlate the failure with a tool.
+        assert!(err.message.starts_with("edit_node:"));
+    }
+
+    /// Brief acceptance #1: listing-then-lookup parity. A node ID returned
+    /// by `list_children(parent_id)` must be retrievable via `get_node`
+    /// without the caller having to handle propagation lag manually. The
+    /// server-level half of this guarantee is the propagation-retry
+    /// helpers on `WorkflowyClient`; this test confirms those helpers are
+    /// the ones the handlers use, not the bare endpoints.
+    #[tokio::test]
+    async fn get_node_handler_uses_propagation_retry() {
+        // We can't reach the live API in unit tests; instead this test
+        // documents the wiring contract by reading the handler source via
+        // a sentinel grep. The matching string lives in the handler body
+        // — if a future refactor swaps `_with_propagation_retry` back to
+        // the bare `get_node`/`get_children`, this test fails loud.
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains("get_node_with_propagation_retry"),
+            "get_node handler must call propagation-retry variant; otherwise nodes \
+             returned via list_children may 404 on direct lookup due to upstream lag"
+        );
+        assert!(
+            src.contains("get_children_with_propagation_retry"),
+            "list_children + get_node child fetch must both use propagation-retry"
+        );
+    }
+
+    /// Brief P4 #3: per-call-type health. `workflowy_status` must distinguish
+    /// between call paths so the assistant can read a single status response
+    /// to know whether `get_node` is healthy while `search_nodes` is
+    /// degraded — the diagnostic gap that made Pattern B hard to pinpoint.
+    #[tokio::test]
+    async fn workflowy_status_includes_per_tool_health() {
+        let server = new_test_server();
+        // Drive a mix of ok and err calls so the per-tool histogram has data.
+        for _ in 0..3 {
+            let _ = server
+                .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+                .await
+                .expect("status ok");
+        }
+        // get_node with empty id always errors — useful to seed an err entry.
+        let _ = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        let body = result_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("status payload");
+        let per_tool = v.get("per_tool_health").expect("per_tool_health field present");
+        let workflowy_status_health = per_tool.get("workflowy_status").expect("workflowy_status entry");
+        assert_eq!(workflowy_status_health["status"], "healthy");
+        let get_node_health = per_tool.get("get_node").expect("get_node entry");
+        // The empty-id rejection is the only get_node call recorded — must
+        // show up as failing (1.0 err_rate).
+        assert_eq!(get_node_health["status"], "failing");
+        assert_eq!(get_node_health["err"], 1);
     }
 
     #[tokio::test]

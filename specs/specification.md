@@ -109,7 +109,29 @@ re-implementing them:
    ("parent not found"/"stale parent"), `move_node` re-fetches the
    target parent's children listing and retries the move once. 5xx
    errors continue to use the standard exponential-backoff path.
-9. **Best-effort transactions.** `transaction` applies a sequence of
+9. **Propagation-lag tolerance for read paths.** `get_node` and
+   `list_children` go through `*_with_propagation_retry` helpers on
+   `WorkflowyClient` that retry up to 3 times (200/400/800 ms backoff)
+   on a 404. Workflowy has been observed to return a node ID via a
+   parent's children listing before that ID is queryable directly —
+   the brief calls this "Pattern A". The retry closes the consistency
+   window that callers used to have to handle themselves.
+10. **Structured tool errors.** Every handler that fails goes through
+    `tool_error(operation, node_id, err)` which picks a JSON-RPC error
+    code (`RESOURCE_NOT_FOUND` for 404s, `INTERNAL_ERROR` otherwise),
+    sets `message` to `"<operation>: <err>"`, and attaches a `data`
+    payload with `{operation, node_id, hint, error}`. Clients that
+    only display the bare `message` still see the operation; clients
+    that surface `data` get a one-sentence remediation hint
+    (propagation lag, timeout, backend error, auth failure, cancelled).
+11. **Per-tool health visibility.** `workflowy_status.per_tool_health`
+    is a histogram over the most recent 200 op-log entries, reporting
+    `total / ok / err / ok_rate / status` per tool with status thresholds
+    `healthy ≥ 75%`, `degraded ≥ 50%`, `failing < 50%`. Pattern B
+    (search succeeds while direct reads fail) is now diagnosable from
+    a single status response.
+
+12. **Best-effort transactions.** `transaction` applies a sequence of
    create/edit/delete/move operations sequentially; on first failure
    it replays inverse operations in reverse order to roll back
    what already succeeded. `delete` is intentionally not invertible

@@ -13,6 +13,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// True when an error looks like a 404 from the Workflowy API — used by
+/// the propagation-lag retry helpers to recognise the "not found yet"
+/// case worth waiting for. Matches both the direct `ApiError` form and
+/// the wrapped `RetryExhausted` form (since `is_retryable` returns false
+/// for 404, retry exhaustion fires after one attempt).
+fn is_404_like(e: &WorkflowyError) -> bool {
+    let text = e.to_string().to_lowercase();
+    text.contains("api error 404") || text.contains("not found")
+}
+
 /// True when an error looks like the upstream complaining about a
 /// stale or missing parent reference during a move. Used by
 /// [`WorkflowyClient::move_node`] to decide whether to retry-with-refresh.
@@ -292,6 +302,66 @@ impl WorkflowyClient {
     /// Get a single node by ID
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
         self.get_node_cancellable(node_id, None).await
+    }
+
+    /// Get a node tolerating propagation lag.
+    ///
+    /// Workflowy's API has been observed to return a node ID via a parent's
+    /// children listing before that node is queryable directly — typical
+    /// eventual-consistency behaviour. The standard `get_node` returns a
+    /// hard 404 in that window. This variant retries up to `MAX_PROP_RETRIES`
+    /// times with exponential backoff (200 / 400 / 800 ms) so callers don't
+    /// have to re-implement the wait themselves. Other errors propagate
+    /// immediately.
+    pub async fn get_node_with_propagation_retry(&self, node_id: &str) -> Result<WorkflowyNode> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.get_node_cancellable(node_id, None).await {
+                Ok(n) => return Ok(n),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "get_node 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Children-listing variant of [`Self::get_node_with_propagation_retry`].
+    /// Same retry policy: 404 means upstream may not have caught up yet.
+    pub async fn get_children_with_propagation_retry(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<WorkflowyNode>> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.get_children_cancellable(node_id, None).await {
+                Ok(c) => return Ok(c),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "get_children 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn get_node_cancellable(

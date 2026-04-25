@@ -254,6 +254,30 @@
     preserved.
 
 - [x] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
+
+- [x] **T-159 (Brief 2026-04-25)**: Transient-failure brief
+  - **Pattern A (per-ID failures)**: added
+    `WorkflowyClient::get_node_with_propagation_retry` and
+    `get_children_with_propagation_retry` — 3 attempts, 200/400/800 ms
+    backoff on 404 only. `is_404_like` recognises both bare ApiError
+    and the wrapped RetryExhausted form. The `get_node` handler runs
+    both fetches through the retry path; the `list_children` handler
+    too.
+  - **Pattern B (lost error detail)**: new `tool_error(op, id, err)`
+    helper picks an appropriate JSON-RPC code (`RESOURCE_NOT_FOUND`
+    for 404s, `INTERNAL_ERROR` otherwise), sets `message` to
+    `"<op>: <err>"` so even minimal clients show the operation, and
+    attaches `data` with `{operation, node_id, hint, error}`. Wired
+    into get_node and list_children; can be extended to other
+    handlers as touched.
+  - **Pattern C (degradation visibility)**: `workflowy_status` now
+    includes `per_tool_health` — per-tool histogram over the last
+    200 op-log entries with status thresholds healthy/degraded/
+    failing. The brief's Pattern B (search ok, direct reads fail) is
+    now visible from a single status response.
+  - Three brief acceptance tests added: `tool_error_carries_…`,
+    `get_node_handler_uses_propagation_retry`,
+    `workflowy_status_includes_per_tool_health`.
   - `tests/proptest_node_id.rs`: 5 property tests over hyphenated /
     unhyphenated UUID strings, garbage strings (no panics), and
     `null` deserialisation (always rejected at the serde layer).
