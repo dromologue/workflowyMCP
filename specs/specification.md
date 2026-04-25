@@ -93,12 +93,18 @@ re-implementing them:
    launch a heavy query can see both liveness and load before
    committing.
 6. **Short-hash node references.** Every handler that takes a
-   `node_id` accepts either a full 32-char hex UUID or the 12-char
-   short hash Workflowy uses in URLs. Resolution is `O(1)` against the
-   server's name index, which is populated automatically by every
-   subtree walk and on every write. The name index has no TTL — it
-   stays valid until explicitly invalidated by a write (or `clear`),
-   so once populated it serves lookups indefinitely.
+   `node_id` accepts three forms: full UUID (with or without hyphens),
+   the **12-char URL-suffix** form Workflowy puts in URLs
+   (`workflowy.com/#/abc123def456`), and the **8-char prefix** form
+   used widely in docs and skill files (e.g. `c1ef1ad5` for
+   `c1ef1ad5-…`, the first segment of the canonical 8-4-4-4-12
+   hyphenated layout). Resolution is `O(1)` against the server's
+   name index, which is populated automatically by every subtree walk
+   and on every write. The 8-char form is collision-aware: if two
+   distinct UUIDs share a prefix, resolution returns `None` and the
+   caller must disambiguate via the full UUID. The name index has no
+   TTL — once populated it serves lookups indefinitely until a write
+   invalidates the affected entry.
 7. **`edit_node` field-loss workaround.** When both `name` and
    `description` are supplied to `edit_node`, the client splits the
    update into two sequential POSTs (one per field) instead of a

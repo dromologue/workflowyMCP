@@ -255,6 +255,24 @@
 
 - [x] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
 
+- [x] **T-160 (Eval-driven 2026-04-25)**: 8-char short-hash IDs
+  - The wflow eval suite (`Evals/evals.json`) and the wflow skill
+    (`~/.claude/skills/wflow/SKILL.md`) reference canonical nodes by
+    8-char prefixes (e.g. `c1ef1ad5` for Tasks). Pre-fix, the server
+    only accepted 12-char URL-suffix short hashes, so eval 1 (morning
+    review) failed at the data layer.
+  - `NameIndex` gained `by_prefix_hash` mapping the first 8 hex chars
+    of every ingested UUID → full UUID. `prefix_hash_of` extracts the
+    canonical first segment.
+  - `resolve_short_hash` now accepts either 8 or 12 char input. The
+    8-char path is collision-aware: if two distinct UUIDs share a
+    prefix, returns `None` rather than guessing.
+  - `is_short_hash` (server-side) accepts both lengths so
+    `check_node_id` short-circuits cleanly at the handler boundary.
+  - 4 new tests cover prefix extraction, resolution, collision, and
+    invalidation. 206 unit tests passing.
+  - First Evals run captured in `Evals/results/run-20260425T194943Z.json`.
+
 - [x] **T-159 (Brief 2026-04-25)**: Transient-failure brief
   - **Pattern A (per-ID failures)**: added
     `WorkflowyClient::get_node_with_propagation_retry` and

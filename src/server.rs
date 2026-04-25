@@ -187,11 +187,16 @@ fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     }
 }
 
-/// Heuristic: is `s` a 12-char hex short hash? Used to short-circuit
+/// Heuristic: is `s` a hex short hash? Used to short-circuit
 /// `check_node_id` so callers can pass either form transparently.
+/// Accepts both the 12-char URL-suffix form (Workflowy URLs) and the
+/// 8-char prefix form (the first segment of a hyphenated UUID, used
+/// widely in docs and skill files).
 fn is_short_hash(s: &str) -> bool {
+    use crate::utils::name_index::{SHORT_HASH_LEN_PREFIX, SHORT_HASH_LEN_URL};
     let stripped: String = s.chars().filter(|c| *c != '-').collect();
-    stripped.len() == crate::utils::name_index::SHORT_HASH_LEN
+    let len = stripped.len();
+    (len == SHORT_HASH_LEN_URL || len == SHORT_HASH_LEN_PREFIX)
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
 }
 

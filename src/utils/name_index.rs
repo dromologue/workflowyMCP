@@ -13,11 +13,23 @@ use crate::types::WorkflowyNode;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
-/// Length (in lowercase hex chars) of the short-hash form of a UUID. Workflowy
-/// URLs use the trailing 12 hex characters (e.g. `workflowy.com/#/abc123def456`)
-/// as a unique handle for a node. Resolving this back to the full UUID is an
-/// O(1) lookup via [`NameIndex::resolve_short_hash`].
-pub const SHORT_HASH_LEN: usize = 12;
+/// Lengths (in lowercase hex chars) of the two short-hash forms accepted
+/// for a UUID:
+///
+/// - **12 hex chars** (`SHORT_HASH_LEN_URL`) is what Workflowy uses in
+///   URLs — the trailing 12 hex of a UUID (e.g.
+///   `workflowy.com/#/abc123def456`).
+/// - **8 hex chars** (`SHORT_HASH_LEN_PREFIX`) is the form humans use
+///   in notes / docs / skills — the first segment of the canonical
+///   8-4-4-4-12 UUID layout (e.g. `c1ef1ad5` for
+///   `c1ef1ad5-ce38-8fed-bf6f-4737f286b86a`).
+///
+/// Both resolve via [`NameIndex::resolve_short_hash`] in `O(1)`.
+pub const SHORT_HASH_LEN_URL: usize = 12;
+pub const SHORT_HASH_LEN_PREFIX: usize = 8;
+/// Backward-compatible alias for the URL-suffix form. Prefer the
+/// length constants above in new code.
+pub const SHORT_HASH_LEN: usize = SHORT_HASH_LEN_URL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameIndexEntry {
@@ -31,17 +43,35 @@ struct IndexedValue {
     entries: Vec<NameIndexEntry>,
 }
 
+/// Tracks one or more nodes that share an 8-hex-char prefix. We keep the
+/// first observed full UUID for the unambiguous-resolution path and the
+/// count so collision-aware callers can branch on it.
+#[derive(Debug, Clone)]
+struct PrefixEntry {
+    full_uuid: String,
+    count: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct NameIndex {
     by_name: RwLock<HashMap<String, IndexedValue>>,
     /// Reverse lookup: node_id -> lowercased name, so we can remove stale
     /// entries when the name changes or the node is deleted.
     by_id: RwLock<HashMap<String, String>>,
-    /// Short-hash → full UUID. Indexed by the last 12 lowercase-hex chars
-    /// of the UUID (with hyphens stripped). Workflowy's web UI uses this as
-    /// its public node handle in URLs; resolving it cheaply means callers
-    /// don't have to round-trip through the API just to convert URL → UUID.
+    /// Short-hash → full UUID. Indexed by the URL-suffix form (last 12
+    /// lowercase-hex chars of the UUID, hyphens stripped). Workflowy's web
+    /// UI uses this as its public node handle in URLs; resolving it
+    /// cheaply means callers don't have to round-trip through the API
+    /// just to convert URL → UUID.
     by_short_hash: RwLock<HashMap<String, String>>,
+    /// Prefix-hash → full UUID. Indexed by the first 8 hex chars of the
+    /// UUID (the first segment of the canonical 8-4-4-4-12 layout).
+    /// Documentation and skill files commonly use this form (e.g.
+    /// `c1ef1ad5` for `c1ef1ad5-…`). 8-char collisions are vanishingly
+    /// rare in a 32-char hex space; on collision we keep the first
+    /// observed mapping and return None for subsequent lookups so the
+    /// caller can disambiguate via full UUID.
+    by_prefix_hash: RwLock<HashMap<String, PrefixEntry>>,
 }
 
 impl NameIndex {
@@ -58,8 +88,9 @@ impl NameIndex {
         let mut by_name = self.by_name.write();
         let mut by_id = self.by_id.write();
         let mut by_short = self.by_short_hash.write();
+        let mut by_prefix = self.by_prefix_hash.write();
         for node in nodes {
-            self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &node.id);
+            self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, &node.id);
             let key = node.name.to_lowercase();
             let entry = NameIndexEntry {
                 node_id: node.id.clone(),
@@ -69,6 +100,20 @@ impl NameIndex {
             by_id.insert(node.id.clone(), key.clone());
             if let Some(short) = short_hash_of(&node.id) {
                 by_short.insert(short, node.id.clone());
+            }
+            if let Some(prefix) = prefix_hash_of(&node.id) {
+                by_prefix
+                    .entry(prefix)
+                    .and_modify(|e| {
+                        // Prefix collision: bump count, keep first id, so a
+                        // future resolve_short_hash returns None for that
+                        // ambiguous prefix and forces the caller to use the
+                        // full UUID.
+                        if e.full_uuid != node.id {
+                            e.count = e.count.saturating_add(1);
+                        }
+                    })
+                    .or_insert(PrefixEntry { full_uuid: node.id.clone(), count: 1 });
             }
             by_name
                 .entry(key)
@@ -110,13 +155,44 @@ impl NameIndex {
         out
     }
 
-    /// Resolve a 12-char hex short hash to its full UUID. Returns `None`
-    /// if the hash isn't in the index — callers must treat that as
-    /// "not seen yet", not "doesn't exist". Run a `build_name_index`
-    /// walk over the relevant subtree to populate.
+    /// Resolve a short-hash form to its full UUID.
+    ///
+    /// Accepts both the 12-char URL-suffix form and the 8-char prefix
+    /// form (the first segment of a hyphenated UUID, used widely in
+    /// docs and skill files). Hyphens are stripped before matching, so
+    /// `"abcd-1234-5678"` and `"abcd12345678"` both look up the
+    /// 12-char form.
+    ///
+    /// Returns `None` if the hash isn't in the index, isn't a valid
+    /// hex length, or — for the prefix form — collides with multiple
+    /// distinct full UUIDs (collision-aware: the caller must
+    /// disambiguate using the full UUID).
     pub fn resolve_short_hash(&self, short: &str) -> Option<String> {
-        let key = normalize_short_hash(short)?;
-        self.by_short_hash.read().get(&key).cloned()
+        let stripped: String = short.chars().filter(|c| *c != '-').collect();
+        match stripped.len() {
+            n if n == SHORT_HASH_LEN_URL => {
+                if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let key = stripped.to_lowercase();
+                self.by_short_hash.read().get(&key).cloned()
+            }
+            n if n == SHORT_HASH_LEN_PREFIX => {
+                if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let key = stripped.to_lowercase();
+                let guard = self.by_prefix_hash.read();
+                let entry = guard.get(&key)?;
+                if entry.count > 1 {
+                    // Ambiguous prefix — refuse to guess.
+                    None
+                } else {
+                    Some(entry.full_uuid.clone())
+                }
+            }
+            _ => None,
+        }
     }
 
     /// True when the index contains any entries.
@@ -129,7 +205,8 @@ impl NameIndex {
         let mut by_name = self.by_name.write();
         let mut by_id = self.by_id.write();
         let mut by_short = self.by_short_hash.write();
-        self.remove_locked(&mut by_name, &mut by_id, &mut by_short, node_id);
+        let mut by_prefix = self.by_prefix_hash.write();
+        self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, node_id);
     }
 
     /// Drop every entry.
@@ -137,6 +214,7 @@ impl NameIndex {
         self.by_name.write().clear();
         self.by_id.write().clear();
         self.by_short_hash.write().clear();
+        self.by_prefix_hash.write().clear();
     }
 
     pub fn size(&self) -> usize {
@@ -148,6 +226,7 @@ impl NameIndex {
         by_name: &mut HashMap<String, IndexedValue>,
         by_id: &mut HashMap<String, String>,
         by_short: &mut HashMap<String, String>,
+        by_prefix: &mut HashMap<String, PrefixEntry>,
         node_id: &str,
     ) {
         if let Some(key) = by_id.remove(node_id) {
@@ -167,7 +246,31 @@ impl NameIndex {
                 by_short.remove(&short);
             }
         }
+        if let Some(prefix) = prefix_hash_of(node_id) {
+            // Same idea for the 8-char prefix form. If the entry was a
+            // collision (count > 1) we can't safely decrement without
+            // knowing which other node shared the prefix; leave the
+            // entry in place — resolution still returns None for
+            // collisions, which is the conservative behaviour.
+            if let Some(entry) = by_prefix.get(&prefix) {
+                if entry.count == 1 && entry.full_uuid == node_id {
+                    by_prefix.remove(&prefix);
+                }
+            }
+        }
     }
+}
+
+/// Compute the 8-char prefix form of a UUID (the first segment of the
+/// canonical 8-4-4-4-12 hyphenated layout). Returns `None` if the
+/// input isn't a valid UUID. This is the form humans use in docs and
+/// skill files (e.g. `c1ef1ad5` for `c1ef1ad5-…`).
+pub fn prefix_hash_of(node_id: &str) -> Option<String> {
+    let stripped: String = node_id.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != 32 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(stripped[..SHORT_HASH_LEN_PREFIX].to_lowercase())
 }
 
 /// Compute the 12-char short-hash form of a UUID by stripping hyphens
@@ -179,16 +282,6 @@ pub fn short_hash_of(node_id: &str) -> Option<String> {
         return None;
     }
     Some(stripped[stripped.len() - SHORT_HASH_LEN..].to_lowercase())
-}
-
-/// Normalise a candidate short hash: strip hyphens, lowercase, validate.
-/// Returns `None` if it isn't 12 hex chars.
-fn normalize_short_hash(input: &str) -> Option<String> {
-    let stripped: String = input.chars().filter(|c| *c != '-').collect();
-    if stripped.len() != SHORT_HASH_LEN || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(stripped.to_lowercase())
 }
 
 #[cfg(test)]
@@ -339,6 +432,56 @@ mod tests {
         assert!(idx.resolve_short_hash("446655440000").is_some());
         idx.invalidate_node(id);
         assert!(idx.resolve_short_hash("446655440000").is_none());
+    }
+
+    #[test]
+    fn prefix_hash_of_returns_first_8_hex_chars() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(prefix_hash_of(id).as_deref(), Some("550e8400"));
+        let id2 = "550e8400e29b41d4a716446655440000";
+        assert_eq!(prefix_hash_of(id2).as_deref(), Some("550e8400"));
+    }
+
+    #[test]
+    fn resolve_short_hash_accepts_8_char_prefix_form() {
+        // The wflow skill uses 8-char prefixes (e.g. `c1ef1ad5` for Tasks).
+        // Pre-fix, only 12-char trailing hashes resolved; this regression
+        // guard catches a future revert.
+        let idx = NameIndex::new();
+        let id = "c1ef1ad5-ce38-8fed-bf6f-4737f286b86a";
+        idx.ingest(&[node(id, "Tasks", None)]);
+        assert_eq!(idx.resolve_short_hash("c1ef1ad5").as_deref(), Some(id));
+        // Hyphenated input strips to the same prefix.
+        assert_eq!(idx.resolve_short_hash("c1ef-1ad5").as_deref(), Some(id));
+    }
+
+    #[test]
+    fn resolve_short_hash_returns_none_on_8_char_collision() {
+        // Two distinct UUIDs with the same 8-char prefix — refuse to guess.
+        let idx = NameIndex::new();
+        idx.ingest(&[
+            node("c1ef1ad5-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Tasks-A", None),
+            node("c1ef1ad5-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Tasks-B", None),
+        ]);
+        assert!(
+            idx.resolve_short_hash("c1ef1ad5").is_none(),
+            "ambiguous prefix must return None, not silently pick one"
+        );
+        // Full UUID still resolves unambiguously.
+        assert_eq!(
+            idx.resolve_short_hash("aaaaaaaaaaaa").as_deref(),
+            Some("c1ef1ad5-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn invalidate_node_removes_unique_prefix_entry() {
+        let idx = NameIndex::new();
+        let id = "deadbeef-0000-0000-0000-000000000001";
+        idx.ingest(&[node(id, "X", None)]);
+        assert_eq!(idx.resolve_short_hash("deadbeef").as_deref(), Some(id));
+        idx.invalidate_node(id);
+        assert!(idx.resolve_short_hash("deadbeef").is_none());
     }
 
     #[test]
