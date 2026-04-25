@@ -18,31 +18,53 @@ use serde_json::json;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::api::{SubtreeFetch, WorkflowyClient};
+use crate::api::{FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
+use crate::defaults;
 use crate::types::{WorkflowyNode, NodeId};
 use crate::utils::cache::NodeCache;
+use crate::utils::cancel::CancelRegistry;
 use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
+use crate::utils::name_index::NameIndex;
 use crate::utils::node_paths::{build_node_path_with_map, build_node_map};
 use crate::utils::subtree::{is_todo, is_completed};
 use crate::utils::tag_parser::parse_node_tags;
 use crate::validation::validate_node_id;
+use std::time::{Duration, Instant};
 
-/// Validate a node_id parameter, returning McpError on failure.
+/// Validate a node_id parameter, returning McpError on failure. The
+/// underlying validator rejects the empty string, so any call where the
+/// serde layer has defaulted a missing `node_id` to `""` is caught here.
 fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     validate_node_id(id).map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
 /// Build a truncation warning string for text responses. Empty when the fetch
-/// was complete; otherwise announces the cap so the caller knows results may
-/// be partial.
+/// was complete; otherwise announces the cap and the reason so the caller
+/// knows whether to narrow the scope, raise the budget, or retry.
 fn truncation_banner(truncated: bool, limit: usize) -> String {
-    if truncated {
-        format!(
+    truncation_banner_with_reason(truncated, limit, None)
+}
+
+fn truncation_banner_with_reason(
+    truncated: bool,
+    limit: usize,
+    reason: Option<TruncationReason>,
+) -> String {
+    if !truncated {
+        return String::new();
+    }
+    match reason {
+        Some(TruncationReason::Timeout) => format!(
+            "⚠ subtree walk timed out before completion (budget {} ms). Results below reflect whatever was collected — retry with narrower parent_id/max_depth or raise the budget.\n\n",
+            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+        ),
+        Some(TruncationReason::Cancelled) => {
+            "⚠ subtree walk was cancelled; results below are partial.\n\n".to_string()
+        }
+        _ => format!(
             "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.\n\n",
             limit
-        )
-    } else {
-        String::new()
+        ),
     }
 }
 
@@ -52,6 +74,15 @@ pub struct WorkflowyMcpServer {
     tool_router: ToolRouter<Self>,
     client: Arc<WorkflowyClient>,
     cache: Arc<NodeCache>,
+    /// Shared cancellation registry: the `cancel_all` tool bumps the generation,
+    /// so every outstanding tree walk sees its guard flip and bails out early.
+    cancel_registry: CancelRegistry,
+    /// Opportunistic name index populated whenever a walk returns. Invalidated
+    /// on every write so it cannot disagree with the tree for longer than the
+    /// current mutation.
+    name_index: Arc<NameIndex>,
+    /// Server start time; surfaced by health_check for uptime visibility.
+    started_at: Instant,
 }
 
 // --- Parameter structs ---
@@ -169,6 +200,10 @@ pub struct FindNodeParams {
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
     pub max_depth: Option<usize>,
+    #[schemars(description = "Opt in to scanning from the workspace root when parent_id is omitted. Disabled by default because unscoped contains-searches on large trees time out; use sparingly, or build a name index first with build_name_index")]
+    pub allow_root_scan: Option<bool>,
+    #[schemars(description = "Serve results from the opportunistic name index when it has data instead of walking the tree. Safe for stable names; will miss recently-created nodes not yet indexed. Default: false")]
+    pub use_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -339,6 +374,25 @@ pub struct ConvertMarkdownParams {
     pub analyze_only: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[schemars(description = "Quick diagnostic: verify Workflowy API reachability without a tree walk")]
+pub struct HealthCheckParams {}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[schemars(description = "Cancel any in-flight tree walks. Future calls are unaffected")]
+pub struct CancelAllParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(description = "Populate the opportunistic name index by walking a subtree")]
+pub struct BuildNameIndexParams {
+    #[schemars(description = "Root node to start the walk from. Omit with allow_root_scan=true to walk the workspace root (expensive on large trees)")]
+    pub root_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth to walk (default: 10)")]
+    pub max_depth: Option<usize>,
+    #[schemars(description = "Opt in to an unscoped walk when root_id is omitted. Refused by default")]
+    pub allow_root_scan: Option<bool>,
+}
+
 // --- Tool router and handler ---
 
 #[tool_router]
@@ -352,7 +406,36 @@ impl WorkflowyMcpServer {
             tool_router: Self::tool_router(),
             client,
             cache,
+            cancel_registry: CancelRegistry::new(),
+            name_index: Arc::new(NameIndex::new()),
+            started_at: Instant::now(),
         }
+    }
+
+    /// Build fetch controls that honour the server-wide cancel registry plus
+    /// the configured subtree-walk timeout. All handlers go through this so
+    /// cancellation and deadline enforcement are uniform.
+    fn fetch_controls(&self) -> FetchControls {
+        FetchControls::with_timeout(Duration::from_millis(defaults::SUBTREE_FETCH_TIMEOUT_MS))
+            .and_cancel(self.cancel_registry.guard())
+    }
+
+    /// Walk a subtree with the server's standard controls and push every
+    /// visited node through the name index before returning. Keeps the tree
+    /// walk and the opportunistic index population in one place so no handler
+    /// can forget to feed the index.
+    async fn walk_subtree(
+        &self,
+        root_id: Option<&str>,
+        max_depth: usize,
+    ) -> crate::error::Result<SubtreeFetch> {
+        let controls = self.fetch_controls();
+        let fetch = self
+            .client
+            .get_subtree_with_controls(root_id, max_depth, defaults::MAX_SUBTREE_NODES, controls)
+            .await?;
+        self.name_index.ingest(&fetch.nodes);
+        Ok(fetch)
     }
 
     #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. For large trees, use parent_id to scope the search and max_depth to control depth.")]
@@ -364,8 +447,8 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
 
-        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit }) => {
+        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
                 let query_lower = params.query.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
                     .iter()
@@ -465,6 +548,15 @@ impl WorkflowyMcpServer {
                 if let Some(pid) = &params.parent_id {
                     self.cache.invalidate_node(pid);
                 }
+                // Seed the name index so subsequent lookups see the new node
+                // without needing a fresh walk.
+                self.name_index.ingest(&[WorkflowyNode {
+                    id: created.id.clone(),
+                    name: params.name.clone(),
+                    description: params.description.clone(),
+                    parent_id: params.parent_id.as_deref().map(|s| s.to_string()),
+                    ..Default::default()
+                }]);
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -474,13 +566,23 @@ impl WorkflowyMcpServer {
         }
     }
 
-    #[tool(description = "Edit an existing Workflowy node's name or description.")]
+    #[tool(description = "Edit an existing Workflowy node's name or description. At least one of name/description must be provided.")]
     async fn edit_node(
         &self,
         Parameters(params): Parameters<EditNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         info!(node_id = %params.node_id, "Editing node");
         check_node_id(&params.node_id)?;
+
+        // Reject no-op edits at the boundary: the Workflowy API happily
+        // accepts an empty PATCH body and returns success, which would mask
+        // caller bugs where a field was dropped somewhere upstream.
+        if params.name.is_none() && params.description.is_none() {
+            return Err(McpError::invalid_params(
+                "edit_node requires at least one of `name` or `description`".to_string(),
+                None,
+            ));
+        }
 
         match self
             .client
@@ -489,6 +591,7 @@ impl WorkflowyMcpServer {
         {
             Ok(_) => {
                 self.cache.invalidate_node(&params.node_id);
+                self.name_index.invalidate_node(&params.node_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Updated node `{}`",
                     params.node_id
@@ -512,6 +615,7 @@ impl WorkflowyMcpServer {
         match self.client.delete_node(&params.node_id).await {
             Ok(_) => {
                 self.cache.invalidate_node(&params.node_id);
+                self.name_index.invalidate_node(&params.node_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Deleted node `{}`",
                     params.node_id
@@ -533,6 +637,17 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
         check_node_id(&params.new_parent_id)?;
 
+        // Capture the current parent before the move so we can invalidate its
+        // children listing afterwards. A failed pre-read is not fatal — the
+        // move itself still runs and we fall back to invalidating just the
+        // node and the new parent, as the code used to.
+        let old_parent_id = self
+            .client
+            .get_node(&params.node_id)
+            .await
+            .ok()
+            .and_then(|n| n.parent_id);
+
         match self
             .client
             .move_node(&params.node_id, &params.new_parent_id, params.priority)
@@ -541,6 +656,12 @@ impl WorkflowyMcpServer {
             Ok(_) => {
                 self.cache.invalidate_node(&params.node_id);
                 self.cache.invalidate_node(&params.new_parent_id);
+                if let Some(pid) = &old_parent_id {
+                    if pid.as_str() != params.new_parent_id.as_str() {
+                        self.cache.invalidate_node(pid);
+                    }
+                }
+                self.name_index.invalidate_node(&params.node_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Moved node `{}` under `{}`",
                     params.node_id, params.new_parent_id
@@ -596,8 +717,8 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(tag = %params.tag, max_depth, "Tag search");
 
-        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit }) => {
+        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
                 let tag_lower = params.tag.to_lowercase();
                 let mut results: Vec<&WorkflowyNode> = nodes
                     .iter()
@@ -714,8 +835,8 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
 
-        match self.client.get_subtree_recursive(Some(&params.node_id), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit }) => {
+        match self.walk_subtree(Some(&params.node_id), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, .. }) => {
                 if all_nodes.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
                         format!("Node `{}` not found or has no descendants", params.node_id)
@@ -740,17 +861,50 @@ impl WorkflowyMcpServer {
 
     // --- New tools required by wmanage skill ---
 
-    #[tool(description = "Find a node by name. Supports exact, contains, and starts_with match modes. Returns node_id for use with other tools. If multiple matches, returns options for selection. Use parent_id to scope and max_depth to control depth.")]
+    #[tool(description = "Find a node by name. Supports exact, contains, and starts_with match modes. Returns node_id for use with other tools. Omitting parent_id triggers a root-of-tree walk, which is refused by default on large trees — pass allow_root_scan=true to opt in, or use_index=true to serve from the opportunistic name index. Use selection to disambiguate multiple matches.")]
     async fn find_node(
         &self,
         Parameters(params): Parameters<FindNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let match_mode = params.match_mode.as_deref().unwrap_or("exact");
         let max_depth = params.max_depth.unwrap_or(3);
-        info!(name = %params.name, match_mode, max_depth, "Finding node");
+        let use_index = params.use_index.unwrap_or(false);
+        let allow_root_scan = params.allow_root_scan.unwrap_or(false);
+        if let Some(pid) = &params.parent_id {
+            check_node_id(pid)?;
+        }
+        info!(name = %params.name, match_mode, max_depth, use_index, allow_root_scan, "Finding node");
 
-        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit }) => {
+        // Refuse unscoped walks by default so a caller that forgot `parent_id`
+        // cannot blow the client timeout on a 250k-node tree. Index-backed
+        // lookups are exempt because they don't touch the API.
+        if params.parent_id.is_none() && !allow_root_scan && !use_index {
+            return Err(McpError::invalid_params(
+                "find_node refuses to scan from the workspace root by default. Pass parent_id to scope the search, set allow_root_scan=true to opt in, or set use_index=true to serve from the opportunistic name index.".to_string(),
+                None,
+            ));
+        }
+
+        // Index fast path. We still require either a scoped parent_id (so we
+        // can filter hits) or an explicit allow_root_scan to return unscoped
+        // results, to preserve the contract above.
+        if use_index && self.name_index.is_populated() {
+            let hits = self.name_index.lookup(&params.name, match_mode);
+            let hits: Vec<_> = if let Some(parent) = params.parent_id.as_deref() {
+                hits.into_iter()
+                    .filter(|e| e.parent_id.as_deref() == Some(parent))
+                    .collect()
+            } else {
+                hits
+            };
+            if !hits.is_empty() || !allow_root_scan {
+                return Ok(self.render_find_node_index_result(&params, match_mode, hits));
+            }
+            // allow_root_scan=true and index empty -> fall through to live walk.
+        }
+
+        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, .. }) => {
                 let search = params.name.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
                     let name = n.name.to_lowercase();
@@ -762,14 +916,20 @@ impl WorkflowyMcpServer {
                 }).collect();
 
                 let node_map = build_node_map(&nodes);
+                let banner = truncation_banner_with_reason(truncated, limit, truncation_reason);
 
                 if matches.is_empty() {
-                    let result = json!({
+                    let mut result = json!({
                         "found": false,
                         "truncated": truncated,
                         "truncation_limit": limit,
+                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "banner": banner,
                         "message": format!("No nodes found matching '{}' (mode: {}). Try match_mode: 'contains'.", params.name, match_mode)
                     });
+                    if truncated {
+                        result["hint"] = json!("Results are partial — narrow parent_id or max_depth, or retry with use_index after build_name_index populates.");
+                    }
                     Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                 } else if matches.len() == 1 || params.selection.is_some() {
                     let idx = params.selection.unwrap_or(1);
@@ -784,6 +944,7 @@ impl WorkflowyMcpServer {
                         "found": true,
                         "truncated": truncated,
                         "truncation_limit": limit,
+                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
                         "node_id": node.id,
                         "name": node.name,
                         "path": path,
@@ -810,6 +971,7 @@ impl WorkflowyMcpServer {
                         "multiple_matches": true,
                         "truncated": truncated,
                         "truncation_limit": limit,
+                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches for '{}'. Use selection parameter to choose.", matches.len(), params.name)
@@ -819,6 +981,64 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed to find node: {}", e), None)),
         }
+    }
+
+    fn render_find_node_index_result(
+        &self,
+        params: &FindNodeParams,
+        match_mode: &str,
+        hits: Vec<crate::utils::name_index::NameIndexEntry>,
+    ) -> CallToolResult {
+        if hits.is_empty() {
+            let result = json!({
+                "found": false,
+                "index_served": true,
+                "message": format!("No nodes matching '{}' in name index (mode: {}). Retry without use_index for a live walk, or run build_name_index to populate.", params.name, match_mode)
+            });
+            return CallToolResult::success(vec![Content::text(result.to_string())]);
+        }
+        if hits.len() == 1 || params.selection.is_some() {
+            let idx = params.selection.unwrap_or(1);
+            if idx < 1 || idx > hits.len() {
+                return CallToolResult::success(vec![Content::text(
+                    json!({
+                        "error": format!("Selection {} out of range (1-{})", idx, hits.len())
+                    })
+                    .to_string(),
+                )]);
+            }
+            let hit = &hits[idx - 1];
+            let result = json!({
+                "found": true,
+                "index_served": true,
+                "node_id": hit.node_id,
+                "name": hit.name,
+                "parent_id": hit.parent_id,
+                "message": format!("Found '{}' via name index", hit.name)
+            });
+            return CallToolResult::success(vec![Content::text(result.to_string())]);
+        }
+        let options: Vec<serde_json::Value> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                json!({
+                    "option": i + 1,
+                    "name": h.name,
+                    "id": h.node_id,
+                    "parent_id": h.parent_id
+                })
+            })
+            .collect();
+        let result = json!({
+            "found": false,
+            "index_served": true,
+            "multiple_matches": true,
+            "count": hits.len(),
+            "options": options,
+            "message": format!("Found {} matches for '{}' via name index. Use selection to choose.", hits.len(), params.name)
+        });
+        CallToolResult::success(vec![Content::text(result.to_string())])
     }
 
     #[tool(description = "Search for a target node and insert content under it. Combines search and insert into one tool. If multiple matches, returns options for selection.")]
@@ -834,8 +1054,8 @@ impl WorkflowyMcpServer {
             return Err(McpError::invalid_params("Content cannot be empty".to_string(), None));
         }
 
-        match self.client.get_subtree_recursive(None, max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit }) => {
+        match self.walk_subtree(None, max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
                 let query = params.search_query.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
                     let in_name = n.name.to_lowercase().contains(&query);
@@ -923,8 +1143,8 @@ impl WorkflowyMcpServer {
         info!(max_depth, "Daily review");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit }) => {
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -1036,8 +1256,8 @@ impl WorkflowyMcpServer {
         info!(days, max_depth, "Getting recent changes");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let now_ms = Utc::now().timestamp_millis();
@@ -1088,8 +1308,8 @@ impl WorkflowyMcpServer {
         info!(max_depth, "Listing overdue items");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -1138,8 +1358,8 @@ impl WorkflowyMcpServer {
         info!(days, max_depth, "Listing upcoming items");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
 
-        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -1209,8 +1429,8 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, "Getting project summary");
         check_node_id(&params.node_id)?;
 
-        match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(Some(&params.node_id), 10).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(
@@ -1320,8 +1540,8 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(node_id = %params.node_id, max_depth, "Finding backlinks");
 
-        match self.client.get_subtree_recursive(None, max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(None, max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit: node_limit, .. }) => {
                 let node_map = build_node_map(&nodes);
                 let target = node_map.get(params.node_id.as_str());
                 let target_name = target.map(|n| n.name.as_str()).unwrap_or("unknown");
@@ -1377,8 +1597,8 @@ impl WorkflowyMcpServer {
         info!(status, max_depth, "Listing todos");
         if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
 
-        match self.client.get_subtree_recursive(params.parent_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
@@ -1432,8 +1652,8 @@ impl WorkflowyMcpServer {
         let include_children = params.include_children.unwrap_or(true);
         info!(node_id = %params.node_id, target = %params.target_parent_id, "Duplicating node");
 
-        match self.client.get_subtree_recursive(Some(&params.node_id), 10).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(Some(&params.node_id), 10).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
                         format!(
@@ -1541,8 +1761,8 @@ impl WorkflowyMcpServer {
             }).to_string()
         };
 
-        match self.client.get_subtree_recursive(Some(&params.template_node_id), 10).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(Some(&params.template_node_id), 10).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
                         format!(
@@ -1655,8 +1875,8 @@ impl WorkflowyMcpServer {
         }
 
         let max_depth = params.max_depth.unwrap_or(5);
-        match self.client.get_subtree_recursive(params.root_id.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit }) => {
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 // Refuse destructive bulk ops on a truncated view — we would
                 // otherwise delete only a partial match set silently.
                 if truncated && params.operation == "delete" && !dry_run {
@@ -1749,6 +1969,7 @@ impl WorkflowyMcpServer {
                         let path = build_node_path_with_map(&node.id, &node_map);
                         affected_nodes.push(json!({ "id": node.id, "name": node.name, "path": path }));
                         self.cache.invalidate_node(&node.id);
+                        self.name_index.invalidate_node(&node.id);
                         if let Some(pid) = &node.parent_id {
                             touched_parents.insert(pid.clone());
                         }
@@ -1930,6 +2151,91 @@ impl WorkflowyMcpServer {
         });
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
     }
+
+    #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget to confirm reachability and reports cache/name-index sizes. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
+    async fn health_check(
+        &self,
+        Parameters(_params): Parameters<HealthCheckParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
+        let probe = tokio::time::timeout(timeout, self.client.get_top_level_nodes()).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (api_reachable, top_level_count, error) = match probe {
+            Ok(Ok(nodes)) => (true, Some(nodes.len()), None::<String>),
+            Ok(Err(e)) => (false, None, Some(e.to_string())),
+            Err(_) => (false, None, Some(format!("timed out after {} ms", timeout.as_millis()))),
+        };
+        let cache_stats = self.cache.stats();
+        let result = json!({
+            "status": if api_reachable { "ok" } else { "degraded" },
+            "api_reachable": api_reachable,
+            "latency_ms": elapsed_ms,
+            "budget_ms": timeout.as_millis() as u64,
+            "top_level_count": top_level_count,
+            "cache": {
+                "node_count": cache_stats.node_count,
+                "parent_count": cache_stats.parent_count,
+            },
+            "name_index": {
+                "size": self.name_index.size(),
+                "populated": self.name_index.is_populated(),
+            },
+            "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "cancel_generation": self.cancel_registry.generation(),
+            "error": error,
+        });
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+    }
+
+    #[tool(description = "Cancel every in-flight tree walk. Subsequent calls are unaffected. Use when a find_node / get_subtree / search is taking longer than the client is willing to wait.")]
+    async fn cancel_all(
+        &self,
+        Parameters(_params): Parameters<CancelAllParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let new_gen = self.cancel_registry.cancel_all();
+        let result = json!({
+            "status": "cancelled",
+            "generation": new_gen,
+            "message": "In-flight walks have been signalled to return partial results; new calls start fresh."
+        });
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+    }
+
+    #[tool(description = "Walk a subtree and populate the opportunistic name index. After this, find_node with use_index=true can answer lookups without touching the API. Walks are bounded by the standard subtree-fetch timeout and node-count cap, so large scopes may return partial results.")]
+    async fn build_name_index(
+        &self,
+        Parameters(params): Parameters<BuildNameIndexParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
+        let allow_root_scan = params.allow_root_scan.unwrap_or(false);
+        if let Some(rid) = &params.root_id {
+            check_node_id(rid)?;
+        }
+        if params.root_id.is_none() && !allow_root_scan {
+            return Err(McpError::invalid_params(
+                "build_name_index refuses an unscoped walk by default. Pass root_id to scope it, or set allow_root_scan=true to accept a full walk (bounded by the subtree-fetch budget).".to_string(),
+                None,
+            ));
+        }
+        info!(root_id = ?params.root_id, max_depth, allow_root_scan, "Building name index");
+
+        match self.walk_subtree(params.root_id.as_deref(), max_depth).await {
+            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, elapsed_ms }) => {
+                let result = json!({
+                    "status": if truncated { "partial" } else { "ok" },
+                    "nodes_indexed": nodes.len(),
+                    "index_size_after": self.name_index.size(),
+                    "truncated": truncated,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_limit": limit,
+                    "elapsed_ms": elapsed_ms,
+                });
+                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+            }
+            Err(e) => Err(McpError::internal_error(format!("Failed to build name index: {}", e), None)),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1948,14 +2254,14 @@ impl ServerHandler for WorkflowyMcpServer {
             instructions: Some(
                 "I manage Workflowy content. Available operations:
 - search_nodes: Search by text query
-- find_node: Find node by name (exact/contains/starts_with)
+- find_node: Find node by name (exact/contains/starts_with). Requires parent_id or allow_root_scan=true; set use_index=true for cached fast path.
 - get_node: Get a specific node by ID
 - list_children: List children of a node
-- get_subtree: Get the full tree under a node
+- get_subtree: Get the full tree under a node (bounded by timeout + node cap; see truncation_reason)
 - create_node: Create a new node
-- edit_node: Edit a node's name or description
+- edit_node: Edit a node's name or description (at least one must be provided)
 - delete_node: Delete a node
-- move_node: Move a node to a new parent
+- move_node: Move a node to a new parent (invalidates old and new parent)
 - insert_content: Insert hierarchical content from indented text
 - smart_insert: Search + insert in one call
 - tag_search: Search by tag (#tag or @person)
@@ -1969,7 +2275,10 @@ impl ServerHandler for WorkflowyMcpServer {
 - duplicate_node: Deep-copy a node subtree
 - create_from_template: Copy template with {{variable}} substitution
 - bulk_update: Apply operations to filtered nodes (with dry_run)
-- convert_markdown: Convert markdown to Workflowy format"
+- convert_markdown: Convert markdown to Workflowy format
+- health_check: Sub-second API + cache + index diagnostic
+- cancel_all: Cancel in-flight tree walks so partial results return immediately
+- build_name_index: Populate the opportunistic name index for fast find_node lookups"
                     .to_string(),
             ),
         }
@@ -2476,5 +2785,241 @@ mod tests {
         let err = result.expect_err("unknown operations must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("invalid operation"), "got: {msg}");
+    }
+
+    // --- New hardening + tool tests ---
+
+    fn valid_id() -> &'static str {
+        "550e8400-e29b-41d4-a716-446655440000"
+    }
+
+    fn other_valid_id() -> &'static str {
+        "550e8400-e29b-41d4-a716-446655440001"
+    }
+
+    #[test]
+    fn find_node_params_accept_new_flags() {
+        let params: FindNodeParams = serde_json::from_value(json!({
+            "name": "Tasks",
+            "allow_root_scan": true,
+            "use_index": true,
+        }))
+        .unwrap();
+        assert_eq!(params.allow_root_scan, Some(true));
+        assert_eq!(params.use_index, Some(true));
+    }
+
+    #[test]
+    fn find_node_params_default_both_flags_none() {
+        let params: FindNodeParams = serde_json::from_value(json!({ "name": "Tasks" })).unwrap();
+        assert_eq!(params.allow_root_scan, None);
+        assert_eq!(params.use_index, None);
+    }
+
+    #[test]
+    fn truncation_banner_timeout_text_differs_from_node_limit() {
+        let timeout = truncation_banner_with_reason(true, 10_000, Some(TruncationReason::Timeout));
+        let limit = truncation_banner_with_reason(true, 10_000, Some(TruncationReason::NodeLimit));
+        assert!(timeout.contains("timed out"), "timeout banner: {timeout}");
+        assert!(limit.contains("truncated at"), "limit banner: {limit}");
+        assert_ne!(timeout, limit);
+    }
+
+    #[test]
+    fn truncation_banner_cancelled_text() {
+        let banner =
+            truncation_banner_with_reason(true, 10_000, Some(TruncationReason::Cancelled));
+        assert!(banner.contains("cancelled"), "banner: {banner}");
+    }
+
+    #[tokio::test]
+    async fn edit_node_rejects_empty_update() {
+        let server = new_test_server();
+        let params = EditNodeParams {
+            node_id: NodeId::from(valid_id()),
+            name: None,
+            description: None,
+        };
+        let err = server
+            .edit_node(Parameters(params))
+            .await
+            .expect_err("edit_node with no fields must reject");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("at least one"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn edit_node_rejects_invalid_id() {
+        let server = new_test_server();
+        let params = EditNodeParams {
+            node_id: NodeId::from(""),
+            name: Some("x".to_string()),
+            description: None,
+        };
+        let err = server
+            .edit_node(Parameters(params))
+            .await
+            .expect_err("edit_node with empty id must reject");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("invalid node id"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn find_node_refuses_root_scan_by_default() {
+        let server = new_test_server();
+        let params = FindNodeParams {
+            name: "Tasks".to_string(),
+            match_mode: None,
+            selection: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: None,
+            use_index: None,
+        };
+        let err = server
+            .find_node(Parameters(params))
+            .await
+            .expect_err("unscoped find_node must refuse by default");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("allow_root_scan"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn find_node_rejects_invalid_parent_id() {
+        let server = new_test_server();
+        let params = FindNodeParams {
+            name: "Tasks".to_string(),
+            match_mode: None,
+            selection: None,
+            parent_id: Some(NodeId::from("not-a-uuid")),
+            max_depth: None,
+            allow_root_scan: None,
+            use_index: None,
+        };
+        let err = server.find_node(Parameters(params)).await.expect_err("bad id must reject");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("invalid node id"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn find_node_use_index_returns_hit_without_walking() {
+        let server = new_test_server();
+        // Seed the name index directly — the live client is unreachable so a
+        // walk would fail. This asserts the fast path skips the walk.
+        server.name_index.ingest(&[WorkflowyNode {
+            id: valid_id().to_string(),
+            name: "Tasks".to_string(),
+            parent_id: None,
+            ..Default::default()
+        }]);
+        let params = FindNodeParams {
+            name: "Tasks".to_string(),
+            match_mode: Some("exact".to_string()),
+            selection: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: None,
+            use_index: Some(true),
+        };
+        let result = server
+            .find_node(Parameters(params))
+            .await
+            .expect("index path must succeed");
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(body.contains("\"index_served\":true"), "body: {body}");
+        assert!(body.contains(valid_id()), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn cancel_all_bumps_generation() {
+        let server = new_test_server();
+        let before = server.cancel_registry.generation();
+        let result = server
+            .cancel_all(Parameters(CancelAllParams::default()))
+            .await
+            .expect("cancel_all never fails");
+        let after = server.cancel_registry.generation();
+        assert_eq!(after, before + 1);
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(body.contains("\"status\":\"cancelled\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_degraded_on_unreachable_api() {
+        // The test client points at an unreachable host, so the probe must
+        // fail quickly without blowing the budget.
+        let server = new_test_server();
+        let result = server
+            .health_check(Parameters(HealthCheckParams::default()))
+            .await
+            .expect("health_check must always return");
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(body.contains("\"status\":\"degraded\""), "body: {body}");
+        assert!(body.contains("\"api_reachable\":false"), "body: {body}");
+        assert!(body.contains("\"latency_ms\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn build_name_index_refuses_root_scan_by_default() {
+        let server = new_test_server();
+        let params = BuildNameIndexParams {
+            root_id: None,
+            max_depth: None,
+            allow_root_scan: None,
+        };
+        let err = server
+            .build_name_index(Parameters(params))
+            .await
+            .expect_err("unscoped build_name_index must refuse");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("allow_root_scan"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn move_node_rejects_invalid_target() {
+        let server = new_test_server();
+        let params = MoveNodeParams {
+            node_id: NodeId::from(""),
+            new_parent_id: NodeId::from(other_valid_id()),
+            priority: None,
+        };
+        let err = server.move_node(Parameters(params)).await.expect_err("bad id must reject");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("invalid node id"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn new_tools_are_registered() {
+        let server = new_test_server();
+        assert!(server.get_tool("health_check").is_some());
+        assert!(server.get_tool("cancel_all").is_some());
+        assert!(server.get_tool("build_name_index").is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_registry_flips_guards_held_by_walk_controls() {
+        let server = new_test_server();
+        let guard = server.cancel_registry.guard();
+        assert!(!guard.is_cancelled());
+        server
+            .cancel_all(Parameters(CancelAllParams::default()))
+            .await
+            .unwrap();
+        assert!(guard.is_cancelled(), "cancel_all must flip outstanding guards");
     }
 }

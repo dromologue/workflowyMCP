@@ -67,6 +67,15 @@ pub const MAX_TREE_DEPTH: usize = 10;
 /// Hard cap on nodes returned by a single subtree fetch.
 /// Callers receive a `truncated` flag whenever this cap is hit.
 pub const MAX_SUBTREE_NODES: usize = 10_000;
+/// Wall-clock budget for a subtree walk (milliseconds). When hit, the walk
+/// returns whatever has been collected plus a timeout truncation flag.
+pub const SUBTREE_FETCH_TIMEOUT_MS: u64 = 20_000;
+/// Concurrency for parallel child fetches inside a subtree walk. Kept close
+/// to the rate-limit burst so the limiter, not this cap, shapes throughput.
+pub const SUBTREE_FETCH_CONCURRENCY: usize = 5;
+/// Wall-clock budget for health checks (milliseconds). Must stay sub-second
+/// on any tree size so the tool is usable when the API is degraded.
+pub const HEALTH_CHECK_TIMEOUT_MS: u64 = 5_000;
 
 // --- API ---
 /// Workflowy API base URL
@@ -91,6 +100,10 @@ mod tests {
         assert!(MAX_TREE_DEPTH >= DEFAULT_REVIEW_DEPTH);
         assert!(!RETRY_STATUSES.is_empty());
         assert!(RETRY_STATUSES.contains(&429)); // rate limit must be retried
+        // New: timeouts must be positive and sane.
+        assert!(SUBTREE_FETCH_TIMEOUT_MS >= 1_000 && SUBTREE_FETCH_TIMEOUT_MS <= 120_000);
+        assert!(SUBTREE_FETCH_CONCURRENCY >= 1 && SUBTREE_FETCH_CONCURRENCY <= 50);
+        assert!(HEALTH_CHECK_TIMEOUT_MS >= 500 && HEALTH_CHECK_TIMEOUT_MS <= 10_000);
     }
 
     #[test]

@@ -39,12 +39,26 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 - **Node Cache** (`utils/cache.rs`): Injectable (or global `lazy_static` default), 30s TTL, parking_lot RwLock. O(n) subtree invalidation via parent-children index.
 - **Rate Limiter** (`utils/rate_limiter.rs`): Token bucket, 5 req/sec, burst 10.
 - **Job Queue** (`utils/job_queue.rs`): Background job lifecycle with TTL cleanup (tokio::spawn). Max 1000 job history.
+- **Cancel Registry** (`utils/cancel.rs`): Generation-counter cancellation primitive. `cancel_all` bumps the counter so every outstanding `CancelGuard` returns `is_cancelled = true` at its next checkpoint; guards taken afterwards are fresh.
+- **Name Index** (`utils/name_index.rs`): Opportunistic, case-insensitive `name -> [entry]` map fed by every subtree walk. Backed by `parking_lot::RwLock`; invalidated per-node on every write. Entries have a 5-minute TTL so stale names can't outlive the node cache by much.
 - **Date Parser** (`utils/date_parser.rs`): Extracts due dates from node text. Priority: `due:YYYY-MM-DD` > `#due-YYYY-MM-DD` > bare date.
 - **Tag Parser** (`utils/tag_parser.rs`): Extracts `#tags` and `@mentions` from node text.
 - **Node Paths** (`utils/node_paths.rs`): Builds hierarchical display paths by following parent_id chains.
 - **Subtree** (`utils/subtree.rs`): Collects all descendants of a node. Todo/completion detection.
 
-### MCP Tools (23 total)
+### Tree Walk Controls
+
+`get_subtree_with_controls` on the client is the single entry point for every tree walk. All server handlers route through `WorkflowyMcpServer::walk_subtree`, which wraps:
+
+1. A wall-clock deadline (`defaults::SUBTREE_FETCH_TIMEOUT_MS`, 20 s).
+2. A `CancelGuard` from the shared `CancelRegistry`.
+3. Opportunistic name-index ingestion of every returned node.
+
+`SubtreeFetch` carries `truncation_reason: Option<TruncationReason>` (`NodeLimit`/`Timeout`/`Cancelled`) and `elapsed_ms`. Handlers surface both through the `truncation_banner_with_reason` helper and the JSON responses.
+
+Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH_CONCURRENCY)` (5). The rate limiter serialises requests internally, so this parallelism collapses HTTP RTT stalls without exceeding the sustained rate.
+
+### MCP Tools (26 total)
 
 | Category | Tools |
 |----------|-------|
@@ -54,6 +68,7 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 | Todo Management | list_todos |
 | Due Dates & Scheduling | list_upcoming, list_overdue, daily_review |
 | Project Management | get_project_summary, get_recent_changes |
+| Diagnostics & Ops | health_check, cancel_all, build_name_index |
 
 ### Workflowy API Constraints
 
@@ -64,14 +79,19 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 ### Known Limitations
 
 - `bulk_update` `complete` / `uncomplete` are rejected at the handler boundary — the Workflowy completion endpoints are not yet modelled in the client. Tag-based workflows are the interim substitute.
-- Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000). Tools surface a `truncated` flag when the cap is hit; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
+- Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000) **and** at `defaults::SUBTREE_FETCH_TIMEOUT_MS` (20 000 ms). Tools surface a `truncated` flag plus a `truncation_reason` (`node_limit` / `timeout` / `cancelled`) when either budget fires; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
+- `find_node` refuses to scan from the workspace root when `parent_id` is omitted. Pass `parent_id`, set `allow_root_scan=true` to accept the full walk, or set `use_index=true` after running `build_name_index` to serve from the opportunistic name index.
+- `edit_node` requires at least one of `name` or `description`; an empty patch is rejected at the handler boundary rather than POSTed as `{}`.
+- `move_node` invalidates the cache for the node, the new parent, **and** the old parent (captured via a pre-read). The name index is invalidated for the moved node.
+- `cancel_all` bumps the cancel-registry generation: every outstanding tree walk returns partial results on its next checkpoint with `truncation_reason = "cancelled"`. New calls start fresh.
+- `health_check` calls `GET /nodes` (top-level only) with a 5-second budget; it is safe to use as a liveness probe regardless of tree size.
 
 ## Testing
 
 Unit tests use `#[cfg(test)]` modules alongside source. No live API calls in unit tests. Integration test in `tests/live_insert.rs` requires `WORKFLOWY_API_KEY`.
 
 ```bash
-cargo test --lib                           # unit tests only (122 tests)
+cargo test --lib                           # unit tests only (159 tests)
 cargo test --lib -- test_name              # run specific test
 cargo test --lib -- --nocapture            # with stdout
 ```
@@ -95,3 +115,4 @@ Environment variables loaded from `.env` via dotenv (`src/config.rs`):
 | parking_lot | Fast RwLock |
 | chrono | Date handling |
 | regex | Pattern matching (dates, tags) |
+| futures | `buffer_unordered` for parallel child fetches |

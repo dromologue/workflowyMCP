@@ -5,20 +5,82 @@ use crate::config::{RetryConfig, RateLimitConfig};
 use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::{WorkflowyNode, CreatedNode};
-use crate::utils::RateLimiter;
+use crate::utils::{CancelGuard, RateLimiter};
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Result of a subtree fetch. `truncated` is true when the node cap was hit
-/// and `nodes` therefore reflects a partial view of the tree.
+/// Why a subtree fetch returned partial data, when it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationReason {
+    /// [`defaults::MAX_SUBTREE_NODES`] cap was hit.
+    NodeLimit,
+    /// Wall-clock budget elapsed before the walk completed.
+    Timeout,
+    /// A [`CancelGuard`] reported cancellation mid-walk.
+    Cancelled,
+}
+
+impl TruncationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TruncationReason::NodeLimit => "node_limit",
+            TruncationReason::Timeout => "timeout",
+            TruncationReason::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Result of a subtree fetch. `truncated` is true when the walk stopped
+/// early; `truncation_reason` explains why.
 #[derive(Debug, Clone)]
 pub struct SubtreeFetch {
     pub nodes: Vec<WorkflowyNode>,
     pub truncated: bool,
     pub limit: usize,
+    pub truncation_reason: Option<TruncationReason>,
+    /// Wall-clock duration of the walk.
+    pub elapsed_ms: u64,
+}
+
+/// Optional controls for a subtree walk: deadline budget and a cancellation
+/// guard that gets checked between levels and between child-fetch batches.
+#[derive(Debug, Clone, Default)]
+pub struct FetchControls {
+    pub deadline: Option<Instant>,
+    pub cancel: Option<CancelGuard>,
+}
+
+impl FetchControls {
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self { deadline: Some(deadline), cancel: None }
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_deadline(Instant::now() + timeout)
+    }
+
+    pub fn and_cancel(mut self, guard: CancelGuard) -> Self {
+        self.cancel = Some(guard);
+        self
+    }
+
+    fn status(&self) -> Option<TruncationReason> {
+        if let Some(cancel) = &self.cancel {
+            if cancel.is_cancelled() {
+                return Some(TruncationReason::Cancelled);
+            }
+        }
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                return Some(TruncationReason::Timeout);
+            }
+        }
+        None
+    }
 }
 
 pub struct WorkflowyClient {
@@ -90,39 +152,102 @@ impl WorkflowyClient {
     /// Recursively fetch a subtree rooted at `root_id` up to `max_depth` levels.
     /// If `root_id` is None, fetches from the workspace root (top-level nodes).
     /// When `root_id` is Some, the root node itself is included as the first element.
-    /// Returns a [`SubtreeFetch`] with the flat node list and a `truncated` flag
-    /// indicating whether the [`defaults::MAX_SUBTREE_NODES`] cap was hit.
+    /// Uses the default node-limit cap and wall-clock timeout.
     pub async fn get_subtree_recursive(
         &self,
         root_id: Option<&str>,
         max_depth: usize,
     ) -> Result<SubtreeFetch> {
-        self.get_subtree_with_limit(root_id, max_depth, defaults::MAX_SUBTREE_NODES).await
+        let controls = FetchControls::with_timeout(Duration::from_millis(
+            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+        ));
+        self.get_subtree_with_controls(root_id, max_depth, defaults::MAX_SUBTREE_NODES, controls).await
     }
 
-    /// Same as [`get_subtree_recursive`] but with an explicit node-count cap.
-    /// Exposed mainly for tests; callers that honour the default should use
-    /// [`get_subtree_recursive`].
+    /// Legacy entry point used by tests — same as [`get_subtree_recursive`]
+    /// but with an explicit node-count cap and no wall-clock budget.
     pub async fn get_subtree_with_limit(
         &self,
         root_id: Option<&str>,
         max_depth: usize,
         node_limit: usize,
     ) -> Result<SubtreeFetch> {
+        self.get_subtree_with_controls(root_id, max_depth, node_limit, FetchControls::default()).await
+    }
+
+    /// Core subtree walker: honours both the node-count cap and the caller's
+    /// deadline/cancellation controls. Returns a partial [`SubtreeFetch`] on
+    /// timeout or cancellation rather than erroring, so callers can surface
+    /// whatever was collected.
+    pub async fn get_subtree_with_controls(
+        &self,
+        root_id: Option<&str>,
+        max_depth: usize,
+        node_limit: usize,
+        controls: FetchControls,
+    ) -> Result<SubtreeFetch> {
+        let started = Instant::now();
         let mut all_nodes = Vec::new();
-        let truncated = match root_id {
+        let reason: Option<TruncationReason>;
+
+        // Bail early if cancellation/deadline already fired before we made a request.
+        if let Some(status) = controls.status() {
+            return Ok(SubtreeFetch {
+                nodes: all_nodes,
+                truncated: true,
+                limit: node_limit,
+                truncation_reason: Some(status),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+
+        match root_id {
             Some(id) => {
-                let root = self.get_node(id).await?;
-                all_nodes.push(root);
-                let children = self.get_children(id).await?;
-                self.fetch_descendants(&children, &mut all_nodes, 0, max_depth, node_limit).await?
+                match self.get_node(id).await {
+                    Ok(root) => all_nodes.push(root),
+                    Err(e) => return Err(e),
+                }
+                if all_nodes.len() >= node_limit {
+                    return Ok(SubtreeFetch {
+                        nodes: all_nodes,
+                        truncated: true,
+                        limit: node_limit,
+                        truncation_reason: Some(TruncationReason::NodeLimit),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+                if let Some(status) = controls.status() {
+                    reason = Some(status);
+                } else {
+                    match self.get_children(id).await {
+                        Ok(children) => {
+                            reason = self
+                                .fetch_descendants(&children, &mut all_nodes, 0, max_depth, node_limit, &controls)
+                                .await?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
             None => {
-                let top = self.get_top_level_nodes().await?;
-                self.fetch_descendants(&top, &mut all_nodes, 0, max_depth, node_limit).await?
+                match self.get_top_level_nodes().await {
+                    Ok(top) => {
+                        reason = self
+                            .fetch_descendants(&top, &mut all_nodes, 0, max_depth, node_limit, &controls)
+                            .await?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        };
-        Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit })
+        }
+
+        Ok(SubtreeFetch {
+            nodes: all_nodes,
+            truncated: reason.is_some(),
+            limit: node_limit,
+            truncation_reason: reason,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
     }
 
     /// Fetch all nodes in the workspace tree. For large trees (250k+ nodes),
@@ -131,9 +256,11 @@ impl WorkflowyClient {
         self.get_subtree_recursive(None, defaults::MAX_TREE_DEPTH).await
     }
 
-    /// Fetch descendants level-by-level, sequentially per node (rate-limited).
-    /// Caps total nodes at `node_limit` to avoid runaway fetches on large trees.
-    /// Returns `true` if the cap was hit and traversal stopped early.
+    /// Fetch descendants level-by-level, parallelising per-level child fetches
+    /// up to [`defaults::SUBTREE_FETCH_CONCURRENCY`]. The rate-limiter serialises
+    /// each HTTP call internally, so this parallelism eliminates RTT stalls
+    /// without exceeding the sustained rate. Returns the truncation reason,
+    /// if any.
     async fn fetch_descendants(
         &self,
         initial_nodes: &[WorkflowyNode],
@@ -141,57 +268,80 @@ impl WorkflowyClient {
         start_depth: usize,
         max_depth: usize,
         node_limit: usize,
-    ) -> Result<bool> {
+        controls: &FetchControls,
+    ) -> Result<Option<TruncationReason>> {
         let mut current_level: Vec<WorkflowyNode> = initial_nodes.to_vec();
         let mut depth = start_depth;
 
         while depth < max_depth && !current_level.is_empty() {
-            out.extend(current_level.iter().cloned());
-            if out.len() >= node_limit {
-                out.truncate(node_limit);
-                warn!(limit = node_limit, "Node cap reached, subtree truncated");
-                return Ok(true);
+            // Accumulate this level before descending. If it blows the cap,
+            // record a node-limit truncation and stop.
+            for node in current_level.iter() {
+                if out.len() >= node_limit {
+                    warn!(limit = node_limit, "Node cap reached, subtree truncated");
+                    return Ok(Some(TruncationReason::NodeLimit));
+                }
+                out.push(node.clone());
             }
 
-            let mut next_level = Vec::new();
-            let mut level_truncated = false;
-            for node in &current_level {
-                match self.get_children(&node.id).await {
+            if let Some(status) = controls.status() {
+                return Ok(Some(status));
+            }
+
+            let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+            let ids: Vec<String> = current_level.iter().map(|n| n.id.clone()).collect();
+            let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
+                let res = self.get_children(&id).await;
+                (id, res)
+            }))
+            .buffer_unordered(concurrency);
+
+            tokio::pin!(fetches);
+
+            let mut next_level: Vec<WorkflowyNode> = Vec::new();
+            let mut stop: Option<TruncationReason> = None;
+            while let Some((id, res)) = fetches.next().await {
+                match res {
                     Ok(children) => next_level.extend(children),
-                    Err(e) => {
-                        warn!(error = %e, node_id = %node.id, "Failed to fetch children, skipping branch");
-                    }
+                    Err(e) => warn!(error = %e, node_id = %id, "Failed to fetch children, skipping branch"),
                 }
                 if out.len() + next_level.len() >= node_limit {
-                    level_truncated = true;
+                    stop = Some(TruncationReason::NodeLimit);
                     break;
                 }
+                if let Some(status) = controls.status() {
+                    stop = Some(status);
+                    break;
+                }
+            }
+            drop(fetches);
+
+            if let Some(reason) = stop {
+                let remaining = node_limit.saturating_sub(out.len());
+                out.extend(next_level.into_iter().take(remaining));
+                if reason == TruncationReason::NodeLimit {
+                    warn!(limit = node_limit, "Node cap reached during level fetch, subtree truncated");
+                }
+                return Ok(Some(reason));
             }
 
             current_level = next_level;
             depth += 1;
-
-            if level_truncated {
-                let remaining = node_limit.saturating_sub(out.len());
-                out.extend(current_level.into_iter().take(remaining));
-                warn!(limit = node_limit, "Node cap reached during level fetch, subtree truncated");
-                return Ok(true);
-            }
         }
 
         // If we stopped because we hit max_depth, the final level's children
-        // were not fetched; that is expected and is not a node-limit truncation.
-        if !current_level.is_empty() && out.len() + current_level.len() > node_limit {
-            let remaining = node_limit.saturating_sub(out.len());
-            out.extend(current_level.into_iter().take(remaining));
-            warn!(limit = node_limit, "Node cap reached on final level, subtree truncated");
-            return Ok(true);
-        }
+        // were not fetched; that is expected and is not a cap truncation.
         if !current_level.is_empty() {
+            let remaining = node_limit.saturating_sub(out.len());
+            if current_level.len() > remaining {
+                out.extend(current_level.into_iter().take(remaining));
+                warn!(limit = node_limit, "Node cap reached on final level, subtree truncated");
+                return Ok(Some(TruncationReason::NodeLimit));
+            }
             out.extend(current_level);
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     /// Create a new node
@@ -535,10 +685,89 @@ mod tests {
     fn test_subtree_fetch_clone_and_debug() {
         // Guard that the public type remains trivially cloneable and printable,
         // since callers pattern-match on it across tool handlers.
-        let fetch = SubtreeFetch { nodes: Vec::new(), truncated: true, limit: 10_000 };
+        let fetch = SubtreeFetch {
+            nodes: Vec::new(),
+            truncated: true,
+            limit: 10_000,
+            truncation_reason: Some(TruncationReason::NodeLimit),
+            elapsed_ms: 5,
+        };
         let cloned = fetch.clone();
         assert!(cloned.truncated);
         assert_eq!(cloned.limit, 10_000);
+        assert_eq!(cloned.truncation_reason, Some(TruncationReason::NodeLimit));
         assert!(format!("{:?}", cloned).contains("SubtreeFetch"));
+    }
+
+    #[test]
+    fn test_truncation_reason_as_str() {
+        assert_eq!(TruncationReason::NodeLimit.as_str(), "node_limit");
+        assert_eq!(TruncationReason::Timeout.as_str(), "timeout");
+        assert_eq!(TruncationReason::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn test_fetch_controls_status_cancelled() {
+        use crate::utils::CancelRegistry;
+        let registry = CancelRegistry::new();
+        let controls = FetchControls::default().and_cancel(registry.guard());
+        assert!(controls.status().is_none());
+        registry.cancel_all();
+        assert_eq!(controls.status(), Some(TruncationReason::Cancelled));
+    }
+
+    #[test]
+    fn test_fetch_controls_status_timeout() {
+        let controls = FetchControls::with_deadline(Instant::now() - Duration::from_millis(1));
+        assert_eq!(controls.status(), Some(TruncationReason::Timeout));
+    }
+
+    #[test]
+    fn test_fetch_controls_cancel_takes_precedence_over_timeout() {
+        use crate::utils::CancelRegistry;
+        let registry = CancelRegistry::new();
+        let controls = FetchControls::with_deadline(Instant::now() - Duration::from_millis(1))
+            .and_cancel(registry.guard());
+        // Timeout already fired, but cancel should win since we check it first.
+        registry.cancel_all();
+        assert_eq!(controls.status(), Some(TruncationReason::Cancelled));
+    }
+
+    #[test]
+    fn test_fetch_controls_no_deadline_no_cancel() {
+        let controls = FetchControls::default();
+        assert!(controls.status().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_subtree_honours_expired_deadline_immediately() {
+        // Even against an unreachable server, an already-expired deadline must
+        // return a partial Ok rather than waste an HTTP round-trip.
+        let client = test_client();
+        let controls = FetchControls::with_deadline(Instant::now() - Duration::from_secs(1));
+        let fetch = client
+            .get_subtree_with_controls(None, 3, 100, controls)
+            .await
+            .expect("expired deadline should return Ok(partial)");
+        assert!(fetch.truncated);
+        assert_eq!(fetch.truncation_reason, Some(TruncationReason::Timeout));
+        assert!(fetch.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_subtree_honours_pre_cancelled_guard() {
+        use crate::utils::CancelRegistry;
+        let client = test_client();
+        let registry = CancelRegistry::new();
+        let guard = registry.guard();
+        registry.cancel_all();
+        let controls = FetchControls::default().and_cancel(guard);
+        let fetch = client
+            .get_subtree_with_controls(None, 3, 100, controls)
+            .await
+            .expect("cancelled guard should return Ok(partial)");
+        assert!(fetch.truncated);
+        assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
+        assert!(fetch.nodes.is_empty());
     }
 }
