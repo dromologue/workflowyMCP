@@ -2,10 +2,10 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Updated 2026-04**: Rust v2 implements **26 tools**. Concept mapping, graph analysis,
+> **Updated 2026-04 (post-Pass-3)**: Rust v2 implements **28 tools**. Concept mapping, graph analysis,
 > and Dropbox integration have been removed from scope. See `tasks.md` for remaining roadmap.
 
-## Implemented Tools (Rust v2 — 26 total)
+## Implemented Tools (Rust v2 — 28 total)
 
 | Category | Tool | Status |
 |----------|------|--------|
@@ -33,14 +33,15 @@
 | Project Management | get_project_summary | Implemented |
 | Project Management | get_recent_changes | Implemented |
 | Diagnostics & Ops | health_check | Implemented |
+| Diagnostics & Ops | workflowy_status | Implemented (extended liveness + workload + rate-limit visibility) |
 | Diagnostics & Ops | cancel_all | Implemented |
 | Diagnostics & Ops | build_name_index | Implemented |
+| Diagnostics & Ops | get_recent_tool_calls | Implemented (in-memory ring buffer, default 1024 entries) |
 
 ### Not Yet Implemented
 
-batch_create_nodes, transaction, create_mirror, workflowy_status,
-get_recent_tool_calls. Tracked in `tasks.md` and the multi-pass plan at
-`tasks/reliability-and-ergonomics.md`.
+batch_create_nodes, transaction, create_mirror. Tracked in `tasks.md`
+and the multi-pass plan at `tasks/reliability-and-ergonomics.md`.
 
 ---
 
@@ -64,6 +65,21 @@ re-implementing them:
    the requested node and its depth-1 children, matching what
    `list_children` would return for the same ID. The two endpoints can no
    longer disagree on what a node's children are.
+4. **Every tool invocation is recorded.** A fixed-capacity in-memory
+   ring buffer captures `{ tool, params_hash, started_at, finished_at,
+   duration_ms, status, error }` for every handler call. `params_hash`
+   is a SHA-256 over the canonical-JSON form of the params (keys
+   sorted, no whitespace) so identical calls hash the same regardless
+   of producer formatting. `get_recent_tool_calls` exposes the buffer
+   without recording itself.
+5. **Workload visibility.** `workflowy_status` reports
+   `in_flight_walks` (live count, RAII-tracked through `walk_subtree`),
+   `last_request_ms` (wall-clock duration of the most recent HTTP
+   call), `tree_size_estimate` (last non-truncated unscoped walk),
+   plus the most recent upstream rate-limit headers (`RateLimit-*` and
+   `X-RateLimit-*` are both captured). Callers checking whether to
+   launch a heavy query can see both liveness and load before
+   committing.
 
 ---
 

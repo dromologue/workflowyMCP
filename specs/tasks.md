@@ -181,8 +181,27 @@
   - One extra parallel HTTP call; failures degrade to empty children with
     a warn log.
 
-- [ ] **T-153 (Pass 2)**: Deserialisation diagnostics + `workflowy_status`
-- [ ] **T-154 (Pass 3)**: Operation log + `get_recent_tool_calls`
+- [x] **T-153 (Pass 2)**: Deserialisation diagnostics + `workflowy_status`
+  - `check_node_id` now warns (with tool-correlated context) when a
+    handler-boundary validation rejects an empty/malformed id.
+  - `workflowy_status` tool: extended liveness probe surfacing
+    `in_flight_walks`, `last_request_ms`, `tree_size_estimate`, and a
+    `rate_limit` snapshot of the most recent upstream headers.
+  - `WorkflowyClient` captures both `RateLimit-*` and `X-RateLimit-*`
+    header conventions on every response (success or failure).
+  - `WalkGuard` RAII bumps `in_flight_walks` for the duration of every
+    `walk_subtree` call so the count is always accurate.
+
+- [x] **T-154 (Pass 3)**: Operation log + `get_recent_tool_calls`
+  - New `utils::op_log::OpLog`: ring buffer (default 1024) with
+    `{ tool, params_hash (SHA-256 over canonical JSON), started_at,
+    finished_at, duration_ms, status, error }`. Total-recorded counter
+    survives evictions.
+  - `record_op!` macro instruments every tool handler with one extra
+    line; both ok and err returns produce a log entry.
+  - `get_recent_tool_calls` tool returns recent entries (limit, since
+    filter) without recording itself, so callers get a clean snapshot.
+
 - [ ] **T-155 (Pass 4)**: Authoritative name index + short-hash IDs
 - [ ] **T-156 (Pass 5)**: Heavy-workflow primitives (batch / transaction /
   edit_node hardening / move_node retry)

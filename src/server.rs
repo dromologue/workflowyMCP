@@ -26,16 +26,78 @@ use crate::utils::cancel::CancelRegistry;
 use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
 use crate::utils::name_index::NameIndex;
 use crate::utils::node_paths::{build_node_path_with_map, build_node_map};
+use crate::utils::op_log::OpLog;
 use crate::utils::subtree::{is_todo, is_completed};
 use crate::utils::tag_parser::parse_node_tags;
 use crate::validation::validate_node_id;
 use std::time::{Duration, Instant};
 
+/// Wrap a handler body so the call is recorded in the per-call op log.
+/// Use as the outermost expression of every tool handler:
+///
+/// ```ignore
+/// async fn foo(&self, Parameters(params): Parameters<FooParams>) -> Result<CallToolResult, McpError> {
+///     record_op!(self, "foo", params, {
+///         // existing body, including `?` early returns
+///     })
+/// }
+/// ```
+///
+/// The macro hashes the params, opens a recorder, runs the body inside
+/// an async block (so `?` returns from the block, not the outer
+/// function), then finishes the recorder with Ok/Err before returning.
+macro_rules! record_op {
+    ($self:ident, $tool:literal, $params:ident, $body:block) => {{
+        let __pj = serde_json::to_value(&$params).unwrap_or(serde_json::Value::Null);
+        let __recorder = $self.op_log.record($tool, &__pj);
+        let __result: Result<CallToolResult, McpError> = async move $body.await;
+        match &__result {
+            Ok(_) => __recorder.finish_ok(),
+            Err(e) => __recorder.finish_err(e.to_string()),
+        }
+        __result
+    }};
+}
+
 /// Validate a node_id parameter, returning McpError on failure. The
 /// underlying validator rejects the empty string, so any call where the
 /// serde layer has defaulted a missing `node_id` to `""` is caught here.
+/// Also emits a `warn!` line on failure so an assistant scraping the
+/// stderr log can correlate validation errors with the calling tool.
 fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
-    validate_node_id(id).map_err(|e| McpError::invalid_params(e.to_string(), None))
+    let id_ref = id.as_ref();
+    match validate_node_id(id_ref) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                node_id_len = id_ref.len(),
+                node_id_preview = %id_ref.chars().take(16).collect::<String>(),
+                error = %e,
+                "Rejected node_id at handler boundary; check the calling MCP client for a missing/null id"
+            );
+            Err(McpError::invalid_params(e.to_string(), None))
+        }
+    }
+}
+
+/// RAII guard that bumps an in-flight counter on construction and
+/// decrements on drop. Ensures `workflowy_status` reports an accurate
+/// figure even if a handler aborts early.
+struct WalkGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WalkGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for WalkGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Test-only shorthand: build a banner without a path. Production callers go
@@ -120,11 +182,24 @@ pub struct WorkflowyMcpServer {
     name_index: Arc<NameIndex>,
     /// Server start time; surfaced by health_check for uptime visibility.
     started_at: Instant,
+    /// Count of subtree walks currently in flight. Surfaced by
+    /// `workflowy_status` so a caller deciding whether to launch a heavy
+    /// query can see if the shared rate limiter is already busy.
+    in_flight_walks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Best-effort estimate of total tree size: updated whenever a walk
+    /// completes with a non-truncated count, surfaced by
+    /// `workflowy_status`. A `0` means "no full walk has happened yet".
+    tree_size_estimate: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-call ring-buffer log: every tool invocation records start/end
+    /// timestamps, params hash, and outcome. The assistant queries this
+    /// via `get_recent_tool_calls` to self-diagnose hangs and
+    /// unexpected returns within a session.
+    op_log: OpLog,
 }
 
 // --- Parameter structs ---
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Search for nodes in Workflowy by text")]
 pub struct SearchNodesParams {
     #[schemars(description = "Text query to search for in node names and descriptions")]
@@ -137,14 +212,14 @@ pub struct SearchNodesParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get a specific node by its ID")]
 pub struct GetNodeParams {
     #[schemars(description = "The UUID of the node to retrieve")]
     pub node_id: NodeId,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Create a new node in Workflowy")]
 pub struct CreateNodeParams {
     #[schemars(description = "The title/name of the new node")]
@@ -157,7 +232,7 @@ pub struct CreateNodeParams {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Edit an existing node's name or description")]
 pub struct EditNodeParams {
     #[schemars(description = "The UUID of the node to edit")]
@@ -168,14 +243,14 @@ pub struct EditNodeParams {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Delete a node from Workflowy")]
 pub struct DeleteNodeParams {
     #[schemars(description = "The UUID of the node to delete")]
     pub node_id: NodeId,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Move a node to a new parent")]
 pub struct MoveNodeParams {
     #[schemars(description = "The UUID of the node to move")]
@@ -186,14 +261,14 @@ pub struct MoveNodeParams {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get all children of a node")]
 pub struct GetChildrenParams {
     #[schemars(description = "The UUID of the parent node")]
     pub node_id: NodeId,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Search nodes by tag")]
 pub struct TagSearchParams {
     #[schemars(description = "Tag to search for (e.g. '#project' or '@person')")]
@@ -206,7 +281,7 @@ pub struct TagSearchParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Insert content as hierarchical nodes from indented text")]
 pub struct InsertContentParams {
     #[schemars(description = "Parent node ID to insert content under")]
@@ -215,7 +290,7 @@ pub struct InsertContentParams {
     pub content: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get the full tree under a node")]
 pub struct GetSubtreeParams {
     #[schemars(description = "The UUID of the root node")]
@@ -224,7 +299,7 @@ pub struct GetSubtreeParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Find a node by name with match mode support")]
 pub struct FindNodeParams {
     #[schemars(description = "Name of the node to find")]
@@ -243,7 +318,7 @@ pub struct FindNodeParams {
     pub use_index: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Search for a target node and insert content under it")]
 pub struct SmartInsertParams {
     #[schemars(description = "Search text to find the target node")]
@@ -258,7 +333,7 @@ pub struct SmartInsertParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Daily review: overdue items, upcoming deadlines, and recent changes in one call")]
 pub struct DailyReviewParams {
     #[schemars(description = "Optional root node ID to scope the review")]
@@ -275,7 +350,7 @@ pub struct DailyReviewParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get recently modified nodes within a time window")]
 pub struct GetRecentChangesParams {
     #[schemars(description = "Number of days to look back (default: 7)")]
@@ -290,7 +365,7 @@ pub struct GetRecentChangesParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "List overdue items sorted by most overdue first")]
 pub struct ListOverdueParams {
     #[schemars(description = "Optional root node ID to scope the search")]
@@ -303,7 +378,7 @@ pub struct ListOverdueParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "List items with upcoming due dates")]
 pub struct ListUpcomingParams {
     #[schemars(description = "Days ahead to look (default: 14)")]
@@ -318,7 +393,7 @@ pub struct ListUpcomingParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get project summary with stats, tags, and recent changes")]
 pub struct GetProjectSummaryParams {
     #[schemars(description = "Root node ID of the project")]
@@ -329,7 +404,7 @@ pub struct GetProjectSummaryParams {
     pub recently_modified_days: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Find all nodes that contain a Workflowy link to a given node")]
 pub struct FindBacklinksParams {
     #[schemars(description = "The node ID to find backlinks for")]
@@ -340,7 +415,7 @@ pub struct FindBacklinksParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "List todo items with optional filtering")]
 pub struct ListTodosParams {
     #[schemars(description = "Parent node ID to scope todos under")]
@@ -355,7 +430,7 @@ pub struct ListTodosParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Deep-copy a node and its subtree to a new location")]
 pub struct DuplicateNodeParams {
     #[schemars(description = "The node ID to duplicate")]
@@ -368,7 +443,7 @@ pub struct DuplicateNodeParams {
     pub name_prefix: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Copy a template node with {{variable}} substitution")]
 pub struct CreateFromTemplateParams {
     #[schemars(description = "Template node ID to copy from")]
@@ -379,7 +454,7 @@ pub struct CreateFromTemplateParams {
     pub variables: Option<std::collections::HashMap<String, String>>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Apply an operation to all nodes matching a filter")]
 pub struct BulkUpdateParams {
     #[schemars(description = "Text search filter")]
@@ -402,7 +477,7 @@ pub struct BulkUpdateParams {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Convert markdown to Workflowy-compatible indented text format")]
 pub struct ConvertMarkdownParams {
     #[schemars(description = "Markdown content to convert")]
@@ -411,15 +486,28 @@ pub struct ConvertMarkdownParams {
     pub analyze_only: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
 #[schemars(description = "Quick diagnostic: verify Workflowy API reachability without a tree walk")]
 pub struct HealthCheckParams {}
 
-#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
+#[schemars(description = "Extended diagnostic: liveness plus in-flight workload, last-request latency, tree-size estimate, and upstream rate-limit headers")]
+pub struct WorkflowyStatusParams {}
+
+#[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
 #[schemars(description = "Cancel any in-flight tree walks. Future calls are unaffected")]
 pub struct CancelAllParams {}
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Return recent tool invocations from the in-memory ring buffer")]
+pub struct GetRecentToolCallsParams {
+    #[schemars(description = "Maximum number of entries to return (default: 50, max bounded by buffer capacity)")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Only return entries finished at or after this unix-millis timestamp")]
+    pub since_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Populate the opportunistic name index by walking a subtree")]
 pub struct BuildNameIndexParams {
     #[schemars(description = "Root node to start the walk from. Omit with allow_root_scan=true to walk the workspace root (expensive on large trees)")]
@@ -446,7 +534,16 @@ impl WorkflowyMcpServer {
             cancel_registry: CancelRegistry::new(),
             name_index: Arc::new(NameIndex::new()),
             started_at: Instant::now(),
+            in_flight_walks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tree_size_estimate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            op_log: OpLog::new(),
         }
+    }
+
+    /// Test/inspection accessor for the operation log.
+    #[cfg(test)]
+    pub(crate) fn op_log(&self) -> &OpLog {
+        &self.op_log
     }
 
     /// Build fetch controls that honour the server-wide cancel registry plus
@@ -460,18 +557,28 @@ impl WorkflowyMcpServer {
     /// Walk a subtree with the server's standard controls and push every
     /// visited node through the name index before returning. Keeps the tree
     /// walk and the opportunistic index population in one place so no handler
-    /// can forget to feed the index.
+    /// can forget to feed the index. Also maintains the `in_flight_walks`
+    /// counter and the best-effort `tree_size_estimate` for diagnostic
+    /// surfaces.
     async fn walk_subtree(
         &self,
         root_id: Option<&str>,
         max_depth: usize,
     ) -> crate::error::Result<SubtreeFetch> {
+        let _guard = WalkGuard::new(self.in_flight_walks.clone());
         let controls = self.fetch_controls();
         let fetch = self
             .client
             .get_subtree_with_controls(root_id, max_depth, defaults::MAX_SUBTREE_NODES, controls)
             .await?;
         self.name_index.ingest(&fetch.nodes);
+        // A non-truncated, root-scoped walk gives us a fresh tree-size
+        // sample. We deliberately do not lower the estimate on partial
+        // walks — stale-but-larger is more useful than zero.
+        if !fetch.truncated && root_id.is_none() {
+            self.tree_size_estimate
+                .store(fetch.nodes.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(fetch)
     }
 
@@ -480,6 +587,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<SearchNodesParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "search_nodes", params, {
         let max_results = params.max_results.unwrap_or(20);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
@@ -540,6 +648,7 @@ impl WorkflowyMcpServer {
                 ))
             }
         }
+        })
     }
 
     #[tool(description = "Get a specific Workflowy node by its ID. Returns the node's full details (name, description, tags) plus a depth-1 listing of its direct children — matching what list_children would return for the same ID. The children listing costs one extra HTTP call; use list_children directly when you don't need the parent metadata.")]
@@ -547,6 +656,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<GetNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "get_node", params, {
         info!(node_id = %params.node_id, "Getting node");
         check_node_id(&params.node_id)?;
 
@@ -596,6 +706,7 @@ impl WorkflowyMcpServer {
             McpError::internal_error(format!("Serialization error: {}", e), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+        })
     }
 
     #[tool(description = "Create a new node in Workflowy. Optionally specify a parent node ID and position.")]
@@ -603,6 +714,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<CreateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "create_node", params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
         if let Some(pid) = &params.parent_id { check_node_id(pid)?; }
 
@@ -636,6 +748,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "Edit an existing Workflowy node's name or description. At least one of name/description must be provided.")]
@@ -643,6 +756,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<EditNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "edit_node", params, {
         info!(node_id = %params.node_id, "Editing node");
         check_node_id(&params.node_id)?;
 
@@ -674,6 +788,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "Delete a Workflowy node by its ID.")]
@@ -681,6 +796,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<DeleteNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "delete_node", params, {
         info!(node_id = %params.node_id, "Deleting node");
         check_node_id(&params.node_id)?;
 
@@ -698,6 +814,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "Move a node to a new parent in Workflowy.")]
@@ -705,6 +822,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<MoveNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "move_node", params, {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
         check_node_id(&params.node_id)?;
         check_node_id(&params.new_parent_id)?;
@@ -744,6 +862,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "List all children of a Workflowy node.")]
@@ -751,6 +870,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<GetChildrenParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "list_children", params, {
         info!(node_id = %params.node_id, "Getting children");
         check_node_id(&params.node_id)?;
 
@@ -778,6 +898,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "Search for nodes by tag (e.g. #project, @person). Returns all nodes containing the specified tag. Use parent_id to scope and max_depth to control search depth.")]
@@ -785,6 +906,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<TagSearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "tag_search", params, {
         let max_results = params.max_results.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(tag = %params.tag, max_depth, "Tag search");
@@ -836,6 +958,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it.")]
@@ -843,6 +966,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<InsertContentParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
         check_node_id(&params.parent_id)?;
 
@@ -895,6 +1019,7 @@ impl WorkflowyMcpServer {
             "Inserted {} node(s) under `{}`",
             created_count, params.parent_id
         ))]))
+        })
     }
 
     #[tool(description = "Get the full subtree under a node, showing the hierarchical structure. Use max_depth to limit traversal depth for large trees.")]
@@ -902,6 +1027,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<GetSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "get_subtree", params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
@@ -929,6 +1055,7 @@ impl WorkflowyMcpServer {
                 None,
             )),
         }
+        })
     }
 
     // --- New tools required by wmanage skill ---
@@ -938,6 +1065,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<FindNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "find_node", params, {
         let match_mode = params.match_mode.as_deref().unwrap_or("exact");
         let max_depth = params.max_depth.unwrap_or(3);
         let use_index = params.use_index.unwrap_or(false);
@@ -1062,6 +1190,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed to find node: {}", e), None)),
         }
+        })
     }
 
     fn render_find_node_index_result(
@@ -1127,6 +1256,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<SmartInsertParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "smart_insert", params, {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.search_query, max_depth, "Smart insert");
 
@@ -1213,6 +1343,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Daily review: get overdue items, upcoming deadlines, recent changes, and pending todos in one call. Use root_id to scope and max_depth to control depth.")]
@@ -1220,6 +1351,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<DailyReviewParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "daily_review", params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Daily review");
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
@@ -1323,6 +1455,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed daily review: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Get recently modified nodes within a time window.")]
@@ -1330,6 +1463,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<GetRecentChangesParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "get_recent_changes", params, {
         let days = params.days.unwrap_or(7) as i64;
         let include_completed = params.include_completed.unwrap_or(true);
         let limit = params.limit.unwrap_or(50);
@@ -1376,6 +1510,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "List overdue items (past due date, incomplete) sorted by most overdue first.")]
@@ -1383,6 +1518,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<ListOverdueParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "list_overdue", params, {
         let include_completed = params.include_completed.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(5);
@@ -1425,6 +1561,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "List items with upcoming due dates, sorted by nearest deadline first.")]
@@ -1432,6 +1569,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<ListUpcomingParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "list_upcoming", params, {
         let days = params.days.unwrap_or(14) as i64;
         let include_no_due_date = params.include_no_due_date.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
@@ -1498,6 +1636,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Get project summary with stats, tag counts, assignee counts, and recently modified nodes.")]
@@ -1505,6 +1644,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<GetProjectSummaryParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "get_project_summary", params, {
         let include_tags = params.include_tags.unwrap_or(true);
         let recent_days = params.recently_modified_days.unwrap_or(7) as i64;
         info!(node_id = %params.node_id, "Getting project summary");
@@ -1607,6 +1747,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     // --- Remaining planned tools ---
@@ -1616,6 +1757,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<FindBacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "find_backlinks", params, {
         check_node_id(&params.node_id)?;
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
@@ -1665,6 +1807,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "List todo items, optionally filtered by parent, status, or text query.")]
@@ -1672,6 +1815,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<ListTodosParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "list_todos", params, {
         let limit = params.limit.unwrap_or(50);
         let status = params.status.as_deref().unwrap_or("all");
         let max_depth = params.max_depth.unwrap_or(5);
@@ -1721,6 +1865,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Deep-copy a node and its subtree to a new location.")]
@@ -1728,6 +1873,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<DuplicateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "duplicate_node", params, {
         check_node_id(&params.node_id)?;
         check_node_id(&params.target_parent_id)?;
         let include_children = params.include_children.unwrap_or(true);
@@ -1823,6 +1969,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Copy a template node with {{variable}} substitution in names and descriptions.")]
@@ -1830,6 +1977,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<CreateFromTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "create_from_template", params, {
         check_node_id(&params.template_node_id)?;
         check_node_id(&params.target_parent_id)?;
         let vars = params.variables.unwrap_or_default();
@@ -1920,6 +2068,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Apply an operation to all nodes matching a filter. Supports delete, add_tag, remove_tag. Use dry_run to preview. Note: complete/uncomplete are not yet implemented and will be rejected.")]
@@ -1927,6 +2076,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<BulkUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "bulk_update", params, {
         let dry_run = params.dry_run.unwrap_or(false);
         let limit = params.limit.unwrap_or(20);
         let status = params.status.as_deref().unwrap_or("all");
@@ -2080,6 +2230,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed: {}", e), None)),
         }
+        })
     }
 
     #[tool(description = "Convert markdown to Workflowy-compatible 2-space indented text format. Handles headers, lists, code blocks, blockquotes, and tables.")]
@@ -2087,6 +2238,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<ConvertMarkdownParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "convert_markdown", params, {
         let analyze_only = params.analyze_only.unwrap_or(false);
         info!(analyze_only, "Converting markdown");
 
@@ -2231,6 +2383,7 @@ impl WorkflowyMcpServer {
             "usage_hint": "Pass the 'content' field to insert_content to add to Workflowy"
         });
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        })
     }
 
     #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget to confirm reachability and reports cache/name-index sizes. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
@@ -2238,6 +2391,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(_params): Parameters<HealthCheckParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "health_check", _params, {
         let started = Instant::now();
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
         let probe = tokio::time::timeout(timeout, self.client.get_top_level_nodes()).await;
@@ -2267,6 +2421,58 @@ impl WorkflowyMcpServer {
             "error": error,
         });
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        })
+    }
+
+    #[tool(description = "Extended liveness probe: confirms Workflowy reachability AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy.")]
+    async fn workflowy_status(
+        &self,
+        Parameters(_params): Parameters<WorkflowyStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "workflowy_status", _params, {
+        let started = Instant::now();
+        let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
+        let probe = tokio::time::timeout(timeout, self.client.get_top_level_nodes()).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (api_reachable, top_level_count, error) = match probe {
+            Ok(Ok(nodes)) => (true, Some(nodes.len()), None::<String>),
+            Ok(Err(e)) => (false, None, Some(e.to_string())),
+            Err(_) => (false, None, Some(format!("timed out after {} ms", timeout.as_millis()))),
+        };
+        let cache_stats = self.cache.stats();
+        let rate_limit = self.client.rate_limit_snapshot();
+        let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
+        let tree_estimate = self.tree_size_estimate.load(std::sync::atomic::Ordering::Relaxed);
+        let result = json!({
+            "status": if api_reachable { "ok" } else { "degraded" },
+            "api_reachable": api_reachable,
+            "latency_ms": elapsed_ms,
+            "budget_ms": timeout.as_millis() as u64,
+            "top_level_count": top_level_count,
+            "in_flight_walks": in_flight,
+            "last_request_ms": self.client.last_request_ms(),
+            "tree_size_estimate": tree_estimate,
+            "tree_size_estimate_known": tree_estimate > 0,
+            "cache": {
+                "node_count": cache_stats.node_count,
+                "parent_count": cache_stats.parent_count,
+            },
+            "name_index": {
+                "size": self.name_index.size(),
+                "populated": self.name_index.is_populated(),
+            },
+            "rate_limit": {
+                "remaining": rate_limit.remaining,
+                "limit": rate_limit.limit,
+                "reset_unix_seconds": rate_limit.reset_unix_seconds,
+                "observed": rate_limit.remaining.is_some() || rate_limit.limit.is_some() || rate_limit.reset_unix_seconds.is_some(),
+            },
+            "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "cancel_generation": self.cancel_registry.generation(),
+            "error": error,
+        });
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        })
     }
 
     #[tool(description = "Cancel every in-flight tree walk. Subsequent calls are unaffected. Use when a find_node / get_subtree / search is taking longer than the client is willing to wait.")]
@@ -2274,6 +2480,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(_params): Parameters<CancelAllParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "cancel_all", _params, {
         let new_gen = self.cancel_registry.cancel_all();
         let result = json!({
             "status": "cancelled",
@@ -2281,6 +2488,7 @@ impl WorkflowyMcpServer {
             "message": "In-flight walks have been signalled to return partial results; new calls start fresh."
         });
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        })
     }
 
     #[tool(description = "Walk a subtree and populate the opportunistic name index. After this, find_node with use_index=true can answer lookups without touching the API. Walks are bounded by the standard subtree-fetch timeout and node-count cap, so large scopes may return partial results.")]
@@ -2288,6 +2496,7 @@ impl WorkflowyMcpServer {
         &self,
         Parameters(params): Parameters<BuildNameIndexParams>,
     ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "build_name_index", params, {
         let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
         if let Some(rid) = &params.root_id {
@@ -2316,6 +2525,29 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(McpError::internal_error(format!("Failed to build name index: {}", e), None)),
         }
+        })
+    }
+
+    #[tool(description = "Return recent tool invocations from the in-memory ring buffer. Use for self-diagnosis: when a call hangs or returns unexpectedly, the previous N entries reveal the workload that produced the symptom. Includes tool name, params hash, start/finish timestamps, duration, and ok/err status.")]
+    async fn get_recent_tool_calls(
+        &self,
+        Parameters(params): Parameters<GetRecentToolCallsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Note: this handler does NOT record itself — the act of querying
+        // the log shouldn't perturb the log it's reporting on.
+        let limit = params
+            .limit
+            .unwrap_or(50)
+            .min(self.op_log.capacity());
+        let entries = self.op_log.recent(limit, params.since_unix_ms);
+        let payload = json!({
+            "buffer_capacity": self.op_log.capacity(),
+            "buffer_size": self.op_log.len(),
+            "total_recorded": self.op_log.total_recorded(),
+            "returned": entries.len(),
+            "entries": entries,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
     }
 }
 
@@ -2809,6 +3041,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_log_records_handler_invocations_with_status() {
+        let server = new_test_server();
+        // First call: succeeds (no API needed)
+        let _ = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        // Second call: fails (invalid node id)
+        let _ = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+
+        let entries = server.op_log().recent(10, None);
+        assert!(entries.len() >= 2, "expected at least 2 entries, got {}", entries.len());
+        // Newest first.
+        let names: Vec<&str> = entries.iter().map(|e| e.tool.as_str()).collect();
+        assert!(names.contains(&"get_node"), "missing get_node entry; got {names:?}");
+        assert!(names.contains(&"workflowy_status"), "missing workflowy_status entry; got {names:?}");
+
+        // Status reflects the actual outcome of each call.
+        let get_node_entry = entries.iter().find(|e| e.tool == "get_node").unwrap();
+        assert_eq!(get_node_entry.status, crate::utils::OpStatus::Err);
+        assert!(get_node_entry.error.is_some(), "err entry must include message");
+
+        let status_entry = entries.iter().find(|e| e.tool == "workflowy_status").unwrap();
+        assert_eq!(status_entry.status, crate::utils::OpStatus::Ok);
+        assert!(status_entry.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_recent_tool_calls_returns_entries_without_recording_itself() {
+        let server = new_test_server();
+        // Drive a few calls.
+        for _ in 0..3 {
+            let _ = server
+                .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+                .await;
+        }
+        let total_before = server.op_log().total_recorded();
+        // Querying the log must NOT record itself — otherwise a caller can
+        // never get a clean snapshot.
+        let result = server
+            .get_recent_tool_calls(Parameters(GetRecentToolCallsParams { limit: Some(10), since_unix_ms: None }))
+            .await
+            .expect("query returns");
+        let total_after = server.op_log().total_recorded();
+        assert_eq!(total_before, total_after, "get_recent_tool_calls must not record itself");
+        let body = result_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("payload JSON");
+        assert!(v["entries"].as_array().unwrap().len() >= 3);
+        assert_eq!(v["total_recorded"], total_after);
+    }
+
+    #[tokio::test]
+    async fn workflowy_status_returns_in_flight_and_rate_limit_fields() {
+        let server = new_test_server();
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("workflowy_status must always return");
+        let body = result_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("status payload is JSON");
+        // Required new fields — caller relies on these to decide whether to
+        // launch a heavy query.
+        assert!(v.get("in_flight_walks").is_some(), "missing in_flight_walks: {body}");
+        assert!(v.get("last_request_ms").is_some(), "missing last_request_ms: {body}");
+        assert!(v.get("tree_size_estimate").is_some(), "missing tree_size_estimate: {body}");
+        assert!(v.get("rate_limit").is_some(), "missing rate_limit: {body}");
+        assert_eq!(v["in_flight_walks"], 0, "no walks running in test: {body}");
+        assert_eq!(
+            v["rate_limit"]["observed"], false,
+            "no live API in this test, headers must be marked unobserved: {body}"
+        );
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .find_map(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
     async fn get_node_handler_returns_invalid_id_error() {
         // Sanity: get_node still validates IDs at the handler boundary even
         // though the handler now also fetches children. An empty ID must be
@@ -3159,8 +3476,10 @@ mod tests {
     async fn new_tools_are_registered() {
         let server = new_test_server();
         assert!(server.get_tool("health_check").is_some());
+        assert!(server.get_tool("workflowy_status").is_some());
         assert!(server.get_tool("cancel_all").is_some());
         assert!(server.get_tool("build_name_index").is_some());
+        assert!(server.get_tool("get_recent_tool_calls").is_some());
     }
 
     #[tokio::test]

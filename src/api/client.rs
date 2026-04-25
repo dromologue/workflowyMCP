@@ -145,16 +145,37 @@ impl FetchControls {
     }
 }
 
+/// Snapshot of upstream rate-limit headers as of the last response. `i64`
+/// because Workflowy may not send these headers at all — we use `-1` to
+/// mean "never seen one yet". An `Option`-based design would require a
+/// `Mutex`; atomics let `workflowy_status` read without contention.
+#[derive(Debug, Clone)]
+pub struct RateLimitSnapshot {
+    pub remaining: Option<i64>,
+    pub reset_unix_seconds: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 pub struct WorkflowyClient {
     http_client: Client,
     base_url: String,
     api_key: String,
     retry_config: RetryConfig,
     rate_limiter: Arc<RateLimiter>,
+    /// Elapsed milliseconds of the last successful request. `0` if no
+    /// request has completed yet.
+    last_request_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Most recent upstream RateLimit-Remaining header, or `-1` if not
+    /// observed. Workflowy's API may not send these — readers must treat
+    /// `-1` as "unknown", not "zero".
+    rate_limit_remaining: Arc<std::sync::atomic::AtomicI64>,
+    rate_limit_limit: Arc<std::sync::atomic::AtomicI64>,
+    rate_limit_reset_unix: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl WorkflowyClient {
     pub fn new(base_url: String, api_key: String) -> Result<Self> {
+        use std::sync::atomic::AtomicI64;
         let http_client = Client::builder()
             .timeout(Duration::from_secs(defaults::HTTP_TIMEOUT_SECS))
             .build()
@@ -166,7 +187,50 @@ impl WorkflowyClient {
             api_key,
             retry_config: RetryConfig::default(),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
+            last_request_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rate_limit_remaining: Arc::new(AtomicI64::new(-1)),
+            rate_limit_limit: Arc::new(AtomicI64::new(-1)),
+            rate_limit_reset_unix: Arc::new(AtomicI64::new(-1)),
         })
+    }
+
+    /// Last successful request's wall-clock duration in ms. `0` until the
+    /// first request completes.
+    pub fn last_request_ms(&self) -> u64 {
+        self.last_request_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot of the most recent upstream rate-limit headers. Each field
+    /// is `None` if Workflowy has not (yet) returned that header — callers
+    /// must not assume the upstream sends them.
+    pub fn rate_limit_snapshot(&self) -> RateLimitSnapshot {
+        use std::sync::atomic::Ordering;
+        fn opt(v: i64) -> Option<i64> { if v < 0 { None } else { Some(v) } }
+        RateLimitSnapshot {
+            remaining: opt(self.rate_limit_remaining.load(Ordering::Relaxed)),
+            limit: opt(self.rate_limit_limit.load(Ordering::Relaxed)),
+            reset_unix_seconds: opt(self.rate_limit_reset_unix.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn record_rate_limit_headers(&self, headers: &reqwest::header::HeaderMap) {
+        use std::sync::atomic::Ordering;
+        // Workflowy's docs do not pin a specific header set; capture both
+        // the IETF standard names (`RateLimit-*`) and the common GitHub-style
+        // `X-RateLimit-*` so we work against either convention without
+        // needing schema confirmation up front.
+        for (name, atomic) in [
+            ("ratelimit-remaining", &self.rate_limit_remaining),
+            ("x-ratelimit-remaining", &self.rate_limit_remaining),
+            ("ratelimit-limit", &self.rate_limit_limit),
+            ("x-ratelimit-limit", &self.rate_limit_limit),
+            ("ratelimit-reset", &self.rate_limit_reset_unix),
+            ("x-ratelimit-reset", &self.rate_limit_reset_unix),
+        ] {
+            if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<i64>().ok()) {
+                atomic.store(v.max(0), Ordering::Relaxed);
+            }
+        }
     }
 
     // --- High-level API methods ---
@@ -684,6 +748,7 @@ impl WorkflowyClient {
             req = req.json(body_value);
         }
 
+        let send_started = Instant::now();
         // Race the in-flight HTTP send against a cancellation poll. Dropping
         // the send future cleanly cancels the underlying connection in reqwest.
         let response = match cancel {
@@ -696,6 +761,12 @@ impl WorkflowyClient {
             }
             None => req.send().await.map_err(WorkflowyError::HttpError)?,
         };
+
+        // Record latency and any rate-limit headers regardless of success —
+        // a 429 still tells us something useful about upstream throttling.
+        let elapsed_ms = send_started.elapsed().as_millis() as u64;
+        self.last_request_ms.store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
+        self.record_rate_limit_headers(response.headers());
 
         let status = response.status();
 
@@ -954,6 +1025,40 @@ mod tests {
         assert!(fetch.truncated);
         assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
         assert!(fetch.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_rate_limit_snapshot_unknown_until_request() {
+        let client = test_client();
+        let snap = client.rate_limit_snapshot();
+        assert!(snap.remaining.is_none());
+        assert!(snap.limit.is_none());
+        assert!(snap.reset_unix_seconds.is_none());
+        assert_eq!(client.last_request_ms(), 0);
+    }
+
+    #[test]
+    fn test_rate_limit_snapshot_records_observed_headers() {
+        // Direct exercise of the header parser — doesn't require a live API.
+        let client = test_client();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("ratelimit-remaining", "42".parse().unwrap());
+        headers.insert("ratelimit-limit", "100".parse().unwrap());
+        headers.insert("ratelimit-reset", "1700000000".parse().unwrap());
+        client.record_rate_limit_headers(&headers);
+        let snap = client.rate_limit_snapshot();
+        assert_eq!(snap.remaining, Some(42));
+        assert_eq!(snap.limit, Some(100));
+        assert_eq!(snap.reset_unix_seconds, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn test_rate_limit_snapshot_accepts_x_prefixed_variants() {
+        let client = test_client();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "7".parse().unwrap());
+        client.record_rate_limit_headers(&headers);
+        assert_eq!(client.rate_limit_snapshot().remaining, Some(7));
     }
 
     #[tokio::test]
