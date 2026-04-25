@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::api::{FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
+use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
 use crate::defaults;
 use crate::types::{WorkflowyNode, NodeId};
 use crate::utils::cache::NodeCache;
@@ -64,8 +64,19 @@ macro_rules! record_op {
 /// serde layer has defaulted a missing `node_id` to `""` is caught here.
 /// Also emits a `warn!` line on failure so an assistant scraping the
 /// stderr log can correlate validation errors with the calling tool.
+///
+/// As of Pass 4 this also accepts a 12-char hex short-hash form (the
+/// trailing 12 chars of a UUID, as used in Workflowy URLs) — but only
+/// the validator-level check. Handlers that need to use the resolved
+/// full UUID for an API call should go through
+/// [`WorkflowyMcpServer::resolve_node_ref`] instead.
 fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
     let id_ref = id.as_ref();
+    if is_short_hash(id_ref) {
+        // A short hash on its own is fine at the validator boundary; the
+        // resolver inside the handler will turn it into a full UUID.
+        return Ok(());
+    }
     match validate_node_id(id_ref) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -78,6 +89,14 @@ fn check_node_id(id: impl AsRef<str>) -> Result<(), McpError> {
             Err(McpError::invalid_params(e.to_string(), None))
         }
     }
+}
+
+/// Heuristic: is `s` a 12-char hex short hash? Used to short-circuit
+/// `check_node_id` so callers can pass either form transparently.
+fn is_short_hash(s: &str) -> bool {
+    let stripped: String = s.chars().filter(|c| *c != '-').collect();
+    stripped.len() == crate::utils::name_index::SHORT_HASH_LEN
+        && stripped.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// RAII guard that bumps an in-flight counter on construction and
@@ -508,6 +527,56 @@ pub struct GetRecentToolCallsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "One create operation in a batch")]
+pub struct BatchCreateOpParams {
+    #[schemars(description = "Name (text content) of the new node")]
+    pub name: String,
+    #[schemars(description = "Optional note/description for the new node")]
+    pub description: Option<String>,
+    #[schemars(description = "Optional parent node ID (UUID or short hash). Omit to create at workspace root.")]
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Optional priority/sort key (lower sorts earlier)")]
+    pub priority: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Create many nodes in one call. Operations run with bounded concurrency; results are returned in input order with per-operation status.")]
+pub struct BatchCreateNodesParams {
+    #[schemars(description = "List of create operations to apply")]
+    pub operations: Vec<BatchCreateOpParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "One operation inside a transaction. `op` is one of: create, edit, delete, move.")]
+pub struct TransactionOpParams {
+    #[schemars(description = "Operation kind: create | edit | delete | move")]
+    pub op: String,
+    /// For create: parent_id and name (required), description/priority (optional).
+    /// For edit: node_id (required), name and/or description.
+    /// For delete: node_id (required).
+    /// For move: node_id, new_parent_id (required), priority (optional).
+    #[schemars(description = "Node ID — required for edit, delete, and move operations")]
+    pub node_id: Option<NodeId>,
+    #[schemars(description = "Parent node ID — required for create, ignored for others")]
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Target parent ID — required for move operations")]
+    pub new_parent_id: Option<NodeId>,
+    #[schemars(description = "Name field — required for create, optional for edit")]
+    pub name: Option<String>,
+    #[schemars(description = "Description/note — optional for create and edit")]
+    pub description: Option<String>,
+    #[schemars(description = "Priority/sort key — optional for create and move")]
+    pub priority: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially (so dependencies resolve in order); on first failure the server replays inverse operations to roll back what already succeeded. True atomicity is not possible without upstream transaction support — this is a best-effort wrapper around per-op rollback.")]
+pub struct TransactionParams {
+    #[schemars(description = "Operations to apply, in execution order")]
+    pub operations: Vec<TransactionOpParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Populate the opportunistic name index by walking a subtree")]
 pub struct BuildNameIndexParams {
     #[schemars(description = "Root node to start the walk from. Omit with allow_root_scan=true to walk the workspace root (expensive on large trees)")]
@@ -552,6 +621,33 @@ impl WorkflowyMcpServer {
     fn fetch_controls(&self) -> FetchControls {
         FetchControls::with_timeout(Duration::from_millis(defaults::SUBTREE_FETCH_TIMEOUT_MS))
             .and_cancel(self.cancel_registry.guard())
+    }
+
+    /// Resolve a `node_id` parameter to a full UUID string. Accepts either
+    /// the canonical 32-hex-char UUID (with or without hyphens) or the
+    /// 12-char short-hash form Workflowy uses in URLs. Short-hash
+    /// resolution requires the name index to have seen the target node;
+    /// a miss returns a pointed error rather than silently failing.
+    ///
+    /// Tools that need to call the Workflowy API with the resolved id
+    /// should call this instead of treating the param string as the full
+    /// UUID directly.
+    fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
+        if is_short_hash(raw) {
+            match self.name_index.resolve_short_hash(raw) {
+                Some(full) => Ok(full),
+                None => Err(McpError::invalid_params(
+                    format!(
+                        "Short-hash '{}' is not in the name index. Pass the full UUID, or run build_name_index first to populate.",
+                        raw
+                    ),
+                    None,
+                )),
+            }
+        } else {
+            // Already a full UUID (or we'll fail later in the API call).
+            Ok(raw.to_string())
+        }
     }
 
     /// Walk a subtree with the server's standard controls and push every
@@ -659,21 +755,22 @@ impl WorkflowyMcpServer {
         record_op!(self, "get_node", params, {
         info!(node_id = %params.node_id, "Getting node");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
         // Fetch the node and its direct children in parallel — they are
         // independent API calls, and previously `get_node` returned an empty
         // `children: []` field that disagreed with `list_children`. Surfacing
         // the children alongside the parent removes that footgun without
         // forcing callers to make a second tool call.
-        let node_fut = self.client.get_node(&params.node_id);
-        let children_fut = self.client.get_children(&params.node_id);
+        let node_fut = self.client.get_node(&resolved);
+        let children_fut = self.client.get_children(&resolved);
         let (node_res, children_res) = tokio::join!(node_fut, children_fut);
 
         let node = match node_res {
             Ok(n) => n,
             Err(e) => {
                 return Err(McpError::internal_error(
-                    format!("Failed to get node {}: {}", params.node_id, e),
+                    format!("Failed to get node {}: {}", resolved, e),
                     None,
                 ));
             }
@@ -686,7 +783,7 @@ impl WorkflowyMcpServer {
         let children: Vec<WorkflowyNode> = match children_res {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(node_id = %params.node_id, error = %e, "get_node: child fetch failed; returning parent with empty children");
+                tracing::warn!(node_id = %resolved, error = %e, "get_node: child fetch failed; returning parent with empty children");
                 Vec::new()
             }
         };
@@ -759,6 +856,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "edit_node", params, {
         info!(node_id = %params.node_id, "Editing node");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
         // Reject no-op edits at the boundary: the Workflowy API happily
         // accepts an empty PATCH body and returns success, which would mask
@@ -772,15 +870,15 @@ impl WorkflowyMcpServer {
 
         match self
             .client
-            .edit_node(&params.node_id, params.name.as_deref(), params.description.as_deref())
+            .edit_node(&resolved, params.name.as_deref(), params.description.as_deref())
             .await
         {
             Ok(_) => {
-                self.cache.invalidate_node(&params.node_id);
-                self.name_index.invalidate_node(&params.node_id);
+                self.cache.invalidate_node(&resolved);
+                self.name_index.invalidate_node(&resolved);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Updated node `{}`",
-                    params.node_id
+                    resolved
                 ))]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -799,14 +897,15 @@ impl WorkflowyMcpServer {
         record_op!(self, "delete_node", params, {
         info!(node_id = %params.node_id, "Deleting node");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.client.delete_node(&params.node_id).await {
+        match self.client.delete_node(&resolved).await {
             Ok(_) => {
-                self.cache.invalidate_node(&params.node_id);
-                self.name_index.invalidate_node(&params.node_id);
+                self.cache.invalidate_node(&resolved);
+                self.name_index.invalidate_node(&resolved);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Deleted node `{}`",
-                    params.node_id
+                    resolved
                 ))]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -826,6 +925,8 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
         check_node_id(&params.node_id)?;
         check_node_id(&params.new_parent_id)?;
+        let resolved_node = self.resolve_node_ref(&params.node_id)?;
+        let resolved_parent = self.resolve_node_ref(&params.new_parent_id)?;
 
         // Capture the current parent before the move so we can invalidate its
         // children listing afterwards. A failed pre-read is not fatal — the
@@ -833,28 +934,28 @@ impl WorkflowyMcpServer {
         // node and the new parent, as the code used to.
         let old_parent_id = self
             .client
-            .get_node(&params.node_id)
+            .get_node(&resolved_node)
             .await
             .ok()
             .and_then(|n| n.parent_id);
 
         match self
             .client
-            .move_node(&params.node_id, &params.new_parent_id, params.priority)
+            .move_node(&resolved_node, &resolved_parent, params.priority)
             .await
         {
             Ok(_) => {
-                self.cache.invalidate_node(&params.node_id);
-                self.cache.invalidate_node(&params.new_parent_id);
+                self.cache.invalidate_node(&resolved_node);
+                self.cache.invalidate_node(&resolved_parent);
                 if let Some(pid) = &old_parent_id {
-                    if pid.as_str() != params.new_parent_id.as_str() {
+                    if pid.as_str() != resolved_parent.as_str() {
                         self.cache.invalidate_node(pid);
                     }
                 }
-                self.name_index.invalidate_node(&params.node_id);
+                self.name_index.invalidate_node(&resolved_node);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Moved node `{}` under `{}`",
-                    params.node_id, params.new_parent_id
+                    resolved_node, resolved_parent
                 ))]))
             }
             Err(e) => Err(McpError::internal_error(
@@ -873,13 +974,14 @@ impl WorkflowyMcpServer {
         record_op!(self, "list_children", params, {
         info!(node_id = %params.node_id, "Getting children");
         check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id)?;
 
-        match self.client.get_children(&params.node_id).await {
+        match self.client.get_children(&resolved).await {
             Ok(children) => {
                 if children.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
                         "Node `{}` has no children",
-                        params.node_id
+                        resolved
                     ))]))
                 } else {
                     let items: Vec<String> = children
@@ -2528,6 +2630,148 @@ impl WorkflowyMcpServer {
         })
     }
 
+    #[tool(description = "Create many nodes in one call. Operations are pipelined with bounded concurrency; results are returned in input order with per-operation Ok(node_id) or Err(message). Faster than sequential create_node calls for medium-to-large batches; not transactional.")]
+    async fn batch_create_nodes(
+        &self,
+        Parameters(params): Parameters<BatchCreateNodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "batch_create_nodes", params, {
+        if params.operations.is_empty() {
+            return Err(McpError::invalid_params(
+                "operations must not be empty".to_string(),
+                None,
+            ));
+        }
+        // Validate every node id eagerly so we don't waste round-trips
+        // on a known-bad batch.
+        for op in &params.operations {
+            if let Some(pid) = &op.parent_id {
+                check_node_id(pid)?;
+            }
+        }
+
+        // Resolve short-hash parents up front so the batch sees full UUIDs.
+        let resolved_ops: Vec<BatchCreateOp> = params
+            .operations
+            .into_iter()
+            .map(|o| {
+                let parent_id = match o.parent_id {
+                    Some(pid) => Some(self.resolve_node_ref(&pid)?),
+                    None => None,
+                };
+                Ok::<BatchCreateOp, McpError>(BatchCreateOp {
+                    name: o.name,
+                    description: o.description,
+                    parent_id,
+                    priority: o.priority,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let parents_to_invalidate: std::collections::HashSet<String> = resolved_ops
+            .iter()
+            .filter_map(|o| o.parent_id.clone())
+            .collect();
+
+        let results = self.client.batch_create_nodes(resolved_ops).await;
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let entries: Vec<serde_json::Value> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| match r {
+                Ok(created) => {
+                    succeeded += 1;
+                    self.name_index.ingest(&[WorkflowyNode {
+                        id: created.id.clone(),
+                        name: created.name.clone(),
+                        parent_id: created.parent_id.clone(),
+                        ..Default::default()
+                    }]);
+                    json!({
+                        "index": i,
+                        "ok": true,
+                        "id": created.id,
+                        "name": created.name,
+                        "parent_id": created.parent_id,
+                    })
+                }
+                Err(e) => {
+                    failed += 1;
+                    json!({ "index": i, "ok": false, "error": e.to_string() })
+                }
+            })
+            .collect();
+
+        for pid in parents_to_invalidate {
+            self.cache.invalidate_node(&pid);
+        }
+
+        let payload = json!({
+            "total": entries.len(),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": entries,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
+    #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that.")]
+    async fn transaction(
+        &self,
+        Parameters(params): Parameters<TransactionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "transaction", params, {
+        if params.operations.is_empty() {
+            return Err(McpError::invalid_params("operations must not be empty".to_string(), None));
+        }
+
+        // Each entry: (description-of-completed-op, inverse-action)
+        let mut applied: Vec<TxnInverse> = Vec::new();
+        let mut applied_results: Vec<serde_json::Value> = Vec::new();
+
+        for (idx, op) in params.operations.iter().enumerate() {
+            let outcome = self.apply_txn_op(op).await;
+            match outcome {
+                Ok((summary, inverse)) => {
+                    applied_results.push(json!({ "index": idx, "ok": true, "summary": summary }));
+                    if let Some(inv) = inverse {
+                        applied.push(inv);
+                    }
+                }
+                Err(err) => {
+                    // Roll back in reverse order. Each inverse failure is
+                    // logged but does not abort the rollback — we want to
+                    // get as much state back as possible.
+                    let mut rollback_log: Vec<serde_json::Value> = Vec::new();
+                    while let Some(inv) = applied.pop() {
+                        match self.run_inverse(inv).await {
+                            Ok(summary) => rollback_log.push(json!({ "ok": true, "summary": summary })),
+                            Err(e) => rollback_log.push(json!({ "ok": false, "error": e.to_string() })),
+                        }
+                    }
+                    let payload = json!({
+                        "status": "rolled_back",
+                        "failed_at_index": idx,
+                        "error": err.to_string(),
+                        "applied_before_failure": applied_results,
+                        "rollback": rollback_log,
+                    });
+                    return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+                }
+            }
+        }
+
+        let payload = json!({
+            "status": "applied",
+            "operations": applied_results,
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
     #[tool(description = "Return recent tool invocations from the in-memory ring buffer. Use for self-diagnosis: when a call hangs or returns unexpectedly, the previous N entries reveal the workload that produced the symptom. Includes tool name, params hash, start/finish timestamps, duration, and ok/err status.")]
     async fn get_recent_tool_calls(
         &self,
@@ -2548,6 +2792,197 @@ impl WorkflowyMcpServer {
             "entries": entries,
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+    }
+}
+
+/// Inverse of a successful transaction step. Applied in reverse order
+/// during rollback. Not every operation has a clean inverse — see
+/// [`WorkflowyMcpServer::apply_txn_op`] for which operations support
+/// rollback and which only run forward.
+enum TxnInverse {
+    /// Roll back a `create` by deleting the new node.
+    DeleteCreated { node_id: String, parent_id: Option<String> },
+    /// Roll back an `edit` by reapplying the previous name/description.
+    RestoreEdit {
+        node_id: String,
+        prev_name: Option<String>,
+        prev_description: Option<String>,
+    },
+    /// Roll back a `move` by moving the node back to its previous parent.
+    UnMove {
+        node_id: String,
+        prev_parent_id: Option<String>,
+        prev_priority: Option<i32>,
+    },
+}
+
+/// Out-of-router helpers for `transaction`. Kept outside the
+/// `#[tool_router]` impl so they don't get registered as tools.
+impl WorkflowyMcpServer {
+    /// Execute one transaction op. Returns a human-readable summary plus
+    /// the inverse to replay on rollback (`None` if the op is not
+    /// invertible — currently only `delete`).
+    async fn apply_txn_op(
+        &self,
+        op: &TransactionOpParams,
+    ) -> Result<(serde_json::Value, Option<TxnInverse>), McpError> {
+        match op.op.as_str() {
+            "create" => {
+                let parent_id = match &op.parent_id {
+                    Some(pid) => Some(self.resolve_node_ref(pid)?),
+                    None => None,
+                };
+                let name = op.name.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("create requires `name`".to_string(), None)
+                })?;
+                let created = self
+                    .client
+                    .create_node(name, op.description.as_deref(), parent_id.as_deref(), op.priority)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("create failed: {}", e), None))?;
+                if let Some(pid) = &parent_id {
+                    self.cache.invalidate_node(pid);
+                }
+                self.name_index.ingest(&[WorkflowyNode {
+                    id: created.id.clone(),
+                    name: created.name.clone(),
+                    parent_id: parent_id.clone(),
+                    ..Default::default()
+                }]);
+                let summary = json!({
+                    "op": "create",
+                    "id": created.id.clone(),
+                    "name": created.name.clone(),
+                });
+                let inverse = TxnInverse::DeleteCreated {
+                    node_id: created.id,
+                    parent_id,
+                };
+                Ok((summary, Some(inverse)))
+            }
+            "edit" => {
+                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
+                    McpError::invalid_params("edit requires `node_id`".to_string(), None)
+                })?;
+                let node_id = self.resolve_node_ref(node_id_raw)?;
+                if op.name.is_none() && op.description.is_none() {
+                    return Err(McpError::invalid_params(
+                        "edit requires at least one of `name`/`description`".to_string(),
+                        None,
+                    ));
+                }
+                // Capture the prior state so we can restore it on
+                // rollback. A failed pre-read disables the rollback for
+                // this op rather than aborting — partial rollback is
+                // better than none.
+                let prev = self.client.get_node(&node_id).await.ok();
+                self.client
+                    .edit_node(&node_id, op.name.as_deref(), op.description.as_deref())
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("edit failed: {}", e), None))?;
+                self.cache.invalidate_node(&node_id);
+                self.name_index.invalidate_node(&node_id);
+                let summary = json!({ "op": "edit", "id": node_id.clone() });
+                let inverse = prev.map(|n| TxnInverse::RestoreEdit {
+                    node_id,
+                    prev_name: Some(n.name),
+                    prev_description: n.description,
+                });
+                Ok((summary, inverse))
+            }
+            "delete" => {
+                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
+                    McpError::invalid_params("delete requires `node_id`".to_string(), None)
+                })?;
+                let node_id = self.resolve_node_ref(node_id_raw)?;
+                self.client.delete_node(&node_id).await.map_err(|e| {
+                    McpError::internal_error(format!("delete failed: {}", e), None)
+                })?;
+                self.cache.invalidate_node(&node_id);
+                self.name_index.invalidate_node(&node_id);
+                let summary = json!({ "op": "delete", "id": node_id });
+                // Delete is intentionally NOT invertible — recreating a
+                // deleted subtree (with stable ids and modification
+                // timestamps) is not something this server can promise.
+                // Caller should sequence deletes last in a transaction.
+                Ok((summary, None))
+            }
+            "move" => {
+                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
+                    McpError::invalid_params("move requires `node_id`".to_string(), None)
+                })?;
+                let new_parent_raw = op.new_parent_id.as_ref().ok_or_else(|| {
+                    McpError::invalid_params("move requires `new_parent_id`".to_string(), None)
+                })?;
+                let node_id = self.resolve_node_ref(node_id_raw)?;
+                let new_parent = self.resolve_node_ref(new_parent_raw)?;
+                let prev = self.client.get_node(&node_id).await.ok();
+                let prev_parent_id = prev.as_ref().and_then(|n| n.parent_id.clone());
+                let prev_priority = prev.as_ref().and_then(|n| n.priority).map(|p| p as i32);
+                self.client
+                    .move_node(&node_id, &new_parent, op.priority)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("move failed: {}", e), None))?;
+                self.cache.invalidate_node(&node_id);
+                self.cache.invalidate_node(&new_parent);
+                if let Some(pid) = &prev_parent_id {
+                    self.cache.invalidate_node(pid);
+                }
+                self.name_index.invalidate_node(&node_id);
+                let summary = json!({ "op": "move", "id": node_id.clone(), "to": new_parent.clone() });
+                let inverse = TxnInverse::UnMove {
+                    node_id,
+                    prev_parent_id,
+                    prev_priority,
+                };
+                Ok((summary, Some(inverse)))
+            }
+            other => Err(McpError::invalid_params(
+                format!("unknown transaction op '{}'; expected create/edit/delete/move", other),
+                None,
+            )),
+        }
+    }
+
+    /// Apply a single inverse during rollback. Each path is best-effort:
+    /// failures during rollback are surfaced to the caller in the
+    /// transaction response but do not stop the rollback from continuing.
+    async fn run_inverse(&self, inv: TxnInverse) -> Result<serde_json::Value, McpError> {
+        match inv {
+            TxnInverse::DeleteCreated { node_id, parent_id } => {
+                self.client
+                    .delete_node(&node_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("rollback delete failed: {}", e), None))?;
+                if let Some(pid) = &parent_id {
+                    self.cache.invalidate_node(pid);
+                }
+                self.name_index.invalidate_node(&node_id);
+                Ok(json!({ "rolled_back": "create", "id": node_id }))
+            }
+            TxnInverse::RestoreEdit { node_id, prev_name, prev_description } => {
+                self.client
+                    .edit_node(&node_id, prev_name.as_deref(), prev_description.as_deref())
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("rollback edit failed: {}", e), None))?;
+                self.cache.invalidate_node(&node_id);
+                self.name_index.invalidate_node(&node_id);
+                Ok(json!({ "rolled_back": "edit", "id": node_id }))
+            }
+            TxnInverse::UnMove { node_id, prev_parent_id, prev_priority } => {
+                if let Some(pid) = prev_parent_id {
+                    self.client
+                        .move_node(&node_id, &pid, prev_priority)
+                        .await
+                        .map_err(|e| McpError::internal_error(format!("rollback move failed: {}", e), None))?;
+                    self.cache.invalidate_node(&node_id);
+                    self.cache.invalidate_node(&pid);
+                    Ok(json!({ "rolled_back": "move", "id": node_id, "to": pid }))
+                } else {
+                    Ok(json!({ "skipped": "move", "id": node_id, "reason": "previous parent unknown" }))
+                }
+            }
+        }
     }
 }
 
@@ -3041,6 +3476,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_node_ref_returns_full_uuid_for_known_short_hash() {
+        let server = new_test_server();
+        let full = "550e8400-e29b-41d4-a716-446655440000";
+        // Seed the index by ingesting a node with this id.
+        server.name_index.ingest(&[WorkflowyNode {
+            id: full.to_string(),
+            name: "Tasks".to_string(),
+            parent_id: None,
+            ..Default::default()
+        }]);
+        let resolved = server
+            .resolve_node_ref("446655440000")
+            .expect("known short hash should resolve");
+        assert_eq!(resolved, full);
+    }
+
+    #[tokio::test]
+    async fn resolve_node_ref_errors_on_unknown_short_hash() {
+        let server = new_test_server();
+        let err = server
+            .resolve_node_ref("ffffffffffff")
+            .expect_err("unknown short hash must error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("short-hash") || msg.contains("name index"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_node_ref_passes_full_uuid_through() {
+        let server = new_test_server();
+        let full = "550e8400-e29b-41d4-a716-446655440000";
+        let resolved = server
+            .resolve_node_ref(full)
+            .expect("full UUID should pass through unchanged");
+        assert_eq!(resolved, full);
+    }
+
+    #[tokio::test]
+    async fn check_node_id_accepts_short_hash_at_boundary() {
+        // The handler-boundary validator must let short hashes through;
+        // resolve_node_ref handles the actual lookup later.
+        check_node_id("446655440000").expect("12-char hex must validate");
+        check_node_id("550e8400-e29b-41d4-a716-446655440000").expect("full UUID must validate");
+        // But garbage still rejects.
+        assert!(check_node_id("garbage").is_err());
+        assert!(check_node_id("").is_err());
+    }
+
+    #[tokio::test]
     async fn op_log_records_handler_invocations_with_status() {
         let server = new_test_server();
         // First call: succeeds (no API needed)
@@ -3480,6 +3966,76 @@ mod tests {
         assert!(server.get_tool("cancel_all").is_some());
         assert!(server.get_tool("build_name_index").is_some());
         assert!(server.get_tool("get_recent_tool_calls").is_some());
+        assert!(server.get_tool("batch_create_nodes").is_some());
+        assert!(server.get_tool("transaction").is_some());
+    }
+
+    #[tokio::test]
+    async fn batch_create_nodes_rejects_empty_operations() {
+        let server = new_test_server();
+        let err = server
+            .batch_create_nodes(Parameters(BatchCreateNodesParams { operations: Vec::new() }))
+            .await
+            .expect_err("empty batch must reject");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn batch_create_nodes_validates_parent_ids_eagerly() {
+        let server = new_test_server();
+        let bad = BatchCreateOpParams {
+            name: "x".to_string(),
+            description: None,
+            parent_id: Some(NodeId::from("not-a-uuid")),
+            priority: None,
+        };
+        let good = BatchCreateOpParams {
+            name: "y".to_string(),
+            description: None,
+            parent_id: None,
+            priority: None,
+        };
+        let err = server
+            .batch_create_nodes(Parameters(BatchCreateNodesParams {
+                operations: vec![good, bad],
+            }))
+            .await
+            .expect_err("invalid parent id must abort batch");
+        assert!(err.to_string().to_lowercase().contains("invalid"));
+    }
+
+    #[tokio::test]
+    async fn transaction_rejects_empty_operations() {
+        let server = new_test_server();
+        let err = server
+            .transaction(Parameters(TransactionParams { operations: Vec::new() }))
+            .await
+            .expect_err("empty transaction must reject");
+        assert!(err.to_string().to_lowercase().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn transaction_rejects_unknown_op_kind() {
+        let server = new_test_server();
+        // First op is invalid; the handler rejects via apply_txn_op.
+        let result = server
+            .transaction(Parameters(TransactionParams {
+                operations: vec![TransactionOpParams {
+                    op: "frobnicate".to_string(),
+                    node_id: None,
+                    parent_id: None,
+                    new_parent_id: None,
+                    name: None,
+                    description: None,
+                    priority: None,
+                }],
+            }))
+            .await
+            .expect("handler returns Ok with rolled-back payload even on first-op failure");
+        let body = result_text(&result);
+        assert!(body.contains("rolled_back"), "expected rollback envelope, got: {body}");
+        assert!(body.contains("frobnicate"), "expected error to mention bad op: {body}");
     }
 
     #[tokio::test]

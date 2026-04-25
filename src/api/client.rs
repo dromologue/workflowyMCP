@@ -13,6 +13,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// True when an error looks like the upstream complaining about a
+/// stale or missing parent reference during a move. Used by
+/// [`WorkflowyClient::move_node`] to decide whether to retry-with-refresh.
+/// Matches conservatively: parent-related errors are well-defined as
+/// `RetryExhausted` wrapping a 4xx whose body mentions "parent" or
+/// "not found"; a 5xx is left to the normal retry path. This is a
+/// heuristic — if Workflowy adds a structured error code we should
+/// switch to that, but until then a string match is the only signal we
+/// have.
+fn is_parent_related_error(e: &WorkflowyError) -> bool {
+    let text = e.to_string().to_lowercase();
+    if !text.contains("parent") && !text.contains("not found") {
+        return false;
+    }
+    // Don't retry on 5xx — that's already covered by the request layer's
+    // exponential backoff. The error string format is "API error 500:
+    // ..." (see WorkflowyError::ApiError Display impl), so match on
+    // "api error 5" (already lowercased) to detect server-side errors.
+    if text.contains("api error 5") {
+        return false;
+    }
+    true
+}
+
 /// Poll a [`CancelGuard`] until it flips to cancelled. Used inside
 /// `tokio::select!` to race against an in-flight HTTP send, so a `cancel_all`
 /// drops the connection within ~50 ms instead of waiting for the request to
@@ -143,6 +167,15 @@ impl FetchControls {
         }
         None
     }
+}
+
+/// One create operation for [`WorkflowyClient::batch_create_nodes`].
+#[derive(Debug, Clone)]
+pub struct BatchCreateOp {
+    pub name: String,
+    pub description: Option<String>,
+    pub parent_id: Option<String>,
+    pub priority: Option<i32>,
 }
 
 /// Snapshot of upstream rate-limit headers as of the last response. `i64`
@@ -549,6 +582,48 @@ impl WorkflowyClient {
         Ok(TruncationOutcome::complete())
     }
 
+    /// Pipelined batch creator. Submits `operations.len()` create calls
+    /// concurrently (bounded by [`defaults::SUBTREE_FETCH_CONCURRENCY`])
+    /// and returns the resulting `CreatedNode` values **in input order**.
+    /// Per-operation failures appear as `Err` in the output; a successful
+    /// op returns `Ok(CreatedNode)`. The caller decides whether partial
+    /// success is acceptable.
+    ///
+    /// Not transactional — Workflowy's REST surface does not expose
+    /// multi-op transactions, so any rollback semantics belong in
+    /// higher-level handlers (see `transaction` tool).
+    pub async fn batch_create_nodes(
+        &self,
+        operations: Vec<BatchCreateOp>,
+    ) -> Vec<Result<CreatedNode>> {
+        let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+        // Stream with index so we can sort back into input order — the
+        // futures may complete out of order under buffer_unordered.
+        let stream = futures::stream::iter(operations.into_iter().enumerate().map(
+            |(idx, op)| async move {
+                let res = self
+                    .create_node(
+                        &op.name,
+                        op.description.as_deref(),
+                        op.parent_id.as_deref(),
+                        op.priority,
+                    )
+                    .await;
+                (idx, res)
+            },
+        ))
+        .buffer_unordered(concurrency);
+
+        let mut collected: Vec<(usize, Result<CreatedNode>)> = Vec::new();
+        futures::pin_mut!(stream);
+        use futures::StreamExt;
+        while let Some(item) = stream.next().await {
+            collected.push(item);
+        }
+        collected.sort_by_key(|(i, _)| *i);
+        collected.into_iter().map(|(_, r)| r).collect()
+    }
+
     /// Create a new node
     pub async fn create_node(
         &self,
@@ -584,14 +659,37 @@ impl WorkflowyClient {
         })
     }
 
-    /// Edit a node's name or description
-    /// Workflowy API uses POST (not PUT) for updates
+    /// Edit a node's name and/or description.
+    ///
+    /// **Wire behaviour.** When both `name` and `description` are
+    /// supplied, the server issues two separate `POST /nodes/{id}`
+    /// requests — one per field — instead of a single combined PATCH.
+    /// This works around an observed upstream issue where a combined
+    /// payload would intermittently lose one field; splitting costs an
+    /// extra round-trip but produces deterministic results. The
+    /// Workflowy MCP skill's wflow workaround documented this, and Pass
+    /// 5 of the reliability plan moves the fix server-side so callers
+    /// don't have to think about it.
+    ///
+    /// Workflowy uses POST (not PUT) for updates.
     pub async fn edit_node(
         &self,
         node_id: &str,
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<()> {
+        let endpoint = format!("/nodes/{}", node_id);
+
+        if name.is_some() && description.is_some() {
+            // Split: name first, then description. Both must succeed.
+            let name_body = json!({ "name": name.unwrap() });
+            let _: serde_json::Value = self.request("POST", &endpoint, Some(name_body)).await?;
+            let desc_body = json!({ "description": description.unwrap() });
+            let _: serde_json::Value = self.request("POST", &endpoint, Some(desc_body)).await?;
+            return Ok(());
+        }
+
+        // Single-field update: combined payload is safe.
         let mut body = json!({});
         if let Some(n) = name {
             body["name"] = json!(n);
@@ -599,7 +697,6 @@ impl WorkflowyClient {
         if let Some(d) = description {
             body["description"] = json!(d);
         }
-        let endpoint = format!("/nodes/{}", node_id);
         let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
         Ok(())
     }
@@ -611,8 +708,16 @@ impl WorkflowyClient {
         Ok(())
     }
 
-    /// Move a node to a new parent
-    /// Workflowy API uses POST (not PUT) for move
+    /// Move a node to a new parent.
+    ///
+    /// Workflowy uses POST (not PUT) for move. On a parent-related 4xx
+    /// (e.g. "parent not found", "stale parent"), retry once after
+    /// re-fetching the new parent's children listing — the wflow skill
+    /// documented this as needed because IDs handed back by the server
+    /// can stale faster than callers can use them. The retry refreshes
+    /// any in-memory state the upstream relies on without changing the
+    /// caller-visible contract: a single move request still returns
+    /// either Ok or one Err.
     pub async fn move_node(
         &self,
         node_id: &str,
@@ -624,8 +729,20 @@ impl WorkflowyClient {
             body["priority"] = json!(pri);
         }
         let endpoint = format!("/nodes/{}/move", node_id);
-        let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
-        Ok(())
+
+        match self.request::<serde_json::Value>("POST", &endpoint, Some(body.clone())).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_parent_related_error(&e) => {
+                // Refresh the new parent's children listing (which forces
+                // upstream to re-evaluate its view of the parent's state),
+                // then retry the move once. If the second attempt also
+                // fails, surface that error unchanged.
+                let _ = self.get_children(new_parent_id).await;
+                let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // --- Low-level request with retry ---
@@ -1025,6 +1142,24 @@ mod tests {
         assert!(fetch.truncated);
         assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
         assert!(fetch.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_is_parent_related_error_matches_4xx_text() {
+        let api404 = WorkflowyError::api_error(404, "parent not found");
+        let retried = WorkflowyError::RetryExhausted {
+            attempts: 3,
+            reason: "API error 400: parent missing".to_string(),
+        };
+        let unrelated = WorkflowyError::api_error(401, "unauthorized");
+        let server_err = WorkflowyError::api_error(500, "parent not found");
+        assert!(is_parent_related_error(&api404), "404+parent should match");
+        assert!(is_parent_related_error(&retried), "wrapped retry should match");
+        assert!(!is_parent_related_error(&unrelated), "401 unrelated must not match");
+        assert!(
+            !is_parent_related_error(&server_err),
+            "5xx is left to backoff retry, must not be re-tried by move_node refresh"
+        );
     }
 
     #[test]

@@ -202,9 +202,35 @@
   - `get_recent_tool_calls` tool returns recent entries (limit, since
     filter) without recording itself, so callers get a clean snapshot.
 
-- [ ] **T-155 (Pass 4)**: Authoritative name index + short-hash IDs
-- [ ] **T-156 (Pass 5)**: Heavy-workflow primitives (batch / transaction /
-  edit_node hardening / move_node retry)
+- [x] **T-155 (Pass 4)**: Authoritative name index + short-hash IDs
+  - `NameIndex` no longer TTL-evicts entries; persistence is bounded by
+    explicit `invalidate_node` (writes do this) and `clear`.
+  - New `by_short_hash` map records each ingested UUID's trailing 12
+    hex chars → full UUID for O(1) URL → UUID resolution.
+  - `WorkflowyMcpServer::resolve_node_ref(raw)` accepts either form;
+    short-hash misses produce a pointed error pointing at
+    `build_name_index`.
+  - `check_node_id` short-circuits for valid 12-char hex inputs so
+    handlers can pass either form transparently.
+  - Wired into get_node, list_children, edit_node, delete_node,
+    move_node. Other handlers will follow as touched.
+
+- [x] **T-156 (Pass 5)**: Heavy-workflow primitives
+  - `WorkflowyClient::edit_node` splits combined name+description
+    updates into two sequential POSTs to dodge the upstream field-loss
+    bug documented in the wflow skill.
+  - `WorkflowyClient::move_node` detects parent-related 4xx errors
+    (not 5xx) and refreshes the new parent's children listing before
+    retrying once.
+  - `BatchCreateOp` and `WorkflowyClient::batch_create_nodes`:
+    pipelined creates with bounded concurrency; results in input order.
+  - New `batch_create_nodes` MCP tool: validates parents eagerly,
+    resolves short-hash parents, ingests created nodes into the name
+    index, returns per-op `ok`/`error`.
+  - New `transaction` MCP tool: sequential ops with best-effort
+    rollback. Inverse for create=delete, edit=restore-prev,
+    move=un-move; delete is non-invertible by design.
+
 - [ ] **T-157 (Pass 6)**: Mirror primitives + API expansion
 - [ ] **T-158 (Pass 7)**: proptest + load harness + CI acceptance
 

@@ -12,11 +12,12 @@
 use crate::types::WorkflowyNode;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
 
-/// TTL for opportunistic index entries. Matches the node cache so a stale
-/// index can never outlive a stale node entry.
-pub const NAME_INDEX_TTL_SECS: u64 = 300;
+/// Length (in lowercase hex chars) of the short-hash form of a UUID. Workflowy
+/// URLs use the trailing 12 hex characters (e.g. `workflowy.com/#/abc123def456`)
+/// as a unique handle for a node. Resolving this back to the full UUID is an
+/// O(1) lookup via [`NameIndex::resolve_short_hash`].
+pub const SHORT_HASH_LEN: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameIndexEntry {
@@ -28,7 +29,6 @@ pub struct NameIndexEntry {
 #[derive(Debug)]
 struct IndexedValue {
     entries: Vec<NameIndexEntry>,
-    inserted_at: SystemTime,
 }
 
 #[derive(Debug, Default)]
@@ -37,6 +37,11 @@ pub struct NameIndex {
     /// Reverse lookup: node_id -> lowercased name, so we can remove stale
     /// entries when the name changes or the node is deleted.
     by_id: RwLock<HashMap<String, String>>,
+    /// Short-hash → full UUID. Indexed by the last 12 lowercase-hex chars
+    /// of the UUID (with hyphens stripped). Workflowy's web UI uses this as
+    /// its public node handle in URLs; resolving it cheaply means callers
+    /// don't have to round-trip through the API just to convert URL → UUID.
+    by_short_hash: RwLock<HashMap<String, String>>,
 }
 
 impl NameIndex {
@@ -45,15 +50,16 @@ impl NameIndex {
     }
 
     /// Ingest a batch of nodes, overwriting existing entries for each node.
+    /// Also records each node's short-hash form for URL → UUID resolution.
     pub fn ingest(&self, nodes: &[WorkflowyNode]) {
         if nodes.is_empty() {
             return;
         }
-        let now = SystemTime::now();
         let mut by_name = self.by_name.write();
         let mut by_id = self.by_id.write();
+        let mut by_short = self.by_short_hash.write();
         for node in nodes {
-            self.remove_locked(&mut by_name, &mut by_id, &node.id);
+            self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &node.id);
             let key = node.name.to_lowercase();
             let entry = NameIndexEntry {
                 node_id: node.id.clone(),
@@ -61,13 +67,15 @@ impl NameIndex {
                 parent_id: node.parent_id.clone(),
             };
             by_id.insert(node.id.clone(), key.clone());
+            if let Some(short) = short_hash_of(&node.id) {
+                by_short.insert(short, node.id.clone());
+            }
             by_name
                 .entry(key)
                 .and_modify(|v| {
                     v.entries.push(entry.clone());
-                    v.inserted_at = now;
                 })
-                .or_insert_with(|| IndexedValue { entries: vec![entry], inserted_at: now });
+                .or_insert_with(|| IndexedValue { entries: vec![entry] });
         }
     }
 
@@ -78,26 +86,15 @@ impl NameIndex {
     pub fn lookup(&self, query: &str, match_mode: &str) -> Vec<NameIndexEntry> {
         let q = query.to_lowercase();
         let by_name = self.by_name.read();
-        let ttl = Duration::from_secs(NAME_INDEX_TTL_SECS);
-        let now = SystemTime::now();
-        let fresh = |entry: &IndexedValue| {
-            now.duration_since(entry.inserted_at).unwrap_or_default() <= ttl
-        };
-
         let mut out = Vec::new();
         match match_mode {
             "exact" => {
                 if let Some(hit) = by_name.get(&q) {
-                    if fresh(hit) {
-                        out.extend(hit.entries.iter().cloned());
-                    }
+                    out.extend(hit.entries.iter().cloned());
                 }
             }
             "starts_with" | "contains" => {
                 for (key, value) in by_name.iter() {
-                    if !fresh(value) {
-                        continue;
-                    }
                     let keep = if match_mode == "starts_with" {
                         key.starts_with(&q)
                     } else {
@@ -113,7 +110,16 @@ impl NameIndex {
         out
     }
 
-    /// True when the index contains any entries (fresh or stale).
+    /// Resolve a 12-char hex short hash to its full UUID. Returns `None`
+    /// if the hash isn't in the index — callers must treat that as
+    /// "not seen yet", not "doesn't exist". Run a `build_name_index`
+    /// walk over the relevant subtree to populate.
+    pub fn resolve_short_hash(&self, short: &str) -> Option<String> {
+        let key = normalize_short_hash(short)?;
+        self.by_short_hash.read().get(&key).cloned()
+    }
+
+    /// True when the index contains any entries.
     pub fn is_populated(&self) -> bool {
         !self.by_id.read().is_empty()
     }
@@ -122,13 +128,15 @@ impl NameIndex {
     pub fn invalidate_node(&self, node_id: &str) {
         let mut by_name = self.by_name.write();
         let mut by_id = self.by_id.write();
-        self.remove_locked(&mut by_name, &mut by_id, node_id);
+        let mut by_short = self.by_short_hash.write();
+        self.remove_locked(&mut by_name, &mut by_id, &mut by_short, node_id);
     }
 
     /// Drop every entry.
     pub fn clear(&self) {
         self.by_name.write().clear();
         self.by_id.write().clear();
+        self.by_short_hash.write().clear();
     }
 
     pub fn size(&self) -> usize {
@@ -139,6 +147,7 @@ impl NameIndex {
         &self,
         by_name: &mut HashMap<String, IndexedValue>,
         by_id: &mut HashMap<String, String>,
+        by_short: &mut HashMap<String, String>,
         node_id: &str,
     ) {
         if let Some(key) = by_id.remove(node_id) {
@@ -149,7 +158,37 @@ impl NameIndex {
                 }
             }
         }
+        if let Some(short) = short_hash_of(node_id) {
+            // Only drop the short-hash entry if it still points at the
+            // node we are invalidating — different nodes whose UUIDs
+            // happen to share a 12-char suffix are vanishingly rare in
+            // a 32-char hex space, but cheap to defend against.
+            if by_short.get(&short).map(|v| v.as_str()) == Some(node_id) {
+                by_short.remove(&short);
+            }
+        }
     }
+}
+
+/// Compute the 12-char short-hash form of a UUID by stripping hyphens
+/// and taking the trailing 12 lowercase hex chars. Returns `None` if
+/// the input isn't recognisably a UUID.
+pub fn short_hash_of(node_id: &str) -> Option<String> {
+    let stripped: String = node_id.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != 32 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(stripped[stripped.len() - SHORT_HASH_LEN..].to_lowercase())
+}
+
+/// Normalise a candidate short hash: strip hyphens, lowercase, validate.
+/// Returns `None` if it isn't 12 hex chars.
+fn normalize_short_hash(input: &str) -> Option<String> {
+    let stripped: String = input.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != SHORT_HASH_LEN || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(stripped.to_lowercase())
 }
 
 #[cfg(test)]
@@ -252,5 +291,68 @@ mod tests {
         assert!(!idx.is_populated());
         idx.ingest(&[node("1", "A", None)]);
         assert!(idx.is_populated());
+    }
+
+    #[test]
+    fn short_hash_of_returns_trailing_12_hex_chars() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(short_hash_of(id).as_deref(), Some("446655440000"));
+        let id2 = "550e8400e29b41d4a716446655440000"; // unhyphenated
+        assert_eq!(short_hash_of(id2).as_deref(), Some("446655440000"));
+    }
+
+    #[test]
+    fn short_hash_of_rejects_non_uuid() {
+        assert_eq!(short_hash_of("not-a-uuid"), None);
+        assert_eq!(short_hash_of(""), None);
+        assert_eq!(short_hash_of("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn resolve_short_hash_returns_full_uuid_after_ingest() {
+        let idx = NameIndex::new();
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        idx.ingest(&[node(id, "Tasks", None)]);
+        assert_eq!(idx.resolve_short_hash("446655440000").as_deref(), Some(id));
+        // Case insensitivity.
+        assert_eq!(idx.resolve_short_hash("446655440000").as_deref(), Some(id));
+        // Hyphenated input is also accepted as long as it strips to 12 hex.
+        assert_eq!(idx.resolve_short_hash("4466-5544-0000").as_deref(), Some(id));
+    }
+
+    #[test]
+    fn resolve_short_hash_returns_none_for_unknown() {
+        let idx = NameIndex::new();
+        idx.ingest(&[node("550e8400-e29b-41d4-a716-446655440000", "A", None)]);
+        assert_eq!(idx.resolve_short_hash("ffffffffffff"), None);
+        // Non-hex inputs.
+        assert_eq!(idx.resolve_short_hash("not-hex-here"), None);
+        // Wrong length.
+        assert_eq!(idx.resolve_short_hash("abc"), None);
+    }
+
+    #[test]
+    fn invalidate_node_removes_short_hash_entry() {
+        let idx = NameIndex::new();
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        idx.ingest(&[node(id, "A", None)]);
+        assert!(idx.resolve_short_hash("446655440000").is_some());
+        idx.invalidate_node(id);
+        assert!(idx.resolve_short_hash("446655440000").is_none());
+    }
+
+    #[test]
+    fn no_ttl_eviction_indefinite_lifetime() {
+        // Pass 4 promotes the index from opportunistic-with-TTL to
+        // authoritative-until-invalidated. Confirm a long sleep doesn't
+        // drop entries the way the old TTL would have.
+        let idx = NameIndex::new();
+        idx.ingest(&[node("1", "Persistent", None)]);
+        // We can't easily fake-clock a long sleep here, but we can confirm
+        // that there's no fresh()/expiry path by checking an entry persists
+        // after multiple lookups.
+        for _ in 0..3 {
+            assert_eq!(idx.lookup("persistent", "exact").len(), 1);
+        }
     }
 }

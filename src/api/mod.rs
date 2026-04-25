@@ -1,4 +1,4 @@
 //! API module exports
 pub mod client;
 
-pub use client::{FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
+pub use client::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};

@@ -2,10 +2,10 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Updated 2026-04 (post-Pass-3)**: Rust v2 implements **28 tools**. Concept mapping, graph analysis,
+> **Updated 2026-04 (post-Pass-5)**: Rust v2 implements **30 tools**. Concept mapping, graph analysis,
 > and Dropbox integration have been removed from scope. See `tasks.md` for remaining roadmap.
 
-## Implemented Tools (Rust v2 — 28 total)
+## Implemented Tools (Rust v2 — 30 total)
 
 | Category | Tool | Status |
 |----------|------|--------|
@@ -26,6 +26,8 @@
 | Content Modification | duplicate_node | Implemented |
 | Content Modification | create_from_template | Implemented |
 | Content Modification | bulk_update | Implemented |
+| Content Modification | batch_create_nodes | Implemented (pipelined; per-op status) |
+| Content Modification | transaction | Implemented (sequential with best-effort rollback) |
 | Todo Management | list_todos | Implemented |
 | Due Dates | list_upcoming | Implemented |
 | Due Dates | list_overdue | Implemented |
@@ -40,8 +42,9 @@
 
 ### Not Yet Implemented
 
-batch_create_nodes, transaction, create_mirror. Tracked in `tasks.md`
-and the multi-pass plan at `tasks/reliability-and-ergonomics.md`.
+create_mirror (requires upstream mirror API support — see Pass 6).
+Tracked in `tasks.md` and the multi-pass plan at
+`tasks/reliability-and-ergonomics.md`.
 
 ---
 
@@ -80,6 +83,31 @@ re-implementing them:
    `X-RateLimit-*` are both captured). Callers checking whether to
    launch a heavy query can see both liveness and load before
    committing.
+6. **Short-hash node references.** Every handler that takes a
+   `node_id` accepts either a full 32-char hex UUID or the 12-char
+   short hash Workflowy uses in URLs. Resolution is `O(1)` against the
+   server's name index, which is populated automatically by every
+   subtree walk and on every write. The name index has no TTL — it
+   stays valid until explicitly invalidated by a write (or `clear`),
+   so once populated it serves lookups indefinitely.
+7. **`edit_node` field-loss workaround.** When both `name` and
+   `description` are supplied to `edit_node`, the client splits the
+   update into two sequential POSTs (one per field) instead of a
+   combined payload. This works around an observed upstream issue
+   where the combined form intermittently lost one field. Costs an
+   extra round-trip; produces deterministic results.
+8. **`move_node` retry-with-refresh.** On a parent-related 4xx error
+   ("parent not found"/"stale parent"), `move_node` re-fetches the
+   target parent's children listing and retries the move once. 5xx
+   errors continue to use the standard exponential-backoff path.
+9. **Best-effort transactions.** `transaction` applies a sequence of
+   create/edit/delete/move operations sequentially; on first failure
+   it replays inverse operations in reverse order to roll back
+   what already succeeded. `delete` is intentionally not invertible
+   (a deleted subtree's exact ids/timestamps cannot be recreated), so
+   transactions should sequence deletes last. `batch_create_nodes` is
+   a separate, non-transactional pipelined creator for cases where
+   per-op partial success is acceptable.
 
 ---
 

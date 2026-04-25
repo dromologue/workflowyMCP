@@ -14,14 +14,14 @@ with: code + tests + commit + tick the box here.
 ## Current state
 
 - Pass 1: complete
-- Pass 2: complete (177 tests passing)
-- Pass 3: complete (177 tests passing)
-- Pass 4: not started
-- Pass 5: not started
+- Pass 2: complete
+- Pass 3: complete
+- Pass 4: complete
+- Pass 5: complete (192 tests passing)
 - Pass 6: not started
 - Pass 7: not started
 
-Last touched: 2026-04-25 (Pass 2 + Pass 3 implemented).
+Last touched: 2026-04-25 (Passes 4 + 5 implemented).
 
 ---
 
