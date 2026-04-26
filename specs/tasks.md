@@ -311,6 +311,77 @@
     property 6 already names the three accepted node-ref forms; the
     bug was in handler implementation, not contract).
 
+- [x] **T-164 (Brief 2026-04-26: MCP/CLI parity for graph hygiene)**:
+      lift audit + review heuristics into a shared lib; expose them as
+      MCP tools so callers don't have to shell out
+  - **Source.** Internal audit of the MCP surface against the
+    `wflow-do` CLI shipped earlier the same day: the CLI gained
+    `audit-mirrors` / `review` / `index` / `--dry-run` (T-163
+    follow-up); the MCP server gained none of them. Concrete
+    consequence: an assistant on a healthy MCP transport could not
+    request a mirror audit or a review-surface pass without
+    `Bash`-shelling to the CLI binary, which is slower, harder to
+    compose with other MCP calls, and skips `per_tool_health` logging.
+  - **What landed (option 2 of three considered).**
+    - **`src/audit.rs`** — new pure-data module exposing
+      `audit_mirrors(&[WorkflowyNode]) -> Vec<MirrorFinding>` and
+      `build_review(&nodes, days_stale, today, now_unix, blob) ->
+      ReviewReport`. No I/O, no client, no implicit clock — every
+      moving part is a parameter so tests are deterministic. The
+      `extract_marker(text, prefix)` regex helper accepts both UUIDs
+      and opaque pillar tokens (`[\w-]{3,40}`) so canonical_of:lead
+      and mirror_of:`<uuid>` both parse from the same function.
+    - **MCP handlers** in `src/server.rs`: `audit_mirrors` and `review`
+      with new `AuditMirrorsParams` / `ReviewParams` structs. Default
+      scope for both is the user's Distillations subtree
+      (`7e351f77-c7b4-4709-86a7-ea6733a63171`); `root_id` open for
+      narrower or wider scopes. Return JSON with `{scope, scanned,
+      truncated, truncation_reason, ...}` plus the typed payload.
+      Bucket (d) of `review` reads recent session-log files via a
+      private `load_recent_session_logs_blob_for_review()` helper —
+      not in `audit.rs` because the lib is pure-data.
+    - **`src/bin/wflow_do.rs`** refactored to `use
+      workflowy_mcp_server::audit::{audit_mirrors, build_review}`
+      instead of duplicating the heuristic. CLI's own
+      `load_recent_session_logs_blob()` mirrors the server's helper —
+      same blob, same `cutoff = now - 7*86400`. CLI tests collapsed
+      from 3 audit/review tests to one wiring smoke test (the lib
+      has comprehensive coverage now).
+  - **Why option 2.** Considered three: (1) leave the gap and let
+    `Bash` shell-out be the workaround forever; (2) wrap the
+    heuristic with new MCP tools and share the lib; (3) make a generic
+    MCP tool that exec's `wflow-do <subcommand>`. Option 3 was
+    rejected as a process-per-call workaround that loses structured
+    error handling and feels like a workaround rather than a fix.
+    Option 1 punted on a real ergonomic gap. Option 2 also means the
+    new tools show up in `workflowy_status.per_tool_health` so any
+    future degradation is visible alongside other tools.
+  - **Tool count.** 36 → 38. Both new tools registered in
+    `tool_router`; `new_tools_are_registered` test extended to assert
+    both appear via `get_tool`.
+  - **Tests.** 214 → 231 (+17): 12 new in `audit::tests`
+    (extract_marker happy/sad path, every audit finding kind, every
+    review bucket, multi-pillar max-not-sum guard, source-MOC URL
+    matching) plus 5 new in `server::tests`
+    (`audit_mirrors_handler_dispatches_via_walk_subtree`,
+    `review_handler_dispatches_via_walk_subtree`,
+    `audit_review_handlers_route_through_lib_module`, plus the
+    `new_tools_are_registered` extension and an audit/review delegate
+    smoke in CLI). The lib-routing test is a source-pattern check —
+    if a future refactor accidentally re-implements the heuristic in
+    either surface, the test fails before deploy.
+  - **Specs.**
+    - `specs/specification.md` opens with "Rust v2 implements 38
+      tools" and a new "audit_mirrors and review (T-164)" subsection
+      enumerating the four finding kinds and four review buckets in
+      one place.
+    - This `tasks.md` entry, T-164, sitting above T-163.
+  - **Out of scope (deliberate).** `index` and `--dry-run` stay
+    CLI-only — `index` is pure local-FS work that doesn't need the
+    MCP transport, and `--dry-run` is a shell-pipeline staging
+    primitive (MCP tool calls already get user approval at the
+    protocol layer).
+
 - [x] **T-163 (Brief 2026-04-25 follow-up: post-deploy report)**:
       ship Tests β, γ, ε from the brief in priority order
   - **Source.** User-supplied second brief after observing the T-162

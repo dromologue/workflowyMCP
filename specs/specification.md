@@ -2,11 +2,13 @@
 
 > What the Workflowy MCP Server does and why.
 
-> **Updated 2026-04 (post-Pass-7)**: Rust v2 implements **36 tools** (30 from Pass 5 + 6 from Pass 6).
+> **Updated 2026-04-26 (T-164)**: Rust v2 implements **38 tools** — 36 prior + audit_mirrors and review.
+> Audit/review heuristics live in the shared `audit` lib module so the
+> MCP handlers and the `wflow-do` CLI use one implementation.
 > Concept mapping, graph analysis, and Dropbox integration have been removed from scope.
 > See `tasks.md` for remaining roadmap.
 
-## Implemented Tools (Rust v2 — 36 total)
+## Implemented Tools (Rust v2 — 38 total)
 
 | Category | Tool | Status |
 |----------|------|--------|
@@ -46,6 +48,41 @@
 | API Expansion | find_by_tag_and_path | Implemented (tag ∩ hierarchical path filter) |
 | API Expansion | export_subtree | Implemented (OPML / Markdown / JSON) |
 | API Expansion | create_mirror | **Stub** — returns explanatory error; Workflowy's REST API does not expose mirror creation |
+| Graph Hygiene | audit_mirrors | Implemented (T-164) — walks subtree, reports BROKEN / DRIFTED / ORPHAN / LONELY against the canonical_of:/mirror_of: convention |
+| Graph Hygiene | review | Implemented (T-164) — four buckets: revisit-due, multi-pillar (≥3 signal), stale cross-pillar (>days_stale), source-MOC re-cited |
+
+### audit_mirrors and review (T-164)
+
+Two graph-hygiene tools landed 2026-04-26 to give MCP-callers the same
+weekly-review and mirror-audit surface that the `wflow-do` CLI exposes.
+Heuristics are extracted into `crate::audit` (a pure-data module — no
+I/O, no client) so both transports share one implementation.
+
+**audit_mirrors** walks `root_id` (default Distillations) and reports
+findings in four classes against the wflow Mirror Discipline convention:
+
+- **BROKEN**: `mirror_of:<uuid>` does not resolve in scope.
+- **DRIFTED**: mirror name no longer substring-matches the canonical's name.
+- **ORPHAN**: mirror's claimed canonical lacks a `canonical_of:` marker.
+- **LONELY**: canonical with `canonical_of:` set but no mirrors point at it.
+
+**review** walks the same default scope and surfaces:
+
+- (a) `#revisit` notes whose `revisit_due:` date is past today.
+- (b) Nodes where `max(mirror_of count, distinct pillar tag count) ≥ 3`.
+  Max-not-sum guards against double-counting nodes that use both
+  `mirror_of:` lines and pillar tags.
+- (c) Cross-pillar concept maps with `last_modified` older than
+  `days_stale` (default 90).
+- (d) Source-MOC-shaped nodes whose description URLs/DOIs appear in any
+  session-log file under `~/code/SecondBrain/session-logs/` modified in
+  the last 7 days. Bucket (d) is skipped (returns empty) when the
+  directory is unreachable.
+
+Both tools return `{scope, scanned, truncated, truncation_reason, ...}`
+plus the typed payload (`findings` array or `buckets` object). The
+audit/review surfaces are read-only and idempotent — safe to schedule
+weekly.
 
 ### Not Implemented
 

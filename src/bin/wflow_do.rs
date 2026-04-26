@@ -352,7 +352,14 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             let fetch = client
                 .get_subtree_with_controls(Some(scope), 8, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let report = build_review(&fetch.nodes, *days_stale, chrono::Utc::now().timestamp());
+            let blob = load_recent_session_logs_blob();
+            let report = build_review(
+                &fetch.nodes,
+                *days_stale,
+                chrono::Utc::now().date_naive(),
+                chrono::Utc::now().timestamp(),
+                &blob,
+            );
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&json!({
                     "scope": scope,
@@ -380,210 +387,54 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
     Ok(())
 }
 
-// --- audit-mirrors helpers ---
+// --- audit-mirrors / review delegation ---
+//
+// The heuristics live in `workflowy_mcp_server::audit` so the MCP tool
+// handlers and this CLI share one implementation. The CLI is now a thin
+// adapter: it loads the recent session-log blob from disk (the lib is
+// pure-data and never touches the filesystem) and passes it through.
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct MirrorFinding {
-    status: String,
-    node_id: String,
-    name: String,
-    issue: String,
-}
+use workflowy_mcp_server::audit::{audit_mirrors, build_review, ReviewReport};
 
-/// Extract the first UUID-shaped capture for the given marker prefix in `text`.
-/// Returns `None` if no marker matches. UUIDs may be the full 36-char form or
-/// the 12-char short hash (matches Workflowy URL format).
-fn extract_marker(text: &str, prefix: &str) -> Option<String> {
-    // Accept full UUIDs (36 chars), 12-char short hashes, and shorter
-    // synthetic IDs used in tests. Lower bound at 3 so tests with `aaa`/`bbb`
-    // markers still parse; production IDs are always longer.
-    let pattern = format!(r"(?i){}\s*([0-9a-f-]{{3,40}})", regex::escape(prefix));
-    let re = regex::Regex::new(&pattern).ok()?;
-    re.captures(text).map(|c| c[1].to_lowercase())
-}
-
-fn audit_mirrors(nodes: &[workflowy_mcp_server::types::WorkflowyNode]) -> Vec<MirrorFinding> {
-    use std::collections::{HashMap, HashSet};
-    let id_match = |a: &str, b: &str| -> bool {
-        let (a, b) = (a.to_lowercase(), b.to_lowercase());
-        a == b || a.ends_with(&b) || b.ends_with(&a)
-    };
-    let mk = |status: &str, n: &workflowy_mcp_server::types::WorkflowyNode, issue: String| MirrorFinding {
-        status: status.into(), node_id: n.id.clone(), name: n.name.clone(), issue,
-    };
-    let by_id: HashMap<&str, &workflowy_mcp_server::types::WorkflowyNode> =
-        nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut canonical_targets: HashSet<String> = HashSet::new();
-    let mut mirrors_by_target: HashMap<String, Vec<String>> = HashMap::new();
-    let mut findings = Vec::new();
-    for n in nodes {
-        let desc = n.description.as_deref().unwrap_or("");
-        if extract_marker(desc, "canonical_of:").is_some() {
-            canonical_targets.insert(n.id.to_lowercase());
-        }
-        if let Some(target) = extract_marker(desc, "mirror_of:") {
-            mirrors_by_target.entry(target.clone()).or_default().push(n.id.clone());
-            let canon = by_id.values().find(|c| id_match(&c.id, &target));
-            match canon {
-                None => findings.push(mk("BROKEN", n, format!("mirror_of:{} not found in scope", target))),
-                Some(canon) => {
-                    let (mn, cn) = (n.name.to_lowercase(), canon.name.to_lowercase());
-                    if !mn.contains(&cn) && !cn.contains(&mn) {
-                        findings.push(mk("DRIFTED", n, format!("name diverges from canonical \"{}\"", canon.name)));
-                    }
-                    let canon_desc = canon.description.as_deref().unwrap_or("");
-                    if extract_marker(canon_desc, "canonical_of:").is_none() {
-                        findings.push(mk("ORPHAN", n, format!("canonical {} has no canonical_of: marker", canon.id)));
-                    }
-                }
-            }
-        }
-    }
-    for cid in &canonical_targets {
-        if !mirrors_by_target.keys().any(|t| id_match(t, cid)) {
-            if let Some(canon) = nodes.iter().find(|n| &n.id.to_lowercase() == cid) {
-                findings.push(mk("LONELY", canon, "canonical has no mirrors (may be intentional)".into()));
-            }
-        }
-    }
-    findings
-}
-
-// --- review helpers ---
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct ReviewReport {
-    revisit_due: Vec<ReviewItem>,
-    multi_pillar: Vec<ReviewItem>,
-    stale_cross_pillar: Vec<ReviewItem>,
-    source_moc_reuse: Vec<ReviewItem>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct ReviewItem {
-    node_id: String,
-    name: String,
-    detail: String,
-}
-
-const PILLAR_TAGS: &[&str] = &["#leadership", "#ethics", "#building", "#learning", "#decide"];
 const SECONDS_PER_DAY: i64 = 86_400;
 
-fn build_review(
-    nodes: &[workflowy_mcp_server::types::WorkflowyNode],
-    days_stale: i64,
-    now_unix: i64,
-) -> ReviewReport {
-    let stale_cutoff = now_unix - days_stale * SECONDS_PER_DAY;
-    let mut report = ReviewReport {
-        revisit_due: vec![],
-        multi_pillar: vec![],
-        stale_cross_pillar: vec![],
-        source_moc_reuse: vec![],
+/// Read recent session-log files (last 7 days) into a single blob the
+/// review function can scan for URL/DOI matches. Returns `""` if the
+/// `~/code/SecondBrain/session-logs/` directory doesn't exist — the
+/// review function then skips bucket (d) gracefully.
+fn load_recent_session_logs_blob() -> String {
+    let Some(home) = std::env::var("HOME").ok() else {
+        return String::new();
     };
-    let date_re = regex::Regex::new(r"revisit_due:\s*(\d{4}-\d{2}-\d{2})").unwrap();
-    let today = chrono::Utc::now().date_naive();
-    for n in nodes {
-        let desc = n.description.as_deref().unwrap_or("");
-        let combined = format!("{} {}", n.name, desc).to_lowercase();
-        // (a) revisit-due past today
-        if combined.contains("#revisit") {
-            if let Some(cap) = date_re.captures(desc) {
-                if let Ok(d) = chrono::NaiveDate::parse_from_str(&cap[1], "%Y-%m-%d") {
-                    if d < today {
-                        report.revisit_due.push(ReviewItem {
-                            node_id: n.id.clone(),
-                            name: n.name.clone(),
-                            detail: format!("revisit_due:{} (past today)", &cap[1]),
-                        });
-                    }
-                }
-            }
-        }
-        // (b) multi-pillar: count mirror_of markers OR distinct pillar tags
-        let mirror_of_count = desc.matches("mirror_of:").count() + desc.matches("#mirrored_in:").count();
-        let pillar_count = PILLAR_TAGS.iter().filter(|t| combined.contains(*t)).count();
-        let max_signal = mirror_of_count.max(pillar_count);
-        if max_signal >= 3 {
-            report.multi_pillar.push(ReviewItem {
-                node_id: n.id.clone(),
-                name: n.name.clone(),
-                detail: format!("signal={} (mirror_of={}, pillars={})", max_signal, mirror_of_count, pillar_count),
-            });
-        }
-        // (c) stale cross-pillar concept maps
-        let is_cross_pillar = pillar_count >= 2 || combined.contains("cross-pillar") || combined.contains("concept map");
-        if is_cross_pillar {
-            if let Some(lm) = n.last_modified {
-                if lm < stale_cutoff {
-                    let days = (now_unix - lm) / SECONDS_PER_DAY;
-                    report.stale_cross_pillar.push(ReviewItem {
-                        node_id: n.id.clone(),
-                        name: n.name.clone(),
-                        detail: format!("last_modified {} days ago", days),
-                    });
-                }
-            }
-        }
-    }
-    // (d) Source-MOC reuse: scan recent session-logs for URL/DOI references in source MOC descriptions.
-    report.source_moc_reuse = source_moc_reuse(nodes).unwrap_or_default();
-    report
-}
-
-fn source_moc_reuse(nodes: &[workflowy_mcp_server::types::WorkflowyNode]) -> Option<Vec<ReviewItem>> {
-    let logs_dir = format!(
-        "{}/code/SecondBrain/session-logs",
-        std::env::var("HOME").ok()?
-    );
-    let dir = std::path::Path::new(&logs_dir);
+    let dir = std::path::PathBuf::from(format!("{}/code/SecondBrain/session-logs", home));
     if !dir.exists() {
-        return None;
+        return String::new();
     }
     let cutoff = chrono::Utc::now().timestamp() - 7 * SECONDS_PER_DAY;
-    let mut recent_blob = String::new();
-    if let Ok(read) = std::fs::read_dir(dir) {
+    let mut blob = String::new();
+    if let Ok(read) = std::fs::read_dir(&dir) {
         for ent in read.flatten() {
             if let Ok(meta) = ent.metadata() {
-                let mtime = meta.modified().ok()
+                let mtime = meta
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 if mtime >= cutoff {
                     if let Ok(c) = std::fs::read_to_string(ent.path()) {
-                        recent_blob.push_str(&c);
-                        recent_blob.push('\n');
+                        blob.push_str(&c);
+                        blob.push('\n');
                     }
                 }
             }
         }
     }
-    let url_re = regex::Regex::new(r"https?://\S+|10\.\d{4,9}/\S+").unwrap();
-    let mut hits = Vec::new();
-    for n in nodes {
-        let name_lower = n.name.to_lowercase();
-        let looks_like_source_moc = name_lower.contains(" — ")
-            || regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap().is_match(&n.name);
-        if !looks_like_source_moc {
-            continue;
-        }
-        let desc = n.description.as_deref().unwrap_or("");
-        for m in url_re.find_iter(desc) {
-            if recent_blob.contains(m.as_str()) {
-                hits.push(ReviewItem {
-                    node_id: n.id.clone(),
-                    name: n.name.clone(),
-                    detail: format!("re-cited recently: {}", m.as_str()),
-                });
-                break;
-            }
-        }
-    }
-    Some(hits)
+    blob
 }
 
 fn print_review(r: &ReviewReport) {
-    let groups: [(&str, &Vec<ReviewItem>); 4] = [
+    let groups: [(&str, &Vec<workflowy_mcp_server::audit::ReviewItem>); 4] = [
         ("Revisit-due", &r.revisit_due),
         ("Multi-pillar (>=3)", &r.multi_pillar),
         ("Stale cross-pillar", &r.stale_cross_pillar),
@@ -760,41 +611,26 @@ mod tests {
     }
 
     #[test]
-    fn audit_parses_mirror_of_marker_from_description() {
-        // Mirror name must contain (or be contained by) the canonical name —
-        // that's the convention the audit enforces.
+    fn cli_audit_review_delegate_to_lib() {
+        // Smoke check that the CLI's `use workflowy_mcp_server::audit::...`
+        // wiring still resolves — the lib has comprehensive unit coverage
+        // for the heuristics themselves (see src/audit.rs#tests).
         let nodes = vec![
             node("aaa", "Concept X", Some("canonical_of: bbb"), None),
             node("bbb", "Concept X", Some("mirror_of: aaa"), None),
         ];
-        let findings = audit_mirrors(&nodes);
-        // Both ends well-marked, names align; should report no DRIFTED/BROKEN/ORPHAN/LONELY.
-        assert!(findings.is_empty(), "expected clean audit, got {:?}", findings);
+        assert!(audit_mirrors(&nodes).is_empty());
 
-        let drifted = vec![
-            node("aaa", "Canonical X", Some("canonical_of: bbb"), None),
-            node("bbb", "Totally Different Name", Some("mirror_of: aaa"), None),
-        ];
-        let f2 = audit_mirrors(&drifted);
-        assert!(f2.iter().any(|f| f.status == "DRIFTED"), "expected DRIFTED finding, got {:?}", f2);
-
-        let broken = vec![node("bbb", "Lonely Mirror", Some("mirror_of: 99999999"), None)];
-        let f3 = audit_mirrors(&broken);
-        assert!(f3.iter().any(|f| f.status == "BROKEN"), "expected BROKEN finding, got {:?}", f3);
-    }
-
-    #[test]
-    fn review_buckets_a_revisit_node_correctly() {
         let now = chrono::Utc::now().timestamp();
-        let nodes = vec![
-            node("a", "Past-due note #revisit", Some("revisit_due: 2020-01-01"), Some(now)),
-            node("b", "Cross-pillar map #leadership #ethics #building", Some("mirror_of: x\nmirror_of: y\nmirror_of: z"), Some(now - 200 * SECONDS_PER_DAY)),
-            node("c", "Plain note", None, Some(now)),
-        ];
-        let r = build_review(&nodes, 90, now);
-        assert_eq!(r.revisit_due.len(), 1, "expected 1 revisit-due, got {:?}", r.revisit_due);
-        assert!(r.multi_pillar.iter().any(|i| i.node_id == "b"), "expected multi-pillar hit on b");
-        assert!(r.stale_cross_pillar.iter().any(|i| i.node_id == "b"), "expected stale cross-pillar hit on b");
+        let today = chrono::Utc::now().date_naive();
+        let nodes = vec![node(
+            "a",
+            "Past-due note #revisit",
+            Some("revisit_due: 2020-01-01"),
+            Some(now),
+        )];
+        let r = build_review(&nodes, 90, today, now, "");
+        assert_eq!(r.revisit_due.len(), 1);
     }
 
     #[test]

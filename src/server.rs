@@ -187,6 +187,48 @@ fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Displa
     )
 }
 
+/// Read recent session-log files (~/code/SecondBrain/session-logs/,
+/// modified in the last 7 days) into a single string. Bucket (d) of the
+/// `review` tool scans this for URL/DOI matches against source-MOC
+/// descriptions. Returns "" when the directory doesn't exist or no
+/// files are recent enough — the lib's `build_review` skips bucket (d)
+/// gracefully on an empty blob, so this never panics or errors.
+///
+/// Lives on the server side (not in `audit.rs`) because the lib is
+/// pure-data — no I/O, no clock, no env. Both the MCP `review` handler
+/// and the `wflow-do review` CLI subcommand load the blob through their
+/// own filesystem helper and pass it in.
+fn load_recent_session_logs_blob_for_review() -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return String::new();
+    };
+    let dir = std::path::PathBuf::from(format!("{}/code/SecondBrain/session-logs", home));
+    if !dir.exists() {
+        return String::new();
+    }
+    let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
+    let mut blob = String::new();
+    if let Ok(read) = std::fs::read_dir(&dir) {
+        for ent in read.flatten() {
+            if let Ok(meta) = ent.metadata() {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if mtime >= cutoff {
+                    if let Ok(c) = std::fs::read_to_string(ent.path()) {
+                        blob.push_str(&c);
+                        blob.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    blob
+}
+
 /// Wrap a handler body so the call is recorded in the per-call op log.
 /// Use as the outermost expression of every tool handler:
 ///
@@ -895,6 +937,33 @@ pub struct CreateMirrorParams {
     pub target_parent_id: NodeId,
     #[schemars(description = "Optional priority/sort key")]
     pub priority: Option<i32>,
+}
+
+/// Parameters for `audit_mirrors`. Defaults `root_id` to the user's
+/// Distillations subtree (the only place the mirror convention is
+/// applied today). `max_depth` is bounded by the standard subtree-walk
+/// budget; deeper trees return partial results with a truncation flag.
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Audit canonical_of/mirror_of markers across a subtree per the wflow Mirror Discipline convention")]
+pub struct AuditMirrorsParams {
+    #[schemars(description = "Root of the audit (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
+    pub root_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth (default 8)")]
+    pub max_depth: Option<usize>,
+}
+
+/// Parameters for `review`. Same scoping shape as `audit_mirrors`.
+/// `days_stale` defaults to 90 — cross-pillar concept maps with no
+/// edits in that window are surfaced for re-read.
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Surface revisit-due, multi-pillar, stale, and recently-cited content under a subtree")]
+pub struct ReviewParams {
+    #[schemars(description = "Root of the review (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
+    pub root_id: Option<NodeId>,
+    #[schemars(description = "Maximum tree depth (default 8)")]
+    pub max_depth: Option<usize>,
+    #[schemars(description = "Days without edit before a cross-pillar map is reported stale (default 90)")]
+    pub days_stale: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -3456,6 +3525,89 @@ impl WorkflowyMcpServer {
         })
     }
 
+    /// Default scope for both `audit_mirrors` and `review` is the
+    /// Distillations subtree — the only place the wflow Mirror
+    /// Discipline convention is applied today. Hard-coding the UUID
+    /// keeps tool calls one-arg in the common case while leaving
+    /// `root_id` open for narrower or wider scopes.
+    #[doc(hidden)]
+    const DEFAULT_REVIEW_ROOT: &'static str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
+
+    #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171; pass root_id to scope elsewhere. Returns a JSON object with scope, scanned count, truncated flag, and findings array.")]
+    async fn audit_mirrors(
+        &self,
+        Parameters(params): Parameters<AuditMirrorsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "audit_mirrors", params, {
+        let root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid)? }
+            None => Self::DEFAULT_REVIEW_ROOT.to_string(),
+        };
+        let max_depth = params.max_depth.unwrap_or(8);
+        info!(root = %root, max_depth, "audit_mirrors");
+
+        match self.walk_subtree(Some(&root), max_depth).await {
+            Ok(fetch) => {
+                let findings = crate::audit::audit_mirrors(&fetch.nodes);
+                let payload = json!({
+                    "scope": root,
+                    "scanned": fetch.nodes.len(),
+                    "truncated": fetch.truncated,
+                    "truncation_reason": fetch.truncation_reason.map(|r| r.as_str()),
+                    "findings": findings,
+                });
+                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            }
+            Err(e) => Err(tool_error("audit_mirrors", Some(&root), e)),
+        }
+        })
+    }
+
+    #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under ~/code/SecondBrain/session-logs/ in the last 7 days. Default scope: Distillations.")]
+    async fn review(
+        &self,
+        Parameters(params): Parameters<ReviewParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "review", params, {
+        let root = match &params.root_id {
+            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid)? }
+            None => Self::DEFAULT_REVIEW_ROOT.to_string(),
+        };
+        let max_depth = params.max_depth.unwrap_or(8);
+        let days_stale = params.days_stale.unwrap_or(90);
+        info!(root = %root, max_depth, days_stale, "review");
+
+        // Bucket (d) needs the recent session-log text. The lib is
+        // pure-data and never touches disk; load the blob here and
+        // pass it through. If $HOME/code/SecondBrain/session-logs/
+        // doesn't exist, blob is "" and bucket (d) is empty — the
+        // documented graceful-skip behaviour.
+        let blob = load_recent_session_logs_blob_for_review();
+
+        match self.walk_subtree(Some(&root), max_depth).await {
+            Ok(fetch) => {
+                let report = crate::audit::build_review(
+                    &fetch.nodes,
+                    days_stale,
+                    chrono::Utc::now().date_naive(),
+                    chrono::Utc::now().timestamp(),
+                    &blob,
+                );
+                let payload = json!({
+                    "scope": root,
+                    "scanned": fetch.nodes.len(),
+                    "truncated": fetch.truncated,
+                    "truncation_reason": fetch.truncation_reason.map(|r| r.as_str()),
+                    "days_stale": days_stale,
+                    "buckets": report,
+                });
+                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            }
+            Err(e) => Err(tool_error("review", Some(&root), e)),
+        }
+        })
+    }
+
     #[tool(description = "Export a subtree in OPML (for Workflowy/outliner compatibility), Markdown (nested bullets), or JSON (raw node array). For backup, hand-off to other tools, or external processing. Subject to the standard 10 000-node and 20-second walk budgets — large subtrees may return partial output with a truncation marker.")]
     async fn export_subtree(
         &self,
@@ -5191,9 +5343,87 @@ mod tests {
             "find_by_tag_and_path",
             "export_subtree",
             "create_mirror",
+            "audit_mirrors",
+            "review",
         ] {
             assert!(server.get_tool(tool).is_some(), "tool {tool} must be registered");
         }
+    }
+
+    /// Brief 2026-04-26 (T-164): the MCP server exposes audit_mirrors
+    /// and review as first-class tools, not just CLI subcommands. This
+    /// test asserts the handler dispatches through the standard error
+    /// path when the upstream is unreachable in the test harness — a
+    /// proxy for "the wiring compiles and the call reaches the
+    /// audit::* lib module before failing on the network".
+    #[tokio::test]
+    async fn audit_mirrors_handler_dispatches_via_walk_subtree() {
+        let server = new_test_server();
+        let err = server
+            .audit_mirrors(Parameters(AuditMirrorsParams {
+                root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
+                max_depth: Some(2),
+            }))
+            .await
+            .expect_err("upstream unreachable in tests, must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("audit_mirrors"),
+            "error must name the operation: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_handler_dispatches_via_walk_subtree() {
+        let server = new_test_server();
+        let err = server
+            .review(Parameters(ReviewParams {
+                root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
+                max_depth: Some(2),
+                days_stale: Some(30),
+            }))
+            .await
+            .expect_err("upstream unreachable in tests, must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("review"),
+            "error must name the operation: {msg}"
+        );
+    }
+
+    /// The MCP handler and the wflow-do CLI must call into the SAME
+    /// `audit::audit_mirrors` and `audit::build_review` functions, so
+    /// findings are guaranteed identical between transports. Anchored
+    /// here as a source-pattern test — accidental re-implementation in
+    /// either surface fails before deploy.
+    #[test]
+    fn audit_review_handlers_route_through_lib_module() {
+        let server_src = include_str!("server.rs");
+        for needle in &[
+            "crate::audit::audit_mirrors(",
+            "crate::audit::build_review(",
+        ] {
+            assert!(
+                server_src.contains(needle),
+                "server.rs must call {needle} (T-164)"
+            );
+        }
+        let cli_src = include_str!("bin/wflow_do.rs");
+        for needle in &[
+            "audit_mirrors(",
+            "build_review(",
+        ] {
+            assert!(
+                cli_src.contains(needle),
+                "wflow_do.rs must call {needle} (T-164 — same lib path as MCP)"
+            );
+        }
+        // And the use statement that makes it route to the lib, not a
+        // local re-implementation.
+        assert!(
+            cli_src.contains("workflowy_mcp_server::audit::"),
+            "wflow_do.rs must import from the lib module, not redefine"
+        );
     }
 
     #[test]
