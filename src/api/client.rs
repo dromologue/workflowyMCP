@@ -62,24 +62,41 @@ async fn wait_for_cancel(guard: &CancelGuard) {
     }
 }
 
-/// Sleep with cancellation support. Returns `true` if the full duration
-/// elapsed, `false` if cancellation was observed mid-sleep. Used for the
-/// inter-attempt backoff so a cancel during retry-wait doesn't pin the
-/// task for `retry_after` seconds.
-async fn sleep_cancellable(duration: std::time::Duration, cancel: Option<&CancelGuard>) -> bool {
+/// Sleep with abort support. Returns `Ok(())` if the full duration
+/// elapsed, `Err(Cancelled)` if the cancel guard flipped, or
+/// `Err(Timeout)` if the wall-clock deadline elapsed first. Used for the
+/// inter-attempt backoff so a cancel or deadline expiry during retry-wait
+/// doesn't pin the task for `retry_after` seconds. The deadline is
+/// honoured by capping the sleep slice to whatever budget remains.
+async fn sleep_with_abort(
+    duration: Duration,
+    cancel: Option<&CancelGuard>,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let mut target = duration;
+    if let Some(dl) = deadline {
+        let now = Instant::now();
+        if now >= dl {
+            return Err(WorkflowyError::Timeout);
+        }
+        target = std::cmp::min(target, dl - now);
+    }
     match cancel {
         Some(g) => {
             tokio::select! {
                 biased;
-                _ = wait_for_cancel(g) => false,
-                _ = tokio::time::sleep(duration) => true,
+                _ = wait_for_cancel(g) => return Err(WorkflowyError::Cancelled),
+                _ = tokio::time::sleep(target) => {}
             }
         }
-        None => {
-            tokio::time::sleep(duration).await;
-            true
+        None => tokio::time::sleep(target).await,
+    }
+    if let Some(dl) = deadline {
+        if Instant::now() >= dl {
+            return Err(WorkflowyError::Timeout);
         }
     }
+    Ok(())
 }
 
 /// Why a subtree fetch returned partial data, when it did.
@@ -122,6 +139,20 @@ impl TruncationOutcome {
             reason: Some(reason),
             truncated_at_node_id: anchor,
         }
+    }
+}
+
+/// Map an abort-class error onto its truncation reason. Used by the
+/// subtree wrap layer when a tree-walk request bails early on either
+/// cancellation or deadline expiry.
+fn abort_reason(e: &WorkflowyError) -> TruncationReason {
+    match e {
+        WorkflowyError::Cancelled => TruncationReason::Cancelled,
+        WorkflowyError::Timeout => TruncationReason::Timeout,
+        // The wrap layer only ever calls this on the two abort variants;
+        // any other error is a bug. Default to Cancelled rather than
+        // panic so a spurious caller still produces a usable response.
+        _ => TruncationReason::Cancelled,
     }
 }
 
@@ -280,17 +311,19 @@ impl WorkflowyClient {
 
     /// Get top-level nodes only (direct children of root)
     pub async fn get_top_level_nodes(&self) -> Result<Vec<WorkflowyNode>> {
-        self.get_top_level_nodes_cancellable(None).await
+        self.get_top_level_nodes_cancellable(None, None).await
     }
 
     /// Cancellable variant. Pass `Some(guard)` so a `cancel_all` interrupts the
     /// rate-limit wait and the in-flight HTTP request rather than waiting for a
-    /// checkpoint.
+    /// checkpoint. Pass `Some(deadline)` to bound the wall-clock cost of the
+    /// retry loop, the in-flight send, and the inter-attempt backoff.
     pub async fn get_top_level_nodes_cancellable(
         &self,
         cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
-        let response: serde_json::Value = self.request_cancellable("GET", "/nodes", None, cancel).await?;
+        let response: serde_json::Value = self.request_cancellable("GET", "/nodes", None, cancel, deadline).await?;
         let nodes: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
@@ -301,7 +334,7 @@ impl WorkflowyClient {
 
     /// Get a single node by ID
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
-        self.get_node_cancellable(node_id, None).await
+        self.get_node_cancellable(node_id, None, None).await
     }
 
     /// Get a node tolerating propagation lag.
@@ -317,7 +350,7 @@ impl WorkflowyClient {
         const MAX_PROP_RETRIES: u32 = 3;
         let mut attempt: u32 = 0;
         loop {
-            match self.get_node_cancellable(node_id, None).await {
+            match self.get_node_cancellable(node_id, None, None).await {
                 Ok(n) => return Ok(n),
                 Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
                     let delay_ms = 200u64 * (1u64 << attempt);
@@ -345,7 +378,7 @@ impl WorkflowyClient {
         const MAX_PROP_RETRIES: u32 = 3;
         let mut attempt: u32 = 0;
         loop {
-            match self.get_children_cancellable(node_id, None).await {
+            match self.get_children_cancellable(node_id, None, None).await {
                 Ok(c) => return Ok(c),
                 Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
                     let delay_ms = 200u64 * (1u64 << attempt);
@@ -368,9 +401,10 @@ impl WorkflowyClient {
         &self,
         node_id: &str,
         cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<WorkflowyNode> {
         let endpoint = format!("/nodes/{}", node_id);
-        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel).await?;
+        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel, deadline).await?;
         // API wraps single node in {"node": {...}}
         let node_value = response.get("node").cloned().unwrap_or(response);
         serde_json::from_value(node_value).map_err(|e| WorkflowyError::ParseError {
@@ -380,16 +414,17 @@ impl WorkflowyClient {
 
     /// Get direct children of a node
     pub async fn get_children(&self, node_id: &str) -> Result<Vec<WorkflowyNode>> {
-        self.get_children_cancellable(node_id, None).await
+        self.get_children_cancellable(node_id, None, None).await
     }
 
     pub async fn get_children_cancellable(
         &self,
         node_id: &str,
         cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
         let endpoint = format!("/nodes?parent_id={}", node_id);
-        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel).await?;
+        let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel, deadline).await?;
         let mut children: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
@@ -461,17 +496,18 @@ impl WorkflowyClient {
         }
 
         let cancel_ref = controls.cancel.as_ref();
+        let deadline = controls.deadline;
 
         match root_id {
             Some(id) => {
-                match self.get_node_cancellable(id, cancel_ref).await {
+                match self.get_node_cancellable(id, cancel_ref, deadline).await {
                     Ok(root) => all_nodes.push(root),
-                    Err(WorkflowyError::Cancelled) => {
+                    Err(e) if matches!(e, WorkflowyError::Cancelled | WorkflowyError::Timeout) => {
                         return Ok(SubtreeFetch {
                             nodes: all_nodes,
                             truncated: true,
                             limit: node_limit,
-                            truncation_reason: Some(TruncationReason::Cancelled),
+                            truncation_reason: Some(abort_reason(&e)),
                             elapsed_ms: started.elapsed().as_millis() as u64,
                             truncated_at_node_id: Some(id.to_string()),
                         });
@@ -491,15 +527,15 @@ impl WorkflowyClient {
                 if let Some(status) = controls.status() {
                     outcome = TruncationOutcome::stopped(status, Some(id.to_string()));
                 } else {
-                    match self.get_children_cancellable(id, cancel_ref).await {
+                    match self.get_children_cancellable(id, cancel_ref, deadline).await {
                         Ok(children) => {
                             outcome = self
                                 .fetch_descendants(&children, &mut all_nodes, 0, max_depth, node_limit, &controls)
                                 .await?;
                         }
-                        Err(WorkflowyError::Cancelled) => {
+                        Err(e) if matches!(e, WorkflowyError::Cancelled | WorkflowyError::Timeout) => {
                             outcome = TruncationOutcome::stopped(
-                                TruncationReason::Cancelled,
+                                abort_reason(&e),
                                 Some(id.to_string()),
                             );
                         }
@@ -508,14 +544,14 @@ impl WorkflowyClient {
                 }
             }
             None => {
-                match self.get_top_level_nodes_cancellable(cancel_ref).await {
+                match self.get_top_level_nodes_cancellable(cancel_ref, deadline).await {
                     Ok(top) => {
                         outcome = self
                             .fetch_descendants(&top, &mut all_nodes, 0, max_depth, node_limit, &controls)
                             .await?;
                     }
-                    Err(WorkflowyError::Cancelled) => {
-                        outcome = TruncationOutcome::stopped(TruncationReason::Cancelled, None);
+                    Err(e) if matches!(e, WorkflowyError::Cancelled | WorkflowyError::Timeout) => {
+                        outcome = TruncationOutcome::stopped(abort_reason(&e), None);
                     }
                     Err(e) => return Err(e),
                 }
@@ -557,6 +593,7 @@ impl WorkflowyClient {
         let mut current_level: Vec<WorkflowyNode> = initial_nodes.to_vec();
         let mut depth = start_depth;
         let cancel_ref = controls.cancel.as_ref();
+        let deadline = controls.deadline;
 
         while depth < max_depth && !current_level.is_empty() {
             // Accumulate this level before descending. If it blows the cap,
@@ -584,7 +621,7 @@ impl WorkflowyClient {
             let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
             let ids: Vec<String> = current_level.iter().map(|n| n.id.clone()).collect();
             let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
-                let res = self.get_children_cancellable(&id, cancel_ref).await;
+                let res = self.get_children_cancellable(&id, cancel_ref, deadline).await;
                 (id, res)
             }))
             .buffer_unordered(concurrency);
@@ -602,8 +639,8 @@ impl WorkflowyClient {
                 pending_parents.remove(&id);
                 match res {
                     Ok(children) => next_level.extend(children),
-                    Err(WorkflowyError::Cancelled) => {
-                        stop = Some(TruncationReason::Cancelled);
+                    Err(e) if matches!(e, WorkflowyError::Cancelled | WorkflowyError::Timeout) => {
+                        stop = Some(abort_reason(&e));
                         last_unfinished = Some(id);
                         break;
                     }
@@ -922,22 +959,27 @@ impl WorkflowyClient {
         endpoint: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        self.request_cancellable(method, endpoint, body, None).await
+        self.request_cancellable(method, endpoint, body, None, None).await
     }
 
-    /// Cancellable variant. When `cancel` is `Some`, cancellation interrupts:
+    /// Cancellable variant with optional wall-clock deadline. The deadline
+    /// bounds the **entire** retry loop — not a single attempt — so even when
+    /// the upstream returns a hung connection or a long sequence of 5xx
+    /// responses, the call returns `WorkflowyError::Timeout` once the deadline
+    /// has passed. Cancellation and deadline-expiry interrupt:
     /// (a) the rate-limiter wait,
-    /// (b) the in-flight HTTP send,
+    /// (b) the in-flight HTTP send (raced via `tokio::select!`),
     /// (c) the inter-attempt backoff sleep.
-    /// In each case the function returns [`WorkflowyError::Cancelled`] without
-    /// holding tokens or workers, so a `cancel_all` actually frees the shared
-    /// `RateLimiter` for new tool calls.
+    /// In each case the function returns the appropriate abort variant
+    /// without holding tokens or workers, so a `cancel_all` (or budget
+    /// expiry) actually frees the shared `RateLimiter` for new tool calls.
     pub async fn request_cancellable<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         endpoint: &str,
         body: Option<serde_json::Value>,
         cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<T> {
         let mut attempt = 0;
 
@@ -949,9 +991,16 @@ impl WorkflowyClient {
                     return Err(WorkflowyError::Cancelled);
                 }
             }
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return Err(WorkflowyError::Timeout);
+                }
+            }
 
             // Rate limit: wait for a token, but bail if cancellation flips
-            // while we are queued behind earlier waiters.
+            // while we are queued behind earlier waiters. The 50 ms slice
+            // inside `acquire_cancellable` keeps deadline checking timely
+            // even without an explicit deadline-aware acquire.
             match cancel {
                 Some(g) => {
                     if !self.rate_limiter.acquire_cancellable(g).await {
@@ -960,10 +1009,18 @@ impl WorkflowyClient {
                 }
                 None => self.rate_limiter.acquire().await,
             }
+            // Re-check deadline after rate-limit wait — token acquisition
+            // itself can absorb measurable budget when the bucket is drained.
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return Err(WorkflowyError::Timeout);
+                }
+            }
 
-            match self.try_request_cancellable::<T>(method, endpoint, &body, cancel).await {
+            match self.try_request_cancellable::<T>(method, endpoint, &body, cancel, deadline).await {
                 Ok(result) => return Ok(result),
                 Err(WorkflowyError::Cancelled) => return Err(WorkflowyError::Cancelled),
+                Err(WorkflowyError::Timeout) => return Err(WorkflowyError::Timeout),
                 Err(e) => {
                     if attempt < self.retry_config.max_attempts && e.is_retryable() {
                         // Extract retry_after from 429 responses
@@ -979,9 +1036,7 @@ impl WorkflowyClient {
                             error = %e,
                             "Retrying request after backoff"
                         );
-                        if !sleep_cancellable(Duration::from_millis(delay_ms), cancel).await {
-                            return Err(WorkflowyError::Cancelled);
-                        }
+                        sleep_with_abort(Duration::from_millis(delay_ms), cancel, deadline).await?;
                     } else {
                         return Err(WorkflowyError::RetryExhausted {
                             attempts: attempt,
@@ -1009,6 +1064,7 @@ impl WorkflowyClient {
         endpoint: &str,
         body: &Option<serde_json::Value>,
         cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(url = %url, method = method, "Making API request");
@@ -1033,17 +1089,35 @@ impl WorkflowyClient {
         }
 
         let send_started = Instant::now();
-        // Race the in-flight HTTP send against a cancellation poll. Dropping
-        // the send future cleanly cancels the underlying connection in reqwest.
-        let response = match cancel {
-            Some(g) => {
-                tokio::select! {
-                    biased;
-                    _ = wait_for_cancel(g) => return Err(WorkflowyError::Cancelled),
-                    res = req.send() => res.map_err(WorkflowyError::HttpError)?,
-                }
+        // Race the in-flight HTTP send against the cancel guard *and* the
+        // wall-clock deadline. Dropping the send future cleanly cancels the
+        // underlying connection in reqwest, so a hung upstream cannot keep
+        // the task alive past `deadline`. `pending::<()>()` plays the role
+        // of a never-resolving future so we keep one `tokio::select!` shape
+        // regardless of which controls the caller supplied.
+        use std::future::pending;
+        let cancel_branch = async {
+            match cancel {
+                Some(g) => wait_for_cancel(g).await,
+                None => pending::<()>().await,
             }
-            None => req.send().await.map_err(WorkflowyError::HttpError)?,
+        };
+        let timeout_branch = async {
+            match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now < dl {
+                        tokio::time::sleep(dl - now).await;
+                    }
+                }
+                None => pending::<()>().await,
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            _ = cancel_branch => return Err(WorkflowyError::Cancelled),
+            _ = timeout_branch => return Err(WorkflowyError::Timeout),
+            res = req.send() => res.map_err(WorkflowyError::HttpError)?,
         };
 
         // Record latency and any rate-limit headers regardless of success —
@@ -1361,6 +1435,57 @@ mod tests {
         headers.insert("x-ratelimit-remaining", "7".parse().unwrap());
         client.record_rate_limit_headers(&headers);
         assert_eq!(client.rate_limit_snapshot().remaining, Some(7));
+    }
+
+    #[tokio::test]
+    async fn test_request_cancellable_bails_on_expired_deadline_before_any_send() {
+        // If the deadline is already in the past, the retry loop must return
+        // `Timeout` on the very first iteration — without consuming a rate
+        // token or attempting an HTTP request. Regression guard for the
+        // hang the user reported on `tag_search`: previously the deadline
+        // was only checked between batches, so a stalled HTTP send could
+        // run the full retry budget.
+        let client = test_client();
+        let past = Instant::now() - Duration::from_millis(1);
+        let started = Instant::now();
+        let res: Result<serde_json::Value> = client
+            .request_cancellable("GET", "/nodes", None, None, Some(past))
+            .await;
+        let elapsed = started.elapsed();
+        match res {
+            Err(WorkflowyError::Timeout) => {}
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expired-deadline check must short-circuit; took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sleep_with_abort_returns_timeout_when_deadline_inside_duration() {
+        // The inter-attempt backoff sleep must wake at the deadline, not at
+        // the full backoff duration. Without this, a 5-attempt 10s backoff
+        // would keep the call alive for ~30s past a 1s deadline.
+        let started = Instant::now();
+        let dl = started + Duration::from_millis(20);
+        let res = sleep_with_abort(Duration::from_secs(5), None, Some(dl)).await;
+        let elapsed = started.elapsed();
+        assert!(matches!(res, Err(WorkflowyError::Timeout)));
+        // 100 ms is generous slack for CI scheduling jitter; the point is
+        // we must not wait for 5s.
+        assert!(elapsed < Duration::from_millis(150), "took {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_sleep_with_abort_completes_when_deadline_outside_duration() {
+        // Sanity: when the deadline is generous, the sleep returns Ok.
+        let started = Instant::now();
+        let dl = started + Duration::from_secs(10);
+        let res = sleep_with_abort(Duration::from_millis(20), None, Some(dl)).await;
+        assert!(matches!(res, Ok(())));
+        assert!(started.elapsed() >= Duration::from_millis(15));
     }
 
     #[tokio::test]
