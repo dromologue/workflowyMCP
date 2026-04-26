@@ -163,9 +163,21 @@ NODE=$(wflow-do create --name "Triage" | tail -n1)
 # move it under a known parent, then delete when done
 wflow-do move "$NODE" --to <parent-uuid>
 wflow-do delete "$NODE"
+
+# audit canonical_of:/mirror_of: convention drift under Distillations
+wflow-do audit-mirrors
+
+# what's worth re-reading: revisit-due, multi-pillar, stale, source-MOC re-cited
+wflow-do review --days-stale 90
+
+# regenerate the local session-logs index (no API call)
+wflow-do index
+
+# plan-mode for any write verb — prints `DRY-RUN <verb> ...` and exits 0
+wflow-do --dry-run delete <uuid>
 ```
 
-Available subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`. Add `--json` for raw JSON on every command, `--quiet` to suppress info-level logging. On error the binary writes `<command>: <message> [<proximate_cause>]` to stderr and exits 1; the proximate-cause taxonomy matches the MCP server's `tool_error` classification.
+Available subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`. Add `--json` for raw JSON on every command, `--quiet` to suppress info-level logging, `--dry-run` (write verbs only) to preview the planned operation without calling the API. On error the binary writes `<command>: <message> [<proximate_cause>]` to stderr and exits 1; the proximate-cause taxonomy matches the MCP server's `tool_error` classification.
 
 ## Conventions
 
