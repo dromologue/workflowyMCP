@@ -1,201 +1,178 @@
 # Workflowy MCP Server
 
-A Rust MCP server that gives Claude full read/write access to your Workflowy outline. Search, insert, organize, manage tasks, and track deadlines — all through natural language.
+A Rust MCP server that turns Workflowy into a working second brain — capture, triage, distillation, retrieval, and synthesis — driven by Claude (Code, Desktop, or web). The server gives any LLM read/write access to your Workflowy graph; the templates in this repo turn that raw access into a disciplined workflow that compounds across sessions.
 
-Works with **Claude Desktop** and **Claude Code** as an MCP server.
+You can use it three ways:
 
-## Prerequisites
+1. **As a plain MCP server** — Claude Desktop or Claude Code calls 26 tools against your Workflowy account. Skip the templates entirely.
+2. **As a second brain** — install the `templates/secondbrain/` skeleton and the `templates/skills/wflow/SKILL.md` skill, and Claude follows a structured capture → triage → distillation → retrieval loop.
+3. **As a starting point** — fork the templates, adjust the workflow categories to your taste, layer in your own conventions.
 
-- [Rust toolchain](https://rustup.rs) (1.70+)
-- A Workflowy account with API access
-- Claude Desktop and/or Claude Code
+The methodology is opinionated; the server is not. Use whichever level suits you.
+
+---
 
 ## Install
 
+Prerequisites: [Rust toolchain](https://rustup.rs) (1.70+), a Workflowy account with [API access](https://workflowy.com/api-key), and Claude Desktop and/or Claude Code.
+
 ```bash
-git clone https://github.com/dromologue/workflowyMCP.git
-cd workflowyMCP
+git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
+cd ~/code/workflowy-mcp-server
 cargo build --release
 ```
 
-The compiled binary is at `target/release/workflowy-mcp-server`.
+The binary lands at `target/release/workflowy-mcp-server`.
+
+---
 
 ## Configure
 
-### 1. Workflowy API key
-
-Get your API key from [workflowy.com/api-key](https://workflowy.com/api-key), then create `.env` in the project root:
-
-```
-WORKFLOWY_API_KEY=your-api-key
-```
-
-### 2. Claude Desktop (MCP server)
-
-Add to your Claude Desktop config:
-
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-
-**Option A — `.env` file (recommended):** Set `cwd` so the server finds `.env` automatically:
-
-```json
-{
-  "mcpServers": {
-    "workflowy": {
-      "command": "/absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server",
-      "cwd": "/absolute/path/to/workflowyMCP"
-    }
-  }
-}
-```
-
-**Option B — inline credentials:**
-
-```json
-{
-  "mcpServers": {
-    "workflowy": {
-      "command": "/absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server",
-      "env": {
-        "WORKFLOWY_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-Restart Claude Desktop after saving. The 26 tools listed below become available immediately.
-
-**Large trees (100k+ nodes):** Search and review tools use a `max_depth` parameter (default: 3–5) to avoid fetching the entire tree. Subtree fetches also cap at 10 000 nodes **and** at a 20-second wall-clock budget; every tool response includes a `truncated` flag with a `truncation_reason` (`node_limit`, `timeout`, or `cancelled`) when either fires, so you can narrow with `parent_id`/`root_id` or reduce `max_depth`. `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view to avoid partial copies or partial deletes. Use `health_check` as a sub-second liveness probe before kicking off larger calls, `cancel_all` to abort in-flight walks, and `build_name_index` to populate the cached name index so `find_node` with `use_index=true` answers without hitting the API.
-
-### 3. Claude Code
-
-Register the MCP server with Claude Code so its 26 tools appear in every session:
+Create `.env` in the repo root:
 
 ```bash
-claude mcp add workflowy -- /absolute/path/to/workflowyMCP/target/release/workflowy-mcp-server
+WORKFLOWY_API_KEY=<your-api-key>
+```
+
+Then wire the server into your MCP host.
+
+### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "workflowy": {
+      "command": "/absolute/path/to/workflowy-mcp-server/target/release/workflowy-mcp-server",
+      "cwd": "/absolute/path/to/workflowy-mcp-server"
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You can also pass credentials via `env` if you'd rather not rely on `cwd`.
+
+### Claude Code
+
+```bash
+claude mcp add workflowy -- /absolute/path/to/workflowy-mcp-server/target/release/workflowy-mcp-server
 ```
 
 Verify with `claude mcp list` — the entry should report `✓ Connected`.
 
-## Usage
+That's it for plain MCP usage. To stop here, jump to [Tool reference](#tool-reference). To set up the second-brain workflow, continue.
 
-Ask Claude naturally — it will use the MCP tools:
+---
 
-- "Search my Workflowy for anything tagged #review"
-- "What's overdue in my Projects?"
-- "Add a task to Office: Review Q2 budget"
-- "Give me a daily review of my tasks"
+## Set up the second brain
 
-## Tools (26 implemented)
+The repo ships generic templates so you (or an LLM bootstrapping you) can stand up a working second brain without inheriting the original author's specific node IDs. The detailed walk-through is in [docs/SETUP.md](docs/SETUP.md). The summary:
 
-### Search & Navigate
+```bash
+# 1. Create your operational secondBrain directory
+mkdir -p ~/code/secondBrain
+cp -R templates/secondbrain/* ~/code/secondBrain/
 
-| Tool | What it does |
-|------|-------------|
-| `search_nodes` | Text search in node names and descriptions |
-| `find_node` | Look up a node by name (exact, contains, or starts_with match modes) |
-| `get_node` | Get a node by ID, plus a depth-1 listing of its direct children |
-| `list_children` | List children of a node |
-| `tag_search` | Search by tag (`#tag` or `@person`) in names, descriptions, and tags |
-| `get_subtree` | Get the full tree under a node |
-| `find_backlinks` | Find all nodes that link to a given node |
+# 2. Install the wflow skill (Claude Code only — Claude Desktop uses Project instructions)
+mkdir -p ~/.claude/skills/wflow
+cp templates/skills/wflow/SKILL.md ~/.claude/skills/wflow/SKILL.md
 
-### Create & Edit
+# 3. Identify your structural Workflowy nodes (Tasks, Inbox, Journal, etc.)
+#    and write the UUIDs into ~/code/secondBrain/memory/workflowy_node_links.md
+#    The wflow skill will walk you through this on first use.
+```
 
-| Tool | What it does |
-|------|-------------|
-| `create_node` | Create a new node with optional parent and position |
-| `insert_content` | Insert hierarchical content (2-space indentation = nesting) |
-| `smart_insert` | Search for a target node, then insert content into it |
-| `convert_markdown` | Convert markdown to Workflowy-compatible indented format |
-| `edit_node` | Edit a node's name or description |
-| `move_node` | Move a node to a new parent |
-| `delete_node` | Delete a node |
-| `duplicate_node` | Deep-copy a node and its subtree |
-| `create_from_template` | Copy template with `{{variable}}` substitution |
-| `bulk_update` | Apply `delete`, `add_tag`, or `remove_tag` to filtered nodes (with `dry_run` mode). `complete` / `uncomplete` are not yet supported. |
+After Step 1 the MCP server's persistent name index begins checkpointing to `~/code/secondBrain/memory/name_index.json` automatically. After Step 3 your second brain has the node IDs it needs to operate; future sessions read this file at boot.
 
-### Todos & Scheduling
+For Claude Desktop or claude.ai, paste `templates/skills/wflow/SKILL.md` into a Project's custom instructions or upload it as a Skill. Same content, different surface — see the multi-surface deployment section in [docs/SETUP.md](docs/SETUP.md).
 
-| Tool | What it does |
-|------|-------------|
-| `list_todos` | List todo items with optional parent, status, and text filters |
-| `list_upcoming` | Items due in the next N days, sorted by nearest deadline |
-| `list_overdue` | Past-due items sorted by most overdue first |
-| `daily_review` | One-call standup: overdue, upcoming, recent changes, pending todos |
+---
 
-### Project Management
+## Methodology
 
-| Tool | What it does |
-|------|-------------|
-| `get_project_summary` | Stats, tag counts, assignees, overdue items for a subtree |
-| `get_recent_changes` | Nodes modified within a time window |
+The skill organises Claude's work into two halves.
 
-### Diagnostics & Ops
+**Operate** is the tempo of your working week. Daily prioritisation, weekly review, monthly themes, task capture, inbox triage, project status, reading-list management, journaling. These are short, frequent, conversational interactions: "what's on my plate today?", "capture this task", "triage my inbox."
 
-| Tool | What it does |
-|------|-------------|
-| `health_check` | Sub-second liveness probe: confirms API reachability and reports cache + name-index sizes |
-| `cancel_all` | Cancels every in-flight tree walk; outstanding calls return partial results with `truncation_reason = "cancelled"` |
-| `build_name_index` | Walks a subtree to populate the opportunistic name index, enabling `find_node` with `use_index=true` to answer without hitting the API |
+**Synthesise** is the slower work of turning captured material into a graph that compounds. Distil a single source into atomic notes, batch-process the reading list, run cross-system research that pulls together everything you have on a topic. Synthesis writes back into a `Distillations` subtree (or wherever you keep your atomic notes), mirrored into pillars and themes.
+
+Three habits hold it together:
+
+- **Cached node IDs** at `~/code/secondBrain/memory/workflowy_node_links.md`. The wflow skill reads this on every bootstrap so it never has to re-walk the tree to find Tasks or Inbox.
+- **Drafts before writes.** Any distillation involving more than a few mutations produces a markdown file in `~/code/secondBrain/drafts/` first. Protects against MCP wedges; gives you a chance to veto routing before the graph mutates.
+- **One session log per session that touched the graph.** Both a Workflowy node (for navigation) and a local file at `~/code/secondBrain/session-logs/` (for audit). They should agree.
+
+The repo's [templates/secondbrain/README.md](templates/secondbrain/README.md) covers the operational discipline in more depth.
+
+---
+
+## How short-hash resolution works
+
+Workflowy URLs use a 12-character short hash (the trailing 12 hex of the UUID, like `c4ae1944b67e`). The Workflowy API requires the full UUID. The server resolves the gap automatically:
+
+- A **persistent name index** at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`) caches every short hash → UUID it has ever seen. Survives restarts. Checkpointed every 30 seconds when dirty. Refreshed by a 6-hour background walk.
+- On a cache miss, the resolver **walks the workspace synchronously** with a 5-minute budget. A watcher polls the index every 100 ms and cancels the walk as soon as the target hash appears, so found-early lookups don't pay the full timeout.
+
+This means you can paste any Workflowy URL fragment into a prompt and the server resolves it without any manual indexing. First miss after a fresh server install may take up to a minute; everything after is O(1) against the cache.
+
+---
+
+## Tool reference
+
+The server exposes 26 tools. Most operations work in terms of `node_id`, which accepts any of: full UUID (with or without hyphens), 12-char URL-suffix short hash, or 8-char prefix used in docs.
+
+**Search & navigate:** `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`.
+
+**Create & edit:** `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree`.
+
+**Todos & scheduling:** `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since`.
+
+**Project management:** `get_project_summary`, `get_recent_changes`.
+
+**Diagnostics & ops:** `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `audit_mirrors`, `review`, `get_recent_tool_calls`.
+
+Conventions parsed from node text:
+
+- Tags: `#inbox`, `#review`, `#urgent`
+- Assignees: `@alice`, `@bob`
+- Due dates: `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15` (priority order)
+
+Large-tree behaviour: subtree fetches cap at 10 000 nodes and a 20-second wall-clock budget; every response includes `truncated` plus a `truncation_reason`. Use `parent_id` / `max_depth` to scope down. `health_check` is a sub-second liveness probe safe to use as a circuit breaker.
+
+---
 
 ## CLI: wflow-do
 
-A second binary, `wflow-do`, exposes the same `WorkflowyClient` operations as a plain shell command. Use it as a workaround for transport-layer drops in Claude Desktop's MCP layer — Bash dispatch is independent of MCP tool dispatch, so shelling out from any Claude session reaches the API even when the MCP transport is silently dropping calls.
-
-Build it alongside the server:
+A second binary, `wflow-do`, exposes the same operations as a plain shell command. Useful as a fallback for transport-layer drops in the MCP layer — Bash dispatch is independent of MCP dispatch.
 
 ```bash
 cargo build --release --bin wflow-do
+
+# Examples
+target/release/wflow-do status                              # liveness + rate-limit snapshot
+target/release/wflow-do search --query "concept maps"
+target/release/wflow-do --dry-run delete <uuid>             # plan-mode preview
+target/release/wflow-do review --days-stale 90              # what's worth re-reading
+target/release/wflow-do audit-mirrors                       # canonical_of:/mirror_of: drift
 ```
 
-The binary lives at `target/release/wflow-do`. It reads `WORKFLOWY_API_KEY` from the environment or `.env` (same loader as the MCP server). Example session:
+Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`. Use `--json` for raw output, `--dry-run` (write verbs only) to preview without calling the API.
 
-```bash
-# liveness + rate-limit snapshot
-wflow-do status
-
-# create a node, capture the UUID for use downstream
-NODE=$(wflow-do create --name "Triage" | tail -n1)
-
-# move it under a known parent, then delete when done
-wflow-do move "$NODE" --to <parent-uuid>
-wflow-do delete "$NODE"
-
-# audit canonical_of:/mirror_of: convention drift under Distillations
-wflow-do audit-mirrors
-
-# what's worth re-reading: revisit-due, multi-pillar, stale, source-MOC re-cited
-wflow-do review --days-stale 90
-
-# regenerate the local session-logs index (no API call)
-wflow-do index
-
-# plan-mode for any write verb — prints `DRY-RUN <verb> ...` and exits 0
-wflow-do --dry-run delete <uuid>
-```
-
-Available subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`. Add `--json` for raw JSON on every command, `--quiet` to suppress info-level logging, `--dry-run` (write verbs only) to preview the planned operation without calling the API. On error the binary writes `<command>: <message> [<proximate_cause>]` to stderr and exits 1; the proximate-cause taxonomy matches the MCP server's `tool_error` classification.
-
-## Conventions
-
-Tags, assignees, and due dates are parsed from node text:
-
-- **Tags:** `#inbox`, `#review`, `#urgent`
-- **Assignees:** `@alice`, `@bob`
-- **Due dates:** `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15` (priority order)
+---
 
 ## Development
 
 ```bash
-cargo build              # compile (debug)
-cargo build --release    # compile (optimized)
-cargo test --lib         # run 159 unit tests
+cargo build              # debug
+cargo build --release    # optimised
+cargo test --lib         # 242 unit tests
 cargo check              # type-check only
-cargo run --bin workflowy-mcp-server  # start server
 ```
+
+[CLAUDE.md](CLAUDE.md) has the architectural overview; [specs/specification.md](specs/specification.md) is the authoritative behavioural spec.
+
+---
 
 ## License
 
