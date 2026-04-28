@@ -123,6 +123,16 @@ enum Cmd {
         /// Maximum tree depth to walk under each root.
         #[arg(long, default_value_t = 10)]
         max_depth: usize,
+        /// Wall-clock budget per root in seconds. Defaults to the
+        /// resolution-walk timeout (300 s). Set to 0 for no time
+        /// budget — the walk runs until the node-count cap or until
+        /// the subtree is exhausted, whichever fires first. Use a
+        /// large value (e.g. 3600 for one hour per root) to reach
+        /// deep regions of large subtrees that timed out at the
+        /// default. The node-count cap (`RESOLVE_WALK_NODE_CAP`)
+        /// still applies regardless.
+        #[arg(long, default_value_t = (defaults::RESOLVE_WALK_TIMEOUT_MS / 1000) as u64)]
+        timeout_secs: u64,
     },
 }
 
@@ -404,8 +414,15 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             std::fs::write(target, &body)?;
             println!("index: wrote {} entries to {}", entries.len(), target);
         }
-        Cmd::Reindex { roots, index_path, max_depth } => {
-            cmd_reindex(client, roots.as_slice(), index_path.as_deref(), *max_depth).await?;
+        Cmd::Reindex { roots, index_path, max_depth, timeout_secs } => {
+            cmd_reindex(
+                client,
+                roots.as_slice(),
+                index_path.as_deref(),
+                *max_depth,
+                *timeout_secs,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -421,6 +438,7 @@ async fn cmd_reindex(
     roots: &[String],
     index_path_override: Option<&str>,
     max_depth: usize,
+    timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use workflowy_mcp_server::utils::NameIndex;
 
@@ -463,12 +481,24 @@ async fn cmd_reindex(
     };
 
     let started_total = std::time::Instant::now();
+    if timeout_secs == 0 {
+        println!(
+            "reindex: per-root timeout disabled (walks bound only by node cap = {})",
+            defaults::RESOLVE_WALK_NODE_CAP
+        );
+    } else {
+        println!("reindex: per-root timeout = {} s", timeout_secs);
+    }
     for target in walk_targets {
         let label = target.unwrap_or("<workspace_root>");
         let start = std::time::Instant::now();
-        let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-            defaults::RESOLVE_WALK_TIMEOUT_MS,
-        ));
+        let controls = if timeout_secs == 0 {
+            // No deadline; only the node-count cap and any external
+            // cancellation can stop the walk.
+            FetchControls::default()
+        } else {
+            FetchControls::with_timeout(std::time::Duration::from_secs(timeout_secs))
+        };
         let result = client
             .get_subtree_with_controls(
                 target,
