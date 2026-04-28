@@ -79,6 +79,45 @@ The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/n
 
 **Building coverage explicitly:** `build_name_index(parent_id=...)` walks a single subtree deeply; the persistent index makes the work cumulative across sessions. For a one-shot deep index pass from the shell (independent of any running MCP), run `wflow-do reindex --root <UUID> [--root <UUID> ...]` — walks each root with the resolution budget, merges results into the same persistent file, and reports per-root coverage. Useful for fresh installs or recovery from sparse coverage.
 
+#### Direct local index access (fastest possible lookup)
+
+The persistent index file at `~/code/secondBrain/memory/name_index.json` is plain JSON and can be queried **without going through the MCP at all**. Reach for this path before any MCP tool when:
+
+- the MCP transport has been showing drops this session,
+- you need to verify a UUID without making an API call, or
+- you want to find every node matching a name pattern faster than tree-walking.
+
+Schema:
+
+```json
+{
+  "version": 1,
+  "updated_at": <unix_seconds>,
+  "nodes": [
+    {"id": "<full-uuid>", "name": "<HTML-encoded name>", "parent_id": "<full-uuid or null>"}
+  ]
+}
+```
+
+Useful one-liners via Bash + jq:
+
+```bash
+INDEX=~/code/secondBrain/memory/name_index.json
+
+# Resolve a Workflowy URL short hash to its full UUID
+jq -r --arg h "<short-hash>" '.nodes[] | select(.id | endswith($h)) | .id' "$INDEX"
+
+# Find every node whose name contains a substring (case-insensitive)
+jq -r --arg q "<query>" '.nodes[] | select(.name | ascii_downcase | contains($q)) | "\(.id)\t\(.name)"' "$INDEX"
+
+# Get a node's parent UUID
+jq -r --arg id "<uuid>" '.nodes[] | select(.id == $id) | .parent_id' "$INDEX"
+```
+
+Treat the file as **read-only** from the assistant's side — only the MCP server (or `wflow-do reindex`) should write to it, because their write paths use an atomic write-then-rename protocol. A direct edit risks racing with the 30-second checkpoint.
+
+When a file lookup misses, fall back to `node_at_path` / `resolve_link` / the MCP auto-walk in that order. When it hits, you've saved an API round-trip and any transport-layer fragility on top of that.
+
 #### Memory file location
 
 Try these paths in order; use the first one found by the `Read` tool:
