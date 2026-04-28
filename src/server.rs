@@ -418,6 +418,22 @@ impl Drop for WalkGuard {
     }
 }
 
+/// Strip HTML tags from a Workflowy node name. Workflowy stores
+/// inline formatting (links, bold, colour spans) inside the name
+/// field itself, which makes pure-string equality with what a user
+/// typed unreliable. Used by [`WorkflowyMcpServer::node_at_path`] and
+/// [`WorkflowyMcpServer::resolve_link`] when matching path segments
+/// against children's names. Compiles the pattern once per call —
+/// good enough since these paths are short, but if it shows up in a
+/// hot loop, hoist into a `OnceLock`.
+fn strip_html(s: &str) -> String {
+    let re = match regex::Regex::new(r"<[^>]+>") {
+        Ok(r) => r,
+        Err(_) => return s.to_string(),
+    };
+    re.replace_all(s, "").to_string()
+}
+
 /// Result of an on-demand short-hash resolution walk. Carries enough
 /// signal for the resolver to distinguish "walked the whole tree, the
 /// hash genuinely doesn't exist" from "ran out of budget before
@@ -928,6 +944,26 @@ pub struct FindByTagAndPathParams {
     pub max_depth: Option<usize>,
     #[schemars(description = "Maximum results (default 50)")]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Resolve a hierarchical path of node names to its UUID by walking each level — fast on huge trees because it costs one API call per path segment, not a full tree walk")]
+pub struct NodeAtPathParams {
+    #[schemars(description = "Path segments from the start parent to the target. E.g. ['Areas', 'Personal', 'Opportunities', 'Nedbank']. Each segment is matched case-insensitively against children's names with HTML stripped. Whitespace is trimmed. Use this when you know where a node lives but not its UUID — far faster than search_nodes on large workspaces.")]
+    pub path: Vec<String>,
+    #[schemars(description = "Optional starting parent. Default: workspace root. Pass a known UUID or short hash to skip leading segments and shave API calls.")]
+    pub start_parent_id: Option<NodeId>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[schemars(description = "Resolve a Workflowy internal link or short hash to its full node info — purpose-built for the 'I have a Workflowy URL, give me the node' workflow")]
+pub struct ResolveLinkParams {
+    #[schemars(description = "Workflowy URL fragment or short hash. Accepts: full URLs ('https://workflowy.com/#/c4ae1944b67e'), bare 12-char URL-suffix hashes ('c4ae1944b67e'), 8-char doc-form prefixes ('c4ae1944'), or full UUIDs (in which case it just looks up node info).")]
+    pub link: String,
+    #[schemars(description = "Optional parent path to scope the resolution walk under, as a list of node names from root. E.g. ['Areas', 'Personal']. Resolved via node_at_path internally; the resolution walk runs only inside that subtree, which is dramatically faster than a full-workspace walk on big trees.")]
+    pub search_parent_path: Option<Vec<String>>,
+    #[schemars(description = "Alternative to search_parent_path: a parent UUID or short hash directly. Ignored if search_parent_path is also provided.")]
+    pub search_parent_id: Option<NodeId>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -3802,6 +3838,324 @@ impl WorkflowyMcpServer {
             Err(e) => Err(tool_error("review", Some(&root), e)),
         }
         })
+    }
+
+    #[tool(description = "Resolve a hierarchical path of node names to a UUID. ONE API call per path segment, so a four-deep path resolves in ~1 second regardless of total tree size. Use this in preference to search_nodes/tag_search whenever you know where a node lives — finding 'Areas / Personal / Opportunities / Nedbank' costs four list_children calls, not a multi-minute root walk. Each segment matches case-insensitively (HTML stripped, whitespace trimmed) against children's names. Returns the final node's UUID, name, and full canonical path — and ingests every visited node into the persistent name index along the way, so future short-hash lookups under that branch resolve O(1).")]
+    async fn node_at_path(
+        &self,
+        Parameters(params): Parameters<NodeAtPathParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "node_at_path", params, {
+        if params.path.is_empty() {
+            return Err(McpError::invalid_params(
+                "path must contain at least one segment".to_string(),
+                None,
+            ));
+        }
+        let mut current_id: Option<String> = match &params.start_parent_id {
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            None => None,
+        };
+        let mut current_name = "<root>".to_string();
+        let mut traversed: Vec<String> = Vec::new();
+        let mut visited_nodes: Vec<crate::types::WorkflowyNode> = Vec::new();
+
+        for (idx, segment) in params.path.iter().enumerate() {
+            let needle = segment.trim().to_lowercase();
+            if needle.is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("path segment at index {} is empty", idx),
+                    None,
+                ));
+            }
+            let children = match &current_id {
+                Some(id) => self.client.get_children(id).await,
+                None => self.client.get_top_level_nodes().await,
+            };
+            let children = match children {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(tool_error(
+                        "node_at_path",
+                        current_id.as_deref(),
+                        e,
+                    ));
+                }
+            };
+            // Feed the index opportunistically as we descend.
+            self.name_index.ingest(&children);
+            visited_nodes.extend(children.iter().cloned());
+
+            let hit = children.iter().find(|n| {
+                let stripped = strip_html(&n.name).to_lowercase();
+                stripped.trim() == needle
+            });
+            match hit {
+                Some(node) => {
+                    current_id = Some(node.id.clone());
+                    current_name = strip_html(&node.name);
+                    traversed.push(current_name.clone());
+                }
+                None => {
+                    // Surface a useful diagnostic: what segment failed
+                    // and what siblings were available.
+                    let sibling_names: Vec<String> = children
+                        .iter()
+                        .take(20)
+                        .map(|n| strip_html(&n.name))
+                        .collect();
+                    let traversed_str = if traversed.is_empty() {
+                        "<root>".to_string()
+                    } else {
+                        traversed.join(" / ")
+                    };
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "path segment '{}' not found under '{}'. Children seen ({}): {}.",
+                            segment,
+                            traversed_str,
+                            children.len(),
+                            sibling_names.join(", ")
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        let final_id = current_id.expect("at least one segment guarantees current_id is Some");
+        let payload = serde_json::json!({
+            "id": final_id,
+            "name": current_name,
+            "path": traversed,
+            "api_calls": params.path.len(),
+            "nodes_indexed": visited_nodes.len(),
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
+    #[tool(description = "Resolve a Workflowy internal link or short hash to full node info. Optimised for the 'paste this URL, find this node' workflow. When you can name the parent path (e.g. ['Areas', 'Personal']), pass it via search_parent_path — the walk then runs only inside that subtree, taking seconds instead of minutes on huge trees. Bypasses the full-tree walk that ordinary tools fall back to on a short-hash cache miss.")]
+    async fn resolve_link(
+        &self,
+        Parameters(params): Parameters<ResolveLinkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record_op!(self, "resolve_link", params, {
+        let trimmed = params.link.trim();
+        // Extract the trailing hex segment from URL-form input.
+        let last_seg = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let last_seg = last_seg.trim_start_matches('#');
+        let normalised: String = last_seg.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
+        let unhyphen: String = normalised.chars().filter(|c| *c != '-').collect();
+
+        // Direct full-UUID input: just look up.
+        if unhyphen.len() == 32 && unhyphen.chars().all(|c| c.is_ascii_hexdigit()) {
+            return match self.client.get_node(&unhyphen).await {
+                Ok(node) => {
+                    self.name_index.ingest(std::slice::from_ref(&node));
+                    let payload = serde_json::json!({
+                        "id": node.id,
+                        "name": strip_html(&node.name),
+                        "description": node.description,
+                        "parent_id": node.parent_id,
+                        "resolved_via": "full_uuid_passthrough",
+                    });
+                    Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+                }
+                Err(e) => Err(tool_error("resolve_link", Some(&unhyphen), e)),
+            };
+        }
+
+        if !(unhyphen.len() == 12 || unhyphen.len() == 8) || !unhyphen.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "could not extract a Workflowy short hash from '{}'. Expected a 12-char URL-suffix hash, 8-char prefix, or full UUID.",
+                    params.link
+                ),
+                None,
+            ));
+        }
+
+        let short = unhyphen.to_lowercase();
+
+        // Cache hit: return immediately.
+        if let Some(full) = self.name_index.resolve_short_hash(&short) {
+            return self.return_resolved_node(&full, "cache_hit").await;
+        }
+
+        // Resolve search parent if provided.
+        let parent_uuid: Option<String> = if let Some(path) = &params.search_parent_path {
+            if path.is_empty() {
+                None
+            } else {
+                // Reuse the path-walk logic by calling node_at_path inline.
+                let mut current_id: Option<String> = None;
+                for segment in path {
+                    let needle = segment.trim().to_lowercase();
+                    let children = match &current_id {
+                        Some(id) => self.client.get_children(id).await,
+                        None => self.client.get_top_level_nodes().await,
+                    };
+                    let children = children.map_err(|e| tool_error("resolve_link", current_id.as_deref(), e))?;
+                    self.name_index.ingest(&children);
+                    let hit = children.iter().find(|n| {
+                        strip_html(&n.name).to_lowercase().trim() == needle
+                    });
+                    match hit {
+                        Some(node) => current_id = Some(node.id.clone()),
+                        None => {
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "search_parent_path segment '{}' not found under the partial path resolved so far",
+                                    segment
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                current_id
+            }
+        } else if let Some(pid) = &params.search_parent_id {
+            check_node_id(pid)?;
+            Some(self.resolve_node_ref(pid).await?)
+        } else {
+            None
+        };
+
+        // Walk the (parent or root) subtree to populate the index, with
+        // the resolution budget. Re-check the index after.
+        let summary = match self
+            .walk_for_short_hash_scoped(&short, parent_uuid.as_deref())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "resolve_link walk failed");
+                ResolveWalkSummary {
+                    nodes_walked: 0,
+                    truncated: true,
+                    truncation_reason: None,
+                    elapsed_ms: 0,
+                }
+            }
+        };
+
+        if let Some(full) = self.name_index.resolve_short_hash(&short) {
+            return self
+                .return_resolved_node(&full, "scoped_walk")
+                .await;
+        }
+
+        let scope_str = match (&params.search_parent_path, &params.search_parent_id) {
+            (Some(p), _) => format!("path {:?}", p),
+            (None, Some(_)) => "the supplied parent UUID".to_string(),
+            (None, None) => "the workspace root".to_string(),
+        };
+        let reason_str = match summary.truncation_reason {
+            Some(crate::api::TruncationReason::Timeout) => "timeout",
+            Some(crate::api::TruncationReason::NodeLimit) => "node_limit",
+            Some(crate::api::TruncationReason::Cancelled) => "cancelled",
+            None => "none",
+        };
+        Err(McpError::invalid_params(
+            format!(
+                "Short-hash '{}' not found under {} after walking {} nodes in {} ms (truncation: {}). Try: (a) supplying a more specific search_parent_path that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling node_at_path with the full hierarchical path if you know it.",
+                short, scope_str, summary.nodes_walked, summary.elapsed_ms, reason_str,
+            ),
+            None,
+        ))
+        })
+    }
+
+    /// Helper: fetch the node at `full_uuid` and emit a `resolve_link`
+    /// success payload, recording the resolution path so the caller can
+    /// see whether it came from cache or required a walk.
+    async fn return_resolved_node(
+        &self,
+        full_uuid: &str,
+        resolved_via: &str,
+    ) -> Result<CallToolResult, McpError> {
+        match self.client.get_node(full_uuid).await {
+            Ok(node) => {
+                self.name_index.ingest(std::slice::from_ref(&node));
+                let payload = serde_json::json!({
+                    "id": node.id,
+                    "name": strip_html(&node.name),
+                    "description": node.description,
+                    "parent_id": node.parent_id,
+                    "resolved_via": resolved_via,
+                });
+                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            }
+            Err(e) => Err(tool_error("resolve_link", Some(full_uuid), e)),
+        }
+    }
+
+    /// Variant of [`Self::walk_for_short_hash`] that scopes the walk to
+    /// a given parent (or root if `None`). Used by `resolve_link` so
+    /// the caller's parent hint cuts the search space.
+    async fn walk_for_short_hash_scoped(
+        &self,
+        short_hash: &str,
+        parent_id: Option<&str>,
+    ) -> crate::error::Result<ResolveWalkSummary> {
+        use crate::api::client::FetchControls;
+        let local_registry = crate::utils::CancelRegistry::new();
+        let cancel_guard = local_registry.guard();
+        let watcher_guard = cancel_guard.clone();
+        let watcher_index = self.name_index.clone();
+        let watcher_registry = local_registry.clone();
+        let target = short_hash.to_string();
+
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        let watcher = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if watcher_guard.is_cancelled() {
+                            return;
+                        }
+                        if watcher_index.resolve_short_hash(&target).is_some() {
+                            watcher_registry.cancel_all();
+                            return;
+                        }
+                    }
+                    _ = &mut done_rx => return,
+                }
+            }
+        });
+
+        let controls = FetchControls::with_timeout(Duration::from_millis(
+            defaults::RESOLVE_WALK_TIMEOUT_MS,
+        ))
+        .and_cancel(cancel_guard);
+
+        let result = self
+            .client
+            .get_subtree_with_controls(
+                parent_id,
+                defaults::MAX_TREE_DEPTH,
+                defaults::RESOLVE_WALK_NODE_CAP,
+                controls,
+            )
+            .await;
+
+        let _ = done_tx.send(());
+        let _ = watcher.await;
+
+        match result {
+            Ok(fetch) => {
+                let nodes_walked = fetch.nodes.len();
+                self.name_index.ingest(&fetch.nodes);
+                Ok(ResolveWalkSummary {
+                    nodes_walked,
+                    truncated: fetch.truncated,
+                    truncation_reason: fetch.truncation_reason,
+                    elapsed_ms: fetch.elapsed_ms,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[tool(description = "Export a subtree in OPML (for Workflowy/outliner compatibility), Markdown (nested bullets), or JSON (raw node array). For backup, hand-off to other tools, or external processing. Subject to the standard 10 000-node and 20-second walk budgets — large subtrees may return partial output with a truncation marker.")]
