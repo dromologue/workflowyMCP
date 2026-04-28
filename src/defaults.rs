@@ -83,6 +83,35 @@ pub const WORKFLOWY_BASE_URL: &str = "https://workflowy.com/api/v1";
 /// HTTP client timeout (seconds)
 pub const HTTP_TIMEOUT_SECS: u64 = 30;
 
+// --- Persistent name index ---
+/// How often the periodic saver checks the dirty flag and rewrites the
+/// on-disk index. Coalesces rapid bursts of mutations into one fsync;
+/// the rename-on-success protocol means a crash mid-save never produces
+/// a half-written file.
+pub const INDEX_SAVE_INTERVAL_SECS: u64 = 30;
+/// How often the background refresher walks the workspace root to keep
+/// the index in sync with newly added/renamed nodes. The walk inherits
+/// the standard subtree timeout and node cap, so a single pass on a
+/// huge tree may not finish — successive passes converge.
+pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// Wall-clock budget for an on-demand resolution walk triggered by a
+/// short-hash miss in `resolve_node_ref`. Bigger than the regular
+/// subtree budget because the user is *waiting* for this specific
+/// resolution and we want to give it a real chance to succeed before
+/// surfacing the cache-miss error.
+pub const RESOLVE_WALK_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+/// Node cap for the resolution walk. Set generously so a moderately
+/// large tree can be exhaustively walked while still bounding worst
+/// case memory use.
+pub const RESOLVE_WALK_NODE_CAP: usize = 100_000;
+/// Environment variable that overrides the default on-disk path for
+/// the persistent name index. Empty string means "disabled".
+pub const INDEX_PATH_ENV: &str = "WORKFLOWY_INDEX_PATH";
+/// Subdirectory under `$HOME/code/secondBrain/memory` that holds the
+/// persistent index. Documented in the repo's setup guide so a fresh
+/// user knows where to expect their cache to land.
+pub const DEFAULT_INDEX_RELATIVE_PATH: &str = "code/secondBrain/memory/name_index.json";
+
 #[cfg(test)]
 mod tests {
     use super::*;

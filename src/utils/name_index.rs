@@ -11,7 +11,11 @@
 
 use crate::types::WorkflowyNode;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Lengths (in lowercase hex chars) of the two short-hash forms accepted
 /// for a UUID:
@@ -52,6 +56,28 @@ struct PrefixEntry {
     count: u32,
 }
 
+/// On-disk representation of one node entry. Persisted as part of
+/// [`PersistedSnapshot`] so a fresh server start can rehydrate the index
+/// without paying for a full tree walk against the live API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedEntry {
+    id: String,
+    name: String,
+    parent_id: Option<String>,
+}
+
+/// On-disk snapshot of the entire name index. Schema-versioned so we
+/// can evolve the format without breaking older caches; readers ignore
+/// snapshots whose `version` is unfamiliar rather than panicking.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    version: u32,
+    updated_at: u64,
+    nodes: Vec<PersistedEntry>,
+}
+
+const PERSIST_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Default)]
 pub struct NameIndex {
     by_name: RwLock<HashMap<String, IndexedValue>>,
@@ -72,6 +98,15 @@ pub struct NameIndex {
     /// observed mapping and return None for subsequent lookups so the
     /// caller can disambiguate via full UUID.
     by_prefix_hash: RwLock<HashMap<String, PrefixEntry>>,
+    /// Disk path for persistence. When set, [`save_to_disk`] writes here
+    /// and [`load_from_disk`] reads from here. Populated by the server
+    /// startup wiring, not by `Default`, so unit tests don't accidentally
+    /// touch the user's filesystem.
+    save_path: RwLock<Option<PathBuf>>,
+    /// Set when `ingest`/`invalidate_node`/`clear` mutate state since the
+    /// last successful save. Lets a debounced background saver coalesce
+    /// many mutations into one write.
+    dirty: AtomicBool,
 }
 
 impl NameIndex {
@@ -85,13 +120,27 @@ impl NameIndex {
         if nodes.is_empty() {
             return;
         }
+        // Guard against `nodes` containing only entries that are already
+        // identical to the current state — a no-op ingest must not set
+        // `dirty`, otherwise the periodic saver would write the same JSON
+        // forever.
+        let mut changed = false;
         let mut by_name = self.by_name.write();
         let mut by_id = self.by_id.write();
         let mut by_short = self.by_short_hash.write();
         let mut by_prefix = self.by_prefix_hash.write();
         for node in nodes {
-            self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, &node.id);
+            // Skip a redundant ingest: same id + same lowercased name
+            // means nothing in the maps would change. We still treat
+            // parent_id changes as a no-op here because moves are
+            // observed via the cache layer; the by_id key only stores
+            // the lowercased name.
             let key = node.name.to_lowercase();
+            if by_id.get(&node.id).map(|n| n.as_str()) == Some(key.as_str()) {
+                continue;
+            }
+            self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, &node.id);
+            changed = true;
             let entry = NameIndexEntry {
                 node_id: node.id.clone(),
                 name: node.name.clone(),
@@ -121,6 +170,13 @@ impl NameIndex {
                     v.entries.push(entry.clone());
                 })
                 .or_insert_with(|| IndexedValue { entries: vec![entry] });
+        }
+        drop(by_prefix);
+        drop(by_short);
+        drop(by_id);
+        drop(by_name);
+        if changed {
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -206,19 +262,152 @@ impl NameIndex {
         let mut by_id = self.by_id.write();
         let mut by_short = self.by_short_hash.write();
         let mut by_prefix = self.by_prefix_hash.write();
+        let was_present = by_id.contains_key(node_id);
         self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, node_id);
+        if was_present {
+            drop(by_prefix);
+            drop(by_short);
+            drop(by_id);
+            drop(by_name);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Drop every entry.
     pub fn clear(&self) {
+        let was_populated = !self.by_id.read().is_empty();
         self.by_name.write().clear();
         self.by_id.write().clear();
         self.by_short_hash.write().clear();
         self.by_prefix_hash.write().clear();
+        if was_populated {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn size(&self) -> usize {
         self.by_id.read().len()
+    }
+
+    // --- Persistence ---
+
+    /// Configure the on-disk JSON path for this index. Call once at server
+    /// startup. Subsequent calls overwrite the path. Setting it does not
+    /// trigger an immediate save — call [`save_to_disk`] explicitly or
+    /// rely on the periodic saver task.
+    pub fn set_save_path(&self, path: PathBuf) {
+        *self.save_path.write() = Some(path);
+    }
+
+    /// Path the index would write to. `None` until `set_save_path` is called.
+    pub fn save_path(&self) -> Option<PathBuf> {
+        self.save_path.read().clone()
+    }
+
+    /// True iff state has changed since the last successful save. Cleared
+    /// by [`save_to_disk`] on a successful write.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Load entries from the configured save path, if any. Returns the
+    /// number of nodes ingested. A missing file is treated as a clean
+    /// start (returns 0). A malformed file is returned as an
+    /// `InvalidData` error so the caller can decide whether to delete
+    /// and re-walk; we never panic on bad cache contents.
+    ///
+    /// After a successful load, the dirty flag is cleared — entries
+    /// just read from disk should not trigger an immediate write back.
+    pub fn load_from_disk(&self) -> std::io::Result<usize> {
+        let path = match self.save_path() {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+        if !path.exists() {
+            return Ok(0);
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let snap: PersistedSnapshot = serde_json::from_str(&text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if snap.version != PERSIST_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "name index schema version {} is not supported (expected {})",
+                    snap.version, PERSIST_SCHEMA_VERSION
+                ),
+            ));
+        }
+        let count = snap.nodes.len();
+        // Reuse the public ingest path so all derived maps stay
+        // consistent. We need WorkflowyNode stubs for that — fields we
+        // don't persist remain at their `Default` values.
+        let nodes: Vec<WorkflowyNode> = snap
+            .nodes
+            .into_iter()
+            .map(|e| WorkflowyNode {
+                id: e.id,
+                name: e.name,
+                parent_id: e.parent_id,
+                ..Default::default()
+            })
+            .collect();
+        self.ingest(&nodes);
+        // Loading from disk reconstitutes state — there is nothing new
+        // to write back, so clear the dirty flag set by `ingest`.
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(count)
+    }
+
+    /// Atomically write the current index to the configured save path.
+    /// No-op when no path is set. Writes through a `.tmp` sibling and
+    /// renames into place so a crashed save can never leave a half-
+    /// written JSON file behind. Clears the dirty flag on success.
+    pub fn save_to_disk(&self) -> std::io::Result<()> {
+        let path = match self.save_path() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let snap = self.snapshot();
+        let json = serde_json::to_vec_pretty(&snap)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = with_tmp_suffix(&path);
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &path)?;
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Build a snapshot of the index for serialization. The order of
+    /// emitted nodes is deterministic for a given map state (by
+    /// node_id), so successive saves of an unchanged index produce
+    /// byte-identical JSON — useful when the index file is itself
+    /// version-controlled.
+    fn snapshot(&self) -> PersistedSnapshot {
+        let by_name = self.by_name.read();
+        let mut nodes: Vec<PersistedEntry> = Vec::with_capacity(by_name.values().map(|v| v.entries.len()).sum());
+        for value in by_name.values() {
+            for entry in &value.entries {
+                nodes.push(PersistedEntry {
+                    id: entry.node_id.clone(),
+                    name: entry.name.clone(),
+                    parent_id: entry.parent_id.clone(),
+                });
+            }
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        PersistedSnapshot {
+            version: PERSIST_SCHEMA_VERSION,
+            updated_at,
+            nodes,
+        }
     }
 
     fn remove_locked(
@@ -259,6 +448,14 @@ impl NameIndex {
             }
         }
     }
+}
+
+/// Append a `.tmp` segment to a path so atomic writes can rename
+/// over the live file. Used by [`NameIndex::save_to_disk`].
+fn with_tmp_suffix(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 /// Compute the 8-char prefix form of a UUID (the first segment of the
@@ -482,6 +679,79 @@ mod tests {
         assert_eq!(idx.resolve_short_hash("deadbeef").as_deref(), Some(id));
         idx.invalidate_node(id);
         assert!(idx.resolve_short_hash("deadbeef").is_none());
+    }
+
+    #[test]
+    fn save_load_roundtrips_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+
+        let idx = NameIndex::new();
+        idx.set_save_path(path.clone());
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        idx.ingest(&[node(id, "Tasks", Some("root"))]);
+        assert!(idx.is_dirty(), "ingest should mark dirty");
+        idx.save_to_disk().expect("save");
+        assert!(!idx.is_dirty(), "save clears dirty");
+
+        // Fresh index, same path, must rehydrate the entry.
+        let idx2 = NameIndex::new();
+        idx2.set_save_path(path);
+        let count = idx2.load_from_disk().expect("load");
+        assert_eq!(count, 1);
+        assert!(!idx2.is_dirty(), "load must not leave the index dirty");
+        assert_eq!(
+            idx2.resolve_short_hash("446655440000").as_deref(),
+            Some(id)
+        );
+        assert_eq!(idx2.lookup("tasks", "exact").len(), 1);
+    }
+
+    #[test]
+    fn ingest_is_no_op_when_state_unchanged() {
+        // Re-ingesting the same node must NOT flip dirty — the periodic
+        // saver would otherwise loop forever rewriting the same JSON.
+        let idx = NameIndex::new();
+        idx.ingest(&[node("1", "A", None)]);
+        let _ = idx.is_dirty();
+        idx.dirty.store(false, Ordering::Relaxed);
+        idx.ingest(&[node("1", "A", None)]);
+        assert!(!idx.is_dirty(), "redundant ingest must not mark dirty");
+    }
+
+    #[test]
+    fn load_from_disk_handles_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.json");
+        let idx = NameIndex::new();
+        idx.set_save_path(path);
+        assert_eq!(idx.load_from_disk().expect("missing file is OK"), 0);
+    }
+
+    #[test]
+    fn load_from_disk_rejects_bad_schema_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 999, "updated_at": 0, "nodes": []}"#,
+        )
+        .expect("write");
+        let idx = NameIndex::new();
+        idx.set_save_path(path);
+        let err = idx.load_from_disk().expect_err("bad version must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn save_creates_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("a").join("b").join("name_index.json");
+        let idx = NameIndex::new();
+        idx.set_save_path(nested.clone());
+        idx.ingest(&[node("1", "A", None)]);
+        idx.save_to_disk().expect("save creates parents");
+        assert!(nested.exists());
     }
 
     #[test]

@@ -136,12 +136,33 @@ re-implementing them:
    used widely in docs and skill files (e.g. `c1ef1ad5` for
    `c1ef1ad5-…`, the first segment of the canonical 8-4-4-4-12
    hyphenated layout). Resolution is `O(1)` against the server's
-   name index, which is populated automatically by every subtree walk
-   and on every write. The 8-char form is collision-aware: if two
-   distinct UUIDs share a prefix, resolution returns `None` and the
-   caller must disambiguate via the full UUID. The name index has no
-   TTL — once populated it serves lookups indefinitely until a write
-   invalidates the affected entry.
+   name index when the entry is cached. **On a cache miss,
+   `resolve_node_ref` walks the workspace synchronously** with the
+   extended budget (`defaults::RESOLVE_WALK_TIMEOUT_MS`, 5 minutes)
+   and the resolution node cap (`defaults::RESOLVE_WALK_NODE_CAP`,
+   100 000); a watcher polls the index every 100 ms and cancels the
+   walk as soon as the target appears, so found-early lookups don't
+   pay the full timeout. Only when the walk completes without finding
+   the target does the resolver surface a cache-miss error. The
+   8-char form is collision-aware: if two distinct UUIDs share a
+   prefix, resolution returns `None` and the caller must disambiguate
+   via the full UUID. The name index has no TTL — once populated it
+   serves lookups indefinitely until a write invalidates the affected
+   entry.
+6a. **Persistent name index.** The name index survives server
+   restarts. On startup, `WorkflowyMcpServer::with_cache_and_persistence`
+   reads `$WORKFLOWY_INDEX_PATH` (default
+   `$HOME/code/secondBrain/memory/name_index.json`) and rehydrates
+   every entry it finds; a missing or unreadable file is logged and
+   the server starts empty. Mutations set a dirty flag; a background
+   task flushes to disk every `defaults::INDEX_SAVE_INTERVAL_SECS`
+   (30 s) using a write-then-rename protocol so a crash mid-save
+   never produces a half-written file. A second background task
+   walks the workspace root every
+   `defaults::INDEX_REFRESH_INTERVAL_SECS` (6 hours) so newly added
+   or renamed nodes get indexed without user action. Both background
+   tasks are no-ops when no save path is configured (test paths,
+   custom embeddings).
 7. **`edit_node` field-loss workaround.** When both `name` and
    `description` are supplied to `edit_node`, the client splits the
    update into two sequential POSTs (one per field) instead of a

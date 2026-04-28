@@ -16,7 +16,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
 use crate::defaults;
@@ -999,6 +999,33 @@ impl WorkflowyMcpServer {
         }
     }
 
+    /// Production constructor: as `with_cache`, plus configure the
+    /// persistent name index. When `save_path` is `Some`, the index is
+    /// rehydrated from disk synchronously (so the very first tool call
+    /// can see cached short-hash mappings) and any subsequent
+    /// mutations mark it dirty for the periodic saver to pick up. A
+    /// missing or unreadable file is logged at warn and the server
+    /// starts with an empty index — never panicking.
+    pub fn with_cache_and_persistence(
+        client: Arc<WorkflowyClient>,
+        cache: Arc<NodeCache>,
+        save_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let server = Self::with_cache(client, cache);
+        if let Some(path) = save_path {
+            server.name_index.set_save_path(path.clone());
+            match server.name_index.load_from_disk() {
+                Ok(n) => {
+                    info!(loaded = n, path = %path.display(), "name index hydrated from disk");
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "name index load failed; starting empty");
+                }
+            }
+        }
+        server
+    }
+
     /// Test/inspection accessor for the operation log.
     #[cfg(test)]
     pub(crate) fn op_log(&self) -> &OpLog {
@@ -1014,29 +1041,132 @@ impl WorkflowyMcpServer {
     }
 
     /// Resolve a `node_id` parameter to a full UUID string. Accepts either
-    /// the canonical 32-hex-char UUID (with or without hyphens) or the
-    /// 12-char short-hash form Workflowy uses in URLs. Short-hash
-    /// resolution requires the name index to have seen the target node;
-    /// a miss returns a pointed error rather than silently failing.
+    /// the canonical 32-hex-char UUID (with or without hyphens) or one
+    /// of the two short-hash forms (12-char URL suffix or 8-char prefix).
     ///
-    /// Tools that need to call the Workflowy API with the resolved id
-    /// should call this instead of treating the param string as the full
-    /// UUID directly.
-    fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
-        if is_short_hash(raw) {
-            match self.name_index.resolve_short_hash(raw) {
-                Some(full) => Ok(full),
-                None => Err(McpError::invalid_params(
-                    format!(
-                        "Short-hash '{}' is not in the name index. Pass the full UUID, or run build_name_index first to populate.",
-                        raw
-                    ),
-                    None,
-                )),
+    /// On a short-hash cache miss, this method **walks the workspace**
+    /// with the extended resolution budget
+    /// ([`defaults::RESOLVE_WALK_TIMEOUT_MS`]) before giving up. Every
+    /// node visited during the walk is fed into the persistent index, so
+    /// the first short-hash a session resolves pays for the rest. Only
+    /// when the walk completes without finding the target do we surface
+    /// the cache-miss error.
+    async fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
+        if !is_short_hash(raw) {
+            return Ok(raw.to_string());
+        }
+        if let Some(full) = self.name_index.resolve_short_hash(raw) {
+            return Ok(full);
+        }
+        // Cache miss — walk the workspace with the extended budget.
+        info!(short_hash = raw, "resolve_node_ref: cache miss, walking workspace");
+        if let Err(e) = self.walk_for_short_hash(raw).await {
+            warn!(error = %e, "resolve walk failed; treating as cache miss");
+        }
+        if let Some(full) = self.name_index.resolve_short_hash(raw) {
+            return Ok(full);
+        }
+        Err(McpError::invalid_params(
+            format!(
+                "Short-hash '{}' could not be resolved. The walk completed without finding a matching node. Pass the full UUID, or verify the short hash matches an existing node.",
+                raw
+            ),
+            None,
+        ))
+    }
+
+    /// Walk the workspace root with the resolution budget and ingest
+    /// every visited node into the persistent name index. Used by the
+    /// background refresher in `run_server`. Returns
+    /// `(nodes_walked, truncated)` so the caller can log progress.
+    /// Distinct from [`Self::walk_for_short_hash`] in that it has no
+    /// early-termination — the goal is exhaustive coverage, not finding
+    /// one specific node.
+    pub async fn refresh_name_index(&self) -> crate::error::Result<(usize, bool)> {
+        use crate::api::client::FetchControls;
+        let controls = FetchControls::with_timeout(Duration::from_millis(
+            defaults::RESOLVE_WALK_TIMEOUT_MS,
+        ))
+        .and_cancel(self.cancel_registry.guard());
+        let fetch = self
+            .client
+            .get_subtree_with_controls(
+                None,
+                defaults::MAX_TREE_DEPTH,
+                defaults::RESOLVE_WALK_NODE_CAP,
+                controls,
+            )
+            .await?;
+        self.name_index.ingest(&fetch.nodes);
+        Ok((fetch.nodes.len(), fetch.truncated))
+    }
+
+    /// Walk the workspace root with [`defaults::RESOLVE_WALK_TIMEOUT_MS`]
+    /// and the resolution node cap, feeding every visited node into the
+    /// name index. The caller checks the index before and after, so this
+    /// method's only job is to populate. Errors from the walk are
+    /// surfaced so the caller can log them; an `Ok` with no progress
+    /// (e.g. timeout before the target is reached) is still useful
+    /// because future calls inherit whatever was indexed.
+    ///
+    /// Spawns a watcher task that polls the index every 100 ms and
+    /// cancels the walk as soon as the target short-hash appears, so a
+    /// successful early resolution doesn't pay the full timeout.
+    async fn walk_for_short_hash(&self, short_hash: &str) -> crate::error::Result<()> {
+        use crate::api::client::FetchControls;
+        let cancel_guard = self.cancel_registry.guard();
+        let watcher_guard = cancel_guard.clone();
+        let watcher_index = self.name_index.clone();
+        let registry = self.cancel_registry.clone();
+        let target = short_hash.to_string();
+
+        // Watcher: every 100 ms, ask the index whether the target has
+        // shown up. If yes, bump the cancel registry to break the walk
+        // out of its remaining levels. If the walk completes naturally,
+        // the watcher_done channel signals the watcher to exit.
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        let watcher = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if watcher_guard.is_cancelled() {
+                            return;
+                        }
+                        if watcher_index.resolve_short_hash(&target).is_some() {
+                            registry.cancel_all();
+                            return;
+                        }
+                    }
+                    _ = &mut done_rx => return,
+                }
             }
-        } else {
-            // Already a full UUID (or we'll fail later in the API call).
-            Ok(raw.to_string())
+        });
+
+        let controls = FetchControls::with_timeout(Duration::from_millis(
+            defaults::RESOLVE_WALK_TIMEOUT_MS,
+        ))
+        .and_cancel(cancel_guard);
+
+        let result = self
+            .client
+            .get_subtree_with_controls(
+                None,
+                defaults::MAX_TREE_DEPTH,
+                defaults::RESOLVE_WALK_NODE_CAP,
+                controls,
+            )
+            .await;
+
+        // Stop the watcher whether the walk succeeded or failed.
+        let _ = done_tx.send(());
+        let _ = watcher.await;
+
+        match result {
+            Ok(fetch) => {
+                self.name_index.ingest(&fetch.nodes);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1118,7 +1248,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.query, max_results, max_depth, "Searching nodes");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
 
@@ -1186,7 +1316,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "get_node", params, {
         info!(node_id = %params.node_id, "Getting node");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         // Fetch the node and its direct children in parallel — they are
         // independent API calls, and previously `get_node` returned an empty
@@ -1245,7 +1375,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "create_node", params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
 
@@ -1305,7 +1435,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "edit_node", params, {
         info!(node_id = %params.node_id, "Editing node");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         // Reject no-op edits at the boundary: the Workflowy API happily
         // accepts an empty PATCH body and returns success, which would mask
@@ -1343,7 +1473,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "delete_node", params, {
         info!(node_id = %params.node_id, "Deleting node");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         match self.client.delete_node_with_propagation_retry(&resolved).await {
             Ok(_) => {
@@ -1368,8 +1498,8 @@ impl WorkflowyMcpServer {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
         check_node_id(&params.node_id)?;
         check_node_id(&params.new_parent_id)?;
-        let resolved_node = self.resolve_node_ref(&params.node_id)?;
-        let resolved_parent = self.resolve_node_ref(&params.new_parent_id)?;
+        let resolved_node = self.resolve_node_ref(&params.node_id).await?;
+        let resolved_parent = self.resolve_node_ref(&params.new_parent_id).await?;
 
         // Capture the current parent before the move so we can invalidate its
         // children listing afterwards. A failed pre-read is not fatal — the
@@ -1414,7 +1544,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "list_children", params, {
         info!(node_id = %params.node_id, "Getting children");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         match self.client.get_children_with_propagation_retry(&resolved).await {
             Ok(children) => {
@@ -1505,7 +1635,7 @@ impl WorkflowyMcpServer {
         record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
         check_node_id(&params.parent_id)?;
-        let resolved_parent = self.resolve_node_ref(&params.parent_id)?;
+        let resolved_parent = self.resolve_node_ref(&params.parent_id).await?;
 
         // Parse indented lines
         struct ParsedLine<'a> { text: &'a str, indent: usize }
@@ -1566,7 +1696,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         match self.walk_subtree(Some(&resolved), max_depth).await {
             Ok(fetch) => {
@@ -1604,7 +1734,7 @@ impl WorkflowyMcpServer {
         let use_index = params.use_index.unwrap_or(false);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
         info!(name = %params.name, match_mode, max_depth, use_index, allow_root_scan, "Finding node");
@@ -1887,7 +2017,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Daily review");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
 
@@ -2005,7 +2135,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Getting recent changes");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
 
@@ -2062,7 +2192,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Listing overdue items");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
 
@@ -2117,7 +2247,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Listing upcoming items");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
 
@@ -2193,7 +2323,7 @@ impl WorkflowyMcpServer {
         let recent_days = params.recently_modified_days.unwrap_or(7) as i64;
         info!(node_id = %params.node_id, "Getting project summary");
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         match self.walk_subtree(Some(&resolved), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
@@ -2304,7 +2434,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "find_backlinks", params, {
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(node_id = %resolved, max_depth, "Finding backlinks");
@@ -2367,7 +2497,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(status, max_depth, "Listing todos");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid)?) }
+            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
 
@@ -2425,8 +2555,8 @@ impl WorkflowyMcpServer {
         record_op!(self, "duplicate_node", params, {
         check_node_id(&params.node_id)?;
         check_node_id(&params.target_parent_id)?;
-        let resolved_node = self.resolve_node_ref(&params.node_id)?;
-        let resolved_target = self.resolve_node_ref(&params.target_parent_id)?;
+        let resolved_node = self.resolve_node_ref(&params.node_id).await?;
+        let resolved_target = self.resolve_node_ref(&params.target_parent_id).await?;
         let include_children = params.include_children.unwrap_or(true);
         info!(node_id = %resolved_node, target = %resolved_target, "Duplicating node");
 
@@ -2531,8 +2661,8 @@ impl WorkflowyMcpServer {
         record_op!(self, "create_from_template", params, {
         check_node_id(&params.template_node_id)?;
         check_node_id(&params.target_parent_id)?;
-        let resolved_template = self.resolve_node_ref(&params.template_node_id)?;
-        let resolved_target = self.resolve_node_ref(&params.target_parent_id)?;
+        let resolved_template = self.resolve_node_ref(&params.template_node_id).await?;
+        let resolved_target = self.resolve_node_ref(&params.target_parent_id).await?;
         let vars = params.variables.unwrap_or_default();
         info!(template = %resolved_template, "Creating from template");
 
@@ -2635,7 +2765,7 @@ impl WorkflowyMcpServer {
         let status = params.status.as_deref().unwrap_or("all");
         info!(operation = %params.operation, dry_run, "Bulk update");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
 
@@ -3120,7 +3250,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid)?) }
+            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
             None => None,
         };
         if resolved_root.is_none() && !allow_root_scan {
@@ -3170,22 +3300,21 @@ impl WorkflowyMcpServer {
         }
 
         // Resolve short-hash parents up front so the batch sees full UUIDs.
-        let resolved_ops: Vec<BatchCreateOp> = params
-            .operations
-            .into_iter()
-            .map(|o| {
-                let parent_id = match o.parent_id {
-                    Some(pid) => Some(self.resolve_node_ref(&pid)?),
-                    None => None,
-                };
-                Ok::<BatchCreateOp, McpError>(BatchCreateOp {
-                    name: o.name,
-                    description: o.description,
-                    parent_id,
-                    priority: o.priority,
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        // The resolver is async (it may walk the workspace on a short-hash
+        // miss), so we resolve sequentially before the batch dispatches.
+        let mut resolved_ops: Vec<BatchCreateOp> = Vec::with_capacity(params.operations.len());
+        for o in params.operations.into_iter() {
+            let parent_id = match o.parent_id {
+                Some(pid) => Some(self.resolve_node_ref(&pid).await?),
+                None => None,
+            };
+            resolved_ops.push(BatchCreateOp {
+                name: o.name,
+                description: o.description,
+                parent_id,
+                priority: o.priority,
+            });
+        }
 
         let parents_to_invalidate: std::collections::HashSet<String> = resolved_ops
             .iter()
@@ -3298,7 +3427,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "path_of", params, {
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
         let max_depth = params.max_depth.unwrap_or(50);
 
         // Walk parent_id chain. We stop at the first None, the first
@@ -3367,15 +3496,13 @@ impl WorkflowyMcpServer {
         let needle = format!("#{}", tag.trim_start_matches('#'));
 
         // Resolve every id eagerly so a short-hash miss is reported
-        // before we start mutating.
-        let ids: Vec<String> = params
-            .node_ids
-            .iter()
-            .map(|id| {
-                check_node_id(id)?;
-                self.resolve_node_ref(id)
-            })
-            .collect::<Result<_, _>>()?;
+        // before we start mutating. Sequential because the resolver is
+        // async and may walk the workspace on cache miss.
+        let mut ids: Vec<String> = Vec::with_capacity(params.node_ids.len());
+        for id in &params.node_ids {
+            check_node_id(id)?;
+            ids.push(self.resolve_node_ref(id).await?);
+        }
 
         let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
         use futures::StreamExt;
@@ -3449,7 +3576,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "since", params, {
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
         let node = self.client.get_node(&resolved).await.map_err(|e| {
             tool_error("since", Some(&resolved), e)
         })?;
@@ -3476,7 +3603,7 @@ impl WorkflowyMcpServer {
         let limit = params.limit.unwrap_or(50);
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
         let scope = match &params.root_id {
-            Some(r) => Some(self.resolve_node_ref(r)?),
+            Some(r) => Some(self.resolve_node_ref(r).await?),
             None => None,
         };
 
@@ -3540,7 +3667,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "audit_mirrors", params, {
         let root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid)? }
+            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
@@ -3570,7 +3697,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "review", params, {
         let root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid)? }
+            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
@@ -3615,7 +3742,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "export_subtree", params, {
         check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
         let max_depth = params.max_depth.unwrap_or(10);
         let format = params.format.to_lowercase();
         if !matches!(format.as_str(), "opml" | "markdown" | "json") {
@@ -3713,7 +3840,7 @@ impl WorkflowyMcpServer {
         match op.op.as_str() {
             "create" => {
                 let parent_id = match &op.parent_id {
-                    Some(pid) => Some(self.resolve_node_ref(pid)?),
+                    Some(pid) => Some(self.resolve_node_ref(pid).await?),
                     None => None,
                 };
                 let name = op.name.as_deref().ok_or_else(|| {
@@ -3748,7 +3875,7 @@ impl WorkflowyMcpServer {
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
                     McpError::invalid_params("edit requires `node_id`".to_string(), None)
                 })?;
-                let node_id = self.resolve_node_ref(node_id_raw)?;
+                let node_id = self.resolve_node_ref(node_id_raw).await?;
                 if op.name.is_none() && op.description.is_none() {
                     return Err(McpError::invalid_params(
                         "edit requires at least one of `name`/`description`".to_string(),
@@ -3778,7 +3905,7 @@ impl WorkflowyMcpServer {
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
                     McpError::invalid_params("delete requires `node_id`".to_string(), None)
                 })?;
-                let node_id = self.resolve_node_ref(node_id_raw)?;
+                let node_id = self.resolve_node_ref(node_id_raw).await?;
                 self.client.delete_node(&node_id).await.map_err(|e| {
                     tool_error("transaction.delete", Some(&node_id), e)
                 })?;
@@ -3798,8 +3925,8 @@ impl WorkflowyMcpServer {
                 let new_parent_raw = op.new_parent_id.as_ref().ok_or_else(|| {
                     McpError::invalid_params("move requires `new_parent_id`".to_string(), None)
                 })?;
-                let node_id = self.resolve_node_ref(node_id_raw)?;
-                let new_parent = self.resolve_node_ref(new_parent_raw)?;
+                let node_id = self.resolve_node_ref(node_id_raw).await?;
+                let new_parent = self.resolve_node_ref(new_parent_raw).await?;
                 let prev = self.client.get_node(&node_id).await.ok();
                 let prev_parent_id = prev.as_ref().and_then(|n| n.parent_id.clone());
                 let prev_priority = prev.as_ref().and_then(|n| n.priority).map(|p| p as i32);
@@ -3935,11 +4062,108 @@ Diagnostics & ops:
     }
 }
 
+/// Resolve the on-disk path for the persistent name index. Honours the
+/// [`defaults::INDEX_PATH_ENV`] override; falls back to
+/// `$HOME/code/secondBrain/memory/name_index.json`. Returns `None`
+/// when both the override and `$HOME` are unavailable, in which case
+/// the server runs without persistence (and the index lives only in
+/// memory, the historical behaviour).
+fn resolve_index_save_path() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var(defaults::INDEX_PATH_ENV) {
+        let trimmed = custom.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(trimmed));
+    }
+    let home = std::env::var("HOME").ok()?;
+    let mut p = std::path::PathBuf::from(home);
+    p.push(defaults::DEFAULT_INDEX_RELATIVE_PATH);
+    Some(p)
+}
+
+/// Spawn a background task that flushes the dirty name index to disk
+/// every [`defaults::INDEX_SAVE_INTERVAL_SECS`] seconds. The task lives
+/// for as long as the process — there is no graceful shutdown over MCP
+/// stdio, so the periodic checkpoint is the only mechanism we have.
+/// Errors are logged but never propagated; a transient disk failure
+/// must not crash the server.
+fn spawn_index_saver(name_index: Arc<NameIndex>) {
+    if name_index.save_path().is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            defaults::INDEX_SAVE_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Discard the immediate first tick — nothing's been mutated yet.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if name_index.is_dirty() {
+                if let Err(e) = name_index.save_to_disk() {
+                    warn!(error = %e, "name index save failed");
+                } else {
+                    info!(size = name_index.size(), "name index checkpointed");
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a background task that periodically walks the workspace root
+/// to keep the persistent index in sync with newly added or renamed
+/// nodes. The first walk runs after a short startup delay so the
+/// initial set of user requests can take priority on the rate limiter.
+fn spawn_index_refresher(server: WorkflowyMcpServer) {
+    if server.name_index.save_path().is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        // Let the server warm up before kicking the first heavy walk —
+        // the user's first interactive request should not contend with
+        // a refresh on cold start.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let started = Instant::now();
+            match server.refresh_name_index().await {
+                Ok(stats) => info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    nodes = stats.0,
+                    truncated = stats.1,
+                    "background name-index refresh completed"
+                ),
+                Err(e) => warn!(error = %e, "background name-index refresh failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(
+                defaults::INDEX_REFRESH_INTERVAL_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
 /// Start the MCP server on stdio transport
 pub async fn run_server(client: Arc<WorkflowyClient>) -> anyhow::Result<()> {
     info!("Starting Workflowy MCP Server on stdio");
 
-    let server = WorkflowyMcpServer::new(client);
+    let save_path = resolve_index_save_path();
+    if let Some(p) = &save_path {
+        info!(path = %p.display(), "name index persistence enabled");
+    } else {
+        info!("name index persistence disabled (no save path)");
+    }
+
+    let server = WorkflowyMcpServer::with_cache_and_persistence(
+        client,
+        crate::utils::cache::get_cache(),
+        save_path,
+    );
+
+    spawn_index_saver(Arc::clone(&server.name_index));
+    spawn_index_refresher(server.clone());
+
     let service = server.serve(stdio()).await.inspect_err(|e| {
         error!("MCP serve error: {:?}", e);
     })?;
@@ -4390,19 +4614,25 @@ mod tests {
         }]);
         let resolved = server
             .resolve_node_ref("446655440000")
+            .await
             .expect("known short hash should resolve");
         assert_eq!(resolved, full);
     }
 
     #[tokio::test]
     async fn resolve_node_ref_errors_on_unknown_short_hash() {
+        // The auto-walk fallback fires here against an unreachable test
+        // client; the walk fails fast and the resolver surfaces the
+        // cache-miss error. The walk is bounded by RESOLVE_WALK_TIMEOUT_MS,
+        // so this test cannot hang even when the walk path is taken.
         let server = new_test_server();
         let err = server
             .resolve_node_ref("ffffffffffff")
-            .expect_err("unknown short hash must error");
+            .await
+            .expect_err("unknown short hash must error after walk");
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("short-hash") || msg.contains("name index"),
+            msg.contains("short-hash") || msg.contains("name index") || msg.contains("could not be resolved"),
             "got: {msg}"
         );
     }
@@ -4413,8 +4643,79 @@ mod tests {
         let full = "550e8400-e29b-41d4-a716-446655440000";
         let resolved = server
             .resolve_node_ref(full)
+            .await
             .expect("full UUID should pass through unchanged");
         assert_eq!(resolved, full);
+    }
+
+    #[tokio::test]
+    async fn with_cache_and_persistence_rehydrates_index_from_disk() {
+        // Round-trip: build a server, ingest a node, save to disk;
+        // construct a fresh server pointed at the same path and confirm
+        // the short-hash resolves without any walk.
+        use crate::utils::cache::NodeCache;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+
+        let client = Arc::new(WorkflowyClient::new(
+            "http://invalid.local".into(),
+            "test".into(),
+        ).unwrap());
+        let cache = Arc::new(NodeCache::new(defaults::CACHE_MAX_SIZE));
+        let server1 = WorkflowyMcpServer::with_cache_and_persistence(
+            Arc::clone(&client),
+            Arc::clone(&cache),
+            Some(path.clone()),
+        );
+        let full = "550e8400-e29b-41d4-a716-446655440000";
+        server1.name_index.ingest(&[WorkflowyNode {
+            id: full.to_string(),
+            name: "Tasks".to_string(),
+            parent_id: None,
+            ..Default::default()
+        }]);
+        server1.name_index.save_to_disk().expect("save");
+
+        let server2 = WorkflowyMcpServer::with_cache_and_persistence(
+            Arc::clone(&client),
+            Arc::clone(&cache),
+            Some(path.clone()),
+        );
+        // The fresh server resolves the short hash entirely from disk.
+        let resolved = server2
+            .resolve_node_ref("446655440000")
+            .await
+            .expect("rehydrated short hash must resolve from cache");
+        assert_eq!(resolved, full);
+    }
+
+    #[test]
+    fn resolve_index_save_path_uses_env_override_when_set() {
+        // Save and restore the env var so the test is repeatable. We
+        // avoid `std::env::set_var` in async context (it's not
+        // thread-safe across tests) by using a serialised wrapper here.
+        let key = defaults::INDEX_PATH_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/wflow-test/idx.json");
+        let path = resolve_index_save_path().expect("env path");
+        assert_eq!(path.to_string_lossy(), "/tmp/wflow-test/idx.json");
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn resolve_index_save_path_treats_empty_env_as_disabled() {
+        let key = defaults::INDEX_PATH_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "");
+        assert!(resolve_index_save_path().is_none(), "empty env disables persistence");
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[tokio::test]

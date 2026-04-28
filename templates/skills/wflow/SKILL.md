@@ -1,0 +1,141 @@
+---
+name: wflow
+description: Integrated second-brain skill for Workflowy + reMarkable + Claude — capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
+allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__bulk_update, mcp__workflowy__find_backlinks
+---
+
+# wflow — second-brain skill (template)
+
+This is the generic skill template shipped by the workflowy-mcp-server repo. It deliberately contains **no user-specific node IDs** — those live in `~/code/secondBrain/memory/workflowy_node_links.md`. On first use, walk the user through populating that file (see Bootstrap below).
+
+The skill spans the full second-brain loop:
+
+1. **Capture** — tasks, links, ink, reading material.
+2. **Triage and prioritisation** — daily / weekly / monthly cascade.
+3. **Synthesis** — distillation of reading and conversation into atomic notes.
+4. **Retrieval** — graph queries across Workflowy and (optionally) reMarkable.
+
+It is invoked **conversationally** — the user does not need to type slash commands. Match by intent, not by exact wording.
+
+## How the skill is invoked
+
+| User intent | Workflow |
+|---|---|
+| "Plan today" / "what's on my plate" / morning review | Daily prioritisation |
+| "Weekly review" / "where did the week go" | Weekly prioritisation |
+| "Monthly review" / "set monthly themes" | Monthly prioritisation |
+| "Capture X" / "remind me to" / "add X to my todos" | Task capture |
+| "What's the status" / "where am I" | Project status |
+| "Triage my inbox" / "process my inbox" | Inbox triage |
+| "What's in my reading list" / "review reading" | Reading list management |
+| "Journal" / "reflect on today" | Journal check-in |
+| "Distil this" / "summarise this for the second brain" | Distil single source |
+| "What do I have on X" / "trace my thinking on X" | Cross-system research |
+
+When the intent is ambiguous, ask one clarifying question rather than guessing.
+
+---
+
+## System overview
+
+The user has up to four complementary layers:
+
+1. **Workflowy** — system of record and second-brain wiki. Holds tasks, projects, references, the journal, and (optionally) a Distillations subtree.
+2. **reMarkable** *(optional)* — ink capture, marginalia, PDF/EPUB reading.
+3. **Claude** — bidirectional reader and writer.
+4. **secondBrain directory** (`~/code/secondBrain/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, and external-facing briefs.
+
+The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written both to Workflowy and to `~/code/secondBrain/session-logs/`.
+
+---
+
+## Bootstrap (run BEFORE every workflow)
+
+A two-step probe at session start. Both must complete before any workflow proceeds.
+
+### Step 1 — secondBrain draft check
+
+Read `~/code/secondBrain/drafts/`. Files there are pending writes from a previous session that didn't complete — most often because the Workflowy MCP was unstable. If a draft is present:
+
+1. Read the draft to understand the routing plan and execution sequence.
+2. After Step 2 completes, confirm with the user whether to resume execution against the existing plan or set it aside.
+3. If resuming: execute the plan, then move the draft from `drafts/` to `session-logs/` with the original date prefix retained.
+4. If setting aside: leave the draft in place and proceed with the new request.
+
+### Step 2 — MCP health and node-ID resolution
+
+**PERFORMANCE RULE:** the bootstrap must be fast. Never use `find_node` for structural nodes during bootstrap — read them from `memory/workflowy_node_links.md`. Use `search_nodes` with `max_depth:1` only as a last resort.
+
+#### Persistent name index (server-managed)
+
+The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`). It survives restarts; a background task refreshes it every 6 hours; mutations checkpoint every 30 seconds. **Short-hash resolution (Workflowy URL fragments like `c4ae1944b67e`, or 8-char doc-form prefixes) automatically falls back to a workspace walk on cache miss** — never call `build_name_index` manually before passing a short hash to `get_node`. The first miss after a fresh server start may take up to a minute while the walk runs; subsequent calls are O(1) against the cache.
+
+#### Memory file location
+
+Try these paths in order; use the first one found by the `Read` tool:
+
+1. `.auto-memory/workflowy_node_links.md` (Cowork sessions — relative to session mount)
+2. `$HOME/code/secondBrain/memory/workflowy_node_links.md` (canonical for non-Cowork sessions)
+3. `$HOME/.claude/projects/*/memory/workflowy_node_links.md` (Claude Code project memory)
+4. `$HOME/.claude/memory/workflowy_node_links.md` (legacy global fallback)
+
+If all reads fail, create a new memory file at the first writable path using the schema documented in `templates/secondbrain/memory/workflowy_node_links.md`. Then run **first-use population**: ask the user (via `AskUserQuestion`) for the names of their structural nodes (Tasks, Inbox, Journal, etc.), discover their IDs via `find_node`, and populate the table.
+
+#### First-use population (only when memory file is empty)
+
+Use `AskUserQuestion` to confirm the user's structural node names. Common patterns:
+
+- "Where do you keep your todos?" → Tasks
+- "Where do you capture untriaged items?" → Inbox
+- "Where do you write daily entries?" → Journal
+- "Where do you keep your reading queue?" → Reading List
+
+For each name the user provides, call `find_node(name="<name>", parent_id=<workspace root>)` to get the UUID, then write the row into the memory file. Do not assume any default structure.
+
+---
+
+## Workflow categories (skeletons — flesh out per user)
+
+The detailed implementation of each workflow lives in the user's customised copy of this file at `~/.claude/skills/wflow/SKILL.md`. The category list below is the framework; the prompts and tool sequences are user-specific.
+
+### Operate (day-to-day)
+
+- **Daily prioritisation** — surface today's todos, overdue items, and recently-modified projects via `daily_review`. Suggest a focus block for the morning.
+- **Weekly prioritisation** — review last week's completions and unmoved items. Identify what to drop, what to escalate.
+- **Monthly prioritisation** — set themes; promote/demote pillar work.
+- **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo.
+- **Project status** — for a named project, return current state (todos open, recent activity, blockers tagged).
+- **Inbox triage** — walk Inbox children, route each to the right subtree (or delete).
+- **Reading list management** — surface WIP reading, recent additions, items tagged for distillation.
+- **Journal check-in** — append a dated entry under the Journal node.
+
+### Synthesise (slower, compounding)
+
+- **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes.
+- **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
+- **Cross-system research** — query across Workflowy and (optionally) reMarkable for everything related to a topic. Surface as a synthesis with citations back to source nodes.
+- **Extract reMarkable annotations** *(optional)* — use the reMarkable MCP to pull marginalia and route them into Distillations.
+- **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
+- **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
+
+---
+
+## End-of-session discipline
+
+Every session that mutated the second-brain should:
+
+1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `~/code/secondBrain/session-logs/YYYY-MM-DD-<brief-name>.md`.
+2. Move any pending drafts from `drafts/` to `session-logs/` once their writes have landed.
+3. Update `memory/workflowy_node_links.md` if the user moved or renamed a structural node during the session.
+
+If the MCP wedges mid-session (a write returns `Tool execution failed` and `workflowy_status` shows degraded health):
+
+1. Stop writes immediately.
+2. Save the in-flight plan as a markdown file in `~/code/secondBrain/drafts/` with the date prefix and a clear "RESUME EXECUTION" header.
+3. Tell the user the next session will resume from the draft.
+
+---
+
+## Customisation
+
+This template is generic. The user's customisations — preferred wording, project-specific routing rules, detailed workflow scripts — should be edited into their copy of the skill at `~/.claude/skills/wflow/SKILL.md`. Treat the template version (in this repo) as the upstream; pull updates manually when desired.
