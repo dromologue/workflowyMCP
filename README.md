@@ -132,7 +132,7 @@ Practical recovery for huge trees: scope explicitly. `build_name_index` accepts 
 
 The server exposes 26 tools. Most operations work in terms of `node_id`, which accepts any of: full UUID (with or without hyphens), 12-char URL-suffix short hash, or 8-char prefix used in docs.
 
-**Search & navigate:** `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`.
+**Search & navigate:** `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`. Reach for `node_at_path` (path of names → UUID, ~1 second on any tree size) and `resolve_link` (Workflowy URL + optional parent-name path → full node info) before `search_nodes` on large workspaces — they cost O(depth) API calls instead of O(tree).
 
 **Create & edit:** `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree`.
 
@@ -165,9 +165,12 @@ target/release/wflow-do search --query "concept maps"
 target/release/wflow-do --dry-run delete <uuid>             # plan-mode preview
 target/release/wflow-do review --days-stale 90              # what's worth re-reading
 target/release/wflow-do audit-mirrors                       # canonical_of:/mirror_of: drift
+
+# Deep-index multiple subtrees, write to the persistent index file
+target/release/wflow-do reindex --root <UUID> --root <UUID> --root <UUID>
 ```
 
-Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`. Use `--json` for raw output, `--dry-run` (write verbs only) to preview without calling the API.
+Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`, `reindex`. Use `--json` for raw output, `--dry-run` (write verbs only) to preview without calling the API. `reindex` is the shell-driven path for populating `~/code/secondBrain/memory/name_index.json` independently of any running MCP — useful for fresh installs and recovery from sparse coverage on large trees.
 
 ---
 

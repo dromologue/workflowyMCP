@@ -132,17 +132,26 @@ If the user wants their own customisations (extra workflows, project-specific ro
 
 ---
 
-## Step 5 — Trigger an initial index walk (recommended)
+## Step 5 — Trigger an initial deep index pass (recommended)
 
-The MCP server walks the workspace lazily when a short-hash misses its in-memory cache. To pay that cost up front, ask the user to run a single explicit refresh:
+The MCP server walks lazily when a short-hash misses its cache. On large trees (50 k+ nodes) the lazy walk can't cover everything in one shot, so paying the cost up front via the `wflow-do reindex` CLI is the cleanest setup.
 
+First, identify the user's top-level subtree UUIDs (already cached in `~/code/secondBrain/memory/workflowy_node_links.md` from Step 3). Then:
+
+```bash
+~/code/workflowy-mcp-server/target/release/wflow-do reindex \
+  --root <Tasks-UUID> \
+  --root <Inbox-UUID> \
+  --root <Reading-List-UUID> \
+  --root <Distillations-UUID> \
+  --root <any-other-major-subtree-UUIDs>
 ```
-"please run build_name_index with allow_root_scan=true"
-```
 
-The walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minutes by default). On a tree of a few thousand nodes it usually completes in 30–90 seconds at the rate-limit ceiling. The result is checkpointed to `~/code/secondBrain/memory/name_index.json` within 30 seconds and rehydrated on every subsequent server start.
+Each root walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minutes by default), so the full pass for a half-dozen roots runs in 5-25 minutes depending on tree shape. The CLI hydrates from the existing `~/code/secondBrain/memory/name_index.json`, walks each root, and saves the merged index back. Re-run the same command later to extend coverage; the persistent index makes the work cumulative.
 
-**Check before continuing:** the file `~/code/secondBrain/memory/name_index.json` exists and is non-empty. After this point, every Workflowy URL the user pastes resolves cleanly without further setup.
+For smaller trees (≤ 5 k nodes) you can also ask the MCP-driven assistant to run `build_name_index allow_root_scan=true` once — equivalent in effect, just routed through MCP rather than the CLI.
+
+**Check before continuing:** `~/code/secondBrain/memory/name_index.json` exists and is non-empty. With the persistent index in place, every Workflowy URL the user pastes resolves cleanly. For nodes the index hasn't reached yet, the assistant can fall back to `node_at_path` (path of names → UUID in ~1 second) or `resolve_link` (URL + parent-path hint → full node info).
 
 ---
 

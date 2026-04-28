@@ -66,9 +66,18 @@ Read `~/code/secondBrain/drafts/`. Files there are pending writes from a previou
 
 **PERFORMANCE RULE:** the bootstrap must be fast. Never use `find_node` for structural nodes during bootstrap — read them from `memory/workflowy_node_links.md`. Use `search_nodes` with `max_depth:1` only as a last resort.
 
-#### Persistent name index (server-managed)
+#### Persistent name index + path-based discovery
 
-The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`). It survives restarts; a background task refreshes it every 6 hours; mutations checkpoint every 30 seconds. **Short-hash resolution (Workflowy URL fragments like `c4ae1944b67e`, or 8-char doc-form prefixes) automatically falls back to a workspace walk on cache miss** — never call `build_name_index` manually before passing a short hash to `get_node`. The first miss after a fresh server start may take up to a minute while the walk runs; subsequent calls are O(1) against the cache.
+The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`). It survives restarts; a 30-minute background task refreshes it; mutations checkpoint every 30 seconds.
+
+**The fast retrieval surface to reach for first:**
+
+- `node_at_path(path=["Top", "Sub", "Target"])` — walks a hierarchical path of node names. ONE `list_children` call per segment, so resolution is O(depth), not O(tree). Use this whenever you know where a node lives but not its UUID; visited nodes also feed the persistent index, accelerating future short-hash lookups under that branch.
+- `resolve_link(link="...", search_parent_path=[...])` — built for the "I have a Workflowy URL, give me the node info" workflow. Pass the URL or short hash via `link`; pass an optional parent-name path via `search_parent_path` to scope the walk to a single subtree. Returns full node info on success.
+
+**Short-hash auto-walk (fallback):** every `node_id` parameter accepts the 12-char URL-suffix or 8-char doc-prefix forms. On a cache miss the resolver runs a 5-minute walk. For trees over ~50 k nodes the fallback is unreliable — **prefer `node_at_path` or `resolve_link` with a parent path** rather than relying on the auto-walk.
+
+**Building coverage explicitly:** `build_name_index(parent_id=...)` walks a single subtree deeply; the persistent index makes the work cumulative across sessions. For a one-shot deep index pass from the shell (independent of any running MCP), run `wflow-do reindex --root <UUID> [--root <UUID> ...]` — walks each root with the resolution budget, merges results into the same persistent file, and reports per-root coverage. Useful for fresh installs or recovery from sparse coverage.
 
 #### Memory file location
 

@@ -104,6 +104,26 @@ enum Cmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Walk one or more subtrees and merge what's found into the persistent
+    /// name index at `$WORKFLOWY_INDEX_PATH` (default
+    /// `$HOME/code/secondBrain/memory/name_index.json`). Each subtree is
+    /// walked with the resolution budget; partial walks still write the
+    /// nodes they reached. Useful for one-shot deep indexing from the
+    /// shell, independent of any running MCP session.
+    Reindex {
+        /// One or more parent node IDs to walk. If omitted, walks the
+        /// workspace root (which on huge trees will truncate; prefer
+        /// listing top-level subtree IDs explicitly).
+        #[arg(long = "root", value_name = "NODE_ID", num_args = 1..)]
+        roots: Vec<String>,
+        /// Override the index path. Empty string disables persistence
+        /// (useful for dry-runs of how many nodes a walk reaches).
+        #[arg(long)]
+        index_path: Option<String>,
+        /// Maximum tree depth to walk under each root.
+        #[arg(long, default_value_t = 10)]
+        max_depth: usize,
+    },
 }
 
 #[tokio::main]
@@ -164,6 +184,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::AuditMirrors { .. } => "audit-mirrors",
         Cmd::Review { .. } => "review",
         Cmd::Index { .. } => "index",
+        Cmd::Reindex { .. } => "reindex",
     }
 }
 
@@ -383,6 +404,109 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             std::fs::write(target, &body)?;
             println!("index: wrote {} entries to {}", entries.len(), target);
         }
+        Cmd::Reindex { roots, index_path, max_depth } => {
+            cmd_reindex(client, roots.as_slice(), index_path.as_deref(), *max_depth).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a NameIndex pointed at the persistent file, hydrate it from
+/// disk, walk each requested root with the resolution budget, ingest
+/// the visited nodes, and save the merged index back. Reports per-root
+/// progress and the final on-disk size so the user can see coverage
+/// extending across runs.
+async fn cmd_reindex(
+    client: Arc<WorkflowyClient>,
+    roots: &[String],
+    index_path_override: Option<&str>,
+    max_depth: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use workflowy_mcp_server::utils::NameIndex;
+
+    let index = NameIndex::new();
+    let path = match index_path_override {
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(std::path::PathBuf::from(s)),
+        None => {
+            // Match the default the MCP server uses so a CLI reindex
+            // and a server-side walk agree on the persisted file.
+            std::env::var(defaults::INDEX_PATH_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var("HOME").ok().map(|home| {
+                        let mut p = std::path::PathBuf::from(home);
+                        p.push(defaults::DEFAULT_INDEX_RELATIVE_PATH);
+                        p
+                    })
+                })
+        }
+    };
+
+    if let Some(p) = &path {
+        index.set_save_path(p.clone());
+        match index.load_from_disk() {
+            Ok(n) => println!("reindex: loaded {} entries from {}", n, p.display()),
+            Err(e) => println!("reindex: starting empty ({}: {})", p.display(), e),
+        }
+    } else {
+        println!("reindex: persistence disabled (no save path)");
+    }
+
+    // Walk each root in turn. Empty roots = walk from workspace root.
+    let walk_targets: Vec<Option<&str>> = if roots.is_empty() {
+        vec![None]
+    } else {
+        roots.iter().map(|r| Some(r.as_str())).collect()
+    };
+
+    let started_total = std::time::Instant::now();
+    for target in walk_targets {
+        let label = target.unwrap_or("<workspace_root>");
+        let start = std::time::Instant::now();
+        let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
+            defaults::RESOLVE_WALK_TIMEOUT_MS,
+        ));
+        let result = client
+            .get_subtree_with_controls(
+                target,
+                max_depth,
+                defaults::RESOLVE_WALK_NODE_CAP,
+                controls,
+            )
+            .await;
+        match result {
+            Ok(fetch) => {
+                let count = fetch.nodes.len();
+                index.ingest(&fetch.nodes);
+                let trunc = fetch
+                    .truncation_reason
+                    .map(|r| format!(", truncated: {}", r.as_str()))
+                    .unwrap_or_else(|| ", complete".to_string());
+                println!(
+                    "reindex: {} -> {} nodes in {} ms{}",
+                    label,
+                    count,
+                    start.elapsed().as_millis(),
+                    trunc
+                );
+            }
+            Err(e) => {
+                eprintln!("reindex: {} failed: {}", label, e);
+            }
+        }
+    }
+
+    if path.is_some() {
+        index.save_to_disk()?;
+        println!(
+            "reindex: saved {} entries to {} (total elapsed {} ms)",
+            index.size(),
+            path.as_ref().unwrap().display(),
+            started_total.elapsed().as_millis()
+        );
     }
     Ok(())
 }
