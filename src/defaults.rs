@@ -91,9 +91,12 @@ pub const HTTP_TIMEOUT_SECS: u64 = 30;
 pub const INDEX_SAVE_INTERVAL_SECS: u64 = 30;
 /// How often the background refresher walks the workspace root to keep
 /// the index in sync with newly added/renamed nodes. The walk inherits
-/// the standard subtree timeout and node cap, so a single pass on a
-/// huge tree may not finish — successive passes converge.
-pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// the resolution timeout and node cap, so a single pass on a huge
+/// (250k+) tree only covers ~12k nodes — the convergence story is
+/// many short walks stitched together over time rather than one long
+/// one. 30 minutes leaves enough rate-limit headroom for foreground
+/// requests while still building up coverage within a working day.
+pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 /// Wall-clock budget for an on-demand resolution walk triggered by a
 /// short-hash miss in `resolve_node_ref`. Bigger than the regular
 /// subtree budget because the user is *waiting* for this specific

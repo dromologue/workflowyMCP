@@ -1100,10 +1100,24 @@ impl WorkflowyMcpServer {
             Some(crate::api::TruncationReason::Cancelled) => "cancelled",
             None => "none",
         };
+        let tree_estimate = self
+            .tree_size_estimate
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let scale_hint = if tree_estimate > 0 {
+            let coverage_pct = ((summary.nodes_walked as f64) / (tree_estimate as f64) * 100.0)
+                .clamp(0.0, 100.0) as u32;
+            format!(
+                " The known tree-size estimate is ~{} nodes, so this walk covered roughly {}%.",
+                tree_estimate, coverage_pct
+            )
+        } else {
+            String::new()
+        };
+        let index_size = self.name_index.size();
         let body = if summary.truncated {
             format!(
-                "Short-hash '{}' was not found in the {} nodes the walk reached in {} ms before truncating ({}). The walk did NOT cover the full workspace, so the hash may exist in an unwalked region. Recovery: (a) call build_name_index again to extend coverage in the next walk window; (b) pass the full UUID instead; (c) call find_node with a parent_id you know contains the target.",
-                raw, summary.nodes_walked, summary.elapsed_ms, reason_str,
+                "Short-hash '{}' was not found in the {} nodes the walk reached in {} ms before truncating ({}).{} The walk did NOT cover the full workspace, so the hash may exist in an unwalked region. The persistent index now contains {} entries; coverage extends with each walk and via the 30-min background refresher. Recovery: (a) call build_name_index repeatedly with parent_id scoped to a likely region (e.g. Projects, Areas); (b) pass the full UUID directly; (c) call find_node(name=..., use_index=true) — the index already covers the names you've walked through this session.",
+                raw, summary.nodes_walked, summary.elapsed_ms, reason_str, scale_hint, index_size,
             )
         } else {
             format!(
@@ -1153,16 +1167,26 @@ impl WorkflowyMcpServer {
     /// successful early resolution doesn't pay the full timeout.
     async fn walk_for_short_hash(&self, short_hash: &str) -> crate::error::Result<ResolveWalkSummary> {
         use crate::api::client::FetchControls;
-        let cancel_guard = self.cancel_registry.guard();
+        // Each resolver walk gets its own CancelRegistry so the watcher
+        // can cancel **only this walk**, not the server-wide background
+        // refresher (which lives on `self.cancel_registry`). Using the
+        // shared registry meant a successful early-resolution would
+        // tear down a concurrent background indexing pass — the
+        // opposite of what we want on huge trees that need many walks
+        // to converge. The 5-minute walk timeout still bounds this
+        // walk regardless of cancellation.
+        let local_registry = crate::utils::CancelRegistry::new();
+        let cancel_guard = local_registry.guard();
         let watcher_guard = cancel_guard.clone();
         let watcher_index = self.name_index.clone();
-        let registry = self.cancel_registry.clone();
+        let watcher_registry = local_registry.clone();
         let target = short_hash.to_string();
 
         // Watcher: every 100 ms, ask the index whether the target has
-        // shown up. If yes, bump the cancel registry to break the walk
-        // out of its remaining levels. If the walk completes naturally,
-        // the watcher_done channel signals the watcher to exit.
+        // shown up. If yes, bump only the local registry to break this
+        // walk out of its remaining levels. If the walk completes
+        // naturally, the watcher_done channel signals the watcher to
+        // exit.
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
         let watcher = tokio::spawn(async move {
             loop {
@@ -1172,7 +1196,7 @@ impl WorkflowyMcpServer {
                             return;
                         }
                         if watcher_index.resolve_short_hash(&target).is_some() {
-                            registry.cancel_all();
+                            watcher_registry.cancel_all();
                             return;
                         }
                     }

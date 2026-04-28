@@ -111,10 +111,20 @@ The repo's [templates/secondbrain/README.md](templates/secondbrain/README.md) co
 
 Workflowy URLs use a 12-character short hash (the trailing 12 hex of the UUID, like `c4ae1944b67e`). The Workflowy API requires the full UUID. The server resolves the gap automatically:
 
-- A **persistent name index** at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`) caches every short hash → UUID it has ever seen. Survives restarts. Checkpointed every 30 seconds when dirty. Refreshed by a 6-hour background walk.
-- On a cache miss, the resolver **walks the workspace synchronously** with a 5-minute budget. A watcher polls the index every 100 ms and cancels the walk as soon as the target hash appears, so found-early lookups don't pay the full timeout.
+- A **persistent name index** at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`) caches every short hash → UUID it has ever seen. Survives restarts. Checkpointed every 30 seconds when dirty. Refreshed by a 30-minute background walk.
+- On a cache miss, the resolver **walks the workspace synchronously** with a 5-minute budget. A watcher polls the index every 100 ms and cancels the walk as soon as the target appears, so found-early lookups don't pay the full timeout. The walk uses a per-call cancellation registry so it never tears down concurrent indexing work.
 
-This means you can paste any Workflowy URL fragment into a prompt and the server resolves it without any manual indexing. First miss after a fresh server install may take up to a minute; everything after is O(1) against the cache.
+For most personal Workflowy graphs (under ~40 k nodes), the very first short-hash you paste resolves within a minute and everything after is O(1) against the persistent index.
+
+### Large-tree convergence (~50 k nodes and up)
+
+A 5-minute walk indexes roughly 12 k nodes at the Workflowy API's 5 RPS sustained rate. If your workspace is bigger than that, no single walk covers the full tree. The system is designed to **converge over time**:
+
+1. The 30-minute background refresher keeps walking, accumulating coverage in the persistent index.
+2. Foreground misses still trigger an immediate walk to maximise the chance of an in-session resolution.
+3. When a miss returns truncated, the error message reports `nodes_walked / tree_size_estimate` so you know the gap.
+
+Practical recovery for huge trees: scope explicitly. `build_name_index` accepts a `parent_id`, so you can index a known subtree (Projects, Areas, Reading List) deeply in one short walk rather than relying on root-walk breadth. Once a subtree is indexed, every short hash within it resolves O(1) thereafter and survives restarts via the persistent index.
 
 ---
 

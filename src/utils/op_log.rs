@@ -183,7 +183,15 @@ impl OpLogRecorder {
     pub fn finish_err(self, error: impl AsRef<str>) {
         let err = error.as_ref();
         let truncated = if err.len() > MAX_ERROR_LEN {
-            format!("{}…[truncated]", &err[..MAX_ERROR_LEN])
+            // Slice at the largest char boundary at or below the cap —
+            // a naive byte slice panics when MAX_ERROR_LEN lands inside
+            // a multi-byte UTF-8 sequence (em-dashes, non-ASCII
+            // punctuation in error messages, etc.).
+            let mut cut = MAX_ERROR_LEN;
+            while cut > 0 && !err.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}…[truncated]", &err[..cut])
         } else {
             err.to_string()
         };
@@ -291,6 +299,24 @@ mod tests {
         assert_eq!(entries[0].status, OpStatus::Err);
         let err = entries[0].error.as_deref().unwrap();
         assert!(err.len() <= MAX_ERROR_LEN + 32, "error truncation failed: len={}", err.len());
+        assert!(err.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn finish_err_truncation_handles_multi_byte_chars_at_boundary() {
+        // Regression guard: a long error containing a multi-byte UTF-8
+        // char (em-dash, ellipsis, etc.) used to panic when the cut
+        // landed inside the encoded sequence. Any error message above
+        // ~512 bytes — including the resolver's verbose recovery
+        // hints — must not crash the op log.
+        let log = OpLog::new();
+        let mut payload = "x".repeat(MAX_ERROR_LEN - 1);
+        payload.push('—'); // em-dash, 3 bytes — straddles the boundary
+        payload.push_str(&"y".repeat(50));
+        let r = log.record("t", &json!({}));
+        r.finish_err(&payload); // must not panic
+        let entries = log.recent(1, None);
+        let err = entries[0].error.as_deref().unwrap();
         assert!(err.ends_with("[truncated]"));
     }
 
