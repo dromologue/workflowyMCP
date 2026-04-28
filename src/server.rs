@@ -418,6 +418,19 @@ impl Drop for WalkGuard {
     }
 }
 
+/// Result of an on-demand short-hash resolution walk. Carries enough
+/// signal for the resolver to distinguish "walked the whole tree, the
+/// hash genuinely doesn't exist" from "ran out of budget before
+/// reaching the target," which are different recovery scenarios for
+/// the caller.
+#[derive(Debug, Clone)]
+struct ResolveWalkSummary {
+    nodes_walked: usize,
+    truncated: bool,
+    truncation_reason: Option<crate::api::TruncationReason>,
+    elapsed_ms: u64,
+}
+
 /// Test-only shorthand: build a banner without a path. Production callers go
 /// through [`truncation_banner_from_fetch`].
 #[cfg(test)]
@@ -1048,9 +1061,15 @@ impl WorkflowyMcpServer {
     /// with the extended resolution budget
     /// ([`defaults::RESOLVE_WALK_TIMEOUT_MS`]) before giving up. Every
     /// node visited during the walk is fed into the persistent index, so
-    /// the first short-hash a session resolves pays for the rest. Only
-    /// when the walk completes without finding the target do we surface
-    /// the cache-miss error.
+    /// the first short-hash a session resolves pays for the rest.
+    ///
+    /// When the walk runs to completion without finding the target, the
+    /// hash genuinely doesn't exist in the user's tree (shared from
+    /// another account, stale, or typo'd). When the walk hits its
+    /// budget the outcome is ambiguous: the target may exist but in a
+    /// region the walk didn't reach. The error message distinguishes
+    /// the two cases so the caller knows whether to retry, narrow
+    /// scope, or accept a negative result.
     async fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
         if !is_short_hash(raw) {
             return Ok(raw.to_string());
@@ -1060,19 +1079,39 @@ impl WorkflowyMcpServer {
         }
         // Cache miss — walk the workspace with the extended budget.
         info!(short_hash = raw, "resolve_node_ref: cache miss, walking workspace");
-        if let Err(e) = self.walk_for_short_hash(raw).await {
-            warn!(error = %e, "resolve walk failed; treating as cache miss");
-        }
+        let summary = match self.walk_for_short_hash(raw).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "resolve walk failed; treating as cache miss");
+                ResolveWalkSummary {
+                    nodes_walked: 0,
+                    truncated: true,
+                    truncation_reason: None,
+                    elapsed_ms: 0,
+                }
+            }
+        };
         if let Some(full) = self.name_index.resolve_short_hash(raw) {
             return Ok(full);
         }
-        Err(McpError::invalid_params(
+        let reason_str = match summary.truncation_reason {
+            Some(crate::api::TruncationReason::Timeout) => "timeout",
+            Some(crate::api::TruncationReason::NodeLimit) => "node_limit",
+            Some(crate::api::TruncationReason::Cancelled) => "cancelled",
+            None => "none",
+        };
+        let body = if summary.truncated {
             format!(
-                "Short-hash '{}' could not be resolved. The walk completed without finding a matching node. Pass the full UUID, or verify the short hash matches an existing node.",
-                raw
-            ),
-            None,
-        ))
+                "Short-hash '{}' was not found in the {} nodes the walk reached in {} ms before truncating ({}). The walk did NOT cover the full workspace, so the hash may exist in an unwalked region. Recovery: (a) call build_name_index again to extend coverage in the next walk window; (b) pass the full UUID instead; (c) call find_node with a parent_id you know contains the target.",
+                raw, summary.nodes_walked, summary.elapsed_ms, reason_str,
+            )
+        } else {
+            format!(
+                "Short-hash '{}' was not found after walking {} nodes in {} ms. The walk completed without truncation, so this hash does not match any node currently in your workspace. Common causes: link to a shared node from another account, stale/deleted node, or typo in the hash.",
+                raw, summary.nodes_walked, summary.elapsed_ms,
+            )
+        };
+        Err(McpError::invalid_params(body, None))
     }
 
     /// Walk the workspace root with the resolution budget and ingest
@@ -1103,16 +1142,16 @@ impl WorkflowyMcpServer {
 
     /// Walk the workspace root with [`defaults::RESOLVE_WALK_TIMEOUT_MS`]
     /// and the resolution node cap, feeding every visited node into the
-    /// name index. The caller checks the index before and after, so this
-    /// method's only job is to populate. Errors from the walk are
-    /// surfaced so the caller can log them; an `Ok` with no progress
-    /// (e.g. timeout before the target is reached) is still useful
-    /// because future calls inherit whatever was indexed.
+    /// name index. Returns a [`ResolveWalkSummary`] so the caller can
+    /// distinguish "walked everything, target not present" from
+    /// "ran out of budget before the target was reached" — the two
+    /// failure modes look identical from the index alone but are very
+    /// different signals to the user.
     ///
     /// Spawns a watcher task that polls the index every 100 ms and
     /// cancels the walk as soon as the target short-hash appears, so a
     /// successful early resolution doesn't pay the full timeout.
-    async fn walk_for_short_hash(&self, short_hash: &str) -> crate::error::Result<()> {
+    async fn walk_for_short_hash(&self, short_hash: &str) -> crate::error::Result<ResolveWalkSummary> {
         use crate::api::client::FetchControls;
         let cancel_guard = self.cancel_registry.guard();
         let watcher_guard = cancel_guard.clone();
@@ -1163,8 +1202,14 @@ impl WorkflowyMcpServer {
 
         match result {
             Ok(fetch) => {
+                let nodes_walked = fetch.nodes.len();
                 self.name_index.ingest(&fetch.nodes);
-                Ok(())
+                Ok(ResolveWalkSummary {
+                    nodes_walked,
+                    truncated: fetch.truncated,
+                    truncation_reason: fetch.truncation_reason,
+                    elapsed_ms: fetch.elapsed_ms,
+                })
             }
             Err(e) => Err(e),
         }
@@ -4631,9 +4676,33 @@ mod tests {
             .await
             .expect_err("unknown short hash must error after walk");
         let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("short-hash"), "got: {msg}");
+        // Error must distinguish truncated walk (recoverable) from
+        // exhaustive walk (genuinely missing). Against an unreachable
+        // host the walk errors out and we treat it as truncated, so
+        // the message should suggest the recovery actions rather than
+        // claim the hash is missing.
         assert!(
-            msg.contains("short-hash") || msg.contains("name index") || msg.contains("could not be resolved"),
-            "got: {msg}"
+            msg.contains("did not cover") || msg.contains("recovery") || msg.contains("truncating"),
+            "expected truncated-walk wording in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_walk_summary_distinguishes_truncated_from_exhaustive() {
+        // Direct guard on the wording so the error stays useful as the
+        // implementation evolves. The two branches must not be conflated.
+        let server = new_test_server();
+        // Force the truncated branch via the unreachable-host walk.
+        let err = server
+            .resolve_node_ref("aaaaaaaaaaaa")
+            .await
+            .expect_err("must error");
+        let msg = err.to_string();
+        // Must not falsely claim the walk completed when it didn't.
+        assert!(
+            !msg.contains("walk completed without truncation"),
+            "must not claim exhaustive coverage when walk failed: {msg}"
         );
     }
 
