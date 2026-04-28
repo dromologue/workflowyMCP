@@ -146,6 +146,43 @@ The walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minu
 
 ---
 
+## Step 6 — Multi-surface deployment
+
+The MCP server's persistent name index is the cross-session memory layer. It works automatically across every surface that calls the same binary — Claude Code, Claude Desktop, the IDE extension, anything else that speaks MCP. Each host spawns its own process, but they all read and write the same `~/code/secondBrain/memory/name_index.json`, so updates from one session land on disk via the 30-second checkpoint and are inherited by the next session on any surface.
+
+The **skill markdown** (the wflow workflow itself) does not auto-port the same way. `~/.claude/skills/wflow/SKILL.md` is a Claude Code convention; other hosts don't auto-discover that path. Pick the approach that matches the user's surfaces:
+
+### Claude Code (terminal, IDE extension)
+
+Already covered by Step 4 — the skill at `~/.claude/skills/wflow/SKILL.md` is auto-discovered. No extra work.
+
+### Claude Desktop (macOS / Windows app)
+
+Two viable approaches, in order of preference:
+
+**Option A — Project custom instructions.** Open a Project in the desktop app, paste the contents of `templates/skills/wflow/SKILL.md` into its custom instructions. The skill template reads user-specific node IDs at runtime from `~/code/secondBrain/memory/workflowy_node_links.md` via the filesystem MCP, so a single paste covers every project that uses the same Workflowy graph.
+
+**Option B — Filesystem MCP read at session start.** If the host has the filesystem MCP allowlisting `~/code/secondBrain/` and `~/.claude/skills/wflow/`, the user can simply ask "read `~/.claude/skills/wflow/SKILL.md` and follow that workflow." No porting needed; the markdown is the canonical source. This works well if the user opens many short Claude Desktop sessions and doesn't want to maintain Project instructions.
+
+Verify the workflowy MCP entry exists in `~/Library/Application Support/Claude/claude_desktop_config.json` and points at the release binary you built in Step 1. Restart Claude Desktop after edits — the host reads the config once at launch.
+
+### claude.ai (web)
+
+Upload `templates/skills/wflow/SKILL.md` as a Skill via Settings → Capabilities. Same content, different surface. The Workflowy MCP needs to be configured as a remote MCP (claude.ai's MCP support is web-friendly but distinct from desktop MCP); see Anthropic's claude.ai MCP documentation. The persistent index will not be shared with web sessions unless the MCP server is reachable as a remote service — for most users, claude.ai is best treated as a read-only retrieval surface (using the in-built Workflowy export or an HTTP MCP gateway) rather than a write surface.
+
+### What stays in sync, what needs manual mirror
+
+| Layer | Sync mechanism | User action when something changes |
+|-------|----------------|-----------------------------------|
+| Persistent name index (`name_index.json`) | Auto via disk; 30 s checkpoint | None |
+| Cached structural IDs (`workflowy_node_links.md`) | Single file in `~/code/secondBrain/`; every surface reads the same copy | None — but update the file when a structural node moves |
+| Drafts and session logs | Same — single canonical directory | Discipline: write back to `~/code/secondBrain/session-logs/` |
+| Skill markdown (workflow logic) | **Manual** — repo template is upstream, each surface holds a cached copy | Re-paste / re-upload when the template changes substantively |
+
+The cleanest mental model: `~/code/secondBrain/` is the canonical source of truth for cross-session state. The repo's `templates/skills/wflow/SKILL.md` is the canonical source for workflow logic. Each surface holds whatever cached copies are necessary; the data layer self-syncs, the markdown layer needs a manual mirror only when the upstream template changes.
+
+---
+
 ## What goes where (summary)
 
 | Where | Purpose | User-specific? |
