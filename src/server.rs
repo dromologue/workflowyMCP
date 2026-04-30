@@ -418,6 +418,18 @@ impl Drop for WalkGuard {
     }
 }
 
+/// Outcome of [`WorkflowyMcpServer::probe_upstream_with_retry`]. Holds
+/// just enough for the two probe handlers to render their JSON
+/// response without each having to reimplement classification.
+#[derive(Debug)]
+struct ProbeOutcome {
+    api_reachable: bool,
+    top_level_count: Option<usize>,
+    error: Option<String>,
+    elapsed_ms: u64,
+    attempts: u8,
+}
+
 /// Strip HTML tags from a Workflowy node name. Workflowy stores
 /// inline formatting (links, bold, colour spans) inside the name
 /// field itself, which makes pure-string equality with what a user
@@ -1313,6 +1325,86 @@ impl WorkflowyMcpServer {
             age_ms,
             last.error.as_deref().unwrap_or("(no detail)")
         ))
+    }
+
+    /// Probe upstream reachability with one in-budget retry. The 12-write
+    /// burst on 2026-04-30 ended with `health_check` reporting
+    /// `api_reachable: false` even though every preceding write had
+    /// succeeded — a single transient slowness on the very next read
+    /// flipped the signal. Two attempts inside the same wall-clock
+    /// budget convert "one blip = degraded" into "two blips = degraded",
+    /// which is what callers actually want from a liveness probe.
+    ///
+    /// Auth failures (401/403) skip the retry: the API key is sticky and
+    /// re-trying won't change the answer. The auth-failure timestamp on
+    /// the client gets stamped inside `try_request_cancellable` so the
+    /// `authenticated` signal in the probe response can be derived
+    /// independently of "did this probe succeed".
+    async fn probe_upstream_with_retry(&self, budget: Duration) -> ProbeOutcome {
+        use crate::error::WorkflowyError;
+        let started = Instant::now();
+        let half_deadline = started + budget / 2;
+        let full_deadline = started + budget;
+
+        let first = self
+            .client
+            .get_top_level_nodes_cancellable(None, Some(half_deadline))
+            .await;
+        if let Ok(nodes) = first {
+            return ProbeOutcome {
+                api_reachable: true,
+                top_level_count: Some(nodes.len()),
+                error: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                attempts: 1,
+            };
+        }
+        let first_err = first.unwrap_err();
+
+        // Auth failures are sticky — retrying won't change the answer.
+        // The 401/403 timestamp is already stamped on the client by
+        // `try_request_cancellable`; this branch just short-circuits the
+        // probe without paying for a useless second attempt.
+        let is_auth_failure = match &first_err {
+            WorkflowyError::ApiError { status, .. } => matches!(*status, 401 | 403),
+            WorkflowyError::RetryExhausted { reason, .. } => {
+                let l = reason.to_lowercase();
+                l.contains("401") || l.contains("403") || l.contains("unauthor")
+            }
+            _ => false,
+        };
+        if is_auth_failure || Instant::now() >= full_deadline {
+            return ProbeOutcome {
+                api_reachable: false,
+                top_level_count: None,
+                error: Some(first_err.to_string()),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                attempts: 1,
+            };
+        }
+
+        // One more shot inside the remaining budget.
+        let second = self
+            .client
+            .get_top_level_nodes_cancellable(None, Some(full_deadline))
+            .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match second {
+            Ok(nodes) => ProbeOutcome {
+                api_reachable: true,
+                top_level_count: Some(nodes.len()),
+                error: None,
+                elapsed_ms,
+                attempts: 2,
+            },
+            Err(e) => ProbeOutcome {
+                api_reachable: false,
+                top_level_count: None,
+                error: Some(format!("two attempts failed: {} | {}", first_err, e)),
+                elapsed_ms,
+                attempts: 2,
+            },
+        }
     }
 
     /// Walk a subtree with the server's standard controls and push every
@@ -3177,28 +3269,28 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget to confirm reachability and reports cache/name-index sizes. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
+    #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget (one in-budget retry on transient failure) to confirm reachability and reports cache/name-index sizes. Surfaces `authenticated` (independent of probe success — driven by recent 401/403, not timeouts) and `last_successful_api_call_ms_ago` so callers can distinguish a one-shot blip from a sustained outage. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
     async fn health_check(
         &self,
         Parameters(_params): Parameters<HealthCheckParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "health_check", _params, {
-        let started = Instant::now();
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
-        let probe = tokio::time::timeout(timeout, self.client.get_top_level_nodes()).await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let (api_reachable, top_level_count, error) = match probe {
-            Ok(Ok(nodes)) => (true, Some(nodes.len()), None::<String>),
-            Ok(Err(e)) => (false, None, Some(e.to_string())),
-            Err(_) => (false, None, Some(format!("timed out after {} ms", timeout.as_millis()))),
-        };
+        let outcome = self.probe_upstream_with_retry(timeout).await;
         let cache_stats = self.cache.stats();
+        let authenticated = !self
+            .client
+            .recent_auth_failure(Duration::from_secs(defaults::AUTH_FAILURE_WINDOW_SECS));
         let result = json!({
-            "status": if api_reachable { "ok" } else { "degraded" },
-            "api_reachable": api_reachable,
-            "latency_ms": elapsed_ms,
+            "status": if outcome.api_reachable { "ok" } else { "degraded" },
+            "api_reachable": outcome.api_reachable,
+            "authenticated": authenticated,
+            "auth_method": "api_key_env",
+            "latency_ms": outcome.elapsed_ms,
             "budget_ms": timeout.as_millis() as u64,
-            "top_level_count": top_level_count,
+            "probe_attempts": outcome.attempts,
+            "top_level_count": outcome.top_level_count,
+            "last_successful_api_call_ms_ago": self.client.last_success_ms_ago(),
             "cache": {
                 "node_count": cache_stats.node_count,
                 "parent_count": cache_stats.parent_count,
@@ -3207,29 +3299,27 @@ impl WorkflowyMcpServer {
                 "size": self.name_index.size(),
                 "populated": self.name_index.is_populated(),
             },
+            "server_uptime_ms": self.started_at.elapsed().as_millis() as u64,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "cancel_generation": self.cancel_registry.generation(),
-            "error": error,
+            "error": outcome.error,
         });
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
         })
     }
 
-    #[tool(description = "Extended liveness probe: confirms Workflowy reachability AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy.")]
+    #[tool(description = "Extended liveness probe: confirms Workflowy reachability (one in-budget retry on transient failure) AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. `authenticated` reflects whether a 401/403 has been observed in the last 5 minutes — it is NOT flipped by transient timeouts or 5xx, so a one-shot probe miss after a successful write burst no longer looks like an auth failure. `last_successful_api_call_ms_ago` provides the anchor a caller needs to distinguish a transient blip from a sustained outage. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy.")]
     async fn workflowy_status(
         &self,
         Parameters(_params): Parameters<WorkflowyStatusParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "workflowy_status", _params, {
-        let started = Instant::now();
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
-        let probe = tokio::time::timeout(timeout, self.client.get_top_level_nodes()).await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let (api_reachable, top_level_count, error) = match probe {
-            Ok(Ok(nodes)) => (true, Some(nodes.len()), None::<String>),
-            Ok(Err(e)) => (false, None, Some(e.to_string())),
-            Err(_) => (false, None, Some(format!("timed out after {} ms", timeout.as_millis()))),
-        };
+        let outcome = self.probe_upstream_with_retry(timeout).await;
+        let api_reachable = outcome.api_reachable;
+        let top_level_count = outcome.top_level_count;
+        let error = outcome.error.clone();
+        let elapsed_ms = outcome.elapsed_ms;
         let cache_stats = self.cache.stats();
         let rate_limit = self.client.rate_limit_snapshot();
         let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
@@ -3281,27 +3371,43 @@ impl WorkflowyMcpServer {
                 "proximate_cause": cause.as_str(),
             })
         });
-        // Brief 2026-04-25 Test ε `upstream_session` block. We don't
-        // hold a session token (the client uses a long-lived API key
-        // from env), but we surface the equivalent: whether the API
-        // is currently reachable, the rate-limit headers we last
-        // observed, and the server's uptime as a proxy for "session
-        // age" since the API key effectively defines the session.
+        // `upstream_session` reports the auth/rate-limit posture
+        // independently of "did the most recent probe succeed". The
+        // 2026-04-30 incident wired `authenticated = api_reachable`,
+        // which meant a transient timeout right after a 12-write burst
+        // was reported as an auth failure even though the writes
+        // proved the API key was fine. `authenticated` now flips to
+        // false ONLY when a 401/403 has been observed in the recent
+        // window. `session_age_ms` is retained as a back-compat alias
+        // for `server_uptime_ms` — both report MCP process uptime, not
+        // a Workflowy session age (the client uses a long-lived API
+        // key from env, there is no session token to expire).
+        let authenticated = !self
+            .client
+            .recent_auth_failure(Duration::from_secs(defaults::AUTH_FAILURE_WINDOW_SECS));
+        let last_success_ms_ago = self.client.last_success_ms_ago();
+        let server_uptime_ms = self.started_at.elapsed().as_millis() as u64;
         let upstream_session = json!({
-            "authenticated": api_reachable,
+            "authenticated": authenticated,
             "auth_method": "api_key_env",
-            "session_age_ms": self.started_at.elapsed().as_millis() as u64,
+            "session_age_ms": server_uptime_ms,
+            "server_uptime_ms": server_uptime_ms,
+            "session_age_note": "alias for server_uptime_ms — the MCP client uses a long-lived API key, so there is no Workflowy session to age",
+            "last_successful_api_call_ms_ago": last_success_ms_ago,
             "rate_limit_remaining": rate_limit.remaining,
             "rate_limit_limit": rate_limit.limit,
         });
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
             "api_reachable": api_reachable,
+            "authenticated": authenticated,
             "latency_ms": elapsed_ms,
             "budget_ms": timeout.as_millis() as u64,
+            "probe_attempts": outcome.attempts,
             "top_level_count": top_level_count,
             "in_flight_walks": in_flight,
             "last_request_ms": self.client.last_request_ms(),
+            "last_successful_api_call_ms_ago": last_success_ms_ago,
             "tree_size_estimate": tree_estimate,
             "tree_size_estimate_known": tree_estimate > 0,
             "cache": {
@@ -3322,6 +3428,7 @@ impl WorkflowyMcpServer {
             "paths": paths,
             "last_failure": last_failure,
             "upstream_session": upstream_session,
+            "server_uptime_ms": server_uptime_ms,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "cancel_generation": self.cancel_registry.generation(),
             "error": error,
@@ -5671,7 +5778,89 @@ mod tests {
         assert!(session.contains_key("authenticated"));
         assert!(session.contains_key("auth_method"));
         assert!(session.contains_key("session_age_ms"));
+        assert!(session.contains_key("server_uptime_ms"));
         assert!(session.contains_key("rate_limit_remaining"));
+        assert!(
+            session.contains_key("last_successful_api_call_ms_ago"),
+            "upstream_session must surface last_successful_api_call_ms_ago so callers can distinguish a transient blip from a sustained outage"
+        );
+        // 2026-04-30 incident regression: a single failed probe used
+        // to flip `authenticated` to false even though no 401/403 had
+        // been observed. The new wiring drives `authenticated` from
+        // `client.recent_auth_failure` — no auth failures have been
+        // recorded in this fresh server, so it must be true regardless
+        // of whether the probe itself reached the (unreachable) test
+        // host.
+        assert_eq!(
+            session["authenticated"], serde_json::Value::Bool(true),
+            "with no 401/403 observed, `authenticated` must remain true even when the probe fails to reach upstream"
+        );
+        // The top-level mirror of `authenticated` is the field that
+        // routing code in clients tends to read first.
+        assert_eq!(v["authenticated"], serde_json::Value::Bool(true));
+        // server_uptime_ms is the canonical name; session_age_ms is a
+        // back-compat alias holding the same value. The note field
+        // exists to forestall the 2026-04-30 misreading where "44
+        // hours" was interpreted as a Workflowy session age.
+        assert_eq!(
+            session["server_uptime_ms"], session["session_age_ms"],
+            "session_age_ms must alias server_uptime_ms — they are the same metric"
+        );
+    }
+
+    /// Regression test for the 2026-04-30 wiring bug. When a 401/403
+    /// has been observed within the AUTH_FAILURE_WINDOW, `authenticated`
+    /// must report false — independent of whether the probe call itself
+    /// just succeeded. This is the inverse of the test above and proves
+    /// that the new `recent_auth_failure` channel actually drives the
+    /// signal, rather than being decorative.
+    #[tokio::test]
+    async fn workflowy_status_authenticated_false_after_recent_auth_failure() {
+        let server = new_test_server();
+        server.client._test_stamp_auth_failure();
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status returns");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(
+            v["authenticated"], serde_json::Value::Bool(false),
+            "a recent 401/403 stamp must flip `authenticated` to false"
+        );
+        assert_eq!(
+            v["upstream_session"]["authenticated"], serde_json::Value::Bool(false),
+            "upstream_session.authenticated must mirror the top-level signal"
+        );
+    }
+
+    /// Probe responses must include `last_successful_api_call_ms_ago`
+    /// as a Number (not null) once the client has observed at least
+    /// one 2xx — the 12-write burst on 2026-04-30 left a fresh anchor
+    /// that the agent could have used to discount the immediately
+    /// following timeout. Stamping success directly on the client
+    /// proves the field is plumbed end-to-end without needing a live
+    /// upstream.
+    #[tokio::test]
+    async fn health_check_surfaces_last_successful_api_call_ms_ago() {
+        let server = new_test_server();
+        server.client._test_stamp_success();
+        let result = server
+            .health_check(Parameters(HealthCheckParams::default()))
+            .await
+            .expect("health_check returns");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert!(
+            v["last_successful_api_call_ms_ago"].is_number(),
+            "after a stamped success, the field must be a number, got {}",
+            v["last_successful_api_call_ms_ago"]
+        );
+        assert!(
+            v["server_uptime_ms"].is_number(),
+            "server_uptime_ms must be present alongside the back-compat uptime_seconds"
+        );
+        // Even with the unreachable test host, a stamped success leaves
+        // `authenticated: true` since no 401/403 has been recorded.
+        assert_eq!(v["authenticated"], serde_json::Value::Bool(true));
     }
 
     /// Brief 2026-04-25 follow-up Test β: when a read or mutate has

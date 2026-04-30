@@ -76,6 +76,14 @@ pub const SUBTREE_FETCH_CONCURRENCY: usize = 5;
 /// Wall-clock budget for health checks (milliseconds). Must stay sub-second
 /// on any tree size so the tool is usable when the API is degraded.
 pub const HEALTH_CHECK_TIMEOUT_MS: u64 = 5_000;
+/// Window after the most recent observed 401/403 during which probes still
+/// report `authenticated: false`. Outside this window the signal flips back
+/// to true — auth failures are sticky-but-not-permanent so a transient 401
+/// from upstream maintenance doesn't leave the server reporting "unauth"
+/// forever after the next successful call. 5 minutes is long enough to
+/// cover a brief upstream blip without masking a genuine, persistent auth
+/// issue, since any subsequent failed call will re-stamp the timestamp.
+pub const AUTH_FAILURE_WINDOW_SECS: u64 = 5 * 60;
 
 // --- API ---
 /// Workflowy API base URL
@@ -136,6 +144,7 @@ mod tests {
         assert!(SUBTREE_FETCH_TIMEOUT_MS >= 1_000 && SUBTREE_FETCH_TIMEOUT_MS <= 120_000);
         assert!(SUBTREE_FETCH_CONCURRENCY >= 1 && SUBTREE_FETCH_CONCURRENCY <= 50);
         assert!(HEALTH_CHECK_TIMEOUT_MS >= 500 && HEALTH_CHECK_TIMEOUT_MS <= 10_000);
+        assert!(AUTH_FAILURE_WINDOW_SECS >= 60 && AUTH_FAILURE_WINDOW_SECS <= 60 * 60);
     }
 
     #[test]

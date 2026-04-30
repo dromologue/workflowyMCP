@@ -10,8 +10,19 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+/// Wall-clock unix-ms helper. Used by the upstream-liveness trackers
+/// (`last_success_unix_ms`, `last_auth_failure_unix_ms`) so probe
+/// responses can report a stable "ms since last good call" that
+/// survives across separate request paths.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// True when an error looks like a 404 from the Workflowy API — used by
 /// the propagation-lag retry helpers to recognise the "not found yet"
@@ -239,6 +250,15 @@ pub struct WorkflowyClient {
     /// Elapsed milliseconds of the last successful request. `0` if no
     /// request has completed yet.
     last_request_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Unix-ms of the last 2xx response. `0` until the first success.
+    /// Probes use this to surface a stable "last good call" anchor so a
+    /// transient 5xx/timeout doesn't look like a sustained outage.
+    last_success_unix_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Unix-ms of the last 401/403 response. `0` until the first such
+    /// failure. Used to drive the `authenticated` signal independently
+    /// of "did the most recent probe succeed" — a transient timeout
+    /// must not flip `authenticated` to false.
+    last_auth_failure_unix_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Most recent upstream RateLimit-Remaining header, or `-1` if not
     /// observed. Workflowy's API may not send these — readers must treat
     /// `-1` as "unknown", not "zero".
@@ -262,6 +282,8 @@ impl WorkflowyClient {
             retry_config: RetryConfig::default(),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             last_request_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_success_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_auth_failure_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rate_limit_remaining: Arc::new(AtomicI64::new(-1)),
             rate_limit_limit: Arc::new(AtomicI64::new(-1)),
             rate_limit_reset_unix: Arc::new(AtomicI64::new(-1)),
@@ -272,6 +294,52 @@ impl WorkflowyClient {
     /// first request completes.
     pub fn last_request_ms(&self) -> u64 {
         self.last_request_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Unix-ms of the last 2xx response, or `None` if no request has
+    /// succeeded since the process started.
+    pub fn last_success_unix_ms(&self) -> Option<u64> {
+        let v = self.last_success_unix_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// Milliseconds since the last 2xx response. `None` if no request has
+    /// succeeded since the process started. Used by probes so a degraded
+    /// response carries proof of recent upstream liveness instead of just
+    /// a one-shot pass/fail.
+    pub fn last_success_ms_ago(&self) -> Option<u64> {
+        self.last_success_unix_ms()
+            .map(|t| now_unix_ms().saturating_sub(t))
+    }
+
+    /// Unix-ms of the last 401/403 response, or `None` if no auth failure
+    /// has been observed.
+    pub fn last_auth_failure_unix_ms(&self) -> Option<u64> {
+        let v = self.last_auth_failure_unix_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// True iff a 401/403 has been observed within the supplied window.
+    /// This is the right signal for "are we authenticated" — a probe
+    /// timeout or transient 5xx must NOT flip the answer to false, since
+    /// the API key is unrelated to upstream availability.
+    pub fn recent_auth_failure(&self, within: Duration) -> bool {
+        match self.last_auth_failure_unix_ms() {
+            None => false,
+            Some(t) => now_unix_ms().saturating_sub(t) <= within.as_millis() as u64,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn _test_stamp_auth_failure(&self) {
+        self.last_auth_failure_unix_ms
+            .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn _test_stamp_success(&self) {
+        self.last_success_unix_ms
+            .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Snapshot of the most recent upstream rate-limit headers. Each field
@@ -1129,11 +1197,26 @@ impl WorkflowyClient {
         let status = response.status();
 
         if status.is_success() {
+            // Stamp BEFORE attempting body parse — the upstream definitely
+            // answered 2xx, which is the signal probes care about.
+            // Parse failure here is a serialization issue, not an upstream
+            // liveness issue.
+            self.last_success_unix_ms
+                .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
             response
                 .json::<T>()
                 .await
                 .map_err(WorkflowyError::HttpError)
         } else {
+            // Auth failures are special: they prove the API key is wrong
+            // (or revoked), independent of network/upstream health. Track
+            // them on a separate axis so probes can answer
+            // "authenticated?" without conflating it with "reachable?".
+            if matches!(status.as_u16(), 401 | 403) {
+                self.last_auth_failure_unix_ms
+                    .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+            }
+
             let error_text = response
                 .text()
                 .await
@@ -1411,6 +1494,48 @@ mod tests {
         assert!(snap.limit.is_none());
         assert!(snap.reset_unix_seconds.is_none());
         assert_eq!(client.last_request_ms(), 0);
+    }
+
+    /// Regression test for the 2026-04-30 wiring incident: the probe's
+    /// liveness signal must come from `last_success_unix_ms` and the
+    /// `authenticated` signal must come from `last_auth_failure_unix_ms`,
+    /// each on their own axis. Until either has been stamped the
+    /// accessors return `None`, so callers can tell "never observed"
+    /// apart from "observed long ago".
+    #[test]
+    fn test_success_and_auth_failure_trackers_default_to_none() {
+        let client = test_client();
+        assert!(client.last_success_unix_ms().is_none());
+        assert!(client.last_success_ms_ago().is_none());
+        assert!(client.last_auth_failure_unix_ms().is_none());
+        assert!(
+            !client.recent_auth_failure(Duration::from_secs(60)),
+            "no failures observed yet — recent_auth_failure must be false"
+        );
+    }
+
+    #[test]
+    fn test_recent_auth_failure_respects_window() {
+        let client = test_client();
+        client._test_stamp_auth_failure();
+        // Within window: just stamped, must be true.
+        assert!(client.recent_auth_failure(Duration::from_secs(60)));
+        // A zero window is the degenerate case — even a fresh stamp
+        // should not register, because "within zero ms" includes
+        // nothing strictly older than the moment of the call. We
+        // permit equality (saturating arithmetic gives 0 ≤ 0) to keep
+        // the helper simple, which is the documented behaviour.
+    }
+
+    #[test]
+    fn test_last_success_ms_ago_returns_some_after_stamp() {
+        let client = test_client();
+        client._test_stamp_success();
+        let ago = client.last_success_ms_ago().expect("stamped success — must be Some");
+        // Stamping happens within microseconds of the read; the
+        // saturating-sub means the value can be 0. Anything below the
+        // process clock skew threshold is fine.
+        assert!(ago < 5_000, "stamp-then-read should be under 5s, got {ago} ms");
     }
 
     #[test]
