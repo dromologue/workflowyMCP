@@ -106,6 +106,11 @@ re-implementing them:
    walk that would otherwise have spent minutes draining queued requests
    returns within ~50 ms of the cancel call. Cancelled walks return
    `truncation_reason = "cancelled"` with whatever was collected.
+   Single-node read tools (`get_node`, `list_children`) wrap their API
+   calls in `with_read_budget`, which races the inner future against the
+   server-wide cancel registry **and** a wall-clock budget — so
+   `cancel_all` interrupts single-node reads on the same ~50 ms cadence
+   that walks already enforced.
 2. **Truncation is locatable.** Every truncated response includes a
    `truncated_at_node_id` (and, in text-mode banners, a hierarchical
    `Walk stopped at: …` path) naming the parent whose subtree was not
@@ -142,13 +147,19 @@ re-implementing them:
    and the resolution node cap (`defaults::RESOLVE_WALK_NODE_CAP`,
    100 000); a watcher polls the index every 100 ms and cancels the
    walk as soon as the target appears, so found-early lookups don't
-   pay the full timeout. Only when the walk completes without finding
-   the target does the resolver surface a cache-miss error. The
-   8-char form is collision-aware: if two distinct UUIDs share a
-   prefix, resolution returns `None` and the caller must disambiguate
-   via the full UUID. The name index has no TTL — once populated it
-   serves lookups indefinitely until a write invalidates the affected
-   entry.
+   pay the full timeout. The cache-miss error message distinguishes a
+   **truncated** walk (budget exhausted before the workspace was fully
+   covered — the hash may exist in an unwalked region; recovery hint:
+   re-run with the full UUID, scope a `find_node` call, or rebuild the
+   index) from an **exhaustive** walk (the workspace was fully covered
+   without finding the target — the hash is genuinely absent: stale,
+   shared from another account, or typo'd). Both cases include
+   `nodes_walked` and `elapsed_ms` so the caller can choose the right
+   recovery without guessing. The 8-char form is collision-aware: if
+   two distinct UUIDs share a prefix, resolution returns `None` and
+   the caller must disambiguate via the full UUID. The name index has
+   no TTL — once populated it serves lookups indefinitely until a
+   write invalidates the affected entry.
 6a. **Persistent name index.** The name index survives server
    restarts. On startup, `WorkflowyMcpServer::with_cache_and_persistence`
    reads `$WORKFLOWY_INDEX_PATH` (default
@@ -159,10 +170,12 @@ re-implementing them:
    (30 s) using a write-then-rename protocol so a crash mid-save
    never produces a half-written file. A second background task
    walks the workspace root every
-   `defaults::INDEX_REFRESH_INTERVAL_SECS` (6 hours) so newly added
-   or renamed nodes get indexed without user action. Both background
-   tasks are no-ops when no save path is configured (test paths,
-   custom embeddings).
+   `defaults::INDEX_REFRESH_INTERVAL_SECS` (30 minutes) so newly
+   added or renamed nodes get indexed without user action. The 30-min
+   cadence is calibrated against a 250 k-node workspace and a per-walk
+   budget of ~12 k nodes — at this rate quasi-full coverage builds up
+   over a working day. Both background tasks are no-ops when no save
+   path is configured (test paths, custom embeddings).
 7. **`edit_node` field-loss workaround.** When both `name` and
    `description` are supplied to `edit_node`, the client splits the
    update into two sequential POSTs (one per field) instead of a
@@ -194,6 +207,41 @@ re-implementing them:
     `healthy ≥ 75%`, `degraded ≥ 50%`, `failing < 50%`. Pattern B
     (search succeeds while direct reads fail) is now diagnosable from
     a single status response.
+
+11a. **Per-tool wall-clock budgets.** Every API-touching tool runs
+    against an upstream-independent deadline so a hung Workflowy
+    backend cannot wedge the MCP tool surface for longer than the
+    budget. Walks use `SUBTREE_FETCH_TIMEOUT_MS` (20 s).
+    Single-node reads use `READ_NODE_TIMEOUT_MS` (30 s) via the
+    server-side `with_read_budget` helper. `edit_node` uses
+    `EDIT_NODE_TIMEOUT_MS` (60 s) and shares the same deadline across
+    its split name+description POSTs so a flaky upstream cannot
+    double the budget. Hitting the budget returns `Timeout`, which
+    `tool_error` translates into a structured response with the
+    `Timeout` proximate cause; the underlying reqwest send is dropped
+    cleanly so the rate-limiter slot and connection-pool slot are
+    immediately available for the next call.
+
+11b. **Transport-level failures are retryable.** `WorkflowyError::is_retryable`
+    classifies both server-side errors (429 + 5xx status codes) **and**
+    transport-side errors (connect/read/body timeouts, dropped requests
+    surfaced by `reqwest` as `HttpError`). A transient read-timeout
+    against a slow upstream now flows through the backoff loop instead
+    of returning `RetryExhausted` after a single attempt — but only
+    within the per-tool wall-clock budget above, so retries cannot
+    extend a hung call past its deadline.
+
+11c. **`authenticated` is decoupled from probe success.** The client
+    stamps `last_success_unix_ms` on every 2xx response and
+    `last_auth_failure_unix_ms` only on 401/403. Probes derive
+    `authenticated` from `recent_auth_failure(AUTH_FAILURE_WINDOW_SECS)`
+    (5 minutes) instead of equating it with probe success — so a
+    transient timeout or 5xx after a successful write burst no longer
+    flips the auth signal. `last_successful_api_call_ms_ago` is
+    surfaced alongside so callers can anchor a single degraded probe
+    against proof of recent liveness. Both `health_check` and
+    `workflowy_status` make two attempts inside the same wall-clock
+    budget; auth failures skip the retry since the answer won't change.
 
 12. **Best-effort transactions.** `transaction` applies a sequence of
    create/edit/delete/move operations sequentially; on first failure
