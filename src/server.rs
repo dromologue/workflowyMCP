@@ -5376,61 +5376,11 @@ mod tests {
     /// root_id, Optional parent_id, required node_id) and asserts that a
     /// short hash NOT in the name index produces the resolver-side error
     /// rather than reaching the HTTP layer with a raw short hash.
-    #[tokio::test]
-    async fn handlers_route_root_and_parent_short_hashes_through_resolver() {
-        let server = new_test_server();
-        let unindexed = "ffffffffffff"; // 12-char hex, never ingested
-
-        // Optional root_id: list_overdue, list_upcoming, daily_review,
-        // get_recent_changes, bulk_update, build_name_index, list_todos.
-        let err = server
-            .list_overdue(Parameters(ListOverdueParams {
-                root_id: Some(NodeId::from(unindexed)),
-                include_completed: None,
-                limit: None,
-                max_depth: None,
-            }))
-            .await
-            .expect_err("must error before HTTP");
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("name index") || msg.contains("short-hash"),
-            "list_overdue: expected resolver-side error, got: {msg}"
-        );
-
-        // Optional parent_id: list_todos exercises the same pattern via
-        // a different param name.
-        let err = server
-            .list_todos(Parameters(ListTodosParams {
-                parent_id: Some(NodeId::from(unindexed)),
-                status: None,
-                query: None,
-                limit: None,
-                max_depth: None,
-            }))
-            .await
-            .expect_err("must error before HTTP");
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("name index") || msg.contains("short-hash"),
-            "list_todos: expected resolver-side error, got: {msg}"
-        );
-
-        // Required node_id: get_project_summary, find_backlinks,
-        // get_subtree, duplicate_node, create_from_template all use this.
-        let err = server
-            .get_subtree(Parameters(GetSubtreeParams {
-                node_id: NodeId::from(unindexed),
-                max_depth: None,
-            }))
-            .await
-            .expect_err("must error before HTTP");
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("name index") || msg.contains("short-hash"),
-            "get_subtree: expected resolver-side error, got: {msg}"
-        );
-    }
+    // The resolver-routing test that used to live here (a slow
+    // ~30 s exerciser against `invalid.local`) has moved to
+    // `mod load_tests::handlers_route_unindexed_short_hashes_through_resolver`,
+    // where it runs against an in-process wiremock that returns an
+    // empty workspace and completes in milliseconds.
 
     #[tokio::test]
     async fn op_log_records_handler_invocations_with_status() {
@@ -5656,57 +5606,12 @@ mod tests {
     /// representative handlers (delete, edit, move, find_node,
     /// list_overdue) that all reached the upstream error path during
     /// the 2026-04-25 session and produced bare failures.
-    #[tokio::test]
-    async fn handler_errors_carry_structured_data_payload() {
-        let server = new_test_server();
-        // delete_node on an unindexed short hash exercises the
-        // resolve_node_ref miss path; that returns invalid_params with
-        // a clear "name index" message. We then exercise a full-UUID
-        // delete which hits the (unreachable) upstream client and
-        // returns a structured tool_error.
-        let unreachable_uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let err = server
-            .delete_node(Parameters(DeleteNodeParams {
-                node_id: NodeId::from(unreachable_uuid),
-            }))
-            .await
-            .expect_err("upstream is unreachable in tests, must error");
-        let msg = err.to_string();
-        // Must mention the operation by name (proximate cause) so the
-        // assistant can correlate without reading the data field.
-        assert!(
-            msg.contains("delete_node"),
-            "delete_node error must name the operation: {msg}"
-        );
-
-        // edit_node with both fields hits the same upstream path.
-        let err = server
-            .edit_node(Parameters(EditNodeParams {
-                node_id: NodeId::from(unreachable_uuid),
-                name: Some("x".into()),
-                description: Some("y".into()),
-            }))
-            .await
-            .expect_err("upstream unreachable");
-        assert!(
-            err.to_string().contains("edit_node"),
-            "edit_node error must name the operation: {err}"
-        );
-
-        // move_node — covers the third Pattern 6 mutation.
-        let err = server
-            .move_node(Parameters(MoveNodeParams {
-                node_id: NodeId::from(unreachable_uuid),
-                new_parent_id: NodeId::from(unreachable_uuid),
-                priority: None,
-            }))
-            .await
-            .expect_err("upstream unreachable");
-        assert!(
-            err.to_string().contains("move_node"),
-            "move_node error must name the operation: {err}"
-        );
-    }
+    // The mutation-error test that used to live here (a slow
+    // ~30 s exerciser against `invalid.local`, three handlers in
+    // sequence) has moved to
+    // `mod load_tests::mutation_errors_carry_structured_data_payload`,
+    // where each handler runs against a wiremock returning a
+    // non-retryable 404 and the whole test completes in milliseconds.
 
     /// Brief 2026-04-25 Pattern 6 cross-cut: workflowy_status must
     /// surface the most recent failure (tool, finished_at, reason) so
@@ -7229,5 +7134,155 @@ mod load_tests {
             .expect("call must succeed against the parent_id matcher");
         let body = body_text(&result);
         assert!(body.contains("no children"), "body: {body}");
+    }
+
+    /// Migrated from `mod tests::handlers_route_root_and_parent_short_hashes_through_resolver`.
+    /// The previous version ran against `http://invalid.local` and took
+    /// ~30 s while the resolver walked an unreachable workspace through
+    /// the full retry budget. This version points the resolver at a
+    /// wiremock returning an empty workspace, so the walk completes
+    /// instantly as **exhaustive** (per the resolver's truncated-vs-
+    /// exhaustive contract documented in spec property #6) and the
+    /// expected "Short-hash … was not found" error returns in
+    /// milliseconds.
+    ///
+    /// What this test pins: every handler that takes a `node_id` /
+    /// `parent_id` / `root_id` short-hash routes the value through
+    /// `resolve_node_ref` rather than passing the bare short hash to
+    /// the API layer. A future refactor that bypasses the resolver
+    /// would break this contract — and the test would catch it.
+    #[tokio::test]
+    async fn handlers_route_unindexed_short_hashes_through_resolver() {
+        let mock = MockServer::start().await;
+        // Empty workspace: every walk completes immediately as
+        // exhaustive. The resolver concludes the hash is genuinely
+        // absent and returns the expected error.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let unindexed = "ffffffffffff"; // 12-char hex, never ingested
+
+        // Optional root_id: list_overdue, list_upcoming, daily_review,
+        // get_recent_changes, bulk_update, build_name_index, list_todos.
+        let err = server
+            .list_overdue(Parameters(ListOverdueParams {
+                root_id: Some(NodeId::from(unindexed)),
+                include_completed: None,
+                limit: None,
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "list_overdue: expected resolver-side error, got: {msg}"
+        );
+
+        // Optional parent_id: list_todos exercises the same pattern via
+        // a different param name.
+        let err = server
+            .list_todos(Parameters(ListTodosParams {
+                parent_id: Some(NodeId::from(unindexed)),
+                status: None,
+                query: None,
+                limit: None,
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "list_todos: expected resolver-side error, got: {msg}"
+        );
+
+        // Required node_id: get_project_summary, find_backlinks,
+        // get_subtree, duplicate_node, create_from_template all use this.
+        let err = server
+            .get_subtree(Parameters(GetSubtreeParams {
+                node_id: NodeId::from(unindexed),
+                max_depth: None,
+            }))
+            .await
+            .expect_err("must error before HTTP");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("name index") || msg.contains("short-hash"),
+            "get_subtree: expected resolver-side error, got: {msg}"
+        );
+    }
+
+    /// Migrated from `mod tests::handler_errors_carry_structured_data_payload`.
+    /// The previous version ran each mutation through the full retry
+    /// budget against `invalid.local`, totalling ~30 s. This version
+    /// returns a non-retryable 404 from the wiremock so each handler
+    /// fails fast on the first attempt; the assertion that the structured
+    /// `tool_error` payload names the operation is unchanged.
+    ///
+    /// Brief acceptance: 2026-04-25 (Pattern A/B/C transient failures).
+    /// When a tool call fails, the response MUST surface the operation
+    /// name in the error message — otherwise the assistant only sees a
+    /// bare "Tool execution failed" with no diagnostic value.
+    #[tokio::test]
+    async fn mutation_errors_carry_structured_data_payload() {
+        let mock = MockServer::start().await;
+        // 404 on every request: non-retryable, fast failure on first attempt.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let target_uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let err = server
+            .delete_node(Parameters(DeleteNodeParams {
+                node_id: NodeId::from(target_uuid),
+            }))
+            .await
+            .expect_err("404 must surface a tool_error");
+        assert!(
+            err.to_string().contains("delete_node"),
+            "delete_node error must name the operation: {err}"
+        );
+
+        let err = server
+            .edit_node(Parameters(EditNodeParams {
+                node_id: NodeId::from(target_uuid),
+                name: Some("x".into()),
+                description: Some("y".into()),
+            }))
+            .await
+            .expect_err("404 must surface a tool_error");
+        assert!(
+            err.to_string().contains("edit_node"),
+            "edit_node error must name the operation: {err}"
+        );
+
+        let err = server
+            .move_node(Parameters(MoveNodeParams {
+                node_id: NodeId::from(target_uuid),
+                new_parent_id: NodeId::from(target_uuid),
+                priority: None,
+            }))
+            .await
+            .expect_err("404 must surface a tool_error");
+        assert!(
+            err.to_string().contains("move_node"),
+            "move_node error must name the operation: {err}"
+        );
     }
 }

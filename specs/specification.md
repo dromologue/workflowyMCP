@@ -299,18 +299,22 @@ the corresponding reliability property.
 | Transient 503 retry within budget | `list_children_retries_503_within_read_budget` | Retry config of 2 attempts is honoured; tool surfaces the eventual 200. |
 | Auth failure (401) is not retried | `list_children_does_not_retry_on_401` | Single upstream request observed; tool surfaces a fast error rather than burning the read budget. |
 | Children listing carries `parent_id` query param | `children_query_param_is_passed_to_upstream` | Routing pin: a future endpoint refactor that drops the `parent_id` query string trips the test. |
+| Every handler routes short-hash inputs through `resolve_node_ref` | `handlers_route_unindexed_short_hashes_through_resolver` | Three handlers (Optional `root_id`, Optional `parent_id`, required `node_id`) against an empty-workspace mock — the resolver concludes exhaustive walk and returns the expected "Short-hash … was not found" error. A future bypass that passes a raw short hash to the API layer breaks this. |
+| Mutation errors carry structured `tool_error` payload | `mutation_errors_carry_structured_data_payload` | `delete_node` / `edit_node` / `move_node` against a 404 mock each surface a structured error message naming the operation — the brief acceptance criterion that bare "Tool execution failed" is a regression. |
 
 ### Why this matters
 
-The previous failure-mode coverage was two `invalid.local` tests that
-each ran for ~30 s waiting for the read budget to expire — the same
-30 s a user would experience in production. They proved the budget
-existed but said nothing about which retry-loop branch fired or
-whether `cancel_all` actually preempted anything. The mock-based
-suite covers nine distinct paths in 350 ms total and is the
+The previous failure-mode coverage was four `invalid.local` tests
+that each ran for ~30 s waiting for the read budget to expire — the
+same 30 s a user would experience in production. They proved the
+budget existed but said nothing about which retry-loop branch fired
+or whether `cancel_all` actually preempted anything. The mock-based
+suite covers eleven distinct paths in under 2 s total and is the
 primary regression net for any future changes to `with_read_budget`,
-the propagation-retry layer, the 503/transport retry policy, or
-`cancel_all`'s preemption behaviour.
+the propagation-retry layer, the 503/transport retry policy,
+`cancel_all`'s preemption behaviour, the short-hash resolver, or
+the structured `tool_error` payload. Full-suite runtime dropped
+from 160 s to ~40 s as the slow tests were retired.
 
 ---
 
