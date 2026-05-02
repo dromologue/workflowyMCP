@@ -367,6 +367,8 @@ the corresponding reliability property.
 | `transaction` honours bulk budget against hung upstream | `transaction_against_hung_upstream_returns_within_bulk_budget` | Pre-state captures inside `apply_txn_op` no longer let one slow op stretch the whole transaction past the budget. |
 | `node_at_path` honours bulk budget against hung upstream | `node_at_path_against_hung_upstream_returns_within_bulk_budget` | Per-segment `get_children` calls respect the wrapper. |
 | `cancel_all` preempts any in-flight bulk handler | `cancel_all_preempts_inflight_path_of_via_run_handler` | The same ~50 ms cancel-poll cadence that covers `list_children` now covers every handler that goes through `run_handler` — no more handler-by-handler cancel wiring. |
+| `create_node` caps at `WRITE_NODE_TIMEOUT_MS` against hung upstream | `create_node_caps_at_write_budget_against_hung_upstream` | The per-method client deadline drops the in-flight reqwest send and returns `Timeout` instead of letting the retry loop burn the full `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~150 s) — the root cause of the 4-min `insert_content` hangs in the 2026-05-02 report. |
+| `insert_content` returns partial-success on **timeout** (not just cancel) | `insert_content_returns_partial_on_timeout` | A per-line create that hangs past the bulk budget surfaces `status: "partial"`, `reason: "timeout"`, with `created_count` reflecting the lines that completed before the deadline. The deadline takes precedence over downstream upstream errors so the contract holds even when an HTTP error fires alongside the deadline. |
 
 ### Why this matters
 
@@ -375,7 +377,7 @@ that each ran for ~30 s waiting for the read budget to expire — the
 same 30 s a user would experience in production. They proved the
 budget existed but said nothing about which retry-loop branch fired
 or whether `cancel_all` actually preempted anything. The mock-based
-suite covers nineteen distinct paths in under 2 s total and is the
+suite covers twenty-one distinct paths in under 2 s total and is the
 primary regression net for any future changes to `with_tool_budget`,
 the propagation-retry layer, the 503/transport retry policy,
 `cancel_all`'s preemption behaviour, the short-hash resolver, the
@@ -1068,7 +1070,7 @@ User: "Import this research outline into my Project node" (provides 200+ node ou
 2. Behind the scenes, the system:
    - Analyzes workload: 180 nodes, 5 subtrees
    - Assigns 4 workers (automatically determined)
-   - Each worker gets independent rate limiter (5 req/sec)
+   - Each worker gets independent rate limiter (10 req/sec)
    - Workers process their subtrees concurrently
 
 3. Progress tracked during execution:
@@ -1603,7 +1605,7 @@ User: "Insert this large research document (500+ nodes)"
    get_job_result(job_id: "job-123")
    → Returns: {status: "completed", result: {nodesCreated: 512, nodeIds: [...]}}
 
-The server handles all rate limiting internally (5 req/sec with burst of 10).
+The server handles all rate limiting internally (10 req/sec with burst of 20).
 Jobs are retained for 30 minutes after completion.
 ```
 

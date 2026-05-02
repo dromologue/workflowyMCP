@@ -37,7 +37,7 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 ### Key Infrastructure
 
 - **Node Cache** (`utils/cache.rs`): Injectable (or global `lazy_static` default), 30s TTL, parking_lot RwLock. O(n) subtree invalidation via parent-children index.
-- **Rate Limiter** (`utils/rate_limiter.rs`): Token bucket, 5 req/sec, burst 10.
+- **Rate Limiter** (`utils/rate_limiter.rs`): Token bucket, 10 req/sec, burst 20.
 - **Job Queue** (`utils/job_queue.rs`): Background job lifecycle with TTL cleanup (tokio::spawn). Max 1000 job history.
 - **Cancel Registry** (`utils/cancel.rs`): Generation-counter cancellation primitive. `cancel_all` bumps the counter so every outstanding `CancelGuard` returns `is_cancelled = true` at its next checkpoint; guards taken afterwards are fresh.
 - **Name Index** (`utils/name_index.rs`): Case-insensitive `name -> [entry]` map plus short-hash → UUID maps (12-char URL-suffix and 8-char doc prefix), fed by every subtree walk. Backed by `parking_lot::RwLock`; invalidated per-node on every write. **Persisted to disk** at `$WORKFLOWY_INDEX_PATH` (default `$HOME/code/secondBrain/memory/name_index.json`): rehydrated on server startup, checkpointed every 30 s when dirty via write-then-rename, refreshed by a 30-minute background walk (calibrated against 250 k-node trees so quasi-full coverage builds up over a working day rather than a working week). **Auto-walks on short-hash miss**: `resolve_node_ref` fires a workspace walk with `RESOLVE_WALK_TIMEOUT_MS` budget when a short hash isn't cached; a watcher polls the index every 100 ms and cancels the walk as soon as the target appears. Callers no longer need to run `build_name_index` manually before passing a Workflowy URL fragment.

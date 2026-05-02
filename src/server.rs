@@ -2151,8 +2151,12 @@ impl WorkflowyMcpServer {
         // End-to-end deadline. Honoured by every per-line create plus a
         // pre-line check so a row queued behind the rate limiter
         // observes the budget without making an HTTP attempt that
-        // would have to time out on its own.
-        let total_budget = Duration::from_millis(defaults::INSERT_CONTENT_TIMEOUT_MS);
+        // would have to time out on its own. The budget reads from
+        // `self.bulk_budget_ms` (defaulting to
+        // [`defaults::INSERT_CONTENT_TIMEOUT_MS`]) so tests can dial it
+        // down via `with_bulk_budget_ms`, sharing the override surface
+        // with every other bulk handler.
+        let total_budget = Duration::from_millis(self.bulk_budget_ms);
         let overall_deadline = Instant::now() + total_budget;
         let cancel_guard = self.cancel_registry.guard();
 
@@ -2220,6 +2224,23 @@ impl WorkflowyMcpServer {
                     break;
                 }
                 Err(e) => {
+                    // Deadline takes precedence: if the budget has
+                    // already expired, the error is a downstream
+                    // consequence (a connection torn down by the
+                    // racing `tokio::select` arm, an upstream session
+                    // closed, etc.) and the contract is partial-
+                    // success on timeout — not a hard error that the
+                    // caller can't tell apart from a real failure.
+                    if cancel_guard.is_cancelled() {
+                        bailout_reason = Some("cancelled".to_string());
+                        bailout_line = Some(line.text.to_string());
+                        break;
+                    }
+                    if Instant::now() >= overall_deadline {
+                        bailout_reason = Some("timeout".to_string());
+                        bailout_line = Some(line.text.to_string());
+                        break;
+                    }
                     error!(error = %e, line = line.text, "Failed to insert line");
                     return Err(tool_error(
                         "insert_content",
@@ -7791,6 +7812,129 @@ mod load_tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "bulk budget must fire under mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// `WRITE_NODE_TIMEOUT_MS` is the per-method deadline that
+    /// `client.create_node` builds internally. The contract: a hung
+    /// upstream cannot stretch a single create past the budget,
+    /// regardless of retry attempts. Without this guarantee a 140-node
+    /// `insert_content` could push past the MCP client's 4-min hard
+    /// timeout (the failure shape from the 2026-05-02 report). The
+    /// test injects a tiny per-call deadline directly via
+    /// `create_node_cancellable` to exercise the same code path in
+    /// milliseconds.
+    #[tokio::test]
+    async fn create_node_caps_at_write_budget_against_hung_upstream() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"item_id": "11111111-2222-3333-4444-555555555555"})),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = WorkflowyClient::new_with_configs(
+            mock.uri(),
+            "test-key".to_string(),
+            fast_retry(),
+            fast_rate_limit(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let result = client
+            .create_node_cancellable("hello", None, None, None, None, Some(deadline))
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(crate::error::WorkflowyError::Timeout)),
+            "must surface Timeout when deadline fires before mock responds: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "deadline (300 ms) must fire well under the 5 s mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// Failure 1 from the 2026-05-02 report: a 140-node `insert_content`
+    /// could blow past the MCP client's 4-min hard timeout because a
+    /// few transient slow upstream calls compounded across the
+    /// sequential creates. With `INSERT_CONTENT_TIMEOUT_MS` (210 s
+    /// production; 300 ms test override) the operation now returns a
+    /// structured partial-success payload before the client gives up,
+    /// so the caller learns what was inserted. The cancel-path test
+    /// (`insert_content_returns_partial_on_cancel`) covers the same
+    /// code path; this test pins the **timeout** branch specifically.
+    #[tokio::test]
+    async fn insert_content_returns_partial_on_timeout() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        struct ProgressivelySlower(Arc<AtomicUsize>);
+        impl wiremock::Respond for ProgressivelySlower {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let id = format!("aaaaaaaa-bbbb-cccc-dddd-{:012x}", n);
+                let template = ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": id}));
+                if n >= 2 {
+                    // Third+ create hangs for 30 s — well past the
+                    // tight insert_content budget.
+                    template.set_delay(Duration::from_secs(30))
+                } else {
+                    template
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .respond_with(ProgressivelySlower(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        // Tight insert-content budget so the timeout path fires after
+        // the first two fast creates.
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .unwrap(),
+        );
+        let server = WorkflowyMcpServer::new(client)
+            .with_read_budget_ms(60_000)
+            .with_bulk_budget_ms(500);
+
+        let started = Instant::now();
+        let result = server
+            .insert_content(Parameters(InsertContentParams {
+                parent_id: NodeId::from(id_a()),
+                content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
+            }))
+            .await
+            .expect("partial-success returns Ok with structured payload, not Err");
+        let elapsed = started.elapsed();
+
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .expect("partial-success payload must be JSON");
+        assert_eq!(v["status"], "partial", "body: {body}");
+        assert_eq!(v["reason"], "timeout", "body: {body}");
+        let created = v["created_count"].as_u64().expect("created_count");
+        assert!(created >= 1, "must have inserted at least one line: {body}");
+        assert!(created < 5, "must not have inserted all five: {body}");
+        assert_eq!(v["total_count"], 5, "body: {body}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bulk budget (500 ms) must fire well under the 30 s hung mock, elapsed = {elapsed:?}"
         );
     }
 
