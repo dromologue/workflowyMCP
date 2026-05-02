@@ -73,11 +73,23 @@ impl WorkflowyError {
         Self::ParseError { reason: reason.into() }
     }
 
+    /// Whether the request layer should re-enter its backoff loop on this
+    /// error. Covers two families of transient failure:
+    /// * server-side: 429 + 5xx status codes;
+    /// * transport-side: connect/read/body timeouts and dropped requests
+    ///   surfaced by reqwest as `HttpError`. Without this arm the first
+    ///   read-timeout against a slow upstream returns `RetryExhausted`
+    ///   after a single attempt.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            WorkflowyError::ApiError { status, .. } if matches!(*status, 429 | 500 | 502 | 503 | 504)
-        )
+        match self {
+            WorkflowyError::ApiError { status, .. } => {
+                matches!(*status, 429 | 500 | 502 | 503 | 504)
+            }
+            WorkflowyError::HttpError(e) => {
+                e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
+            }
+            _ => false,
+        }
     }
 
     pub fn is_path_traversal(&self) -> bool {
@@ -107,6 +119,27 @@ mod tests {
     fn test_is_not_retryable_404() {
         let err = WorkflowyError::api_error(404, "Not found");
         assert!(!err.is_retryable());
+    }
+
+    /// Forces a real reqwest timeout by giving the client a 1 ns budget.
+    /// The error returned has `is_timeout() == true`, which is exactly the
+    /// failure mode upstream slowness produces in production. Without the
+    /// HttpError arm in `is_retryable`, this returns false and the request
+    /// layer gives up after a single attempt.
+    #[tokio::test]
+    async fn test_is_retryable_transport_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_nanos(1))
+            .build()
+            .unwrap();
+        let reqwest_err = client
+            .get("https://workflowy.com")
+            .send()
+            .await
+            .expect_err("1 ns timeout must fail");
+        assert!(reqwest_err.is_timeout(), "expected a timeout error");
+        let err: WorkflowyError = reqwest_err.into();
+        assert!(err.is_retryable(), "transport timeouts must be retryable");
     }
 
     #[test]

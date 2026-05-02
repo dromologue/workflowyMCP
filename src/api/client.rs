@@ -854,13 +854,20 @@ impl WorkflowyClient {
         description: Option<&str>,
     ) -> Result<()> {
         let endpoint = format!("/nodes/{}", node_id);
+        // Single deadline for the whole logical edit — split-payload writes
+        // share it so a flaky upstream can't double the wall-clock budget.
+        let deadline = Instant::now() + Duration::from_millis(defaults::EDIT_NODE_TIMEOUT_MS);
 
         if name.is_some() && description.is_some() {
             // Split: name first, then description. Both must succeed.
             let name_body = json!({ "name": name.unwrap() });
-            let _: serde_json::Value = self.request("POST", &endpoint, Some(name_body)).await?;
+            let _: serde_json::Value = self
+                .request_cancellable("POST", &endpoint, Some(name_body), None, Some(deadline))
+                .await?;
             let desc_body = json!({ "description": description.unwrap() });
-            let _: serde_json::Value = self.request("POST", &endpoint, Some(desc_body)).await?;
+            let _: serde_json::Value = self
+                .request_cancellable("POST", &endpoint, Some(desc_body), None, Some(deadline))
+                .await?;
             return Ok(());
         }
 
@@ -872,7 +879,9 @@ impl WorkflowyClient {
         if let Some(d) = description {
             body["description"] = json!(d);
         }
-        let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
+        let _: serde_json::Value = self
+            .request_cancellable("POST", &endpoint, Some(body), None, Some(deadline))
+            .await?;
         Ok(())
     }
 

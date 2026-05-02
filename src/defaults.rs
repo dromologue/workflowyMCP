@@ -56,6 +56,11 @@ pub const DEFAULT_MAX_RESULTS: usize = 20;
 pub const MAX_RESPONSE_SIZE: usize = 50_000;
 /// Default tool timeout (seconds)
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
+/// Wall-clock budget for a single `edit_node` call. Bounds the entire
+/// retry loop (including the split name+description POSTs), so a flaky
+/// upstream returns Timeout in ~60 s rather than burning all 5 retry
+/// attempts × HTTP_TIMEOUT_SECS on each transient read-timeout.
+pub const EDIT_NODE_TIMEOUT_MS: u64 = 60_000;
 
 // --- Tree Traversal ---
 /// Default max_depth for search operations

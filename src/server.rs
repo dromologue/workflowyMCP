@@ -6288,43 +6288,52 @@ mod tests {
     }
 
     /// Brief 2026-04-26 (T-164): the MCP server exposes audit_mirrors
-    /// and review as first-class tools, not just CLI subcommands. This
-    /// test asserts the handler dispatches through the standard error
-    /// path when the upstream is unreachable in the test harness — a
-    /// proxy for "the wiring compiles and the call reaches the
-    /// audit::* lib module before failing on the network".
+    /// and review as first-class tools, not just CLI subcommands. The
+    /// test harness has no reachable upstream, so the walk_subtree
+    /// deadline fires and the handler returns a successful response
+    /// carrying `truncation_reason: timeout` — a precise proxy for "the
+    /// wiring compiles and the call reaches walk_subtree before the
+    /// network gives up".
     #[tokio::test]
     async fn audit_mirrors_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
-        let err = server
+        let result = server
             .audit_mirrors(Parameters(AuditMirrorsParams {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
             }))
             .await
-            .expect_err("upstream unreachable in tests, must error");
-        let msg = err.to_string();
+            .expect("handler must return a degraded result, not error");
+        let body = result_text(&result);
         assert!(
-            msg.contains("audit_mirrors"),
-            "error must name the operation: {msg}"
+            body.contains("\"truncation_reason\":\"timeout\""),
+            "must carry walk_subtree truncation marker: {body}"
+        );
+        assert!(
+            body.contains("\"scanned\":0"),
+            "no nodes should be scanned when upstream is unreachable: {body}"
         );
     }
 
     #[tokio::test]
     async fn review_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
-        let err = server
+        let result = server
             .review(Parameters(ReviewParams {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
                 days_stale: Some(30),
             }))
             .await
-            .expect_err("upstream unreachable in tests, must error");
-        let msg = err.to_string();
+            .expect("handler must return a degraded result, not error");
+        let body = result_text(&result);
         assert!(
-            msg.contains("review"),
-            "error must name the operation: {msg}"
+            body.contains("\"truncation_reason\":\"timeout\""),
+            "must carry walk_subtree truncation marker: {body}"
+        );
+        assert!(
+            body.contains("\"scanned\":0"),
+            "no nodes should be scanned when upstream is unreachable: {body}"
         );
     }
 
