@@ -176,20 +176,22 @@ re-implementing them:
    budget of ~12 k nodes — at this rate quasi-full coverage builds up
    over a working day. Both background tasks are no-ops when no save
    path is configured (test paths, custom embeddings).
-7. **`edit_node` wire-field mapping (root cause of P2.4 field loss).**
-   Workflowy's REST API names the description body `note` on the wire;
-   the Rust surface keeps it as `description` and serde's
-   `alias = "note"` covers reads. Writes in `client.rs` map the
-   boundary explicitly: `create_node` sets `body["note"]`, and both
-   branches of `edit_node` (the split combined-edit and the
-   single-field path) send `note`. Sending `description` literally
-   returns 200 OK with the field silently dropped — that was the
-   actual cause of the 2026-05-02 field-loss symptom, not a
-   partial-update bug. The split-into-two-POSTs path is retained for
-   fault isolation between the two fields, but is no longer
-   load-bearing for correctness. Pinned by `tests::write_field_names`
-   in `src/api/client.rs` (wiremock body matchers reject any reversion
-   to `description`).
+7. **Wire-field mapping discipline for writes.** Workflowy's REST API
+   uses camelCase / abbreviated names on the wire that don't always
+   match the Rust struct field. The serde `alias` covers reads; writes
+   are hand-constructed JSON, so each write site maps the field
+   explicitly at the `client.rs` boundary. `create_node` and
+   `edit_node` set `body["note"]` (not `description` — the read-side
+   alias `note` ↔ `description` masked the wire mismatch as the
+   "P2.4 field loss" symptom on 2026-05-02). `set_completion` posts
+   `body["completed"]` (the read-side `WorkflowyNode::completed` boolean
+   has no alias, so the wire field is literally `completed`). Every
+   write field is pinned by a wiremock body-matcher test in
+   `src/api/client.rs::tests::write_field_names`; if a wire field
+   name shifts, the test fails locally without needing a live API.
+   The "split into two POSTs" path on `edit_node` is retained for
+   per-field fault isolation but is no longer load-bearing for
+   correctness now that the field name is correct.
 8. **`move_node` retry-with-refresh.** On a parent-related 4xx error
    ("parent not found"/"stale parent"), `move_node` re-fetches the
    target parent's children listing and retries the move once. 5xx
@@ -878,7 +880,7 @@ Search for a target node by name and insert content. Combines find + insert in o
 |---------|-------------|
 | Create todos | Use `insert_content` with checkbox syntax `[ ]` or `[x]` |
 | List todos | Retrieve all todos with filtering by status, parent, search |
-| Complete/Uncomplete | Toggle completion status of any node |
+| Complete/Uncomplete | Toggle completion via `complete_node` (single node) or `bulk_update` with `operation: complete`/`uncomplete` (filter set) |
 | **List upcoming** | Todos due in the next N days, sorted by urgency |
 | **List overdue** | Past-due items sorted by most overdue first |
 | **Daily review** | One-call standup summary: overdue, upcoming, recent, pending |
@@ -1056,6 +1058,26 @@ Template node `{{project_name}} Plan` becomes `Alpha Plan`. All `{{owner}}` in n
 
 ---
 
+#### complete_node Tool
+
+Toggle a node's native Workflowy completion state. Replaces the tag-based `#done` workaround the wflow skill used to apply when this endpoint was unmodelled.
+
+**Parameters**:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | yes | Full UUID or 12-char short hash of the target node |
+| `completed` | boolean | no | Target state. Default `true` (mark complete); pass `false` to uncomplete a previously-completed node |
+
+**Wire shape**: `POST /nodes/{id}` with `{"completed": true}` or `{"completed": false}`. The read-side `WorkflowyNode::completed` boolean has no serde alias, so the wire field is literally `completed`. Pinned by `tests::write_field_names::set_completion_*` so any wire-field surprise (the description→note bug from 2026-05-02 was the precedent) fails the unit suite locally without needing a live API.
+
+**Behaviour**:
+- The `completedAt` timestamp is server-derived: a successful `complete_node(_, completed=true)` causes the next read to surface a non-null `completed_at`. Uncompleting clears it back to `None`. Callers that need the timestamp re-read the node via `get_node`.
+- Cache + name-index entries for the node are invalidated on success so subsequent reads (`get_node`, `list_todos`, `daily_review`) reflect the new state without a TTL wait.
+- Bounded by `WRITE_NODE_TIMEOUT_MS` (15 s) end-to-end via the `tool_handler!(ToolKind::Write)` wrapper. Propagation-lag retries (3 attempts at 200/400/800 ms) on 404, same as `edit_node` / `delete_node`.
+
+---
+
 #### bulk_update Tool
 
 Apply an operation to all nodes matching a filter. Supports dry-run mode for previewing matches.
@@ -1071,7 +1093,7 @@ Apply an operation to all nodes matching a filter. Supports dry-run mode for pre
 | `limit` | number | no | Max nodes to modify (default: 50, safety limit) |
 
 **Operations**:
-- `complete` / `uncomplete`: Toggle completion status
+- `complete` / `uncomplete`: Toggle completion status. Routes through `client.set_completion`, the same code path the single-node `complete_node` tool uses; same wire shape (`POST /nodes/{id}` with `{"completed": <bool>}`).
 - `delete`: Permanently remove matching nodes
 - `add_tag`: Append `#tag` to node names
 - `remove_tag`: Remove `#tag` from names and notes

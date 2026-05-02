@@ -938,6 +938,67 @@ impl WorkflowyClient {
         Ok(())
     }
 
+    /// Toggle a node's completion state.
+    ///
+    /// **Wire shape.** Workflowy's read side returns `completed: bool`
+    /// (no serde alias on `WorkflowyNode::completed`, so the wire field
+    /// is literally `completed`) and `completedAt: i64?` (camelCase).
+    /// The write payload mirrors the boolean: `POST /nodes/{id}` with
+    /// `{"completed": true}` to mark complete and `{"completed": false}`
+    /// to uncomplete. Pinned by `tests::write_field_names::
+    /// set_completion_*` — if the wire field name shifts (the
+    /// description → note bug from 2026-05-02 was the precedent), the
+    /// tests fail locally without needing a live API.
+    ///
+    /// Bounded by [`defaults::WRITE_NODE_TIMEOUT_MS`] end-to-end. The
+    /// `completedAt` timestamp is server-derived: a successful
+    /// `set_completion(_, true)` causes the next read to surface a
+    /// non-null `completed_at`; uncompleting clears it back to
+    /// `None`. Callers that need the timestamp re-read the node via
+    /// `get_node`.
+    pub async fn set_completion(&self, node_id: &str, completed: bool) -> Result<()> {
+        let endpoint = format!("/nodes/{}", node_id);
+        let deadline = Instant::now() + Duration::from_millis(defaults::WRITE_NODE_TIMEOUT_MS);
+        let body = json!({ "completed": completed });
+        let _: serde_json::Value = self
+            .request_cancellable("POST", &endpoint, Some(body), None, Some(deadline))
+            .await?;
+        Ok(())
+    }
+
+    /// Completion-toggle counterpart to
+    /// [`Self::edit_node_with_propagation_retry`]. Same policy: 3
+    /// attempts with 200/400/800 ms backoff on 404 only, because a
+    /// freshly-created node may surface in a parent's children listing
+    /// before it is mutable directly.
+    pub async fn set_completion_with_propagation_retry(
+        &self,
+        node_id: &str,
+        completed: bool,
+    ) -> Result<()> {
+        const MAX_PROP_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.set_completion(node_id, completed).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
+                    let delay_ms = 200u64 * (1u64 << attempt);
+                    tracing::info!(
+                        node_id = %node_id,
+                        completed,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "set_completion 404 — retrying for propagation lag"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Delete a node. Bounded by [`defaults::WRITE_NODE_TIMEOUT_MS`]
     /// end-to-end so the retry loop cannot stretch a single delete past
     /// the budget — same contract as `create_node`.
@@ -1810,6 +1871,50 @@ mod tests {
                 .edit_node("00000000-0000-0000-0000-000000000001", Some("new"), Some("d"))
                 .await
                 .expect("split edit must reach both mocks — if this fails, the wire field name regressed");
+        }
+
+        /// `set_completion(_, true)` must POST `{"completed": true}` to
+        /// `/nodes/{id}`. Pins the wire shape so the description → note
+        /// failure mode (200 OK with the field silently dropped) cannot
+        /// recur on the completion path.
+        #[tokio::test]
+        async fn set_completion_true_sends_completed_true() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .and(body_partial_json(json!({"completed": true})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .set_completion("00000000-0000-0000-0000-000000000001", true)
+                .await
+                .expect("complete must reach mock — if this fails, the wire field name regressed");
+        }
+
+        /// `set_completion(_, false)` is the symmetric uncomplete path.
+        /// The mock requires the literal `false` value so a
+        /// `{"completed": true}` regression on the uncomplete branch
+        /// would also fail this test.
+        #[tokio::test]
+        async fn set_completion_false_sends_completed_false() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .and(body_partial_json(json!({"completed": false})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .set_completion("00000000-0000-0000-0000-000000000001", false)
+                .await
+                .expect("uncomplete must reach mock — if this fails, the wire field name regressed");
         }
     }
 }

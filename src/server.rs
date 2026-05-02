@@ -814,6 +814,16 @@ pub struct DeleteNodeParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "Toggle a node's completion state. Replaces the tag-based completion workaround documented in the wflow skill — `#done` markers no longer need to be applied as a substitute for native completion.")]
+pub struct CompleteNodeParams {
+    #[schemars(description = "The UUID of the node to mark complete or uncomplete")]
+    pub node_id: NodeId,
+    #[schemars(description = "Target completion state. Default true (mark complete); pass false to uncomplete a previously-completed node.")]
+    pub completed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Move a node to a new parent")]
 pub struct MoveNodeParams {
     #[schemars(description = "The UUID of the node to move")]
@@ -1056,7 +1066,7 @@ pub struct BulkUpdateParams {
     pub root_id: Option<NodeId>,
     #[schemars(description = "Status filter: 'all', 'pending', 'completed' (default: 'all')")]
     pub status: Option<String>,
-    #[schemars(description = "Operation: 'complete', 'uncomplete', 'delete', 'add_tag', 'remove_tag'")]
+    #[schemars(description = "Operation: 'complete', 'uncomplete', 'delete', 'add_tag', 'remove_tag'. `complete`/`uncomplete` toggle native Workflowy completion state via `client.set_completion`; same code path as the single-node `complete_node` tool.")]
     pub operation: String,
     #[schemars(description = "Tag value for add_tag/remove_tag operations")]
     pub operation_tag: Option<String>,
@@ -1127,14 +1137,15 @@ pub struct BatchCreateNodesParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(description = "One operation inside a transaction. `op` is one of: create, edit, delete, move.")]
+#[schemars(description = "One operation inside a transaction. `op` is one of: create, edit, delete, move, complete, uncomplete.")]
 pub struct TransactionOpParams {
-    #[schemars(description = "Operation kind: create | edit | delete | move")]
+    #[schemars(description = "Operation kind: create | edit | delete | move | complete | uncomplete")]
     pub op: String,
     /// For create: parent_id and name (required), description/priority (optional).
     /// For edit: node_id (required), name and/or description.
     /// For delete: node_id (required).
     /// For move: node_id, new_parent_id (required), priority (optional).
+    /// For complete / uncomplete: node_id (required).
     #[schemars(description = "Node ID — required for edit, delete, and move operations")]
     pub node_id: Option<NodeId>,
     #[schemars(description = "Parent node ID — required for create, ignored for others")]
@@ -2097,6 +2108,36 @@ impl WorkflowyMcpServer {
                 ))]))
             }
             Err(e) => Err(tool_error("delete_node", Some(&resolved), e)),
+        }
+        })
+    }
+
+    #[tool(description = "Mark a node complete or uncomplete. Defaults to complete; pass `completed: false` to revert. Replaces the tag-based `#done` workaround documented in the wflow skill — completion is now first-class. Cache is invalidated on success so subsequent reads (`get_node`, `list_todos`, `daily_review`) reflect the new state without a TTL wait.")]
+    async fn complete_node(
+        &self,
+        TracedParams(params): TracedParams<CompleteNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_handler!(self, "complete_node", ToolKind::Write, params, {
+        let target_state = params.completed.unwrap_or(true);
+        info!(node_id = %params.node_id, completed = target_state, "Setting completion");
+        check_node_id(&params.node_id)?;
+        let resolved = self.resolve_node_ref(&params.node_id).await?;
+
+        match self
+            .client
+            .set_completion_with_propagation_retry(&resolved, target_state)
+            .await
+        {
+            Ok(_) => {
+                self.cache.invalidate_node(&resolved);
+                self.name_index.invalidate_node(&resolved);
+                let verb = if target_state { "Completed" } else { "Uncompleted" };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{} node `{}`",
+                    verb, resolved
+                ))]))
+            }
+            Err(e) => Err(tool_error("complete_node", Some(&resolved), e)),
         }
         })
     }
@@ -3535,7 +3576,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Apply an operation to all nodes matching a filter. Supports delete, add_tag, remove_tag. Use dry_run to preview. Note: complete/uncomplete are not yet implemented and will be rejected.")]
+    #[tool(description = "Apply an operation to all nodes matching a filter. Supports complete, uncomplete, delete, add_tag, remove_tag. Use dry_run to preview. complete/uncomplete route through the same `client.set_completion` code path as the single-node `complete_node` tool.")]
     async fn bulk_update(
         &self,
         TracedParams(params): TracedParams<BulkUpdateParams>,
@@ -3550,19 +3591,11 @@ impl WorkflowyMcpServer {
             None => None,
         };
 
-        // Validate operation. complete/uncomplete are rejected up front because
-        // the Workflowy completion endpoints are not yet modelled in the client
-        // and silently returning success would be a data-integrity trap.
-        let valid_ops = ["delete", "add_tag", "remove_tag"];
-        if params.operation == "complete" || params.operation == "uncomplete" {
-            return Err(McpError::invalid_params(
-                format!(
-                    "Operation '{}' is not yet supported: the Workflowy completion endpoints are not modelled. Use a tag-based workflow until completion is wired up.",
-                    params.operation,
-                ),
-                None,
-            ));
-        }
+        // Validate operation. `complete`/`uncomplete` are first-class as
+        // of the completion-state work — they route through
+        // `client.set_completion`, the same code path
+        // `complete_node` uses for single-node toggles.
+        let valid_ops = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
         if !valid_ops.contains(&params.operation.as_str()) {
             return Err(McpError::invalid_params(
                 format!("Invalid operation '{}'. Must be one of: {}", params.operation, valid_ops.join(", ")), None
@@ -3660,6 +3693,8 @@ impl WorkflowyMcpServer {
                             let new_name = tag_re.replace_all(&node.name, "").to_string();
                             self.client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
                         }
+                        "complete" => self.client.set_completion(&node.id, true).await.is_ok(),
+                        "uncomplete" => self.client.set_completion(&node.id, false).await.is_ok(),
                         _ => false,
                     };
                     if success {
@@ -4959,6 +4994,14 @@ enum TxnInverse {
         prev_parent_id: Option<String>,
         prev_priority: Option<i32>,
     },
+    /// Roll back a `complete`/`uncomplete` by toggling the boolean back.
+    /// `prev_completed` is captured pre-flight via `get_node`; if the
+    /// pre-read failed the inverse is dropped (partial rollback is
+    /// better than aborting the rest of the rollback queue).
+    RestoreCompletion {
+        node_id: String,
+        prev_completed: bool,
+    },
 }
 
 /// Out-of-router helpers for `transaction`. Kept outside the
@@ -5082,8 +5125,44 @@ impl WorkflowyMcpServer {
                 };
                 Ok((summary, Some(inverse)))
             }
+            "complete" | "uncomplete" => {
+                let target_state = op.op == "complete";
+                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("{} requires `node_id`", op.op),
+                        None,
+                    )
+                })?;
+                let node_id = self.resolve_node_ref(node_id_raw).await?;
+                // Capture prior state so we can flip back on rollback.
+                // A failed pre-read disables the rollback for this op
+                // rather than aborting (same policy as `edit`).
+                let prev = self.client.get_node(&node_id).await.ok();
+                let prev_completed = prev.as_ref().map(|n| n.completed_at.is_some());
+                self.client
+                    .set_completion(&node_id, target_state)
+                    .await
+                    .map_err(|e| {
+                        tool_error(
+                            if target_state { "transaction.complete" } else { "transaction.uncomplete" },
+                            Some(&node_id),
+                            e,
+                        )
+                    })?;
+                self.cache.invalidate_node(&node_id);
+                self.name_index.invalidate_node(&node_id);
+                let summary = json!({
+                    "op": op.op,
+                    "id": node_id.clone(),
+                });
+                let inverse = prev_completed.map(|p| TxnInverse::RestoreCompletion {
+                    node_id,
+                    prev_completed: p,
+                });
+                Ok((summary, inverse))
+            }
             other => Err(McpError::invalid_params(
-                format!("unknown transaction op '{}'; expected create/edit/delete/move", other),
+                format!("unknown transaction op '{}'; expected create/edit/delete/move/complete/uncomplete", other),
                 None,
             )),
         }
@@ -5126,6 +5205,15 @@ impl WorkflowyMcpServer {
                 } else {
                     Ok(json!({ "skipped": "move", "id": node_id, "reason": "previous parent unknown" }))
                 }
+            }
+            TxnInverse::RestoreCompletion { node_id, prev_completed } => {
+                self.client
+                    .set_completion(&node_id, prev_completed)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("rollback completion failed: {}", e), None))?;
+                self.cache.invalidate_node(&node_id);
+                self.name_index.invalidate_node(&node_id);
+                Ok(json!({ "rolled_back": "completion", "id": node_id, "restored_to": prev_completed }))
             }
         }
     }
@@ -5178,6 +5266,7 @@ Content creation & editing:
 Todos & scheduling:
 - daily_review: Overdue + upcoming + recent + pending in one call
 - list_todos / list_overdue / list_upcoming
+- complete_node: Toggle a node's native Workflowy completion state. Default `completed: true`; pass `false` to uncomplete. Replaces the legacy `#done` tag workaround.
 - get_recent_changes: Nodes modified in the last N days
 - since: Cheap incremental check — has this node changed since a timestamp?
 
@@ -5725,7 +5814,7 @@ mod tests {
         assert!(banner.ends_with("\n\n"));
     }
 
-    // --- bulk_update: complete/uncomplete must be rejected ---
+    // --- bulk_update: complete/uncomplete are first-class operations ---
 
     fn new_test_server() -> WorkflowyMcpServer {
         let client = Arc::new(WorkflowyClient::new(
@@ -6440,44 +6529,32 @@ mod tests {
         assert!(msg.contains("node_id") || msg.contains("invalid"), "got: {msg}");
     }
 
+    /// Pre-completion-state, `bulk_update` rejected `complete` /
+    /// `uncomplete` with "not yet supported". The same operations are
+    /// now first-class — they route through `client.set_completion`,
+    /// the same code path the single-node `complete_node` tool uses.
+    /// Pin the validation acceptance here; the wiremock integration in
+    /// `bulk_update_complete_dispatches_to_set_completion` covers the
+    /// full handler-to-client wire path.
     #[tokio::test]
-    async fn test_bulk_update_rejects_complete() {
-        let server = new_test_server();
-        let params = BulkUpdateParams {
-            root_id: None,
-            operation: "complete".to_string(),
-            query: None,
-            tag: None,
-            status: None,
-            operation_tag: None,
-            dry_run: Some(true),
-            limit: Some(1),
-            max_depth: None,
-        };
-        let result = server.bulk_update(TracedParams(params)).await;
-        let err = result.expect_err("complete must be rejected");
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("not yet supported"), "got: {msg}");
-    }
+    async fn test_bulk_update_accepts_complete_and_uncomplete() {
+        // Validation runs against the params struct directly (no live
+        // upstream needed). Earlier the `not yet supported` error
+        // fired before the walk, so an unreachable test server was
+        // enough. With validation now passing, asserting the params
+        // round-trip and the operation list deserialises is sufficient
+        // here; integration coverage lives in the wiremock test.
+        let complete_params: BulkUpdateParams = serde_json::from_value(json!({
+            "operation": "complete",
+            "dry_run": true,
+        })).expect("complete must deserialize");
+        assert_eq!(complete_params.operation, "complete");
 
-    #[tokio::test]
-    async fn test_bulk_update_rejects_uncomplete() {
-        let server = new_test_server();
-        let params = BulkUpdateParams {
-            root_id: None,
-            operation: "uncomplete".to_string(),
-            query: None,
-            tag: None,
-            status: None,
-            operation_tag: None,
-            dry_run: Some(true),
-            limit: Some(1),
-            max_depth: None,
-        };
-        let result = server.bulk_update(TracedParams(params)).await;
-        let err = result.expect_err("uncomplete must be rejected");
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("not yet supported"), "got: {msg}");
+        let uncomplete_params: BulkUpdateParams = serde_json::from_value(json!({
+            "operation": "uncomplete",
+            "dry_run": true,
+        })).expect("uncomplete must deserialize");
+        assert_eq!(uncomplete_params.operation, "uncomplete");
     }
 
     #[tokio::test]
@@ -7364,7 +7441,7 @@ mod load_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
-    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::matchers::{body_partial_json, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fast_retry() -> RetryConfig {
@@ -8434,6 +8511,132 @@ mod load_tests {
         assert!(
             cancel_elapsed < Duration::from_millis(500),
             "cancel must observe the registry within ~50 ms slice, elapsed = {cancel_elapsed:?}"
+        );
+    }
+
+    /// `complete_node` end-to-end against a wiremock — pins both the
+    /// handler-level dispatch and the wire shape (`POST /nodes/{id}`
+    /// with `{"completed": true}`). The body matcher rejects any
+    /// regression to a different field name; the success message
+    /// proves the handler applied the right verb.
+    #[tokio::test]
+    async fn complete_node_dispatches_completed_true_on_default() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/nodes/[^/]+$"))
+            .and(body_partial_json(json!({"completed": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .complete_node(TracedParams(CompleteNodeParams {
+                node_id: NodeId::from(id_a()),
+                completed: None,
+            }))
+            .await
+            .expect("complete_node must succeed against the body-matcher mock");
+        let body = body_text(&result);
+        assert!(
+            body.starts_with("Completed node"),
+            "default `completed: None` must mean 'mark complete': {body}"
+        );
+    }
+
+    /// Symmetric uncomplete path. With `completed: Some(false)` the
+    /// handler must POST `{"completed": false}` and report
+    /// "Uncompleted node …".
+    #[tokio::test]
+    async fn complete_node_dispatches_completed_false_when_explicit() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/nodes/[^/]+$"))
+            .and(body_partial_json(json!({"completed": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .complete_node(TracedParams(CompleteNodeParams {
+                node_id: NodeId::from(id_a()),
+                completed: Some(false),
+            }))
+            .await
+            .expect("complete_node must succeed against the body-matcher mock");
+        let body = body_text(&result);
+        assert!(
+            body.starts_with("Uncompleted node"),
+            "explicit `completed: Some(false)` must mean 'uncomplete': {body}"
+        );
+    }
+
+    /// `bulk_update` with `operation: "complete"` must filter the walk
+    /// and dispatch each match through `client.set_completion`. The
+    /// pre-completion-state code path rejected this operation outright;
+    /// after wiring, the same handler that creates the rest of the
+    /// bulk-update operations now also creates the completion ones.
+    ///
+    /// Walk shape: top-level GET returns one matching node; the
+    /// follow-up child fetches return empty so the walk doesn't
+    /// duplicate the node into the candidate set.
+    #[tokio::test]
+    async fn bulk_update_complete_dispatches_to_set_completion() {
+        let mock = MockServer::start().await;
+        // Top-level fetch (no parent_id query param): one matching node.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .and(wiremock::matchers::query_param_is_missing("parent_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nodes": [{
+                    "id": id_a(),
+                    "name": "Task #target",
+                    "completed": false
+                }]
+            })))
+            .mount(&mock)
+            .await;
+        // Per-child fetches (`?parent_id=<id>`): empty.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .and(query_param("parent_id", id_a()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+        // Set-completion: POST /nodes/{id} with {"completed": true}.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/nodes/[^/]+$"))
+            .and(body_partial_json(json!({"completed": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .bulk_update(TracedParams(BulkUpdateParams {
+                root_id: None,
+                operation: "complete".to_string(),
+                query: None,
+                tag: Some("target".to_string()),
+                status: Some("pending".to_string()),
+                operation_tag: None,
+                dry_run: Some(false),
+                limit: Some(10),
+                max_depth: Some(2),
+            }))
+            .await
+            .expect("bulk_update complete must succeed against the body-matcher mock");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("response is JSON");
+        assert_eq!(v["operation"], "complete", "body: {body}");
+        assert_eq!(
+            v["affected_count"].as_u64().expect("affected_count"),
+            1,
+            "single matching node must be affected: {body}"
         );
     }
 

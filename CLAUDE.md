@@ -78,14 +78,14 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 
 Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH_CONCURRENCY)` (5). The rate limiter serialises requests internally, so this parallelism collapses HTTP RTT stalls without exceeding the sustained rate.
 
-### MCP Tools (26 total)
+### MCP Tools
 
 | Category | Tools |
 |----------|-------|
 | Search & Navigation | search_nodes, find_node, get_node, list_children, tag_search, get_subtree, find_backlinks |
 | Content Creation | create_node, insert_content (hierarchical), smart_insert, convert_markdown |
 | Content Modification | edit_node, move_node, delete_node, duplicate_node, create_from_template, bulk_update |
-| Todo Management | list_todos |
+| Todo Management | list_todos, complete_node |
 | Due Dates & Scheduling | list_upcoming, list_overdue, daily_review |
 | Project Management | get_project_summary, get_recent_changes |
 | Diagnostics & Ops | health_check, cancel_all, build_name_index |
@@ -98,7 +98,7 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 
 ### Known Limitations
 
-- `bulk_update` `complete` / `uncomplete` are rejected at the handler boundary — the Workflowy completion endpoints are not yet modelled in the client. Tag-based workflows are the interim substitute.
+- `bulk_update` supports `complete`, `uncomplete`, `delete`, `add_tag`, `remove_tag`. `complete`/`uncomplete` route through `client.set_completion`, the same code path the single-node `complete_node` tool uses. The wire payload is `POST /nodes/{id}` with `{"completed": true}` or `{"completed": false}` (the read-side `WorkflowyNode::completed` boolean has no serde alias, so the wire field is literally `completed`); pinned by `tests::write_field_names::set_completion_*` so the description→note failure shape cannot recur on the completion path. The `transaction` tool also accepts `complete` / `uncomplete` ops with rollback to the prior boolean state via `RestoreCompletion`.
 - Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000) **and** at `defaults::SUBTREE_FETCH_TIMEOUT_MS` (20 000 ms). Tools surface a `truncated` flag plus a `truncation_reason` (`node_limit` / `timeout` / `cancelled`) when either budget fires; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
 - `find_node` and `search_nodes` refuse to scan from the workspace root when `parent_id` is omitted. Pass `parent_id`, set `allow_root_scan=true` to accept the full walk, or (find_node only) set `use_index=true` after running `build_name_index` to serve from the opportunistic name index.
 - `insert_content` caps at `defaults::MAX_INSERT_CONTENT_LINES` (200) per call. Above the soft warn threshold (`SOFT_WARN_INSERT_CONTENT_LINES`, 80) the success response includes a chunking hint. The hard cap exists because oversized payloads have been observed to fail at the MCP transport layer before reaching the handler — split into batches of ≤80 and pass each batch's `last_inserted_id` as `parent_id` of the next call to preserve hierarchy.

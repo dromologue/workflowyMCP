@@ -626,6 +626,47 @@
     `degraded_warning_clears_after_get_node_recovery`. All 283 unit
     tests pass.
 
+- [x] **T-166 (Native completion state)**: First-class todo completion.
+    Pre-T-166 the wflow skill used a `#done` tag-based workaround for
+    completion because the Workflowy completion endpoint was not
+    modelled in the client; `bulk_update` rejected `complete` /
+    `uncomplete` at the validation boundary with "not yet supported".
+    Native completion is now wired end-to-end.
+  - **`WorkflowyClient::set_completion(node_id, completed: bool)`** and
+    **`set_completion_with_propagation_retry`**: POST `/nodes/{id}` with
+    `{"completed": <bool>}`. Bounded by `WRITE_NODE_TIMEOUT_MS` (15 s);
+    same propagation-retry policy as `edit_node` /
+    `delete_node` (3 attempts at 200/400/800 ms on 404). The wire field
+    is literally `completed` because the read-side
+    `WorkflowyNode::completed` boolean has no serde alias — pinned by
+    `tests::write_field_names::set_completion_true_sends_completed_true`
+    and `set_completion_false_sends_completed_false` so any wire-field
+    surprise (the description→note bug from 2026-05-02 was the
+    precedent) fails the suite locally without a live API.
+  - **`complete_node` MCP tool**: single-node toggle. Params:
+    `node_id: NodeId` + `completed: Option<bool>` (default `true`).
+    Wraps in `tool_handler!(ToolKind::Write)` so a wedged completion
+    call is preempted by `cancel_all` within the cancel slice and
+    bounded by the Write budget — same uniform safety net every other
+    write handler inherits.
+  - **`bulk_update` operations `complete` / `uncomplete`**: route
+    through the same `client.set_completion` code path. Validation no
+    longer rejects them; the operation set is now
+    `[delete, add_tag, remove_tag, complete, uncomplete]`.
+  - **`transaction` operations `complete` / `uncomplete`** with
+    `RestoreCompletion` inverse: capture the prior boolean state
+    pre-flight via `get_node`, restore on rollback. Same partial-
+    rollback policy as `edit` (failed pre-read disables rollback for
+    that op only).
+  - **Tests**: `set_completion_true_sends_completed_true`,
+    `set_completion_false_sends_completed_false` (wire-shape pins);
+    `complete_node_dispatches_completed_true_on_default`,
+    `complete_node_dispatches_completed_false_when_explicit`
+    (handler-level wiremock); `bulk_update_complete_dispatches_to_set_completion`
+    (full filter-and-dispatch path through the bulk handler);
+    `test_bulk_update_accepts_complete_and_uncomplete` (validation no
+    longer rejects). 291 unit tests pass.
+
 ---
 
 ## Phase 4: Quality & Documentation
