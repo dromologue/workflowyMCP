@@ -1,176 +1,154 @@
 # Workflowy MCP Server
 
-A Rust MCP server that turns Workflowy into a working second brain — capture, triage, distillation, retrieval, and synthesis — driven by Claude (Code, Desktop, or web). The server gives any LLM read/write access to your Workflowy graph; the templates in this repo turn that raw access into a disciplined workflow that compounds across sessions.
+A Rust MCP server that gives Claude (Code, Desktop, or web) read/write access
+to your Workflowy graph, plus a generic template for turning that raw access
+into a working second brain.
 
-You can use it three ways:
+There are two ways to use it:
 
-1. **As a plain MCP server** — Claude Desktop or Claude Code calls 26 tools against your Workflowy account. Skip the templates entirely.
-2. **As a second brain** — install the `templates/secondbrain/` skeleton and the `templates/skills/wflow/SKILL.md` skill, and Claude follows a structured capture → triage → distillation → retrieval loop.
-3. **As a starting point** — fork the templates, adjust the workflow categories to your taste, layer in your own conventions.
+1. **Bare MCP server.** Wire the binary into your MCP host and call the 26
+   tools directly. No templates, no opinions.
+2. **Second brain.** Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The
+   assistant follows the script: builds the binary, wires the host, sets up
+   `~/code/secondBrain/` for your specific data, and installs the wflow
+   skill that drives every subsequent session.
 
-The methodology is opinionated; the server is not. Use whichever level suits you.
+The methodology in option 2 is opinionated; the server itself is not. The
+repo only ships generic templates — your node IDs, drafts, and session logs
+live in `~/code/secondBrain/`, never in this repo.
 
 ---
 
-## Install
-
-Prerequisites: [Rust toolchain](https://rustup.rs) (1.70+), a Workflowy account with [API access](https://workflowy.com/api-key), and Claude Desktop and/or Claude Code.
+## Quick install
 
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
 cd ~/code/workflowy-mcp-server
 cargo build --release
+echo "WORKFLOWY_API_KEY=<your-token>" > .env
 ```
 
-The binary lands at `target/release/workflowy-mcp-server`.
+Wire the resulting `target/release/workflowy-mcp-server` into your MCP host:
+
+- **Claude Code:** `claude mcp add workflowy -- $(pwd)/target/release/workflowy-mcp-server`
+- **Claude Desktop:** edit
+  `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+  or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). See
+  [BOOTSTRAP.md](BOOTSTRAP.md) for the JSON shape.
+
+Verify with `workflowy_status` — the host should return
+`status: "ok"`, `api_reachable: true`.
+
+That's it for plain MCP usage.
 
 ---
 
-## Configure
+## Set up the second brain (recommended)
 
-Create `.env` in the repo root:
+Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The assistant runs through
+six steps: build, wire the host, bootstrap `~/code/secondBrain/`, populate
+your structural node IDs, install the wflow skill, and (optionally)
+pre-warm the persistent name index. After bootstrap, the assistant follows
+[`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) as the
+operating manual.
 
-```bash
-WORKFLOWY_API_KEY=<your-api-key>
-```
-
-Then wire the server into your MCP host.
-
-### Claude Desktop
-
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "workflowy": {
-      "command": "/absolute/path/to/workflowy-mcp-server/target/release/workflowy-mcp-server",
-      "cwd": "/absolute/path/to/workflowy-mcp-server"
-    }
-  }
-}
-```
-
-Restart Claude Desktop. You can also pass credentials via `env` if you'd rather not rely on `cwd`.
-
-### Claude Code
-
-```bash
-claude mcp add workflowy -- /absolute/path/to/workflowy-mcp-server/target/release/workflowy-mcp-server
-```
-
-Verify with `claude mcp list` — the entry should report `✓ Connected`.
-
-That's it for plain MCP usage. To stop here, jump to [Tool reference](#tool-reference). To set up the second-brain workflow, continue.
+The detailed long-form walkthrough — multi-surface deployment, large-tree
+convergence, troubleshooting — lives in [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 
-## Set up the second brain
+## What ships in this repo
 
-The repo ships generic templates so you (or an LLM bootstrapping you) can stand up a working second brain without inheriting the original author's specific node IDs. The detailed walk-through is in [docs/SETUP.md](docs/SETUP.md). The summary:
-
-```bash
-# 1. Create your operational secondBrain directory
-mkdir -p ~/code/secondBrain
-cp -R templates/secondbrain/* ~/code/secondBrain/
-
-# 2. Install the wflow skill (Claude Code only — Claude Desktop uses Project instructions)
-mkdir -p ~/.claude/skills/wflow
-cp templates/skills/wflow/SKILL.md ~/.claude/skills/wflow/SKILL.md
-
-# 3. Identify your structural Workflowy nodes (Tasks, Inbox, Journal, etc.)
-#    and write the UUIDs into ~/code/secondBrain/memory/workflowy_node_links.md
-#    The wflow skill will walk you through this on first use.
+```
+workflowyMCP/
+├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
+├── README.md                 ← this file
+├── docs/SETUP.md             ← long-form bootstrap notes
+├── specs/specification.md    ← authoritative behavioural spec
+├── templates/
+│   ├── secondbrain/          ← skeleton of ~/code/secondBrain/
+│   │   ├── README.md
+│   │   ├── memory/workflowy_node_links.md   (template; user fills in)
+│   │   ├── drafts/  session-logs/  briefs/
+│   └── skills/wflow/SKILL.md ← the operating manual the assistant follows
+└── src/                       ← Rust MCP server source
 ```
 
-After Step 1 the MCP server's persistent name index begins checkpointing to `~/code/secondBrain/memory/name_index.json` automatically. After Step 3 your second brain has the node IDs it needs to operate; future sessions read this file at boot.
-
-For Claude Desktop or claude.ai, paste `templates/skills/wflow/SKILL.md` into a Project's custom instructions or upload it as a Skill. Same content, different surface — see the multi-surface deployment section in [docs/SETUP.md](docs/SETUP.md).
-
----
-
-## Methodology
-
-The skill organises Claude's work into two halves.
-
-**Operate** is the tempo of your working week. Daily prioritisation, weekly review, monthly themes, task capture, inbox triage, project status, reading-list management, journaling. These are short, frequent, conversational interactions: "what's on my plate today?", "capture this task", "triage my inbox."
-
-**Synthesise** is the slower work of turning captured material into a graph that compounds. Distil a single source into atomic notes, batch-process the reading list, run cross-system research that pulls together everything you have on a topic. Synthesis writes back into a `Distillations` subtree (or wherever you keep your atomic notes), mirrored into pillars and themes.
-
-Three habits hold it together:
-
-- **Cached node IDs** at `~/code/secondBrain/memory/workflowy_node_links.md`. The wflow skill reads this on every bootstrap so it never has to re-walk the tree to find Tasks or Inbox.
-- **Drafts before writes.** Any distillation involving more than a few mutations produces a markdown file in `~/code/secondBrain/drafts/` first. Protects against MCP wedges; gives you a chance to veto routing before the graph mutates.
-- **One session log per session that touched the graph.** Both a Workflowy node (for navigation) and a local file at `~/code/secondBrain/session-logs/` (for audit). They should agree.
-
-The repo's [templates/secondbrain/README.md](templates/secondbrain/README.md) covers the operational discipline in more depth.
-
----
-
-## How short-hash resolution works
-
-Workflowy URLs use a 12-character short hash (the trailing 12 hex of the UUID, like `c4ae1944b67e`). The Workflowy API requires the full UUID. The server resolves the gap automatically:
-
-- A **persistent name index** at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`) caches every short hash → UUID it has ever seen. Survives restarts. Checkpointed every 30 seconds when dirty. Refreshed by a 30-minute background walk.
-- On a cache miss, the resolver **walks the workspace synchronously** with a 5-minute budget. A watcher polls the index every 100 ms and cancels the walk as soon as the target appears, so found-early lookups don't pay the full timeout. The walk uses a per-call cancellation registry so it never tears down concurrent indexing work.
-
-For most personal Workflowy graphs (under ~40 k nodes), the very first short-hash you paste resolves within a minute and everything after is O(1) against the persistent index.
-
-### Large-tree convergence (~50 k nodes and up)
-
-A 5-minute walk indexes roughly 12 k nodes at the Workflowy API's 5 RPS sustained rate. If your workspace is bigger than that, no single walk covers the full tree. The system is designed to **converge over time**:
-
-1. The 30-minute background refresher keeps walking, accumulating coverage in the persistent index.
-2. Foreground misses still trigger an immediate walk to maximise the chance of an in-session resolution.
-3. When a miss returns truncated, the error message reports `nodes_walked / tree_size_estimate` so you know the gap.
-
-Practical recovery for huge trees: scope explicitly. `build_name_index` accepts a `parent_id`, so you can index a known subtree (Projects, Areas, Reading List) deeply in one short walk rather than relying on root-walk breadth. Once a subtree is indexed, every short hash within it resolves O(1) thereafter and survives restarts via the persistent index.
+User-specific data (node IDs, drafts, session logs, briefs) belongs in
+`~/code/secondBrain/`. The repo content stays generic so the next person
+who clones it gets a clean starting point.
 
 ---
 
 ## Tool reference
 
-The server exposes 26 tools. Most operations work in terms of `node_id`, which accepts any of: full UUID (with or without hyphens), 12-char URL-suffix short hash, or 8-char prefix used in docs.
+The server exposes 26 tools. `node_id` accepts any of: full UUID (with or
+without hyphens), 12-char URL-suffix short hash, or 8-char prefix.
 
-**Search & navigate:** `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`. Reach for `node_at_path` (path of names → UUID, ~1 second on any tree size) and `resolve_link` (Workflowy URL + optional parent-name path → full node info) before `search_nodes` on large workspaces — they cost O(depth) API calls instead of O(tree).
+| Category | Tools |
+|----------|-------|
+| Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path` |
+| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
+| Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
+| Project management | `get_project_summary`, `get_recent_changes` |
+| Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `audit_mirrors`, `review`, `get_recent_tool_calls` |
 
-**Create & edit:** `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree`.
-
-**Todos & scheduling:** `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since`.
-
-**Project management:** `get_project_summary`, `get_recent_changes`.
-
-**Diagnostics & ops:** `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `audit_mirrors`, `review`, `get_recent_tool_calls`.
+For large workspaces, prefer `node_at_path` (path of names → UUID, ~1 second
+on any tree size) and `resolve_link` (Workflowy URL + optional parent path
+→ full node info) over `search_nodes`. They cost O(depth) API calls instead
+of O(tree).
 
 Conventions parsed from node text:
 
 - Tags: `#inbox`, `#review`, `#urgent`
 - Assignees: `@alice`, `@bob`
-- Due dates: `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15` (priority order)
-
-Large-tree behaviour: subtree fetches cap at 10 000 nodes and a 20-second wall-clock budget; every response includes `truncated` plus a `truncation_reason`. Use `parent_id` / `max_depth` to scope down. `health_check` is a sub-second liveness probe safe to use as a circuit breaker.
+- Due dates: `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15`
+  (priority order)
 
 ---
 
-## CLI: wflow-do
+## Reliability properties
 
-A second binary, `wflow-do`, exposes the same operations as a plain shell command. Useful as a fallback for transport-layer drops in the MCP layer — Bash dispatch is independent of MCP dispatch.
+Every API-touching handler runs inside a uniform `run_handler` wrapper
+that observes the server-wide cancel registry and applies a
+kind-appropriate wall-clock deadline:
+
+| Tool kind | Budget | Examples |
+|-----------|--------|----------|
+| Read | 30 s | `get_node`, `list_children` |
+| Write | 15 s | `create_node`, `delete_node`, `edit_node` |
+| Bulk | 210 s | `insert_content`, `transaction`, `bulk_update`, `path_of`, `node_at_path` |
+| Walk | 20 s (internal) | `search_nodes`, `get_subtree`, `find_node` |
+
+`cancel_all` interrupts any in-flight tool within ~50 ms. On budget
+expiry, bulk operations return a structured partial-success payload
+(`status: "partial"`, `created_count`, `last_inserted_id`, etc.) so the
+caller can resume — no "no result received" without diagnostic.
+
+For the full list (transport-timeout retry, `authenticated`/`api_reachable`
+decoupling, `null` parameter handling, etc.) see
+[`specs/specification.md`](specs/specification.md). 272 lib tests pin the
+contracts, including 21 wiremock-driven failure-mode tests that run in
+under 2 seconds.
+
+---
+
+## CLI: `wflow-do`
+
+A second binary exposes the same operations as a plain shell command.
+Useful as a fallback when the MCP transport drops.
 
 ```bash
-cargo build --release --bin wflow-do
-
-# Examples
-target/release/wflow-do status                              # liveness + rate-limit snapshot
+target/release/wflow-do status                              # liveness
 target/release/wflow-do search --query "concept maps"
-target/release/wflow-do --dry-run delete <uuid>             # plan-mode preview
-target/release/wflow-do review --days-stale 90              # what's worth re-reading
-target/release/wflow-do audit-mirrors                       # canonical_of:/mirror_of: drift
-
-# Deep-index multiple subtrees, write to the persistent index file
-target/release/wflow-do reindex --root <UUID> --root <UUID> --root <UUID>
+target/release/wflow-do --dry-run delete <uuid>             # preview
+target/release/wflow-do reindex --root <UUID> --root <UUID> # pre-warm index
 ```
 
-Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `search`, `audit-mirrors`, `review`, `index`, `reindex`. Use `--json` for raw output, `--dry-run` (write verbs only) to preview without calling the API. `reindex` is the shell-driven path for populating `~/code/secondBrain/memory/name_index.json` independently of any running MCP — useful for fresh installs and recovery from sparse coverage on large trees.
+Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`,
+`edit`, `search`, `audit-mirrors`, `review`, `index`, `reindex`. Use
+`--json` for raw output, `--dry-run` (write verbs only) to preview without
+calling the API.
 
 ---
 
@@ -179,11 +157,12 @@ Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`, `edit`, `s
 ```bash
 cargo build              # debug
 cargo build --release    # optimised
-cargo test --lib         # 242 unit tests
+cargo test --lib         # 272 unit tests
 cargo check              # type-check only
 ```
 
-[CLAUDE.md](CLAUDE.md) has the architectural overview; [specs/specification.md](specs/specification.md) is the authoritative behavioural spec.
+Architectural overview: [CLAUDE.md](CLAUDE.md). Behavioural spec:
+[specs/specification.md](specs/specification.md).
 
 ---
 

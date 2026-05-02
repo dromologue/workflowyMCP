@@ -13,6 +13,9 @@ target/
 # in by tooling but not intended to be tracked here.
 Evals/
 
-# Ignore root .md files except README
+# Ignore root .md files except the canonical entrypoints. Everything else
+# (notes, drafts, working docs) belongs in ~/code/secondBrain/, not the repo.
 /*.md
 !README.md
+!BOOTSTRAP.md
+!CLAUDE.md
