@@ -19,9 +19,9 @@ pub const RETRY_STATUSES: &[u16] = &[429, 500, 502, 503, 504, 408];
 
 // --- Rate Limiting ---
 /// Sustained request rate (requests per second)
-pub const RATE_LIMIT_RPS: u32 = 5;
+pub const RATE_LIMIT_RPS: u32 = 10;
 /// Maximum burst size above sustained rate
-pub const RATE_LIMIT_BURST: u32 = 10;
+pub const RATE_LIMIT_BURST: u32 = 20;
 
 // --- Queue ---
 /// Maximum concurrent batch operations
@@ -70,6 +70,33 @@ pub const EDIT_NODE_TIMEOUT_MS: u64 = 60_000;
 /// a flat-out hung connection returns Timeout to the caller immediately
 /// after, freeing the rate-limiter and connection-pool slot.
 pub const READ_NODE_TIMEOUT_MS: u64 = 30_000;
+/// Wall-clock budget for a single write call (`create_node`,
+/// `delete_node`). Caps the retry loop end-to-end at ~15 s so a
+/// transient upstream slowness cannot make one node-creation burn
+/// the full `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~150 s) — the
+/// failure mode that produced the 4-minute insert_content hangs in
+/// the 2026-05-02 report. Picked at 15 s because a healthy create
+/// completes in <300 ms; budget = 50× headroom is generous without
+/// allowing one slow call to push a 140-node insert past the MCP
+/// client's 4-min timeout.
+pub const WRITE_NODE_TIMEOUT_MS: u64 = 15_000;
+/// Window during which a recent successful API call proves the
+/// upstream is reachable, regardless of whether the current liveness
+/// probe succeeded. Health/status responses surface
+/// `api_reachable: true` when a real tool call has returned a 2xx
+/// within this window. Without this, two consecutive probe timeouts
+/// during a heavy write burst flip the status to degraded even
+/// though the burst itself is the proof of liveness — the lag
+/// described in the 2026-05-02 report.
+pub const API_REACHABILITY_FRESHNESS_MS: u64 = 30_000;
+/// Wall-clock budget for a whole `insert_content` operation. The MCP
+/// client (Claude Desktop) hard-times out at 4 min; we return a
+/// structured partial-success well before that so the caller learns
+/// what was inserted instead of seeing a "no result received" with
+/// no diagnostic. Combined with `WRITE_NODE_TIMEOUT_MS` per single
+/// create, this guarantees `insert_content` either completes or
+/// returns deterministic partial-success data.
+pub const INSERT_CONTENT_TIMEOUT_MS: u64 = 210_000;
 
 // --- Tree Traversal ---
 /// Default max_depth for search operations

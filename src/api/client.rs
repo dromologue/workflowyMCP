@@ -818,13 +818,33 @@ impl WorkflowyClient {
         collected.into_iter().map(|(_, r)| r).collect()
     }
 
-    /// Create a new node
+    /// Create a new node. Bounded by [`defaults::WRITE_NODE_TIMEOUT_MS`]
+    /// end-to-end — the retry loop cannot stretch a single create past
+    /// this budget, which is the root cause of the 4-minute
+    /// `insert_content` hangs in the 2026-05-02 report.
     pub async fn create_node(
         &self,
         name: &str,
         description: Option<&str>,
         parent_id: Option<&str>,
         priority: Option<i32>,
+    ) -> Result<CreatedNode> {
+        self.create_node_cancellable(name, description, parent_id, priority, None, None)
+            .await
+    }
+
+    /// Cancellable variant of [`Self::create_node`] that accepts an
+    /// explicit cancel guard and deadline. Callers that drive bulk
+    /// inserts (`insert_content`) pass a per-operation deadline so an
+    /// individual create can't burn the whole budget.
+    pub async fn create_node_cancellable(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        parent_id: Option<&str>,
+        priority: Option<i32>,
+        cancel: Option<&CancelGuard>,
+        deadline: Option<Instant>,
     ) -> Result<CreatedNode> {
         let mut body = json!({ "name": name });
         if let Some(desc) = description {
@@ -836,7 +856,12 @@ impl WorkflowyClient {
         if let Some(pri) = priority {
             body["priority"] = json!(pri);
         }
-        let response: serde_json::Value = self.request("POST", "/nodes", Some(body)).await?;
+        let effective_deadline = deadline.or_else(|| {
+            Some(Instant::now() + Duration::from_millis(defaults::WRITE_NODE_TIMEOUT_MS))
+        });
+        let response: serde_json::Value = self
+            .request_cancellable("POST", "/nodes", Some(body), cancel, effective_deadline)
+            .await?;
         // Workflowy API returns "item_id" (not "id") for created nodes
         let id = response
             .get("item_id")
@@ -904,10 +929,15 @@ impl WorkflowyClient {
         Ok(())
     }
 
-    /// Delete a node
+    /// Delete a node. Bounded by [`defaults::WRITE_NODE_TIMEOUT_MS`]
+    /// end-to-end so the retry loop cannot stretch a single delete past
+    /// the budget — same contract as `create_node`.
     pub async fn delete_node(&self, node_id: &str) -> Result<()> {
         let endpoint = format!("/nodes/{}", node_id);
-        let _: serde_json::Value = self.request("DELETE", &endpoint, None).await?;
+        let deadline = Instant::now() + Duration::from_millis(defaults::WRITE_NODE_TIMEOUT_MS);
+        let _: serde_json::Value = self
+            .request_cancellable("DELETE", &endpoint, None, None, Some(deadline))
+            .await?;
         Ok(())
     }
 

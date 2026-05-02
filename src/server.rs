@@ -122,6 +122,23 @@ impl ProximateCause {
 ///
 /// Brief 2026-04-25 Test γ: `proximate_cause` is a discrete enum, not a
 /// free-text hint, so callers can switch on it without parsing.
+/// Derive `api_reachable` for the diagnostic tools. The probe is one
+/// signal; a recent successful tool call is another. Either suffices —
+/// the previous behaviour ("derive only from the probe") meant a single
+/// probe blip during a long write burst could flip the status to
+/// degraded even though the burst itself proved the API was up. Rather
+/// than reflect that lag, status now treats a 2xx within
+/// [`defaults::API_REACHABILITY_FRESHNESS_MS`] as positive evidence.
+fn derive_api_reachable(probe_succeeded: bool, last_success_ms_ago: Option<u64>) -> bool {
+    if probe_succeeded {
+        return true;
+    }
+    matches!(
+        last_success_ms_ago,
+        Some(ms) if ms < defaults::API_REACHABILITY_FRESHNESS_MS
+    )
+}
+
 fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Display) -> McpError {
     let err_str = err.to_string();
     let lower = err_str.to_lowercase();
@@ -629,8 +646,14 @@ pub struct MoveNodeParams {
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[schemars(description = "Get all children of a node")]
 pub struct GetChildrenParams {
-    #[schemars(description = "The UUID of the parent node")]
-    pub node_id: NodeId,
+    /// Parent node ID. Omit OR set to `null` to list the workspace root's
+    /// top-level nodes. Both forms are accepted because some MCP clients
+    /// send `{}` for missing fields and others send `{"node_id": null}`;
+    /// previously the latter intermittently surfaced "Tool execution
+    /// failed" while the former returned the root listing.
+    #[serde(default)]
+    #[schemars(description = "Parent node ID (UUID or short hash). Omit OR pass null to list the workspace root's top-level nodes.")]
+    pub node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -1820,19 +1843,38 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<GetChildrenParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "list_children", params, {
-        info!(node_id = %params.node_id, "Getting children");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        // None / null = workspace root. The tool description and
+        // schema are explicit about this so the caller doesn't have
+        // to guess; previously a `null` node_id intermittently
+        // surfaced "Tool execution failed" depending on which path
+        // serde took.
+        let resolved: Option<String> = match params.node_id.as_deref() {
+            None | Some("") => None,
+            Some(id) => {
+                check_node_id(id)?;
+                Some(self.resolve_node_ref(id).await?)
+            }
+        };
+        info!(node_id = ?resolved, "Getting children");
 
-        match self
-            .with_read_budget(self.client.get_children_with_propagation_retry(&resolved))
-            .await
-        {
+        let fetch_result = match resolved.as_deref() {
+            Some(id) => {
+                self.with_read_budget(self.client.get_children_with_propagation_retry(id))
+                    .await
+            }
+            None => {
+                self.with_read_budget(self.client.get_top_level_nodes())
+                    .await
+            }
+        };
+
+        let scope_label = resolved.as_deref().unwrap_or("workspace root").to_string();
+        match fetch_result {
             Ok(children) => {
                 if children.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Node `{}` has no children",
-                        resolved
+                        "`{}` has no children",
+                        scope_label
                     ))]))
                 } else {
                     let items: Vec<String> = children
@@ -1840,13 +1882,14 @@ impl WorkflowyMcpServer {
                         .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
                         .collect();
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "{} children:\n\n{}",
+                        "{} children of `{}`:\n\n{}",
                         children.len(),
+                        scope_label,
                         items.join("\n")
                     ))]))
                 }
             }
-            Err(e) => Err(tool_error("list_children", Some(&resolved), e)),
+            Err(e) => Err(tool_error("list_children", resolved.as_deref(), e)),
         }
         })
     }
@@ -1908,7 +1951,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it.")]
+    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it. Bounded by an end-to-end budget (~210 s) so a flaky upstream cannot wedge the call past the MCP client's 4-min hard timeout. On timeout the response carries a structured partial-success payload (created_count, total_count, last_inserted_id, error) instead of returning bare 'no result received' — the caller can resume from where it stopped.")]
     async fn insert_content(
         &self,
         Parameters(params): Parameters<InsertContentParams>,
@@ -1931,19 +1974,59 @@ impl WorkflowyMcpServer {
             return Ok(CallToolResult::success(vec![Content::text("No content to insert (all lines empty)".to_string())]));
         }
 
-        // Parent stack: index = indent level, value = node ID at that level
+        // End-to-end deadline. Honoured by every per-line create plus a
+        // pre-line check so a row queued behind the rate limiter
+        // observes the budget without making an HTTP attempt that
+        // would have to time out on its own.
+        let total_budget = Duration::from_millis(defaults::INSERT_CONTENT_TIMEOUT_MS);
+        let overall_deadline = Instant::now() + total_budget;
+        let cancel_guard = self.cancel_registry.guard();
+
+        let total = parsed.len();
         let mut parent_stack: Vec<String> = vec![resolved_parent.clone()];
-        let mut created_count = 0;
+        let mut created_count: usize = 0;
+        let mut last_inserted_id: Option<String> = None;
+        // None on success; Some(reason) on partial-success exit.
+        let mut bailout_reason: Option<String> = None;
+        let mut bailout_line: Option<String> = None;
 
         for line in &parsed {
+            // Pre-line budget + cancel checks. A guard taken before the
+            // rate limiter avoids burning a token on a doomed call.
+            if cancel_guard.is_cancelled() {
+                bailout_reason = Some("cancelled".to_string());
+                break;
+            }
+            if Instant::now() >= overall_deadline {
+                bailout_reason = Some("timeout".to_string());
+                bailout_line = Some(line.text.to_string());
+                break;
+            }
+
             // Clamp indent to valid range
             let indent = line.indent.min(parent_stack.len().saturating_sub(1));
-            let parent_id = &parent_stack[indent];
+            let parent_id = parent_stack[indent].clone();
 
-            match self.client.create_node(line.text, None, Some(parent_id), None).await {
+            // Per-call deadline = the tighter of the overall deadline
+            // and the standard write budget. The client's own
+            // `create_node` already bounds at WRITE_NODE_TIMEOUT_MS;
+            // passing the overall deadline keeps the last few rows
+            // from bursting the total budget.
+            match self
+                .client
+                .create_node_cancellable(
+                    line.text,
+                    None,
+                    Some(&parent_id),
+                    None,
+                    Some(&cancel_guard),
+                    Some(overall_deadline),
+                )
+                .await
+            {
                 Ok(created) => {
                     created_count += 1;
-                    // Set this node as parent for the next indent level
+                    last_inserted_id = Some(created.id.clone());
                     let next_level = indent + 1;
                     if next_level < parent_stack.len() {
                         parent_stack[next_level] = created.id;
@@ -1952,14 +2035,51 @@ impl WorkflowyMcpServer {
                         parent_stack.push(created.id);
                     }
                 }
+                Err(WorkflowyError::Cancelled) => {
+                    bailout_reason = Some("cancelled".to_string());
+                    bailout_line = Some(line.text.to_string());
+                    break;
+                }
+                Err(WorkflowyError::Timeout) => {
+                    bailout_reason = Some("timeout".to_string());
+                    bailout_line = Some(line.text.to_string());
+                    break;
+                }
                 Err(e) => {
                     error!(error = %e, line = line.text, "Failed to insert line");
-                    return Err(tool_error("insert_content", Some(parent_id), format!("inserting '{}': {}", line.text, e)));
+                    return Err(tool_error(
+                        "insert_content",
+                        Some(&parent_id),
+                        format!("inserting '{}' (after {}/{} lines): {}", line.text, created_count, total, e),
+                    ));
                 }
             }
         }
 
         self.cache.invalidate_node(&resolved_parent);
+
+        // Partial-success path: report what we got done so the caller
+        // can resume from the last inserted node rather than guessing
+        // whether the call actually wrote anything.
+        if let Some(reason) = bailout_reason {
+            let payload = json!({
+                "status": "partial",
+                "reason": reason,
+                "created_count": created_count,
+                "total_count": total,
+                "parent_id": resolved_parent,
+                "last_inserted_id": last_inserted_id,
+                "stopped_at_line": bailout_line,
+                "message": format!(
+                    "insert_content stopped at {}/{} lines ({}). Last inserted: {}. Resume by re-running with the remaining lines under last_inserted_id (or the original parent if last_inserted_id is null).",
+                    created_count,
+                    total,
+                    reason,
+                    last_inserted_id.as_deref().unwrap_or("none"),
+                ),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+        }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Inserted {} node(s) under `{}`",
@@ -3365,9 +3485,16 @@ impl WorkflowyMcpServer {
         let authenticated = !self
             .client
             .recent_auth_failure(Duration::from_secs(defaults::AUTH_FAILURE_WINDOW_SECS));
+        // Derive api_reachable from probe success OR a recent
+        // successful tool call. This stops the degraded flag from
+        // sticking when the lightweight probe times out during a
+        // heavy write burst that itself proved the API is up.
+        let last_success_ms_ago = self.client.last_success_ms_ago();
+        let api_reachable = derive_api_reachable(outcome.api_reachable, last_success_ms_ago);
         let result = json!({
-            "status": if outcome.api_reachable { "ok" } else { "degraded" },
-            "api_reachable": outcome.api_reachable,
+            "status": if api_reachable { "ok" } else { "degraded" },
+            "api_reachable": api_reachable,
+            "api_reachable_via_recent_success": !outcome.api_reachable && api_reachable,
             "authenticated": authenticated,
             "auth_method": "api_key_env",
             "latency_ms": outcome.elapsed_ms,
@@ -3400,7 +3527,11 @@ impl WorkflowyMcpServer {
         record_op!(self, "workflowy_status", _params, {
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
         let outcome = self.probe_upstream_with_retry(timeout).await;
-        let api_reachable = outcome.api_reachable;
+        // See `health_check` for the rationale: probe success is one
+        // signal; a recent 2xx is another. Either is sufficient
+        // evidence that the API is reachable.
+        let recent_success_ms = self.client.last_success_ms_ago();
+        let api_reachable = derive_api_reachable(outcome.api_reachable, recent_success_ms);
         let top_level_count = outcome.top_level_count;
         let error = outcome.error.clone();
         let elapsed_ms = outcome.elapsed_ms;
@@ -6720,7 +6851,7 @@ mod load_tests {
         let server = server_against(&mock).await;
         let started = Instant::now();
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await;
         let elapsed = started.elapsed();
 
@@ -6792,7 +6923,7 @@ mod load_tests {
         let server_for_call = Arc::clone(&server);
         let call = tokio::spawn(async move {
             server_for_call
-                .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                 .await
         });
 
@@ -6846,7 +6977,7 @@ mod load_tests {
         for _ in 0..20 {
             let s = Arc::clone(&server);
             handles.push(tokio::spawn(async move {
-                s.list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                s.list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                     .await
             }));
         }
@@ -6912,7 +7043,7 @@ mod load_tests {
         let s_hung = Arc::clone(&server);
         let hung = tokio::spawn(async move {
             s_hung
-                .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6924,7 +7055,7 @@ mod load_tests {
         for _ in 0..5 {
             let s = Arc::clone(&server);
             handles.push(tokio::spawn(async move {
-                s.list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                s.list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                     .await
             }));
         }
@@ -6989,7 +7120,7 @@ mod load_tests {
         // propagation backoff plus a fast second call.
         let server = server_against(&mock).await.with_read_budget_ms(2_000);
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must succeed after propagation retry");
         let body = body_text(&result);
@@ -7051,7 +7182,7 @@ mod load_tests {
         let server = WorkflowyMcpServer::new(client).with_read_budget_ms(2_000);
 
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must recover after one 503");
         assert!(body_text(&result).contains("child"));
@@ -7088,7 +7219,7 @@ mod load_tests {
         let server = server_against(&mock).await;
         let started = Instant::now();
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await;
         let elapsed = started.elapsed();
 
@@ -7129,7 +7260,7 @@ mod load_tests {
 
         let server = server_against(&mock).await;
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must succeed against the parent_id matcher");
         let body = body_text(&result);
@@ -7284,5 +7415,173 @@ mod load_tests {
             err.to_string().contains("move_node"),
             "move_node error must name the operation: {err}"
         );
+    }
+
+    /// Failure 2 from the 2026-05-02 report: `list_children` with
+    /// `node_id: null` intermittently returned "Tool execution failed".
+    /// The schema now accepts `Option<NodeId>` (`#[serde(default)]`),
+    /// and the handler routes None → workspace top-level. Two test
+    /// shapes pinned: `null` literal and missing field (since some MCP
+    /// clients send one form and some the other).
+    #[tokio::test]
+    async fn list_children_null_node_id_returns_workspace_root() {
+        let mock = MockServer::start().await;
+        // The top-level fetch hits /nodes with NO query params; the
+        // children fetch would hit /nodes?parent_id=...
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nodes": [
+                    {
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "name": "Root child A"
+                    },
+                    {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "name": "Root child B"
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+
+        // Form 1: explicit `{"node_id": null}` after deserialisation
+        // produces `node_id: None` because the field carries
+        // `#[serde(default)]`.
+        let params: GetChildrenParams = serde_json::from_value(json!({"node_id": null}))
+            .expect("null must deserialise to None");
+        assert!(params.node_id.is_none());
+        let result = server
+            .list_children(Parameters(params))
+            .await
+            .expect("null node_id must succeed against workspace root");
+        let body = body_text(&result);
+        assert!(body.contains("Root child A"), "body must list top-level: {body}");
+        assert!(body.contains("workspace root"), "body must label scope: {body}");
+
+        // Form 2: missing field. Same outcome — None.
+        let params: GetChildrenParams = serde_json::from_value(json!({}))
+            .expect("missing field must deserialise to None");
+        assert!(params.node_id.is_none());
+        let result = server
+            .list_children(Parameters(params))
+            .await
+            .expect("missing node_id must succeed against workspace root");
+        let body = body_text(&result);
+        assert!(body.contains("Root child A"), "body must list top-level: {body}");
+    }
+
+    /// Pure unit test for `derive_api_reachable`. The 2026-05-02 report
+    /// flagged that the degraded flag stuck on after the liveness probe
+    /// blipped during a long write burst — the burst itself proved the
+    /// API was up. The helper now treats a 2xx within the freshness
+    /// window as positive evidence.
+    #[test]
+    fn derive_api_reachable_honours_recent_success_when_probe_fails() {
+        // Probe succeeded → reachable, regardless of last-success.
+        assert!(super::derive_api_reachable(true, None));
+        assert!(super::derive_api_reachable(true, Some(0)));
+        assert!(super::derive_api_reachable(true, Some(60_000)));
+
+        // Probe failed, but a 2xx is recent enough → reachable.
+        assert!(super::derive_api_reachable(false, Some(0)));
+        assert!(super::derive_api_reachable(
+            false,
+            Some(defaults::API_REACHABILITY_FRESHNESS_MS - 1)
+        ));
+
+        // Probe failed and the last 2xx is older than the window
+        // (or never happened) → not reachable.
+        assert!(!super::derive_api_reachable(
+            false,
+            Some(defaults::API_REACHABILITY_FRESHNESS_MS)
+        ));
+        assert!(!super::derive_api_reachable(
+            false,
+            Some(defaults::API_REACHABILITY_FRESHNESS_MS + 60_000)
+        ));
+        assert!(!super::derive_api_reachable(false, None));
+    }
+
+    /// `insert_content` must return a structured partial-success
+    /// payload when interrupted by `cancel_all` rather than a bare
+    /// error. The 2026-05-02 report: a 4-min insert hit the MCP
+    /// client's hard timeout and returned "no result received" with no
+    /// diagnostic — even though the server had inserted a chunk
+    /// successfully. Cancellation is the analogous test surface
+    /// (deterministic to script with wiremock; the timeout path goes
+    /// through the same code).
+    ///
+    /// Setup: mock returns 200 immediately for the first two creates
+    /// then delays 30 s for the third. We fire cancel_all after the
+    /// second create succeeds, and assert the response carries
+    /// `status: "partial"` with `created_count >= 1`.
+    #[tokio::test]
+    async fn insert_content_returns_partial_on_cancel() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // GET /nodes/{id} — used by resolve_node_ref. Return the
+        // parent node so resolution succeeds (won't be reached here
+        // because the parent is a full UUID, but defensive).
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/nodes/.*"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        struct DelayedThirdCreate(Arc<AtomicUsize>);
+        impl wiremock::Respond for DelayedThirdCreate {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let id = format!("aaaaaaaa-bbbb-cccc-dddd-{:012x}", n);
+                let template = ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": id}));
+                if n >= 2 {
+                    template.set_delay(Duration::from_secs(30))
+                } else {
+                    template
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .respond_with(DelayedThirdCreate(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+        let server_for_call = Arc::clone(&server);
+        let call = tokio::spawn(async move {
+            server_for_call
+                .insert_content(Parameters(InsertContentParams {
+                    parent_id: NodeId::from(id_a()),
+                    content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
+                }))
+                .await
+        });
+
+        // Wait long enough for the first two creates to complete and
+        // the third to enter its delay.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.cancel_registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("cancel must preempt within the test budget")
+            .expect("task must not panic")
+            .expect("partial-success returns Ok with structured payload, not Err");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .expect("partial-success payload must be JSON");
+        assert_eq!(v["status"], "partial", "body: {body}");
+        assert_eq!(v["reason"], "cancelled", "body: {body}");
+        let created = v["created_count"].as_u64().expect("created_count");
+        assert!(created >= 1, "must have inserted at least the first line: {body}");
+        assert!(created < 5, "must not have inserted all five: {body}");
+        assert_eq!(v["total_count"], 5, "body: {body}");
+        assert!(v["last_inserted_id"].is_string(), "last_inserted_id must be set: {body}");
     }
 }

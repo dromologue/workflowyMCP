@@ -216,11 +216,25 @@ re-implementing them:
     server-side `with_read_budget` helper. `edit_node` uses
     `EDIT_NODE_TIMEOUT_MS` (60 s) and shares the same deadline across
     its split name+description POSTs so a flaky upstream cannot
-    double the budget. Hitting the budget returns `Timeout`, which
-    `tool_error` translates into a structured response with the
-    `Timeout` proximate cause; the underlying reqwest send is dropped
-    cleanly so the rate-limiter slot and connection-pool slot are
-    immediately available for the next call.
+    double the budget. **Single-node writes** (`create_node`,
+    `delete_node`) use `WRITE_NODE_TIMEOUT_MS` (15 s) — bounding the
+    retry loop end-to-end means a transient upstream slowness cannot
+    make one node-creation burn the full
+    `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~150 s), which was the
+    root cause of the 4-minute `insert_content` hangs in the
+    2026-05-02 report. **`insert_content`** carries an additional
+    end-to-end budget of `INSERT_CONTENT_TIMEOUT_MS` (210 s — well
+    inside the MCP client's 4-min hard timeout) and returns a
+    structured partial-success payload (`status: "partial"`,
+    `reason: "timeout"|"cancelled"`, `created_count`, `total_count`,
+    `last_inserted_id`, `stopped_at_line`) when the budget fires, so
+    callers can resume from where the call stopped instead of seeing
+    "no result received" with no diagnostic. Hitting any budget
+    returns `Timeout`, which `tool_error` translates into a
+    structured response with the `Timeout` proximate cause; the
+    underlying reqwest send is dropped cleanly so the rate-limiter
+    slot and connection-pool slot are immediately available for the
+    next call.
 
 11b. **Transport-level failures are retryable.** `WorkflowyError::is_retryable`
     classifies both server-side errors (429 + 5xx status codes) **and**
@@ -242,6 +256,30 @@ re-implementing them:
     against proof of recent liveness. Both `health_check` and
     `workflowy_status` make two attempts inside the same wall-clock
     budget; auth failures skip the retry since the answer won't change.
+
+11d. **`api_reachable` is decoupled from probe success.** Same pattern
+    as `authenticated`: the diagnostic tools used to set
+    `api_reachable = probe_succeeded`, which meant two consecutive
+    probe blips during a heavy write burst flipped the status to
+    degraded even though the burst itself was the proof of liveness.
+    `derive_api_reachable` now treats a 2xx within
+    `API_REACHABILITY_FRESHNESS_MS` (30 s) as positive evidence: the
+    probe is one signal, a recent successful tool call is another,
+    and either suffices. The response carries
+    `api_reachable_via_recent_success: true` when the probe failed
+    but the freshness window saved the verdict, so callers can tell
+    the cases apart.
+
+11e. **`null` parameters are reliable, not intermittent.** Tools that
+    accept "no scope = workspace root" (`list_children`,
+    `find_node.parent_id`, `create_node.parent_id`,
+    `tag_search.parent_id`, etc.) declare the field as
+    `Option<NodeId>` with `#[serde(default)]`. Both `null` and an
+    omitted field deserialise to `None`, which the handler routes
+    to the top-level fetch — the schema and the runtime agree.
+    Previously `node_id: null` intermittently surfaced "Tool
+    execution failed" because some MCP clients send `null` and some
+    omit the field, and only one form was accepted.
 
 12. **Best-effort transactions.** `transaction` applies a sequence of
    create/edit/delete/move operations sequentially; on first failure
@@ -301,6 +339,9 @@ the corresponding reliability property.
 | Children listing carries `parent_id` query param | `children_query_param_is_passed_to_upstream` | Routing pin: a future endpoint refactor that drops the `parent_id` query string trips the test. |
 | Every handler routes short-hash inputs through `resolve_node_ref` | `handlers_route_unindexed_short_hashes_through_resolver` | Three handlers (Optional `root_id`, Optional `parent_id`, required `node_id`) against an empty-workspace mock — the resolver concludes exhaustive walk and returns the expected "Short-hash … was not found" error. A future bypass that passes a raw short hash to the API layer breaks this. |
 | Mutation errors carry structured `tool_error` payload | `mutation_errors_carry_structured_data_payload` | `delete_node` / `edit_node` / `move_node` against a 404 mock each surface a structured error message naming the operation — the brief acceptance criterion that bare "Tool execution failed" is a regression. |
+| `list_children` with `null` or missing `node_id` returns workspace top-level | `list_children_null_node_id_returns_workspace_root` | Both `{"node_id": null}` and `{}` deserialise to `None` and route to the top-level fetch; the body labels the scope as `workspace root` so the caller knows what they got. |
+| `derive_api_reachable` honours recent success when probe fails | `derive_api_reachable_honours_recent_success_when_probe_fails` | Pure unit test of the freshness-window logic: a 2xx within `API_REACHABILITY_FRESHNESS_MS` keeps `api_reachable: true` even when the latest probe blipped. |
+| `insert_content` returns structured partial-success on cancel | `insert_content_returns_partial_on_cancel` | `cancel_all` mid-insert produces `status: "partial"`, `reason: "cancelled"`, `created_count >= 1`, `last_inserted_id` set — the same code path the timeout branch uses, deterministically scriptable from a test. |
 
 ### Why this matters
 
@@ -309,12 +350,14 @@ that each ran for ~30 s waiting for the read budget to expire — the
 same 30 s a user would experience in production. They proved the
 budget existed but said nothing about which retry-loop branch fired
 or whether `cancel_all` actually preempted anything. The mock-based
-suite covers eleven distinct paths in under 2 s total and is the
+suite covers fourteen distinct paths in under 2 s total and is the
 primary regression net for any future changes to `with_read_budget`,
 the propagation-retry layer, the 503/transport retry policy,
-`cancel_all`'s preemption behaviour, the short-hash resolver, or
-the structured `tool_error` payload. Full-suite runtime dropped
-from 160 s to ~40 s as the slow tests were retired.
+`cancel_all`'s preemption behaviour, the short-hash resolver, the
+structured `tool_error` payload, the `null`-as-workspace-root
+contract on read tools, the `derive_api_reachable` freshness window,
+or the `insert_content` partial-success payload. Full-suite runtime
+dropped from 160 s to ~40 s as the slow tests were retired.
 
 ---
 
