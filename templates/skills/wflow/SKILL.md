@@ -51,7 +51,39 @@ The discipline that turns this into a wiki rather than a notebook is **writing s
 
 ## Bootstrap (run BEFORE every workflow)
 
-A two-step probe at session start. Both must complete before any workflow proceeds.
+A three-step probe at session start. All steps must complete before any workflow proceeds.
+
+### Step 0 — Tool availability probe
+
+Confirm the MCP tool surface this skill needs is actually loaded **before** doing anything else. claude.ai connectors can be disabled, removed, or fail to load silently; the skill must fail loud rather than silently degrade to filesystem-staging.
+
+#### What to probe
+
+- **`workflowy:*`** — required for every workflow.
+- **`Filesystem:*`** — required to read drafts and memory files (skip in Claude Code, which uses native `Read`/`Write`/`Bash`).
+- **`remarkable:*`** — required for any workflow that fetches from a reMarkable tablet.
+
+#### How to probe
+
+Use the **exact server name** as the `tool_search` query — descriptive phrases match the wrong connector (`"filesystem write file"` loads Netlify, `"list_allowed_directories"` loads Gmail, only `"Filesystem"` works):
+
+- `tool_search(query="Workflowy")`
+- `tool_search(query="Filesystem")`
+- `tool_search(query="remarkable")`
+
+Verify each surface with a read-only call:
+
+- `workflowy:health_check()` — `status: "ok"`, `authenticated: true`.
+- `Filesystem:list_allowed_directories()` — includes the user's SecondBrain path.
+- `remarkable:remarkable_status()` — healthy. Probe only when a reMarkable workflow is queued.
+
+#### Fail-loud protocol
+
+If any required tool is unreachable:
+
+1. Stop the bootstrap. Do not proceed to Step 1.
+2. Name the missing tool and tell the user how to fix it: claude.ai connectors at `https://claude.ai/settings/connectors`, or Claude Desktop's `claude_desktop_config.json`. Confirm with the corresponding health-check tool.
+3. Ask explicitly before staging a draft to disk. Never silently degrade. If the user consents, write to the universally allowlisted fallback path with the failure mode tagged in the filename (`...-mcp-down.md`) so the next session's Step 1 resumes execution.
 
 ### Step 1 — secondBrain draft check
 
