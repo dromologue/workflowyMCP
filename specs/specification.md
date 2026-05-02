@@ -281,6 +281,26 @@ re-implementing them:
     execution failed" because some MCP clients send `null` and some
     omit the field, and only one form was accepted.
 
+11f. **One uniform safety net at the handler boundary.** Every
+    API-touching handler runs inside `run_handler(tool, kind, fut)`,
+    which observes the server-wide cancel registry and applies a
+    kind-appropriate wall-clock deadline. The four `ToolKind`
+    variants are the entire taxonomy: `Read` (single-node read),
+    `Write` (single-node write), `Bulk` (multi-step operation that
+    iterates over `client.X` calls), `Walk` (cancel-only — the
+    walker owns its own internal deadline via `FetchControls`). The
+    architecture review on 2026-05-02 found seven handlers that
+    bypassed any budget — `path_of`, `transaction`,
+    `batch_create_nodes`, `duplicate_node`, `create_from_template`,
+    `bulk_update`, `bulk_tag`, `node_at_path` — each of which could
+    theoretically loop unbounded over raw `client.X` calls (a 10-op
+    transaction with one slow upstream call could hang for 25 min).
+    Each is now wrapped in `run_handler(ToolKind::Bulk)` so the
+    bulk-budget (`INSERT_CONTENT_TIMEOUT_MS`, 210 s) and cancel
+    observation are uniform. Tests pin every migrated handler's
+    contract individually against a hung wiremock so a future
+    regression that strips the wrapper trips the suite.
+
 12. **Best-effort transactions.** `transaction` applies a sequence of
    create/edit/delete/move operations sequentially; on first failure
    it replays inverse operations in reverse order to roll back
@@ -342,6 +362,11 @@ the corresponding reliability property.
 | `list_children` with `null` or missing `node_id` returns workspace top-level | `list_children_null_node_id_returns_workspace_root` | Both `{"node_id": null}` and `{}` deserialise to `None` and route to the top-level fetch; the body labels the scope as `workspace root` so the caller knows what they got. |
 | `derive_api_reachable` honours recent success when probe fails | `derive_api_reachable_honours_recent_success_when_probe_fails` | Pure unit test of the freshness-window logic: a 2xx within `API_REACHABILITY_FRESHNESS_MS` keeps `api_reachable: true` even when the latest probe blipped. |
 | `insert_content` returns structured partial-success on cancel | `insert_content_returns_partial_on_cancel` | `cancel_all` mid-insert produces `status: "partial"`, `reason: "cancelled"`, `created_count >= 1`, `last_inserted_id` set — the same code path the timeout branch uses, deterministically scriptable from a test. |
+| `path_of` honours bulk budget against hung upstream | `path_of_against_hung_upstream_returns_within_bulk_budget` | The walk-parent-chain loop returns a `tool_error` well under the mock delay; pre-migration this could hang for 25 min on a 10-deep path with one slow call. |
+| `bulk_tag` honours bulk budget against hung upstream | `bulk_tag_against_hung_upstream_returns_within_bulk_budget` | Parallel `get_node` calls in the tagging loop respect the bulk wrapper's deadline. |
+| `transaction` honours bulk budget against hung upstream | `transaction_against_hung_upstream_returns_within_bulk_budget` | Pre-state captures inside `apply_txn_op` no longer let one slow op stretch the whole transaction past the budget. |
+| `node_at_path` honours bulk budget against hung upstream | `node_at_path_against_hung_upstream_returns_within_bulk_budget` | Per-segment `get_children` calls respect the wrapper. |
+| `cancel_all` preempts any in-flight bulk handler | `cancel_all_preempts_inflight_path_of_via_run_handler` | The same ~50 ms cancel-poll cadence that covers `list_children` now covers every handler that goes through `run_handler` — no more handler-by-handler cancel wiring. |
 
 ### Why this matters
 
@@ -350,14 +375,16 @@ that each ran for ~30 s waiting for the read budget to expire — the
 same 30 s a user would experience in production. They proved the
 budget existed but said nothing about which retry-loop branch fired
 or whether `cancel_all` actually preempted anything. The mock-based
-suite covers fourteen distinct paths in under 2 s total and is the
-primary regression net for any future changes to `with_read_budget`,
+suite covers nineteen distinct paths in under 2 s total and is the
+primary regression net for any future changes to `with_tool_budget`,
 the propagation-retry layer, the 503/transport retry policy,
 `cancel_all`'s preemption behaviour, the short-hash resolver, the
 structured `tool_error` payload, the `null`-as-workspace-root
 contract on read tools, the `derive_api_reachable` freshness window,
-or the `insert_content` partial-success payload. Full-suite runtime
-dropped from 160 s to ~40 s as the slow tests were retired.
+the `insert_content` partial-success payload, and the
+`run_handler(Bulk)` budget contract for every migrated bulk tool.
+Full-suite runtime dropped from 160 s to ~40 s as the slow tests
+were retired.
 
 ---
 

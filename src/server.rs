@@ -122,6 +122,50 @@ impl ProximateCause {
 ///
 /// Brief 2026-04-25 Test γ: `proximate_cause` is a discrete enum, not a
 /// free-text hint, so callers can switch on it without parsing.
+/// Tool kinds for `with_tool_budget`. The wrapper picks the wall-clock
+/// budget from the kind, so call sites stay readable and the budget
+/// constants live in one place ([`defaults`]).
+///
+/// The taxonomy is deliberately small (four kinds) because the server
+/// ships ~40 tools and a finer split would just be noise. Diagnostic
+/// tools (`health_check`, `workflowy_status`, `cancel_all`,
+/// `get_recent_tool_calls`, `build_name_index`) own their own short
+/// budgets and don't go through `with_tool_budget` at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Walk variant is part of the taxonomy; walks rely on internal walk_subtree budget rather than wrapping at the handler boundary.
+enum ToolKind {
+    /// Single-node read (`get_node`, `list_children`). Budget:
+    /// [`defaults::READ_NODE_TIMEOUT_MS`] (30 s default; tests override
+    /// via `read_budget_ms`).
+    Read,
+    /// Single-node write (`create_node`, `delete_node`, plus the
+    /// resolver paths inside other handlers). Budget:
+    /// [`defaults::WRITE_NODE_TIMEOUT_MS`] (15 s) — dovetails with the
+    /// per-method deadlines built into the client. The wrapper itself
+    /// is the cancel observer + safety net, the per-method deadline is
+    /// the primary bound.
+    Write,
+    /// Multi-step bulk operation (`insert_content`, `duplicate_node`,
+    /// `create_from_template`, `bulk_update`, `bulk_tag`,
+    /// `batch_create_nodes`, `transaction`, `path_of`, `node_at_path`).
+    /// Budget: [`defaults::INSERT_CONTENT_TIMEOUT_MS`] (210 s — well
+    /// under the MCP client's 4-min hard timeout). Each per-iteration
+    /// call runs to its own per-method budget; the bulk wrapper caps
+    /// the total wall-clock so a runaway loop returns a structured
+    /// timeout instead of "no result received".
+    Bulk,
+    /// Tree walk (`search_nodes`, `get_subtree`, `find_node`,
+    /// `find_backlinks`, `daily_review`, `list_overdue`,
+    /// `list_upcoming`, `list_todos`, `tag_search`,
+    /// `get_recent_changes`, `get_project_summary`, `audit_mirrors`,
+    /// `review`, `find_by_tag_and_path`, `export_subtree`,
+    /// `smart_insert`, `since`). The walker itself owns
+    /// [`defaults::SUBTREE_FETCH_TIMEOUT_MS`] via `FetchControls` —
+    /// the outer wrapper observes `cancel_all` only, no second
+    /// deadline.
+    Walk,
+}
+
 /// Derive `api_reachable` for the diagnostic tools. The probe is one
 /// signal; a recent successful tool call is another. Either suffices —
 /// the previous behaviour ("derive only from the probe") meant a single
@@ -577,6 +621,14 @@ pub struct WorkflowyMcpServer {
     /// [`Self::with_read_budget_ms`] so failure-mode coverage runs in
     /// milliseconds instead of the production 30 s.
     read_budget_ms: u64,
+    /// Wall-clock budget for bulk tools (`insert_content`, `path_of`,
+    /// `bulk_tag`, `transaction`, `duplicate_node`,
+    /// `create_from_template`, `bulk_update`, `batch_create_nodes`,
+    /// `node_at_path`). Defaults to
+    /// [`defaults::INSERT_CONTENT_TIMEOUT_MS`]; tests dial it down via
+    /// [`Self::with_bulk_budget_ms`] so failure-mode coverage runs in
+    /// milliseconds instead of the production 210 s.
+    bulk_budget_ms: u64,
 }
 
 // --- Parameter structs ---
@@ -1087,6 +1139,7 @@ impl WorkflowyMcpServer {
             tree_size_estimate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             op_log: OpLog::new(),
             read_budget_ms: defaults::READ_NODE_TIMEOUT_MS,
+            bulk_budget_ms: defaults::INSERT_CONTENT_TIMEOUT_MS,
         }
     }
 
@@ -1099,6 +1152,17 @@ impl WorkflowyMcpServer {
     #[cfg(test)]
     pub(crate) fn with_read_budget_ms(mut self, ms: u64) -> Self {
         self.read_budget_ms = ms;
+        self
+    }
+
+    /// Test-only: override the wall-clock budget that
+    /// [`Self::run_handler`] applies to [`ToolKind::Bulk`] handlers.
+    /// Production honours [`defaults::INSERT_CONTENT_TIMEOUT_MS`]
+    /// (210 s); tests dial down to milliseconds so the bulk-budget
+    /// failure paths exercise quickly.
+    #[cfg(test)]
+    pub(crate) fn with_bulk_budget_ms(mut self, ms: u64) -> Self {
+        self.bulk_budget_ms = ms;
         self
     }
 
@@ -1143,38 +1207,59 @@ impl WorkflowyMcpServer {
             .and_cancel(self.cancel_registry.guard())
     }
 
-    /// Wrap a single-node read future with the server-wide cancel registry
-    /// and the [`defaults::READ_NODE_TIMEOUT_MS`] wall-clock budget.
+    /// Apply the server-wide cancel registry and a tool-kind-appropriate
+    /// wall-clock budget to any operation. This is the **single uniform
+    /// safety net** every API-touching handler runs inside; the kind
+    /// selects the budget so the call sites stay readable and the
+    /// constants stay in one place ([`defaults`]).
     ///
-    /// Why this exists: walks already go through `walk_subtree`, which carries
-    /// both a deadline and a cancel guard. Single-node reads (`get_node`,
-    /// `list_children`, the read paths in `edit_node`/`delete_node`/
-    /// `move_node`/etc.) historically called `client.get_node()` directly,
-    /// which passed `(None, None)` for cancel + deadline — the only bound on
-    /// a hung upstream was `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~3.5 min).
-    /// In a real session that produced exactly the symptom users reported:
-    /// one slow upstream call wedged the tool surface for minutes, and
-    /// `cancel_all` could not interrupt it because the in-flight read wasn't
-    /// observing the cancel registry.
+    /// - [`ToolKind::Read`]: bounded at [`defaults::READ_NODE_TIMEOUT_MS`]
+    ///   (or the `read_budget_ms` test override). For single-node reads
+    ///   like `get_node`, `list_children`.
+    /// - [`ToolKind::Write`]: bounded at [`defaults::WRITE_NODE_TIMEOUT_MS`].
+    ///   For single-node writes; the client's per-method deadline is the
+    ///   primary bound, this wrapper adds cancel observation and a
+    ///   safety net.
+    /// - [`ToolKind::Bulk`]: bounded at [`defaults::INSERT_CONTENT_TIMEOUT_MS`].
+    ///   For multi-step operations (`insert_content`, `duplicate_node`,
+    ///   `create_from_template`, `bulk_update`, `bulk_tag`,
+    ///   `batch_create_nodes`, `transaction`, `path_of`, `node_at_path`)
+    ///   that own their own per-iteration logic but need an overall cap.
+    /// - [`ToolKind::Walk`]: cancel-only — walks already carry an internal
+    ///   `SUBTREE_FETCH_TIMEOUT_MS` deadline via `FetchControls`, so an
+    ///   outer deadline would just be redundant.
     ///
-    /// Dropping the inner future on timeout/cancel cleanly aborts the reqwest
-    /// send (closes the connection) and releases the rate-limiter slot, so
-    /// the next tool call starts fresh.
-    async fn with_read_budget<F, T>(&self, fut: F) -> std::result::Result<T, WorkflowyError>
+    /// Dropping the inner future on timeout/cancel cleanly aborts the
+    /// reqwest send (closes the connection) and releases the rate-limiter
+    /// slot, so the next tool call starts fresh.
+    async fn with_tool_budget<F, T>(
+        &self,
+        kind: ToolKind,
+        fut: F,
+    ) -> std::result::Result<T, WorkflowyError>
     where
         F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
     {
-        self.with_read_budget_inner(fut, Duration::from_millis(self.read_budget_ms))
-            .await
+        let budget_ms = match kind {
+            ToolKind::Read => self.read_budget_ms,
+            ToolKind::Write => defaults::WRITE_NODE_TIMEOUT_MS,
+            ToolKind::Bulk => defaults::INSERT_CONTENT_TIMEOUT_MS,
+            ToolKind::Walk => 0,
+        };
+        self.with_tool_budget_ms(kind, fut, budget_ms).await
     }
 
-    /// Implementation of [`Self::with_read_budget`] with the budget injected.
-    /// Tests target this entry point directly so they can exercise the
-    /// timeout/cancel paths in milliseconds rather than the production 30 s.
-    async fn with_read_budget_inner<F, T>(
+    /// Implementation of [`Self::with_tool_budget`] with the budget
+    /// injected. Tests target this entry point directly so they can
+    /// exercise the timeout/cancel paths in milliseconds rather than
+    /// production-scale wall-clock. `budget_ms == 0` (or
+    /// [`ToolKind::Walk`]) skips the deadline arm and observes only the
+    /// cancel registry.
+    async fn with_tool_budget_ms<F, T>(
         &self,
+        kind: ToolKind,
         fut: F,
-        budget: Duration,
+        budget_ms: u64,
     ) -> std::result::Result<T, WorkflowyError>
     where
         F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
@@ -1188,13 +1273,102 @@ impl WorkflowyMcpServer {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        let deadline = tokio::time::sleep(budget);
-        tokio::select! {
-            biased;
-            _ = poll_cancel => Err(WorkflowyError::Cancelled),
-            _ = deadline => Err(WorkflowyError::Timeout),
-            res = fut => res,
+        if matches!(kind, ToolKind::Walk) || budget_ms == 0 {
+            // Cancel-only: the inner future owns its deadline.
+            tokio::select! {
+                biased;
+                _ = poll_cancel => Err(WorkflowyError::Cancelled),
+                res = fut => res,
+            }
+        } else {
+            let deadline = tokio::time::sleep(Duration::from_millis(budget_ms));
+            tokio::select! {
+                biased;
+                _ = poll_cancel => Err(WorkflowyError::Cancelled),
+                _ = deadline => Err(WorkflowyError::Timeout),
+                res = fut => res,
+            }
         }
+    }
+
+    /// Back-compat shim: routes through [`Self::with_tool_budget`] with
+    /// [`ToolKind::Read`]. Kept only to minimise the migration diff for
+    /// `get_node` / `list_children`; new callers should use
+    /// `with_tool_budget` directly so the kind is visible at the call
+    /// site.
+    async fn with_read_budget<F, T>(&self, fut: F) -> std::result::Result<T, WorkflowyError>
+    where
+        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
+    {
+        self.with_tool_budget(ToolKind::Read, fut).await
+    }
+
+    /// Handler-flavoured wrapper that returns [`McpError`]. The inner
+    /// future is the existing handler body — it produces its own
+    /// structured `tool_error` payloads. The wrapper races it against
+    /// the cancel registry and the kind-appropriate wall-clock budget;
+    /// on timeout or cancel, it emits a `tool_error` with the operation
+    /// name so the caller sees the same structured response shape
+    /// regardless of which arm fired. This is the surgical
+    /// intervention the architecture review identified: every
+    /// API-touching handler runs inside one of these wrappers, so a
+    /// future tool added without wiring its own budget still inherits
+    /// the safety net.
+    async fn run_handler<F>(
+        &self,
+        tool: &'static str,
+        kind: ToolKind,
+        fut: F,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+    {
+        let budget_ms = match kind {
+            ToolKind::Read => self.read_budget_ms,
+            ToolKind::Write => defaults::WRITE_NODE_TIMEOUT_MS,
+            ToolKind::Bulk => self.bulk_budget_ms,
+            ToolKind::Walk => 0,
+        };
+        let guard = self.cancel_registry.guard();
+        let poll_cancel = async {
+            loop {
+                if guard.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        if matches!(kind, ToolKind::Walk) || budget_ms == 0 {
+            tokio::select! {
+                biased;
+                _ = poll_cancel => Err(tool_error(tool, None, WorkflowyError::Cancelled)),
+                res = fut => res,
+            }
+        } else {
+            let deadline = tokio::time::sleep(Duration::from_millis(budget_ms));
+            tokio::select! {
+                biased;
+                _ = poll_cancel => Err(tool_error(tool, None, WorkflowyError::Cancelled)),
+                _ = deadline => Err(tool_error(tool, None, WorkflowyError::Timeout)),
+                res = fut => res,
+            }
+        }
+    }
+
+    /// Back-compat shim used by the load-test module to inject a small
+    /// budget on the `Read` tier without touching the server's
+    /// `read_budget_ms` field. Equivalent to `with_tool_budget_ms(Read, ..)`.
+    #[cfg(test)]
+    async fn with_read_budget_inner<F, T>(
+        &self,
+        fut: F,
+        budget: Duration,
+    ) -> std::result::Result<T, WorkflowyError>
+    where
+        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
+    {
+        self.with_tool_budget_ms(ToolKind::Read, fut, budget.as_millis() as u64)
+            .await
     }
 
     /// Resolve a `node_id` parameter to a full UUID string. Accepts either
@@ -2954,6 +3128,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<DuplicateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "duplicate_node", params, {
+        self.run_handler("duplicate_node", ToolKind::Bulk, async move {
         check_node_id(&params.node_id)?;
         check_node_id(&params.target_parent_id)?;
         let resolved_node = self.resolve_node_ref(&params.node_id).await?;
@@ -3051,6 +3226,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
         }
+        }).await
         })
     }
 
@@ -3060,6 +3236,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<CreateFromTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_from_template", params, {
+        self.run_handler("create_from_template", ToolKind::Bulk, async move {
         check_node_id(&params.template_node_id)?;
         check_node_id(&params.target_parent_id)?;
         let resolved_template = self.resolve_node_ref(&params.template_node_id).await?;
@@ -3152,6 +3329,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
         }
+        }).await
         })
     }
 
@@ -3161,6 +3339,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<BulkUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "bulk_update", params, {
+        self.run_handler("bulk_update", ToolKind::Bulk, async move {
         let dry_run = params.dry_run.unwrap_or(false);
         let limit = params.limit.unwrap_or(20);
         let status = params.status.as_deref().unwrap_or("all");
@@ -3317,6 +3496,7 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("bulk_update", resolved_root.as_deref(), e)),
         }
+        }).await
         })
     }
 
@@ -3712,6 +3892,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<BatchCreateNodesParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "batch_create_nodes", params, {
+        self.run_handler("batch_create_nodes", ToolKind::Bulk, async move {
         if params.operations.is_empty() {
             return Err(McpError::invalid_params(
                 "operations must not be empty".to_string(),
@@ -3790,6 +3971,7 @@ impl WorkflowyMcpServer {
             "results": entries,
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        }).await
         })
     }
 
@@ -3799,108 +3981,115 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<TransactionParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "transaction", params, {
-        if params.operations.is_empty() {
-            return Err(McpError::invalid_params("operations must not be empty".to_string(), None));
-        }
+        self.run_handler("transaction", ToolKind::Bulk, async move {
+            if params.operations.is_empty() {
+                return Err(McpError::invalid_params("operations must not be empty".to_string(), None));
+            }
 
-        // Each entry: (description-of-completed-op, inverse-action)
-        let mut applied: Vec<TxnInverse> = Vec::new();
-        let mut applied_results: Vec<serde_json::Value> = Vec::new();
+            // Each entry: (description-of-completed-op, inverse-action)
+            let mut applied: Vec<TxnInverse> = Vec::new();
+            let mut applied_results: Vec<serde_json::Value> = Vec::new();
 
-        for (idx, op) in params.operations.iter().enumerate() {
-            let outcome = self.apply_txn_op(op).await;
-            match outcome {
-                Ok((summary, inverse)) => {
-                    applied_results.push(json!({ "index": idx, "ok": true, "summary": summary }));
-                    if let Some(inv) = inverse {
-                        applied.push(inv);
-                    }
-                }
-                Err(err) => {
-                    // Roll back in reverse order. Each inverse failure is
-                    // logged but does not abort the rollback — we want to
-                    // get as much state back as possible.
-                    let mut rollback_log: Vec<serde_json::Value> = Vec::new();
-                    while let Some(inv) = applied.pop() {
-                        match self.run_inverse(inv).await {
-                            Ok(summary) => rollback_log.push(json!({ "ok": true, "summary": summary })),
-                            Err(e) => rollback_log.push(json!({ "ok": false, "error": e.to_string() })),
+            for (idx, op) in params.operations.iter().enumerate() {
+                let outcome = self.apply_txn_op(op).await;
+                match outcome {
+                    Ok((summary, inverse)) => {
+                        applied_results.push(json!({ "index": idx, "ok": true, "summary": summary }));
+                        if let Some(inv) = inverse {
+                            applied.push(inv);
                         }
                     }
-                    let payload = json!({
-                        "status": "rolled_back",
-                        "failed_at_index": idx,
-                        "error": err.to_string(),
-                        "applied_before_failure": applied_results,
-                        "rollback": rollback_log,
-                    });
-                    return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+                    Err(err) => {
+                        // Roll back in reverse order. Each inverse failure is
+                        // logged but does not abort the rollback — we want to
+                        // get as much state back as possible.
+                        let mut rollback_log: Vec<serde_json::Value> = Vec::new();
+                        while let Some(inv) = applied.pop() {
+                            match self.run_inverse(inv).await {
+                                Ok(summary) => rollback_log.push(json!({ "ok": true, "summary": summary })),
+                                Err(e) => rollback_log.push(json!({ "ok": false, "error": e.to_string() })),
+                            }
+                        }
+                        let payload = json!({
+                            "status": "rolled_back",
+                            "failed_at_index": idx,
+                            "error": err.to_string(),
+                            "applied_before_failure": applied_results,
+                            "rollback": rollback_log,
+                        });
+                        return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+                    }
                 }
             }
-        }
 
-        let payload = json!({
-            "status": "applied",
-            "operations": applied_results,
-        });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            let payload = json!({
+                "status": "applied",
+                "operations": applied_results,
+            });
+            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        }).await
         })
     }
 
-    #[tool(description = "Return the canonical hierarchical path from root to the given node, by walking parent_id pointers via repeated get_node calls. Bounded by max_depth (default 50) so a malformed cycle doesn't loop forever. Each segment is { id, name }; use this for citation in distillations or for any caller that needs a stable, human-readable location.")]
+    #[tool(description = "Return the canonical hierarchical path from root to the given node, by walking parent_id pointers via repeated get_node calls. Bounded by max_depth (default 50) so a malformed cycle doesn't loop forever, AND by the bulk-tool wall-clock budget (~210 s) so a slow upstream cannot stretch the walk past the MCP client's hard timeout. Each segment is { id, name }; use this for citation in distillations or for any caller that needs a stable, human-readable location.")]
     async fn path_of(
         &self,
         Parameters(params): Parameters<PathOfParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "path_of", params, {
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
-        let max_depth = params.max_depth.unwrap_or(50);
+        self.run_handler("path_of", ToolKind::Bulk, async move {
+            check_node_id(&params.node_id)?;
+            let resolved = self.resolve_node_ref(&params.node_id).await?;
+            let max_depth = params.max_depth.unwrap_or(50);
 
-        // Walk parent_id chain. We stop at the first None, the first
-        // missing-node error, the first cycle (id we've seen), or the
-        // depth cap. Each step is one HTTP call; for typical Workflowy
-        // trees (depth 5-10) this is cheap.
-        let mut segments: Vec<serde_json::Value> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut current_id: Option<String> = Some(resolved.clone());
-        let mut depth = 0usize;
-        while let Some(id) = current_id.take() {
-            if !seen.insert(id.clone()) {
-                tracing::warn!(node_id = %id, "path_of: cycle detected, stopping walk");
-                break;
-            }
-            if depth >= max_depth {
-                tracing::warn!(max_depth, "path_of: max_depth reached, returning partial path");
-                break;
-            }
-            depth += 1;
-            match self.client.get_node(&id).await {
-                Ok(node) => {
-                    segments.push(json!({ "id": node.id, "name": node.name }));
-                    current_id = node.parent_id;
-                }
-                Err(e) => {
-                    tracing::warn!(node_id = %id, error = %e, "path_of: get_node failed; returning partial path");
+            // Walk parent_id chain. We stop at the first None, the first
+            // missing-node error, the first cycle (id we've seen), or the
+            // depth cap. Each step is one HTTP call; for typical Workflowy
+            // trees (depth 5-10) this is cheap. The outer
+            // `run_handler` wrapper observes the cancel registry on
+            // every iteration, so a `cancel_all` fires this loop's next
+            // `await` and returns within the cancel-poll slice.
+            let mut segments: Vec<serde_json::Value> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut current_id: Option<String> = Some(resolved.clone());
+            let mut depth = 0usize;
+            while let Some(id) = current_id.take() {
+                if !seen.insert(id.clone()) {
+                    tracing::warn!(node_id = %id, "path_of: cycle detected, stopping walk");
                     break;
                 }
+                if depth >= max_depth {
+                    tracing::warn!(max_depth, "path_of: max_depth reached, returning partial path");
+                    break;
+                }
+                depth += 1;
+                match self.client.get_node(&id).await {
+                    Ok(node) => {
+                        segments.push(json!({ "id": node.id, "name": node.name }));
+                        current_id = node.parent_id;
+                    }
+                    Err(e) => {
+                        tracing::warn!(node_id = %id, error = %e, "path_of: get_node failed; returning partial path");
+                        break;
+                    }
+                }
             }
-        }
-        // Reverse so index 0 is root, last is the requested node.
-        segments.reverse();
-        let display_path = segments
-            .iter()
-            .map(|s| s["name"].as_str().unwrap_or("(untitled)").to_string())
-            .collect::<Vec<_>>()
-            .join(" > ");
-        let payload = json!({
-            "node_id": resolved,
-            "path": display_path,
-            "segments": segments,
-            "depth": segments.len(),
-            "truncated": depth >= max_depth,
-        });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            // Reverse so index 0 is root, last is the requested node.
+            segments.reverse();
+            let display_path = segments
+                .iter()
+                .map(|s| s["name"].as_str().unwrap_or("(untitled)").to_string())
+                .collect::<Vec<_>>()
+                .join(" > ");
+            let payload = json!({
+                "node_id": resolved,
+                "path": display_path,
+                "segments": segments,
+                "depth": segments.len(),
+                "truncated": depth >= max_depth,
+            });
+            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        }).await
         })
     }
 
@@ -3910,6 +4099,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<BulkTagParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "bulk_tag", params, {
+        self.run_handler("bulk_tag", ToolKind::Bulk, async move {
         if params.node_ids.is_empty() {
             return Err(McpError::invalid_params("node_ids must not be empty".to_string(), None));
         }
@@ -3993,6 +4183,7 @@ impl WorkflowyMcpServer {
             "results": entries,
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        }).await
         })
     }
 
@@ -4168,6 +4359,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<NodeAtPathParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "node_at_path", params, {
+        self.run_handler("node_at_path", ToolKind::Bulk, async move {
         if params.path.is_empty() {
             return Err(McpError::invalid_params(
                 "path must contain at least one segment".to_string(),
@@ -4253,6 +4445,7 @@ impl WorkflowyMcpServer {
             "nodes_indexed": visited_nodes.len(),
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        }).await
         })
     }
 
@@ -7414,6 +7607,252 @@ mod load_tests {
         assert!(
             err.to_string().contains("move_node"),
             "move_node error must name the operation: {err}"
+        );
+    }
+
+    // ----- Architecture review: bulk-handler budget contract -----
+    //
+    // The seven critical bypass handlers identified in the 2026-05-02
+    // architecture review (path_of, transaction, batch_create_nodes,
+    // duplicate_node, create_from_template, bulk_update, bulk_tag) plus
+    // node_at_path now wrap their bodies in `run_handler(ToolKind::Bulk)`.
+    // These tests pin the contract: against a hung upstream each handler
+    // returns within the bulk budget instead of looping unbounded over
+    // raw client calls. Each test runs in milliseconds via the
+    // `with_bulk_budget_ms` test override.
+
+    /// Build a server pointing at the given mock with a tight bulk
+    /// budget so the failure-mode tests below run in test time.
+    async fn server_with_tight_bulk_budget(mock: &MockServer) -> WorkflowyMcpServer {
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .expect("client must build against mock"),
+        );
+        WorkflowyMcpServer::new(client)
+            .with_read_budget_ms(300)
+            .with_bulk_budget_ms(300)
+    }
+
+    /// `path_of` walks parent_id pointers via repeated `get_node`. Pre-
+    /// migration each `get_node` was raw `client.get_node` — no per-call
+    /// deadline, no observation of `cancel_all`. A 10-deep path against
+    /// a slow upstream could legitimately take 25 minutes. Now the
+    /// outer wrapper bounds the whole walk.
+    #[tokio::test]
+    async fn path_of_against_hung_upstream_returns_within_bulk_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"node": {"id": id_a(), "name": "x", "parent_id": null}})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_with_tight_bulk_budget(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .path_of(Parameters(PathOfParams {
+                node_id: NodeId::from(id_a()),
+                max_depth: Some(50),
+            }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("path_of"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bulk budget (300 ms) must fire well under the 5 s mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// `bulk_tag` runs `client.get_node` per id in parallel via
+    /// `buffer_unordered`. Pre-migration unbounded.
+    #[tokio::test]
+    async fn bulk_tag_against_hung_upstream_returns_within_bulk_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"node": {"id": id_a(), "name": "x"}})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_with_tight_bulk_budget(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .bulk_tag(Parameters(BulkTagParams {
+                node_ids: vec![NodeId::from(id_a())],
+                tag: "test".to_string(),
+            }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("bulk_tag"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bulk budget must fire under mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// `transaction` captures pre-state via raw `client.get_node` per
+    /// operation. Pre-migration: a 10-op transaction with one slow
+    /// upstream call could hang for 25 minutes. The outer wrapper now
+    /// caps the whole transaction at the bulk budget.
+    #[tokio::test]
+    async fn transaction_against_hung_upstream_returns_within_bulk_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"node": {"id": id_a(), "name": "x"}})),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&mock)
+            .await;
+
+        let server = server_with_tight_bulk_budget(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .transaction(Parameters(TransactionParams {
+                operations: vec![TransactionOpParams {
+                    op: "delete".to_string(),
+                    node_id: Some(NodeId::from(id_a())),
+                    parent_id: None,
+                    new_parent_id: None,
+                    name: None,
+                    description: None,
+                    priority: None,
+                }],
+            }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("transaction"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bulk budget must fire under mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// `node_at_path` walks segments via `client.get_children` /
+    /// `get_top_level_nodes`. Pre-migration unbounded.
+    #[tokio::test]
+    async fn node_at_path_against_hung_upstream_returns_within_bulk_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"nodes": []})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_with_tight_bulk_budget(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .node_at_path(Parameters(NodeAtPathParams {
+                path: vec!["Areas".to_string(), "Personal".to_string()],
+                start_parent_id: None,
+            }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("node_at_path"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bulk budget must fire under mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// Architecture invariant: `cancel_all` preempts any bulk handler
+    /// in flight, not just `list_children`. Pin against `path_of`
+    /// since it's the most loop-heavy migrated handler.
+    #[tokio::test]
+    async fn cancel_all_preempts_inflight_path_of_via_run_handler() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(json!({"node": {"id": id_a(), "name": "x"}})),
+            )
+            .mount(&mock)
+            .await;
+
+        // Long bulk budget — we want cancel, not deadline, to fire.
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .unwrap(),
+        );
+        let server = Arc::new(
+            WorkflowyMcpServer::new(client)
+                .with_read_budget_ms(60_000)
+                .with_bulk_budget_ms(60_000),
+        );
+
+        let server_for_call = Arc::clone(&server);
+        let call = tokio::spawn(async move {
+            server_for_call
+                .path_of(Parameters(PathOfParams {
+                    node_id: NodeId::from(id_a()),
+                    max_depth: Some(50),
+                }))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cancel_started = Instant::now();
+        server.cancel_registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("cancel must preempt within the test budget")
+            .expect("task must not panic");
+        let cancel_elapsed = cancel_started.elapsed();
+
+        let err = result.expect_err("cancelled call must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("cancel"),
+            "tool error must surface the cancelled cause: {err}"
+        );
+        assert!(
+            cancel_elapsed < Duration::from_millis(500),
+            "cancel must observe the registry within ~50 ms slice, elapsed = {cancel_elapsed:?}"
         );
     }
 
