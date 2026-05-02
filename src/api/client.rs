@@ -269,6 +269,25 @@ pub struct WorkflowyClient {
 
 impl WorkflowyClient {
     pub fn new(base_url: String, api_key: String) -> Result<Self> {
+        Self::new_with_configs(
+            base_url,
+            api_key,
+            RetryConfig::default(),
+            RateLimitConfig::default(),
+        )
+    }
+
+    /// Construct a client with explicit retry and rate-limit configs.
+    /// Production callers should use [`Self::new`] (which honours the
+    /// project-wide defaults). Tests use this entry point to dial down
+    /// retry attempts and dial up the rate limit so load tests run in
+    /// milliseconds instead of seconds.
+    pub fn new_with_configs(
+        base_url: String,
+        api_key: String,
+        retry_config: RetryConfig,
+        rate_limit_config: RateLimitConfig,
+    ) -> Result<Self> {
         use std::sync::atomic::AtomicI64;
         let http_client = Client::builder()
             .timeout(Duration::from_secs(defaults::HTTP_TIMEOUT_SECS))
@@ -279,8 +298,8 @@ impl WorkflowyClient {
             http_client,
             base_url,
             api_key,
-            retry_config: RetryConfig::default(),
-            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
+            retry_config,
+            rate_limiter: Arc::new(RateLimiter::new(rate_limit_config)),
             last_request_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_success_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_auth_failure_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

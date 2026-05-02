@@ -555,6 +555,11 @@ pub struct WorkflowyMcpServer {
     /// via `get_recent_tool_calls` to self-diagnose hangs and
     /// unexpected returns within a session.
     op_log: OpLog,
+    /// Wall-clock budget for single-node read tools. Defaults to
+    /// [`defaults::READ_NODE_TIMEOUT_MS`]; tests dial it down via
+    /// [`Self::with_read_budget_ms`] so failure-mode coverage runs in
+    /// milliseconds instead of the production 30 s.
+    read_budget_ms: u64,
 }
 
 // --- Parameter structs ---
@@ -1058,7 +1063,20 @@ impl WorkflowyMcpServer {
             in_flight_walks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tree_size_estimate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             op_log: OpLog::new(),
+            read_budget_ms: defaults::READ_NODE_TIMEOUT_MS,
         }
+    }
+
+    /// Test-only: override the wall-clock budget that
+    /// [`Self::with_read_budget`] applies to single-node read tools.
+    /// Production goes through [`Self::new`]/[`Self::with_cache`] which
+    /// honours [`defaults::READ_NODE_TIMEOUT_MS`]; tests dial this down
+    /// to milliseconds so failure paths exercise in test time rather
+    /// than wall-clock time.
+    #[cfg(test)]
+    pub(crate) fn with_read_budget_ms(mut self, ms: u64) -> Self {
+        self.read_budget_ms = ms;
+        self
     }
 
     /// Production constructor: as `with_cache`, plus configure the
@@ -1123,11 +1141,8 @@ impl WorkflowyMcpServer {
     where
         F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
     {
-        self.with_read_budget_inner(
-            fut,
-            Duration::from_millis(defaults::READ_NODE_TIMEOUT_MS),
-        )
-        .await
+        self.with_read_budget_inner(fut, Duration::from_millis(self.read_budget_ms))
+            .await
     }
 
     /// Implementation of [`Self::with_read_budget`] with the budget injected.
@@ -6363,52 +6378,6 @@ mod tests {
         assert!(matches!(result, Ok(42)));
     }
 
-    /// Regression for the 2026-04-30 wedge: `list_children` against an
-    /// unreachable upstream must surface a structured tool error rather than
-    /// hang the tool surface. The test pin is the structured `tool_error`
-    /// payload — that is the contract handlers use to signal a bounded
-    /// failure to the MCP client. The clock bound is asserted with a generous
-    /// outer `tokio::time::timeout` so a regression that re-introduces the
-    /// retry-loop hang trips the test instead of timing out the whole suite.
-    #[tokio::test]
-    async fn list_children_against_unreachable_upstream_returns_bounded_error() {
-        let server = new_test_server();
-        let params = GetChildrenParams { node_id: NodeId::from(valid_id()) };
-        let result = tokio::time::timeout(
-            // Generous bound: reqwest connect failures complete in ms; even
-            // with retries the call must not approach 60 s. Anything beyond
-            // that means the budget is no longer being applied.
-            Duration::from_secs(60),
-            server.list_children(Parameters(params)),
-        )
-        .await
-        .expect("list_children must return within the bounded budget, not the suite timeout");
-        let err = result.expect_err("unreachable upstream must surface a tool_error");
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("list_children"),
-            "tool error must name the operation: {msg}"
-        );
-    }
-
-    /// Same regression as above for `get_node`. The handler runs the parent
-    /// + children fetches in parallel inside `with_read_budget`, so a hung
-    /// upstream cannot stretch this past the read budget.
-    #[tokio::test]
-    async fn get_node_against_unreachable_upstream_returns_bounded_error() {
-        let server = new_test_server();
-        let params = GetNodeParams { node_id: NodeId::from(valid_id()) };
-        let result = tokio::time::timeout(
-            Duration::from_secs(60),
-            server.get_node(Parameters(params)),
-        )
-        .await
-        .expect("get_node must return within the bounded budget, not the suite timeout");
-        let err = result.expect_err("unreachable upstream must surface a tool_error");
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("get_node"), "tool error must name the operation: {msg}");
-    }
-
     #[tokio::test]
     async fn health_check_reports_degraded_on_unreachable_api() {
         // The test client points at an unreachable host, so the probe must
@@ -6747,5 +6716,518 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.is_cancelled(), "cancel_all must flip outstanding guards");
+    }
+}
+
+/// Load and concurrency tests against a real (in-process) HTTP mock.
+///
+/// Why this exists: the existing test suite uses `http://invalid.local`
+/// to exercise the no-network failure mode. That validates the bounded-
+/// error contract but cannot simulate the failure the 2026-04-30 MCP
+/// failure report actually described — an upstream that *accepts the
+/// connection* and then sits on it. wiremock binds to a random
+/// localhost port and lets us script per-request delays, so the
+/// failure modes from the report are exercised end-to-end through the
+/// real reqwest stack at millisecond granularity.
+///
+/// Rate limiter is dialled to 200 rps / burst 100 in this module so 20-
+/// call bursts complete in milliseconds rather than seconds. Retry
+/// attempts are dialled to 1 so a single-request test exercises a
+/// single network round-trip without backoff noise. Read-budget is
+/// kept tight (300 ms) so `Timeout` paths return promptly.
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use crate::config::{RateLimitConfig, RetryConfig};
+    use crate::types::NodeId;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn fast_retry() -> RetryConfig {
+        RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 10,
+            max_delay_ms: 20,
+            retryable_statuses: defaults::RETRY_STATUSES,
+        }
+    }
+
+    fn fast_rate_limit() -> RateLimitConfig {
+        RateLimitConfig {
+            requests_per_second: 200,
+            burst_size: 100,
+        }
+    }
+
+    /// 32-hex-char canonical UUID used in tests. Matches the
+    /// `valid_id()` helper in the parent module so tool handlers
+    /// validate it the same way.
+    fn id_a() -> &'static str {
+        "11111111-2222-3333-4444-555555555555"
+    }
+
+    async fn server_against(mock: &MockServer) -> WorkflowyMcpServer {
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .expect("client must build against mock"),
+        );
+        WorkflowyMcpServer::new(client).with_read_budget_ms(300)
+    }
+
+    fn body_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Failure 2 from the 2026-04-30 report — the headline failure: the
+    /// upstream accepts the connection and never responds. Without a
+    /// budget the call wedges for ~3.5 min. With `with_read_budget` the
+    /// tool returns a structured error in ~budget. Mock delays 5 s, the
+    /// server's read budget is 300 ms — the assertion is that the call
+    /// returns well under the mock delay (proving the budget fired,
+    /// not the mock).
+    #[tokio::test]
+    async fn list_children_against_hung_upstream_returns_within_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"nodes": []})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("list_children"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "budget must fire well under the 5 s mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// Same failure shape on `get_node`. Both reads (parent + children)
+    /// run in parallel inside `with_read_budget`, so a hung upstream
+    /// cannot stretch the call past the budget on either branch.
+    #[tokio::test]
+    async fn get_node_against_hung_upstream_returns_within_budget() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({"node": null, "nodes": []})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .get_node(Parameters(GetNodeParams { node_id: NodeId::from(id_a()) }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("hung upstream must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("get_node"),
+            "tool error must name the operation: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "budget must fire well under the 5 s mock delay, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// The most diagnostic data point in the 2026-04-30 report:
+    /// `cancel_all` itself appeared to hang for 4 minutes. Once
+    /// in-flight reads observe the cancel registry, `cancel_all` drops
+    /// the in-flight future on the next 50 ms cancel-poll tick. Mock
+    /// delays 30 s; cancel fires after 100 ms; assertion is that the
+    /// call returns Cancelled within ~300 ms.
+    #[tokio::test]
+    async fn cancel_all_preempts_inflight_list_children_within_50ms_slice() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(json!({"nodes": []})),
+            )
+            .mount(&mock)
+            .await;
+
+        // Long read budget — we want cancel, not deadline, to win.
+        let server = Arc::new(server_against(&mock).await.with_read_budget_ms(60_000));
+        let server_for_call = Arc::clone(&server);
+        let call = tokio::spawn(async move {
+            server_for_call
+                .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                .await
+        });
+
+        // Let the call enter its delay, then cancel.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cancel_started = Instant::now();
+        server.cancel_registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("cancel must preempt within the test budget")
+            .expect("task must not panic");
+        let cancel_elapsed = cancel_started.elapsed();
+
+        let err = result.expect_err("cancelled call must surface a tool_error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("cancel"),
+            "tool error must surface the cancelled cause: {msg}"
+        );
+        assert!(
+            cancel_elapsed < Duration::from_millis(500),
+            "cancel must observe the registry within ~50 ms cancel-poll slice, elapsed = {cancel_elapsed:?}"
+        );
+    }
+
+    /// Burst load: 20 concurrent `list_children` calls against a
+    /// healthy mock, modelling the smoke test from the failure report.
+    /// The dispatcher must complete the burst without dropping calls
+    /// or wedging the surface. Time is loosely bounded: rate-limit
+    /// burst plus the per-call HTTP RTT.
+    #[tokio::test]
+    async fn burst_of_20_list_children_completes_under_load() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nodes": [
+                    {
+                        "id": "22222222-3333-4444-5555-666666666666",
+                        "name": "child"
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let s = Arc::clone(&server);
+            handles.push(tokio::spawn(async move {
+                s.list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                    .await
+            }));
+        }
+        let mut ok_count = 0;
+        for h in handles {
+            let res = h.await.expect("task must not panic");
+            if res.is_ok() {
+                ok_count += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(ok_count, 20, "every call in the burst must succeed");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "20-call burst must complete under load, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// The failure mode the report described in step 9: one slow call
+    /// holds a connection / rate-limiter slot, and subsequent calls
+    /// queue behind it. With `with_read_budget` dropping the slow call
+    /// on its deadline, the rest of the surface stays responsive.
+    ///
+    /// Setup: the mock is configured so the very first request hangs
+    /// for 30 s; every subsequent request returns 200 immediately. The
+    /// hung call must hit its budget; the calls behind it must each
+    /// complete on their own, not wait for the hung one to finish.
+    #[tokio::test]
+    async fn one_hung_call_does_not_wedge_other_reads() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // A custom Respond impl that delays only the first request.
+        struct FirstCallHangs(Arc<AtomicUsize>);
+        impl wiremock::Respond for FirstCallHangs {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_json(json!({"nodes": []}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "nodes": [{
+                            "id": "22222222-3333-4444-5555-666666666666",
+                            "name": "child"
+                        }]
+                    }))
+                }
+            }
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(FirstCallHangs(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+
+        // Fire the hung call first; let it claim the first response.
+        let s_hung = Arc::clone(&server);
+        let hung = tokio::spawn(async move {
+            s_hung
+                .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now fire 5 follow-up calls. They must all return promptly,
+        // independent of the hung one.
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let s = Arc::clone(&server);
+            handles.push(tokio::spawn(async move {
+                s.list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("follow-up task must not panic")
+                .expect("follow-up call must succeed despite the hung one");
+        }
+        let followups_elapsed = started.elapsed();
+
+        // Hung call's outcome is asserted last; we want the follow-up
+        // assertion to fail loud if the surface is wedged.
+        assert!(
+            followups_elapsed < Duration::from_secs(2),
+            "follow-up calls must not queue behind the hung one, elapsed = {followups_elapsed:?}"
+        );
+
+        let hung_result = tokio::time::timeout(Duration::from_secs(2), hung)
+            .await
+            .expect("hung call must hit its budget within the test timeout")
+            .expect("task must not panic");
+        assert!(
+            hung_result.is_err(),
+            "hung call must surface a budget error: {hung_result:?}"
+        );
+    }
+
+    /// Propagation-retry happy path: the first 404 doesn't fail the
+    /// call — the retry loop in `*_with_propagation_retry` waits for
+    /// the upstream to catch up. Mock returns 404 then 200; the tool
+    /// returns the eventual 200.
+    #[tokio::test]
+    async fn list_children_recovers_from_propagation_lag_404() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        struct FirstIs404(Arc<AtomicUsize>);
+        impl wiremock::Respond for FirstIs404 {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(404)
+                        .set_body_json(json!({"error": "not found"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "nodes": [{
+                            "id": "22222222-3333-4444-5555-666666666666",
+                            "name": "child"
+                        }]
+                    }))
+                }
+            }
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(FirstIs404(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        // Read budget needs to be large enough to absorb the 200 ms
+        // propagation backoff plus a fast second call.
+        let server = server_against(&mock).await.with_read_budget_ms(2_000);
+        let result = server
+            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .await
+            .expect("call must succeed after propagation retry");
+        let body = body_text(&result);
+        assert!(body.contains("child"), "must return the eventual 200 body: {body}");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "expected one retry");
+    }
+
+    /// Transport-level retry: a connection-reset on the first attempt
+    /// must flow through the backoff loop instead of returning
+    /// `RetryExhausted` after one shot. Mock drops the first request
+    /// at the connection layer (5xx as a stand-in for transport
+    /// failure since wiremock can't easily reset a TCP connection
+    /// mid-flight); the tool returns the second-attempt 200.
+    ///
+    /// The retry budget for this test is 2 attempts so the mock's
+    /// scripted recovery is observable.
+    #[tokio::test]
+    async fn list_children_retries_503_within_read_budget() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        struct FirstIs503(Arc<AtomicUsize>);
+        impl wiremock::Respond for FirstIs503 {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "nodes": [{
+                            "id": "22222222-3333-4444-5555-666666666666",
+                            "name": "child"
+                        }]
+                    }))
+                }
+            }
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(FirstIs503(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                RetryConfig {
+                    max_attempts: 2,
+                    base_delay_ms: 10,
+                    max_delay_ms: 20,
+                    retryable_statuses: defaults::RETRY_STATUSES,
+                },
+                fast_rate_limit(),
+            )
+            .unwrap(),
+        );
+        let server = WorkflowyMcpServer::new(client).with_read_budget_ms(2_000);
+
+        let result = server
+            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .await
+            .expect("call must recover after one 503");
+        assert!(body_text(&result).contains("child"));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expected exactly one retry"
+        );
+    }
+
+    /// Auth failures (401/403) are not retried — the answer won't
+    /// change. The tool should surface the failure quickly so the
+    /// caller can fix the API key, not wait for the read budget.
+    #[tokio::test]
+    async fn list_children_does_not_retry_on_401() {
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        struct CountingResponder(Arc<AtomicUsize>);
+        impl wiremock::Respond for CountingResponder {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({"error": "unauthorized"}))
+            }
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(CountingResponder(Arc::clone(&counter)))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let started = Instant::now();
+        let result = server
+            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("401 must surface a tool_error");
+        assert!(elapsed < Duration::from_millis(500), "no retry on 401: {elapsed:?}");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "401 must not be retried"
+        );
+        let _ = err; // surface check above is sufficient
+    }
+
+    /// Sanity check: the `path("/nodes")` matcher above is
+    /// intentionally narrow — children listing uses
+    /// `?parent_id=<id>` and the top-level listing has no query, but
+    /// both share the same path. This test pins the routing so a
+    /// future change that splits the endpoints can't silently drop
+    /// either listing.
+    #[tokio::test]
+    async fn children_query_param_is_passed_to_upstream() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .and(query_param("parent_id", id_a()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nodes": []
+            })))
+            .mount(&mock)
+            .await;
+        // Also accept a fallback for any unmatched request so we get a
+        // useful error if the matcher above doesn't fire.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .list_children(Parameters(GetChildrenParams { node_id: NodeId::from(id_a()) }))
+            .await
+            .expect("call must succeed against the parent_id matcher");
+        let body = body_text(&result);
+        assert!(body.contains("no children"), "body: {body}");
     }
 }

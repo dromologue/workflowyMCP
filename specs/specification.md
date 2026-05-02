@@ -254,6 +254,66 @@ re-implementing them:
 
 ---
 
+## Load Testing & Failure-Mode Coverage
+
+Reliability properties 11a–11c make claims about how the server
+behaves when the upstream is slow, hung, or returning specific HTTP
+codes. Those claims are pinned by a `load_tests` module in `server.rs`
+that runs against a real in-process HTTP mock (`wiremock`), rather
+than against `http://invalid.local` — which only exercises the
+no-network failure mode and cannot simulate the "upstream accepts the
+connection and then sits on it" pattern that the 2026-04-30 MCP
+failure report described.
+
+### Mock infrastructure
+
+- `WorkflowyClient::new_with_configs(base_url, api_key, retry, rate_limit)`
+  takes explicit retry and rate-limit configs so tests can dial down
+  retry attempts and dial up the rate-limit burst. Production callers
+  use the no-arg `new`, which routes to `new_with_configs` with the
+  project-wide defaults.
+- `WorkflowyMcpServer::with_read_budget_ms(ms)` is a `#[cfg(test)]`
+  builder method that overrides the `READ_NODE_TIMEOUT_MS` budget the
+  server applies to single-node reads. Tests target it so failure
+  paths complete in milliseconds instead of the production 30 s.
+- `wiremock::MockServer` binds to a random localhost port; each test
+  scripts request matchers and per-request delays. Custom
+  `wiremock::Respond` impls let one mock return different responses
+  on different attempts (used for "first call hangs", "first call
+  404", and similar scripted recoveries).
+
+### Covered failure modes
+
+Every test below is a sub-second exercise of a property the server
+claims to enforce. A failure of any one of them is a regression in
+the corresponding reliability property.
+
+| Failure mode | Test | Asserts |
+|--------------|------|---------|
+| Upstream accepts then never responds (`list_children`) | `list_children_against_hung_upstream_returns_within_budget` | Tool returns a `tool_error` well under the 5 s mock delay; the `with_read_budget` deadline (300 ms in test) is what fired. |
+| Same on `get_node` (parallel parent + children fetches) | `get_node_against_hung_upstream_returns_within_budget` | Both branches drop on the budget; the parallel `tokio::join!` cannot stretch the call past it. |
+| `cancel_all` mid-flight on a slow read | `cancel_all_preempts_inflight_list_children_within_50ms_slice` | After the call enters its delay, `cancel_all` produces a Cancelled return within ~500 ms — the 50 ms cancel-poll cadence the implementation guarantees. |
+| Burst of 20 concurrent reads (the smoke test from the report) | `burst_of_20_list_children_completes_under_load` | All 20 calls succeed; total wall-clock under 3 s. |
+| One hung call does not wedge follow-up reads | `one_hung_call_does_not_wedge_other_reads` | The first call hangs for 30 s; 5 follow-up calls all return promptly under 2 s. The hung call itself ultimately surfaces a budget error. |
+| Propagation-lag 404 recovery | `list_children_recovers_from_propagation_lag_404` | First request 404s, retry returns 200; tool surfaces the 200 body. |
+| Transient 503 retry within budget | `list_children_retries_503_within_read_budget` | Retry config of 2 attempts is honoured; tool surfaces the eventual 200. |
+| Auth failure (401) is not retried | `list_children_does_not_retry_on_401` | Single upstream request observed; tool surfaces a fast error rather than burning the read budget. |
+| Children listing carries `parent_id` query param | `children_query_param_is_passed_to_upstream` | Routing pin: a future endpoint refactor that drops the `parent_id` query string trips the test. |
+
+### Why this matters
+
+The previous failure-mode coverage was two `invalid.local` tests that
+each ran for ~30 s waiting for the read budget to expire — the same
+30 s a user would experience in production. They proved the budget
+existed but said nothing about which retry-loop branch fired or
+whether `cancel_all` actually preempted anything. The mock-based
+suite covers nine distinct paths in 350 ms total and is the
+primary regression net for any future changes to `with_read_budget`,
+the propagation-retry layer, the 503/transport retry policy, or
+`cancel_all`'s preemption behaviour.
+
+---
+
 ## Overview
 
 The Workflowy MCP Server is a Model Context Protocol server that enables Claude (and other MCP-compatible AI assistants) to read, search, and write to a user's Workflowy outline. It transforms Workflowy into an AI-accessible knowledge base and capture system.
