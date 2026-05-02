@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                  # compile (debug)
 cargo build --release        # compile (optimized, LTO)
-cargo test --lib             # run all unit tests (~242)
+cargo test --lib             # run all unit tests (~283)
 cargo test                   # run all tests (unit + integration)
 cargo run --bin workflowy-mcp-server  # start MCP server
 cargo check                  # type-check without building
@@ -19,7 +19,7 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 
 ### Module Structure
 
-- **`src/server.rs`** — MCP tool_router with 23 tool handlers. `#[tool]` proc macros register tools; serde + schemars validate inputs via `Parameters<T>` wrapper. Uses `NodeId` newtype for all node ID parameters.
+- **`src/server.rs`** — MCP tool_router with 38 tool handlers. `#[tool]` proc macros register tools; serde + schemars validate inputs via `TracedParams<T>` wrapper (a drop-in replacement for `rmcp::Parameters<T>` that records framework-level deserialization failures to the op log before returning the typed `McpError`). Uses `NodeId` newtype for all node ID parameters. Every parameter struct carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded error instead of silently defaulting to `None`.
 - **`src/api/client.rs`** — Workflowy API client with exponential backoff retry. `get_subtree_recursive()` fetches tree level-by-level via `/nodes?parent_id=` with configurable depth limit (crucial for 250k+ node trees). Returns `SubtreeFetch { nodes, truncated, limit }`; when the `MAX_SUBTREE_NODES` cap (10 000 by default, `defaults.rs`) is hit the flag is surfaced in every tool response so callers can narrow the scope.
 - **`src/defaults.rs`** — Centralized constants for all magic numbers (cache TTL, retry config, validation limits, tree depth defaults).
 - **`src/types.rs`** — Core types including `NodeId` newtype with `Deref<str>`, `AsRef<str>`, `PartialEq<String>`, and `JsonSchema` impls.
@@ -29,8 +29,19 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 ### Request Flow
 
 ```
-MCP tool call → serde deserialization → Parameters<T> → handler → WorkflowyClient → retry loop → Workflowy API
+MCP tool call → TracedParams<T> (serde + op_log on failure) → record_op! → handler → run_handler (kind-specific budget + cancel) → WorkflowyClient → retry loop → Workflowy API
 ```
+
+Two recorder points sit on this path:
+1. **`TracedParams::from_context_part`** records an Err entry to the op
+   log when serde rejects the payload — covering the path that the
+   rmcp framework would otherwise drop before the handler body runs.
+2. **`record_op!`** (inside every handler) records the handler's own
+   outcome (Ok or Err).
+
+Together they guarantee every tool call attempt produces exactly one
+op-log entry. Brief 2026-05-02 named the framework-rejection silence
+as the dominant debugging black hole; `TracedParams` closes it.
 
 Write operations invalidate the node cache via `self.cache.invalidate_node(id)` (cache is dependency-injected).
 
@@ -80,18 +91,21 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 
 - `bulk_update` `complete` / `uncomplete` are rejected at the handler boundary — the Workflowy completion endpoints are not yet modelled in the client. Tag-based workflows are the interim substitute.
 - Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000) **and** at `defaults::SUBTREE_FETCH_TIMEOUT_MS` (20 000 ms). Tools surface a `truncated` flag plus a `truncation_reason` (`node_limit` / `timeout` / `cancelled`) when either budget fires; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
-- `find_node` refuses to scan from the workspace root when `parent_id` is omitted. Pass `parent_id`, set `allow_root_scan=true` to accept the full walk, or set `use_index=true` after running `build_name_index` to serve from the opportunistic name index.
+- `find_node` and `search_nodes` refuse to scan from the workspace root when `parent_id` is omitted. Pass `parent_id`, set `allow_root_scan=true` to accept the full walk, or (find_node only) set `use_index=true` after running `build_name_index` to serve from the opportunistic name index.
+- `insert_content` caps at `defaults::MAX_INSERT_CONTENT_LINES` (200) per call. Above the soft warn threshold (`SOFT_WARN_INSERT_CONTENT_LINES`, 80) the success response includes a chunking hint. The hard cap exists because oversized payloads have been observed to fail at the MCP transport layer before reaching the handler — split into batches of ≤80 and pass each batch's `last_inserted_id` as `parent_id` of the next call to preserve hierarchy.
 - `edit_node` requires at least one of `name` or `description`; an empty patch is rejected at the handler boundary rather than POSTed as `{}`.
 - `move_node` invalidates the cache for the node, the new parent, **and** the old parent (captured via a pre-read). The name index is invalidated for the moved node.
 - `cancel_all` bumps the cancel-registry generation: every outstanding tree walk returns partial results on its next checkpoint with `truncation_reason = "cancelled"`. New calls start fresh.
 - `health_check` calls `GET /nodes` (top-level only) with a 5-second budget; it is safe to use as a liveness probe regardless of tree size.
+- `list_children` accepts both `node_id` and `parent_id` for the parent-to-list-children-of, since every other tool in this server that scopes to a parent uses `parent_id`. Both names reach the handler with the same semantics. Any third name fails the `deny_unknown_fields` check with a typed `unknown field` error.
+- `degraded` self-clears on recovery: once the failing tool returns OK, `workflowy_status.last_failure` and the `DEGRADED` warning that gates `create_node` both clear together via `OpLog::last_unrecovered_failure`. A success on a *different* tool does NOT clear another tool's failure warning.
 
 ## Testing
 
 Unit tests use `#[cfg(test)]` modules alongside source. No live API calls in unit tests. Integration test in `tests/live_insert.rs` requires `WORKFLOWY_API_KEY`.
 
 ```bash
-cargo test --lib                           # unit tests only (159 tests)
+cargo test --lib                           # unit tests only (283 tests)
 cargo test --lib -- test_name              # run specific test
 cargo test --lib -- --nocapture            # with stdout
 ```

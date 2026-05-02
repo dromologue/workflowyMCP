@@ -310,6 +310,118 @@ re-implementing them:
    a separate, non-transactional pipelined creator for cases where
    per-op partial success is acceptable.
 
+13. **Framework-level failures are observable.** Every handler accepts
+    its parameters via `TracedParams<T>`, a drop-in replacement for
+    `rmcp::Parameters<T>` that records every deserialization failure
+    to the op log *before* returning the typed `McpError` to the
+    transport. The rmcp standard wrapper rejects malformed requests
+    before the handler body runs — meaning `per_tool_health.<tool>.err`
+    never moved on "invalid parameters" failures, and the MCP client
+    surfaced the bare string `Tool execution failed` with no
+    diagnostic. Brief 2026-05-02 named that as the dominant debugging
+    black hole. With `TracedParams` in place, every rejected call
+    appears in the op log, every rejection carries a typed
+    `proximate_cause` in its data payload, and `per_tool_health`
+    reflects the real failure rate rather than just the failures that
+    happened to clear deserialization first. The schema, serde wire
+    format, and destructuring (`TracedParams(p)`) match `Parameters`
+    exactly — the only behavioural difference is observability on the
+    failure path.
+
+14. **Parameter mismatches are typed, not silent.** Every parameter
+    struct carries `#[serde(deny_unknown_fields)]`. Brief 2026-05-02
+    pinned the "list_children intermittently returns workspace root"
+    symptom to callers (correctly) sending `parent_id`, which serde
+    silently dropped because the struct field was named `node_id`.
+    Two changes close the gap: (a) `deny_unknown_fields` converts
+    silent drops into typed `unknown field` deserialize errors that
+    `TracedParams` records and surfaces; (b) `GetChildrenParams.node_id`
+    accepts `parent_id` as an alias because every other tool in this
+    server that scopes to a parent uses that name. Both names now
+    reach the handler with the same semantics, and any third name
+    fails fast with a clear diagnostic instead of producing wrong
+    results.
+
+15. **`insert_content` payload cap with chunking guidance.** Brief
+    2026-05-02 reported a 130-line `insert_content` payload returning
+    bare `Tool execution failed` with no per-tool counter movement —
+    the request was being dropped at the MCP transport layer before
+    reaching the handler. Server-side, every line creates a node
+    individually; the server can handle the load. The transport, on
+    some clients, cannot carry an arbitrary-sized request body. Two
+    new defaults make the actual limit visible:
+    `MAX_INSERT_CONTENT_LINES` (200, hard cap — refused at the handler
+    boundary with a typed error and a chunking instruction) and
+    `SOFT_WARN_INSERT_CONTENT_LINES` (80, the empirically-safe
+    ceiling — successful payloads above this still return Ok but the
+    response includes a chunking hint). Together they replace the
+    unobservable transport drop with an actionable error message:
+    "split into batches of ≤80, call once per batch, pass
+    `last_inserted_id` from each batch as `parent_id` of the next to
+    preserve hierarchy."
+
+16. **`search_nodes` refuses unscoped walks by default.** Mirrors
+    `find_node`'s gate. Brief 2026-05-02: `search_nodes` with
+    `parent_id: null` walks workspace root, hits the 20 s subtree
+    budget, and returns a partial result whose Walk-stopped-at marker
+    is somewhere in `Tasks > System Tasks` — never reaching the
+    content the caller wanted. The fix is the same gate `find_node`
+    has: when `parent_id` is omitted (or null), the call is refused
+    unless `allow_root_scan: true` is passed explicitly. The error
+    message names both recovery paths (scope with `parent_id` or opt
+    in to the full walk) so the caller is never stuck guessing.
+
+17. **`degraded` self-clears on recovery.** `last_failure` on the op
+    log used to surface every recorded failure regardless of
+    subsequent successes — once a failure landed in the window, every
+    `workflowy_status` query reported `degraded` even after the
+    failing tool had recovered. The op log now exposes
+    `last_unrecovered_failure`: the most recent failure that has NOT
+    been followed by a success on the same tool. `workflowy_status`
+    surfaces this in the `last_failure` field, and
+    `degraded_warning_if_recent_failure` consults the same helper, so
+    both diagnostic surfaces self-clear together. A success on a
+    *different* tool does not clear another tool's failure warning —
+    a broken tool stays broken until it itself returns OK.
+
+---
+
+## Uniform Failure Contract (Brief 2026-05-02)
+
+Pulling 13–17 together: every failure mode is now either prevented at
+the boundary or observable through a single uniform path. The
+diagnostic surfaces are a coherent set, not a scatter of
+half-overlapping signals:
+
+| Failure mode | Observed via | Self-clearing |
+|---|---|---|
+| Invalid parameters | `op_log` (via `TracedParams`) + `per_tool_health` | n/a (per-call) |
+| Unknown field | `op_log` (via `TracedParams`, deserialize error) | n/a |
+| Oversized `insert_content` | typed handler error with `proximate_cause` | n/a |
+| Unscoped tree walk | typed handler error from gate | n/a |
+| Upstream timeout | `op_log` + `tool_error` data + `last_unrecovered_failure` | yes — clears on next OK for same tool |
+| Cancellation | `op_log` + `truncation_reason: "cancelled"` | yes — fresh guards on next call |
+| Auth failure | `recent_auth_failure(5min)` | yes — clears 5 min after last 401/403 |
+
+The contract callers can rely on:
+
+- **Every tool call attempt produces exactly one op-log entry**, OK or
+  Err. There is no silent path. Even a request rejected at parameter
+  deserialization is recorded.
+- **Every error response carries a `proximate_cause`** drawn from a
+  small enum (`timeout`, `cancelled`, `not_found`, `auth_failure`,
+  `upstream_error`, `lock_contention`, `cache_miss`, `unknown`).
+  Callers route on the enum, not on the human-readable message.
+- **No tool can hang past its `ToolKind` budget.** Read = 30 s,
+  Write = 15 s, Bulk = 210 s, Walk = 20 s (own internal). The cancel
+  registry preempts in-flight work within ~50 ms.
+- **No tool silently drops parameters.** Unknown fields fail fast.
+  Aliases for the same semantic concept (`parent_id` ↔ `node_id` on
+  `list_children`) are explicit, not implicit.
+- **`degraded` means there is unrecovered breakage right now.** It
+  does not mean "we saw a failure once". After the failing tool
+  returns OK, the warning clears.
+
 ---
 
 ## Load Testing & Failure-Mode Coverage

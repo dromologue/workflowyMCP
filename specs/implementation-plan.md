@@ -182,6 +182,29 @@ pub enum WorkflowyError {
 // Error propagation is forced by the compiler
 ```
 
+### Uniform error contract (Brief 2026-05-02)
+
+Every tool error response carries a typed `proximate_cause` drawn from
+`ProximateCause` (`timeout`, `cancelled`, `not_found`, `auth_failure`,
+`upstream_error`, `lock_contention`, `cache_miss`, `unknown`). Callers
+route on the enum, not on the human-readable message.
+
+Every tool call attempt produces exactly one op-log entry. Two
+recorder points cover the path:
+
+1. **`TracedParams::from_context_part`** — records an Err entry when
+   serde rejects the request payload. Without this, parameter
+   deserialization failures bypassed the op log entirely (the rmcp
+   framework rejected the request before the handler body ran), so
+   `per_tool_health.<tool>.err` never moved on those failures.
+2. **`record_op!`** — wraps every handler body, recording the
+   handler's own outcome.
+
+Together they guarantee no silent path. `OpLog::last_unrecovered_failure`
+self-clears once a success on the same tool lands after the failure,
+so `degraded` surfaces match the system's actual state instead of
+being sticky after recovery.
+
 ## Testing Strategy
 
 ### Unit Tests (in-module, `#[cfg(test)]`)

@@ -558,6 +558,67 @@
     runs the scripted session against the sandbox secret on push to
     `main` only.
 
+- [x] **T-165 (Brief 2026-05-02: uniform error model & observability)**:
+    Five symptoms — silent param drops, unobservable framework
+    failures, oversized `insert_content` returning bare
+    `Tool execution failed`, unscoped `search_nodes` timing out,
+    sticky `degraded` after recovery — share the same root cause:
+    silent failure modes scattered across the boundary between
+    transport, framework, and handler. The fixes unify the contract.
+  - **TracedParams<T>**: drop-in replacement for
+    `rmcp::Parameters<T>` that records every framework-level
+    deserialization failure to the op log *before* returning the typed
+    `McpError` to the transport. The rmcp standard wrapper rejects
+    malformed requests before the handler body runs, so
+    `per_tool_health.<tool>.err` never moved on "invalid parameters"
+    failures and the MCP client surfaced bare `Tool execution failed`
+    with no diagnostic. Routing every parameter extraction through
+    `TracedParams` closes the gap end-to-end. Schema, serde wire
+    format, and destructuring (`TracedParams(p)`) match `Parameters`
+    exactly. All 38 handlers migrated.
+  - **`#[serde(deny_unknown_fields)]` on every parameter struct**:
+    converts the silent-drop bug (e.g. `parent_id` passed to
+    `list_children` which expected `node_id` was silently ignored,
+    leading to "intermittent workspace root" symptom) into a typed
+    `unknown field` deserialize error that `TracedParams` records
+    and surfaces.
+  - **`parent_id` alias on `GetChildrenParams.node_id`**: every other
+    tool in this server that scopes to a parent uses `parent_id`, so
+    the natural mistake is to send that name to `list_children`. The
+    alias accepts both names with the same semantics.
+  - **`MAX_INSERT_CONTENT_LINES` (200, hard cap) and
+    `SOFT_WARN_INSERT_CONTENT_LINES` (80, safe ceiling)**:
+    `insert_content` now refuses oversized payloads at the handler
+    boundary with a typed error and a chunking instruction, replacing
+    the unobservable transport drop with an actionable message. The
+    success path emits a chunking hint when the payload is between
+    the soft warn and the hard cap. The cap exists because oversized
+    bodies have been observed to fail at the MCP transport layer
+    before reaching the handler — server-side, every line creates a
+    node individually and the server can handle the load.
+  - **`search_nodes.allow_root_scan` gate**: mirrors `find_node`'s
+    gate. Without `parent_id`, the call is refused unless
+    `allow_root_scan: true` is passed explicitly. The error message
+    names both recovery paths so the caller is never stuck guessing.
+  - **`OpLog::last_unrecovered_failure`**: most recent failure that
+    has NOT been followed by a success on the same tool.
+    `degraded_warning_if_recent_failure` and
+    `workflowy_status.last_failure` both consult this helper, so both
+    diagnostic surfaces self-clear together once the failing tool
+    returns OK.
+  - **Tests**: `get_children_params_accepts_parent_id_alias`,
+    `get_children_params_accepts_node_id`,
+    `get_children_params_rejects_unknown_field`,
+    `search_nodes_params_rejects_unknown_field`,
+    `search_nodes_params_accepts_allow_root_scan`,
+    `search_nodes_refuses_root_scan_by_default`,
+    `insert_content_refuses_payload_over_hard_cap`,
+    `traced_params_recorder_path_records_to_op_log`,
+    `last_unrecovered_failure_clears_after_success_on_same_tool`,
+    `last_unrecovered_failure_persists_across_other_tools`,
+    `degraded_warning_clears_after_get_node_recovery`. All 283 unit
+    tests pass.
+
 ---
 
 ## Phase 4: Quality & Documentation

@@ -115,13 +115,19 @@ Instrument like any production microservice.
 - Record latency, success/failure counts
 - Surface rate limits explicitly so agents can budget calls
 
-**Status**: ⚠️ Have structured tracing. **Gaps**: No correlation IDs per invocation. No latency recording. No rate limit info in responses.
+**Status**: ✅ Op log + per-tool health histogram + uniform error model close the brief 2026-05-02 visibility gap. **Remaining gaps**: no correlation IDs per invocation, no rate limit info in tool result text (only in `workflowy_status`).
+
+**Implemented**:
+- `TracedParams<T>` wrapper records every parameter-deserialization failure to the op log before returning the typed `McpError`. Brief 2026-05-02 named the framework-rejected requests (which never reached the handler body and thus never moved per-tool counters) as the dominant debugging black hole. `TracedParams` closes the gap end-to-end: every rejected call appears in the log, every rejection carries a typed `proximate_cause`.
+- `OpLog.last_unrecovered_failure()` self-clears once a success on the same tool lands after the failure, so `degraded` surfaces match what the system is actually doing.
+- `per_tool_health` histogram over the most recent 200 op-log entries reports `{total, ok, err, ok_rate, status}` per tool. Status thresholds: `healthy ≥ 75%`, `degraded ≥ 50%`, `failing < 50%`.
+- `paths` map in `workflowy_status` gives a flat tool→health-status view for callers that want to gate routing decisions without parsing the histogram.
+- Every parameter struct carries `#[serde(deny_unknown_fields)]` so a field-name typo fails fast with a typed error rather than a silent default.
 
 **Action items**:
-- Generate a request_id per tool invocation, include in all log spans
-- Add timing spans around API calls
-- Return rate limit info in tool results when approaching limits
-- Add metrics counters (tool_calls_total, tool_errors_total, tool_duration_seconds)
+- Generate a request_id per tool invocation, include in all log spans.
+- Return rate limit info in tool result text when approaching limits (currently only surfaced via `workflowy_status`).
+- Add metrics counters (tool_calls_total, tool_errors_total, tool_duration_seconds).
 
 ---
 

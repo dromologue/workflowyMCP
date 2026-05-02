@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        common::FromContextPart,
+        tool::{ToolCallContext, ToolRouter},
+    },
     model::{ErrorCode, *},
     schemars::JsonSchema,
     tool, tool_handler, tool_router,
@@ -295,7 +298,7 @@ fn load_recent_session_logs_blob_for_review() -> String {
 /// Use as the outermost expression of every tool handler:
 ///
 /// ```ignore
-/// async fn foo(&self, Parameters(params): Parameters<FooParams>) -> Result<CallToolResult, McpError> {
+/// async fn foo(&self, TracedParams(params): TracedParams<FooParams>) -> Result<CallToolResult, McpError> {
 ///     record_op!(self, "foo", params, {
 ///         // existing body, including `?` early returns
 ///     })
@@ -631,9 +634,67 @@ pub struct WorkflowyMcpServer {
     bulk_budget_ms: u64,
 }
 
+/// Drop-in replacement for `rmcp::handler::server::wrapper::Parameters`
+/// that records every framework-level deserialization failure to the op
+/// log *before* returning the typed `McpError` to the transport. The
+/// rmcp standard wrapper rejects malformed requests before the handler
+/// body runs, which means `per_tool_health.<tool>.err` never moved on
+/// "invalid parameters" failures and the MCP client surfaced the bare
+/// string `Tool execution failed` with no diagnostic.
+///
+/// Brief 2026-05-02 named that as the dominant debugging black hole.
+/// Routing every parameter extraction through `TracedParams` closes the
+/// gap end-to-end: every rejected call now appears in the op log, every
+/// rejection carries a typed `proximate_cause` in its data payload, and
+/// the per-tool counters reflect the real failure rate rather than just
+/// the failures that happened to clear deserialization first.
+///
+/// Schema (`JsonSchema`), serde wire format, and the destructuring
+/// pattern (`TracedParams(p)`) all match `Parameters` exactly — the
+/// only behavioural difference is observability on the failure path.
+pub struct TracedParams<T>(pub T);
+
+impl<T: JsonSchema> JsonSchema for TracedParams<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+    fn json_schema(g: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        T::json_schema(g)
+    }
+}
+
+impl<T> FromContextPart<ToolCallContext<'_, WorkflowyMcpServer>> for TracedParams<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    fn from_context_part(
+        context: &mut ToolCallContext<WorkflowyMcpServer>,
+    ) -> std::result::Result<Self, McpError> {
+        let arguments = context.arguments.take().unwrap_or_default();
+        let json_value = serde_json::Value::Object(arguments);
+        match serde_json::from_value::<T>(json_value.clone()) {
+            Ok(value) => Ok(TracedParams(value)),
+            Err(e) => {
+                // Record the rejection so per_tool_health reflects every
+                // attempt, not just the ones that reached the handler
+                // body. Without this the counters under-count by exactly
+                // the failure mode the LLM cannot recover from.
+                let msg = format!("invalid parameters: {}", e);
+                let recorder = context
+                    .service
+                    .op_log
+                    .record(context.name.to_string(), &json_value);
+                recorder.finish_err(&msg);
+                Err(tool_error(context.name.as_ref(), None, msg))
+            }
+        }
+    }
+}
+
 // --- Parameter structs ---
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Search for nodes in Workflowy by text")]
 pub struct SearchNodesParams {
     #[schemars(description = "Text query to search for in node names and descriptions")]
@@ -644,9 +705,17 @@ pub struct SearchNodesParams {
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to search (default: 3). Increase for deeper searches in large trees")]
     pub max_depth: Option<usize>,
+    /// Mirror of `find_node`'s gate. Brief 2026-05-02 reported
+    /// `search_nodes` with `parent_id: null` walking workspace root and
+    /// timing out at 20 s on any non-trivial tree, with no recovery
+    /// path. The fix is the same gate `find_node` already has: refuse
+    /// unscoped walks by default, require an explicit opt-in.
+    #[schemars(description = "Opt in to scanning from the workspace root when parent_id is omitted. Disabled by default because unscoped searches on large trees time out; pass parent_id to scope or set this true to accept the full walk.")]
+    pub allow_root_scan: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Get a specific node by its ID")]
 pub struct GetNodeParams {
     #[schemars(description = "The UUID of the node to retrieve")]
@@ -654,6 +723,7 @@ pub struct GetNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Create a new node in Workflowy")]
 pub struct CreateNodeParams {
     #[schemars(description = "The title/name of the new node")]
@@ -667,6 +737,7 @@ pub struct CreateNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Edit an existing node's name or description")]
 pub struct EditNodeParams {
     #[schemars(description = "The UUID of the node to edit")]
@@ -678,6 +749,7 @@ pub struct EditNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Delete a node from Workflowy")]
 pub struct DeleteNodeParams {
     #[schemars(description = "The UUID of the node to delete")]
@@ -685,6 +757,7 @@ pub struct DeleteNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Move a node to a new parent")]
 pub struct MoveNodeParams {
     #[schemars(description = "The UUID of the node to move")]
@@ -696,6 +769,7 @@ pub struct MoveNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Get all children of a node")]
 pub struct GetChildrenParams {
     /// Parent node ID. Omit OR set to `null` to list the workspace root's
@@ -703,12 +777,19 @@ pub struct GetChildrenParams {
     /// send `{}` for missing fields and others send `{"node_id": null}`;
     /// previously the latter intermittently surfaced "Tool execution
     /// failed" while the former returned the root listing.
-    #[serde(default)]
-    #[schemars(description = "Parent node ID (UUID or short hash). Omit OR pass null to list the workspace root's top-level nodes.")]
+    ///
+    /// Accepts the alias `parent_id` because every other tool in this
+    /// server that scopes to a parent uses that name. Brief 2026-05-02
+    /// pinned the "list_children intermittently returns workspace root"
+    /// symptom to callers (correctly) sending `parent_id`, which serde
+    /// silently dropped before `deny_unknown_fields` was wired in.
+    #[serde(default, alias = "parent_id")]
+    #[schemars(description = "Parent node ID (UUID or short hash). Omit OR pass null to list the workspace root's top-level nodes. Accepts `parent_id` as an alias.")]
     pub node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Search nodes by tag")]
 pub struct TagSearchParams {
     #[schemars(description = "Tag to search for (e.g. '#project' or '@person')")]
@@ -722,6 +803,7 @@ pub struct TagSearchParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Insert content as hierarchical nodes from indented text")]
 pub struct InsertContentParams {
     #[schemars(description = "Parent node ID to insert content under")]
@@ -731,6 +813,7 @@ pub struct InsertContentParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Get the full tree under a node")]
 pub struct GetSubtreeParams {
     #[schemars(description = "The UUID of the root node")]
@@ -740,6 +823,7 @@ pub struct GetSubtreeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Find a node by name with match mode support")]
 pub struct FindNodeParams {
     #[schemars(description = "Name of the node to find")]
@@ -759,6 +843,7 @@ pub struct FindNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Search for a target node and insert content under it")]
 pub struct SmartInsertParams {
     #[schemars(description = "Search text to find the target node")]
@@ -774,6 +859,7 @@ pub struct SmartInsertParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Daily review: overdue items, upcoming deadlines, and recent changes in one call")]
 pub struct DailyReviewParams {
     #[schemars(description = "Optional root node ID to scope the review")]
@@ -791,6 +877,7 @@ pub struct DailyReviewParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Get recently modified nodes within a time window")]
 pub struct GetRecentChangesParams {
     #[schemars(description = "Number of days to look back (default: 7)")]
@@ -806,6 +893,7 @@ pub struct GetRecentChangesParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "List overdue items sorted by most overdue first")]
 pub struct ListOverdueParams {
     #[schemars(description = "Optional root node ID to scope the search")]
@@ -819,6 +907,7 @@ pub struct ListOverdueParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "List items with upcoming due dates")]
 pub struct ListUpcomingParams {
     #[schemars(description = "Days ahead to look (default: 14)")]
@@ -834,6 +923,7 @@ pub struct ListUpcomingParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Get project summary with stats, tags, and recent changes")]
 pub struct GetProjectSummaryParams {
     #[schemars(description = "Root node ID of the project")]
@@ -845,6 +935,7 @@ pub struct GetProjectSummaryParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Find all nodes that contain a Workflowy link to a given node")]
 pub struct FindBacklinksParams {
     #[schemars(description = "The node ID to find backlinks for")]
@@ -856,6 +947,7 @@ pub struct FindBacklinksParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "List todo items with optional filtering")]
 pub struct ListTodosParams {
     #[schemars(description = "Parent node ID to scope todos under")]
@@ -871,6 +963,7 @@ pub struct ListTodosParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Deep-copy a node and its subtree to a new location")]
 pub struct DuplicateNodeParams {
     #[schemars(description = "The node ID to duplicate")]
@@ -884,6 +977,7 @@ pub struct DuplicateNodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Copy a template node with {{variable}} substitution")]
 pub struct CreateFromTemplateParams {
     #[schemars(description = "Template node ID to copy from")]
@@ -895,6 +989,7 @@ pub struct CreateFromTemplateParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Apply an operation to all nodes matching a filter")]
 pub struct BulkUpdateParams {
     #[schemars(description = "Text search filter")]
@@ -918,6 +1013,7 @@ pub struct BulkUpdateParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Convert markdown to Workflowy-compatible indented text format")]
 pub struct ConvertMarkdownParams {
     #[schemars(description = "Markdown content to convert")]
@@ -927,18 +1023,22 @@ pub struct ConvertMarkdownParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Quick diagnostic: verify Workflowy API reachability without a tree walk")]
 pub struct HealthCheckParams {}
 
 #[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Extended diagnostic: liveness plus in-flight workload, last-request latency, tree-size estimate, and upstream rate-limit headers")]
 pub struct WorkflowyStatusParams {}
 
 #[derive(Debug, Deserialize, JsonSchema, Default, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Cancel any in-flight tree walks. Future calls are unaffected")]
 pub struct CancelAllParams {}
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Return recent tool invocations from the in-memory ring buffer")]
 pub struct GetRecentToolCallsParams {
     #[schemars(description = "Maximum number of entries to return (default: 50, max bounded by buffer capacity)")]
@@ -948,6 +1048,7 @@ pub struct GetRecentToolCallsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "One create operation in a batch")]
 pub struct BatchCreateOpParams {
     #[schemars(description = "Name (text content) of the new node")]
@@ -961,6 +1062,7 @@ pub struct BatchCreateOpParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Create many nodes in one call. Operations run with bounded concurrency; results are returned in input order with per-operation status.")]
 pub struct BatchCreateNodesParams {
     #[schemars(description = "List of create operations to apply")]
@@ -968,6 +1070,7 @@ pub struct BatchCreateNodesParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "One operation inside a transaction. `op` is one of: create, edit, delete, move.")]
 pub struct TransactionOpParams {
     #[schemars(description = "Operation kind: create | edit | delete | move")]
@@ -991,6 +1094,7 @@ pub struct TransactionOpParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially (so dependencies resolve in order); on first failure the server replays inverse operations to roll back what already succeeded. True atomicity is not possible without upstream transaction support — this is a best-effort wrapper around per-op rollback.")]
 pub struct TransactionParams {
     #[schemars(description = "Operations to apply, in execution order")]
@@ -998,6 +1102,7 @@ pub struct TransactionParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Return the canonical hierarchical path from root to node")]
 pub struct PathOfParams {
     #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
@@ -1007,6 +1112,7 @@ pub struct PathOfParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Apply a single tag to many nodes in one call")]
 pub struct BulkTagParams {
     #[schemars(description = "List of node IDs to tag")]
@@ -1016,6 +1122,7 @@ pub struct BulkTagParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Cheap incremental check: did this node change after the given timestamp?")]
 pub struct SinceParams {
     #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
@@ -1025,6 +1132,7 @@ pub struct SinceParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Find nodes that combine a tag with a path-prefix filter")]
 pub struct FindByTagAndPathParams {
     #[schemars(description = "Tag to match (without leading #)")]
@@ -1040,6 +1148,7 @@ pub struct FindByTagAndPathParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Resolve a hierarchical path of node names to its UUID by walking each level — fast on huge trees because it costs one API call per path segment, not a full tree walk")]
 pub struct NodeAtPathParams {
     #[schemars(description = "Path segments from the start parent to the target. E.g. ['Areas', 'Personal', 'Opportunities', 'Nedbank']. Each segment is matched case-insensitively against children's names with HTML stripped. Whitespace is trimmed. Use this when you know where a node lives but not its UUID — far faster than search_nodes on large workspaces.")]
@@ -1049,6 +1158,7 @@ pub struct NodeAtPathParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Resolve a Workflowy internal link or short hash to its full node info — purpose-built for the 'I have a Workflowy URL, give me the node' workflow")]
 pub struct ResolveLinkParams {
     #[schemars(description = "Workflowy URL fragment or short hash. Accepts: full URLs ('https://workflowy.com/#/c4ae1944b67e'), bare 12-char URL-suffix hashes ('c4ae1944b67e'), 8-char doc-form prefixes ('c4ae1944'), or full UUIDs (in which case it just looks up node info).")]
@@ -1060,6 +1170,7 @@ pub struct ResolveLinkParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Export a subtree as OPML, Markdown, or JSON for backup or external processing")]
 pub struct ExportSubtreeParams {
     #[schemars(description = "Root of the subtree to export")]
@@ -1071,6 +1182,7 @@ pub struct ExportSubtreeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Stub for native Workflowy mirror creation. Workflowy's public REST surface does not expose mirror creation; this tool returns an informative error so callers don't silently fall back to a 'mirror_of: <uuid>' note convention.")]
 pub struct CreateMirrorParams {
     #[schemars(description = "Canonical node to mirror")]
@@ -1086,6 +1198,7 @@ pub struct CreateMirrorParams {
 /// applied today). `max_depth` is bounded by the standard subtree-walk
 /// budget; deeper trees return partial results with a truncation flag.
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Audit canonical_of/mirror_of markers across a subtree per the wflow Mirror Discipline convention")]
 pub struct AuditMirrorsParams {
     #[schemars(description = "Root of the audit (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
@@ -1098,6 +1211,7 @@ pub struct AuditMirrorsParams {
 /// `days_stale` defaults to 90 — cross-pillar concept maps with no
 /// edits in that window are surfaced for re-read.
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Surface revisit-due, multi-pillar, stale, and recently-cited content under a subtree")]
 pub struct ReviewParams {
     #[schemars(description = "Root of the review (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
@@ -1109,6 +1223,7 @@ pub struct ReviewParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Populate the opportunistic name index by walking a subtree")]
 pub struct BuildNameIndexParams {
     #[schemars(description = "Root node to start the walk from. Omit with allow_root_scan=true to walk the workspace root (expensive on large trees)")]
@@ -1569,7 +1684,12 @@ impl WorkflowyMcpServer {
     /// mutations wedged), but the helper is safe to call from any
     /// handler that wants the same gate.
     fn degraded_warning_if_recent_failure(&self, window_ms: u64) -> Option<String> {
-        let last = self.op_log.last_failure()?;
+        // Brief 2026-05-02: the warning was sticky — once any failure
+        // landed in the window, it persisted even after the failing
+        // tool recovered. `last_unrecovered_failure` self-clears once
+        // a success on the same tool lands after the failure, so the
+        // diagnostic surfaces match what the system actually does.
+        let last = self.op_log.last_unrecovered_failure()?;
         // Only count read/mutate failures, not validation/usage errors
         // from this same call class. The brief's failure mode was the
         // upstream wedging, not "I just got told my params are invalid".
@@ -1704,19 +1824,35 @@ impl WorkflowyMcpServer {
         Ok(fetch)
     }
 
-    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. For large trees, use parent_id to scope the search and max_depth to control depth.")]
+    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. PASS parent_id to scope the search; on large trees an unscoped (root-of-workspace) walk hits the 20 s subtree budget and times out before reaching most content. The unscoped walk is refused by default: set allow_root_scan=true to opt in, or scope with parent_id. Use max_depth to control depth.")]
     async fn search_nodes(
         &self,
-        Parameters(params): Parameters<SearchNodesParams>,
+        TracedParams(params): TracedParams<SearchNodesParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "search_nodes", params, {
         let max_results = params.max_results.unwrap_or(20);
         let max_depth = params.max_depth.unwrap_or(3);
-        info!(query = %params.query, max_results, max_depth, "Searching nodes");
+        let allow_root_scan = params.allow_root_scan.unwrap_or(false);
+        info!(query = %params.query, max_results, max_depth, allow_root_scan, "Searching nodes");
         let resolved_parent = match &params.parent_id {
             Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
+
+        // Refuse unscoped walks by default, mirroring find_node. Brief
+        // 2026-05-02: search_nodes with parent_id=null on a large tree
+        // burns its 20 s walk budget before reaching the content the
+        // caller wanted, then returns a partial result with no
+        // recovery path. The fix is the same gate find_node has:
+        // require either parent_id, or an explicit opt-in.
+        if resolved_parent.is_none() && !allow_root_scan {
+            return Err(McpError::invalid_params(
+                "search_nodes refuses to walk from the workspace root by default. \
+                 Pass parent_id to scope the search, or set allow_root_scan=true to \
+                 accept a full walk (bounded by the 20s subtree budget).".to_string(),
+                None,
+            ));
+        }
 
         match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(fetch) => {
@@ -1777,7 +1913,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Get a specific Workflowy node by its ID. Returns the node's full details (name, description, tags) plus a depth-1 listing of its direct children — matching what list_children would return for the same ID. The children listing costs one extra HTTP call; use list_children directly when you don't need the parent metadata.")]
     async fn get_node(
         &self,
-        Parameters(params): Parameters<GetNodeParams>,
+        TracedParams(params): TracedParams<GetNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "get_node", params, {
         info!(node_id = %params.node_id, "Getting node");
@@ -1845,7 +1981,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Create a new node in Workflowy. PREFER passing `parent_id` directly to the destination over the create-then-move pattern: a single create with parent_id has half the failure surface of create-at-root + move (verified 2026-04-25 — a created-at-root MOC was stranded for hours when follow-up move calls were dropped at the transport layer). Pattern 6d (brief 2026-04-25): omitting parent_id (or passing null) places the node at the workspace root — both have the same semantics. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves. When reads/mutations have failed in the last 30 s the success message is suffixed `⚠ DEGRADED: …` — do NOT chain follow-up writes on the new UUID until `workflowy_status` confirms the previously-failing tool is back to `healthy`.")]
     async fn create_node(
         &self,
-        Parameters(params): Parameters<CreateNodeParams>,
+        TracedParams(params): TracedParams<CreateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_node", params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
@@ -1905,7 +2041,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Edit an existing Workflowy node's name or description. At least one of name/description must be provided.")]
     async fn edit_node(
         &self,
-        Parameters(params): Parameters<EditNodeParams>,
+        TracedParams(params): TracedParams<EditNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "edit_node", params, {
         info!(node_id = %params.node_id, "Editing node");
@@ -1943,7 +2079,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Delete a Workflowy node by its ID.")]
     async fn delete_node(
         &self,
-        Parameters(params): Parameters<DeleteNodeParams>,
+        TracedParams(params): TracedParams<DeleteNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "delete_node", params, {
         info!(node_id = %params.node_id, "Deleting node");
@@ -1967,7 +2103,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Move a node to a new parent in Workflowy.")]
     async fn move_node(
         &self,
-        Parameters(params): Parameters<MoveNodeParams>,
+        TracedParams(params): TracedParams<MoveNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "move_node", params, {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
@@ -2014,7 +2150,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "List all children of a Workflowy node.")]
     async fn list_children(
         &self,
-        Parameters(params): Parameters<GetChildrenParams>,
+        TracedParams(params): TracedParams<GetChildrenParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "list_children", params, {
         // None / null = workspace root. The tool description and
@@ -2071,7 +2207,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Search for nodes by tag (e.g. #project, @person). Returns all nodes containing the specified tag. Use parent_id to scope and max_depth to control search depth.")]
     async fn tag_search(
         &self,
-        Parameters(params): Parameters<TagSearchParams>,
+        TracedParams(params): TracedParams<TagSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "tag_search", params, {
         let max_results = params.max_results.unwrap_or(50);
@@ -2125,10 +2261,10 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it. Bounded by an end-to-end budget (~210 s) so a flaky upstream cannot wedge the call past the MCP client's 4-min hard timeout. On timeout the response carries a structured partial-success payload (created_count, total_count, last_inserted_id, error) instead of returning bare 'no result received' — the caller can resume from where it stopped.")]
+    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it. PAYLOAD CAP: ≤200 lines per call (hard, refused with a typed error above this); ≤80 lines is the safe ceiling that has not been observed to fail at the MCP transport layer. Above 80 lines the success response includes a chunking hint. Bounded by an end-to-end budget (~210 s) so a flaky upstream cannot wedge the call past the MCP client's 4-min hard timeout. On timeout the response carries a structured partial-success payload (created_count, total_count, last_inserted_id, error) instead of returning bare 'no result received' — the caller can resume from where it stopped. Pattern: split large content into batches keyed by top-level subtree, call insert_content per batch; the LAST_INSERTED_ID returned by each batch can be passed as parent_id to the next so the hierarchy stitches back together cleanly.")]
     async fn insert_content(
         &self,
-        Parameters(params): Parameters<InsertContentParams>,
+        TracedParams(params): TracedParams<InsertContentParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
@@ -2146,6 +2282,33 @@ impl WorkflowyMcpServer {
 
         if parsed.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text("No content to insert (all lines empty)".to_string())]));
+        }
+
+        // Hard cap on payload size. Brief 2026-05-02: oversized
+        // `insert_content` calls were silently dropped at the MCP
+        // transport before reaching this handler — bare
+        // "Tool execution failed" with no per-tool counter movement.
+        // We cannot fix transport drops, but we can refuse to pretend
+        // the bounded-budget contract is end-to-end. Above the cap,
+        // return a typed error with chunking instructions so the
+        // caller's recovery path is obvious instead of guess-and-retry.
+        if parsed.len() > defaults::MAX_INSERT_CONTENT_LINES {
+            let total = parsed.len();
+            let cap = defaults::MAX_INSERT_CONTENT_LINES;
+            return Err(tool_error(
+                "insert_content",
+                Some(&resolved_parent),
+                format!(
+                    "payload too large: {} lines exceeds the {}-line cap. Split the content \
+                     into batches of ≤{} top-level subtrees and call insert_content once per \
+                     batch — each call into a fresh node returned by the previous batch (or the \
+                     same parent_id) preserves the hierarchy. The cap exists because oversized \
+                     payloads have been observed to fail at the MCP transport layer before \
+                     reaching this handler, surfacing as undiagnosable 'Tool execution failed' \
+                     with no per-tool counter movement.",
+                    total, cap, defaults::SOFT_WARN_INSERT_CONTENT_LINES,
+                ),
+            ));
         }
 
         // End-to-end deadline. Honoured by every per-line create plus a
@@ -2276,17 +2439,31 @@ impl WorkflowyMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        let mut msg = format!(
             "Inserted {} node(s) under `{}`",
             created_count, resolved_parent
-        ))]))
+        );
+        // Soft-warn: above the safe ceiling but under the hard cap.
+        // The call succeeded, but the next one this size may not, so
+        // the caller learns the practical limit before they hit it.
+        if created_count > defaults::SOFT_WARN_INSERT_CONTENT_LINES {
+            msg.push_str(&format!(
+                "\n\n⚠ Payload was {} lines, above the {}-line soft warn threshold. \
+                 Consider splitting into smaller batches for the next call — the \
+                 {}-line hard cap rejects oversized payloads at the handler boundary.",
+                created_count,
+                defaults::SOFT_WARN_INSERT_CONTENT_LINES,
+                defaults::MAX_INSERT_CONTENT_LINES,
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
         })
     }
 
     #[tool(description = "Get the full subtree under a node, showing the hierarchical structure. Use max_depth to limit traversal depth for large trees.")]
     async fn get_subtree(
         &self,
-        Parameters(params): Parameters<GetSubtreeParams>,
+        TracedParams(params): TracedParams<GetSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "get_subtree", params, {
         let max_depth = params.max_depth.unwrap_or(5);
@@ -2322,7 +2499,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Find a node by name. Supports exact, contains, and starts_with match modes. Returns node_id for use with other tools. Omitting parent_id triggers a root-of-tree walk, which is refused by default on large trees — pass allow_root_scan=true to opt in, or use_index=true to serve from the opportunistic name index. Use selection to disambiguate multiple matches.")]
     async fn find_node(
         &self,
-        Parameters(params): Parameters<FindNodeParams>,
+        TracedParams(params): TracedParams<FindNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "find_node", params, {
         let match_mode = params.match_mode.as_deref().unwrap_or("exact");
@@ -2514,7 +2691,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Search for a target node and insert content under it. Combines search and insert into one tool. If multiple matches, returns options for selection.")]
     async fn smart_insert(
         &self,
-        Parameters(params): Parameters<SmartInsertParams>,
+        TracedParams(params): TracedParams<SmartInsertParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "smart_insert", params, {
         let max_depth = params.max_depth.unwrap_or(3);
@@ -2607,7 +2784,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Daily review: get overdue items, upcoming deadlines, recent changes, and pending todos in one call. Use root_id to scope and max_depth to control depth.")]
     async fn daily_review(
         &self,
-        Parameters(params): Parameters<DailyReviewParams>,
+        TracedParams(params): TracedParams<DailyReviewParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "daily_review", params, {
         let max_depth = params.max_depth.unwrap_or(5);
@@ -2722,7 +2899,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Get recently modified nodes within a time window.")]
     async fn get_recent_changes(
         &self,
-        Parameters(params): Parameters<GetRecentChangesParams>,
+        TracedParams(params): TracedParams<GetRecentChangesParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "get_recent_changes", params, {
         let days = params.days.unwrap_or(7) as i64;
@@ -2780,7 +2957,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "List overdue items (past due date, incomplete) sorted by most overdue first.")]
     async fn list_overdue(
         &self,
-        Parameters(params): Parameters<ListOverdueParams>,
+        TracedParams(params): TracedParams<ListOverdueParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "list_overdue", params, {
         let include_completed = params.include_completed.unwrap_or(false);
@@ -2834,7 +3011,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "List items with upcoming due dates, sorted by nearest deadline first.")]
     async fn list_upcoming(
         &self,
-        Parameters(params): Parameters<ListUpcomingParams>,
+        TracedParams(params): TracedParams<ListUpcomingParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "list_upcoming", params, {
         let days = params.days.unwrap_or(14) as i64;
@@ -2912,7 +3089,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Get project summary with stats, tag counts, assignee counts, and recently modified nodes.")]
     async fn get_project_summary(
         &self,
-        Parameters(params): Parameters<GetProjectSummaryParams>,
+        TracedParams(params): TracedParams<GetProjectSummaryParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "get_project_summary", params, {
         let include_tags = params.include_tags.unwrap_or(true);
@@ -3026,7 +3203,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Find all nodes that contain a Workflowy link to the given node.")]
     async fn find_backlinks(
         &self,
-        Parameters(params): Parameters<FindBacklinksParams>,
+        TracedParams(params): TracedParams<FindBacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "find_backlinks", params, {
         check_node_id(&params.node_id)?;
@@ -3085,7 +3262,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "List todo items, optionally filtered by parent, status, or text query.")]
     async fn list_todos(
         &self,
-        Parameters(params): Parameters<ListTodosParams>,
+        TracedParams(params): TracedParams<ListTodosParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "list_todos", params, {
         let limit = params.limit.unwrap_or(50);
@@ -3146,7 +3323,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Deep-copy a node and its subtree to a new location.")]
     async fn duplicate_node(
         &self,
-        Parameters(params): Parameters<DuplicateNodeParams>,
+        TracedParams(params): TracedParams<DuplicateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "duplicate_node", params, {
         self.run_handler("duplicate_node", ToolKind::Bulk, async move {
@@ -3254,7 +3431,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Copy a template node with {{variable}} substitution in names and descriptions.")]
     async fn create_from_template(
         &self,
-        Parameters(params): Parameters<CreateFromTemplateParams>,
+        TracedParams(params): TracedParams<CreateFromTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_from_template", params, {
         self.run_handler("create_from_template", ToolKind::Bulk, async move {
@@ -3357,7 +3534,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Apply an operation to all nodes matching a filter. Supports delete, add_tag, remove_tag. Use dry_run to preview. Note: complete/uncomplete are not yet implemented and will be rejected.")]
     async fn bulk_update(
         &self,
-        Parameters(params): Parameters<BulkUpdateParams>,
+        TracedParams(params): TracedParams<BulkUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "bulk_update", params, {
         self.run_handler("bulk_update", ToolKind::Bulk, async move {
@@ -3524,7 +3701,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Convert markdown to Workflowy-compatible 2-space indented text format. Handles headers, lists, code blocks, blockquotes, and tables.")]
     async fn convert_markdown(
         &self,
-        Parameters(params): Parameters<ConvertMarkdownParams>,
+        TracedParams(params): TracedParams<ConvertMarkdownParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "convert_markdown", params, {
         let analyze_only = params.analyze_only.unwrap_or(false);
@@ -3677,7 +3854,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget (one in-budget retry on transient failure) to confirm reachability and reports cache/name-index sizes. Surfaces `authenticated` (independent of probe success — driven by recent 401/403, not timeouts) and `last_successful_api_call_ms_ago` so callers can distinguish a one-shot blip from a sustained outage. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
     async fn health_check(
         &self,
-        Parameters(_params): Parameters<HealthCheckParams>,
+        TracedParams(_params): TracedParams<HealthCheckParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "health_check", _params, {
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
@@ -3723,7 +3900,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Extended liveness probe: confirms Workflowy reachability (one in-budget retry on transient failure) AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. `authenticated` reflects whether a 401/403 has been observed in the last 5 minutes — it is NOT flipped by transient timeouts or 5xx, so a one-shot probe miss after a successful write burst no longer looks like an auth failure. `last_successful_api_call_ms_ago` provides the anchor a caller needs to distinguish a transient blip from a sustained outage. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy.")]
     async fn workflowy_status(
         &self,
-        Parameters(_params): Parameters<WorkflowyStatusParams>,
+        TracedParams(_params): TracedParams<WorkflowyStatusParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "workflowy_status", _params, {
         let timeout = Duration::from_millis(defaults::HEALTH_CHECK_TIMEOUT_MS);
@@ -3761,7 +3938,13 @@ impl WorkflowyMcpServer {
                 .to_string();
             paths.insert(tool.to_string(), serde_json::Value::String(status));
         }
-        let last_failure = self.op_log.last_failure().map(|f| {
+        // Brief 2026-05-02: `last_failure` was sticky — it kept
+        // surfacing the most recent error long after the failing tool
+        // had recovered, so callers reading `workflowy_status` saw
+        // `degraded` indefinitely. `last_unrecovered_failure`
+        // self-clears once a success on the same tool lands after the
+        // failure, matching what the system is actually doing.
+        let last_failure = self.op_log.last_unrecovered_failure().map(|f| {
             // Best-effort proximate-cause classification from the
             // recorded reason string. Same heuristics as `tool_error`
             // so the value matches what the original error carried.
@@ -3856,7 +4039,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Cancel every in-flight tree walk. Subsequent calls are unaffected. Use when a find_node / get_subtree / search is taking longer than the client is willing to wait.")]
     async fn cancel_all(
         &self,
-        Parameters(_params): Parameters<CancelAllParams>,
+        TracedParams(_params): TracedParams<CancelAllParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "cancel_all", _params, {
         let new_gen = self.cancel_registry.cancel_all();
@@ -3872,7 +4055,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Walk a subtree and populate the opportunistic name index. After this, find_node with use_index=true can answer lookups without touching the API. Walks are bounded by the standard subtree-fetch timeout and node-count cap, so large scopes may return partial results.")]
     async fn build_name_index(
         &self,
-        Parameters(params): Parameters<BuildNameIndexParams>,
+        TracedParams(params): TracedParams<BuildNameIndexParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "build_name_index", params, {
         let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
@@ -3910,7 +4093,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Create many nodes in one call. Operations are pipelined with bounded concurrency; results are returned in input order with per-operation Ok(node_id) or Err(message). Faster than sequential create_node calls for medium-to-large batches; not transactional.")]
     async fn batch_create_nodes(
         &self,
-        Parameters(params): Parameters<BatchCreateNodesParams>,
+        TracedParams(params): TracedParams<BatchCreateNodesParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "batch_create_nodes", params, {
         self.run_handler("batch_create_nodes", ToolKind::Bulk, async move {
@@ -3999,7 +4182,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that.")]
     async fn transaction(
         &self,
-        Parameters(params): Parameters<TransactionParams>,
+        TracedParams(params): TracedParams<TransactionParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "transaction", params, {
         self.run_handler("transaction", ToolKind::Bulk, async move {
@@ -4055,7 +4238,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Return the canonical hierarchical path from root to the given node, by walking parent_id pointers via repeated get_node calls. Bounded by max_depth (default 50) so a malformed cycle doesn't loop forever, AND by the bulk-tool wall-clock budget (~210 s) so a slow upstream cannot stretch the walk past the MCP client's hard timeout. Each segment is { id, name }; use this for citation in distillations or for any caller that needs a stable, human-readable location.")]
     async fn path_of(
         &self,
-        Parameters(params): Parameters<PathOfParams>,
+        TracedParams(params): TracedParams<PathOfParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "path_of", params, {
         self.run_handler("path_of", ToolKind::Bulk, async move {
@@ -4117,7 +4300,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Apply a tag to many nodes in one call. A thin wrapper over bulk_update with operation=add_tag, optimised for the case where the caller already knows the exact node IDs and doesn't need a tree walk to find them. Each node is edited in parallel up to the standard concurrency cap.")]
     async fn bulk_tag(
         &self,
-        Parameters(params): Parameters<BulkTagParams>,
+        TracedParams(params): TracedParams<BulkTagParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "bulk_tag", params, {
         self.run_handler("bulk_tag", ToolKind::Bulk, async move {
@@ -4211,7 +4394,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Cheap incremental sync helper: returns whether the given node has been modified at or after the threshold timestamp (unix milliseconds). One API call. Useful for polling a small set of known-interesting nodes without re-walking the tree.")]
     async fn since(
         &self,
-        Parameters(params): Parameters<SinceParams>,
+        TracedParams(params): TracedParams<SinceParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "since", params, {
         check_node_id(&params.node_id)?;
@@ -4235,7 +4418,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Find nodes that match BOTH a tag and a path prefix. Combines the lateral (tag) and vertical (PARA-style hierarchical path) graph axes in one query, so callers don't have to fetch a tag_search result and post-filter by path.")]
     async fn find_by_tag_and_path(
         &self,
-        Parameters(params): Parameters<FindByTagAndPathParams>,
+        TracedParams(params): TracedParams<FindByTagAndPathParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "find_by_tag_and_path", params, {
         let max_depth = params.max_depth.unwrap_or(5);
@@ -4302,7 +4485,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171; pass root_id to scope elsewhere. Returns a JSON object with scope, scanned count, truncated flag, and findings array.")]
     async fn audit_mirrors(
         &self,
-        Parameters(params): Parameters<AuditMirrorsParams>,
+        TracedParams(params): TracedParams<AuditMirrorsParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "audit_mirrors", params, {
         let root = match &params.root_id {
@@ -4332,7 +4515,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under ~/code/SecondBrain/session-logs/ in the last 7 days. Default scope: Distillations.")]
     async fn review(
         &self,
-        Parameters(params): Parameters<ReviewParams>,
+        TracedParams(params): TracedParams<ReviewParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "review", params, {
         let root = match &params.root_id {
@@ -4377,7 +4560,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Resolve a hierarchical path of node names to a UUID. ONE API call per path segment, so a four-deep path resolves in ~1 second regardless of total tree size. Use this in preference to search_nodes/tag_search whenever you know where a node lives — finding 'Areas / Personal / Opportunities / Nedbank' costs four list_children calls, not a multi-minute root walk. Each segment matches case-insensitively (HTML stripped, whitespace trimmed) against children's names. Returns the final node's UUID, name, and full canonical path — and ingests every visited node into the persistent name index along the way, so future short-hash lookups under that branch resolve O(1).")]
     async fn node_at_path(
         &self,
-        Parameters(params): Parameters<NodeAtPathParams>,
+        TracedParams(params): TracedParams<NodeAtPathParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "node_at_path", params, {
         self.run_handler("node_at_path", ToolKind::Bulk, async move {
@@ -4473,7 +4656,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Resolve a Workflowy internal link or short hash to full node info. Optimised for the 'paste this URL, find this node' workflow. When you can name the parent path (e.g. ['Areas', 'Personal']), pass it via search_parent_path — the walk then runs only inside that subtree, taking seconds instead of minutes on huge trees. Bypasses the full-tree walk that ordinary tools fall back to on a short-hash cache miss.")]
     async fn resolve_link(
         &self,
-        Parameters(params): Parameters<ResolveLinkParams>,
+        TracedParams(params): TracedParams<ResolveLinkParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "resolve_link", params, {
         let trimmed = params.link.trim();
@@ -4697,7 +4880,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Export a subtree in OPML (for Workflowy/outliner compatibility), Markdown (nested bullets), or JSON (raw node array). For backup, hand-off to other tools, or external processing. Subject to the standard 10 000-node and 20-second walk budgets — large subtrees may return partial output with a truncation marker.")]
     async fn export_subtree(
         &self,
-        Parameters(params): Parameters<ExportSubtreeParams>,
+        TracedParams(params): TracedParams<ExportSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "export_subtree", params, {
         check_node_id(&params.node_id)?;
@@ -4732,7 +4915,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Stub for native Workflowy mirror creation. Workflowy's public REST API does not expose mirror creation, so this tool always returns an explanatory error. The user-facing 'mirror_of: <uuid>' note convention remains the documented workaround. Removing this stub once upstream adds the endpoint is tracked in the multi-pass plan (T-157).")]
     async fn create_mirror(
         &self,
-        Parameters(params): Parameters<CreateMirrorParams>,
+        TracedParams(params): TracedParams<CreateMirrorParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_mirror", params, {
         Err(McpError::invalid_params(
@@ -4745,7 +4928,7 @@ impl WorkflowyMcpServer {
     #[tool(description = "Return recent tool invocations from the in-memory ring buffer. Use for self-diagnosis: when a call hangs or returns unexpectedly, the previous N entries reveal the workload that produced the symptom. Includes tool name, params hash, start/finish timestamps, duration, and ok/err status.")]
     async fn get_recent_tool_calls(
         &self,
-        Parameters(params): Parameters<GetRecentToolCallsParams>,
+        TracedParams(params): TracedParams<GetRecentToolCallsParams>,
     ) -> Result<CallToolResult, McpError> {
         // Note: this handler does NOT record itself — the act of querying
         // the log shouldn't perturb the log it's reporting on.
@@ -5732,12 +5915,12 @@ mod tests {
         let server = new_test_server();
         // First call: succeeds (no API needed)
         let _ = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         // Second call: fails (invalid node id)
         let _ = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
             .await
             .expect_err("empty id rejected");
 
@@ -5764,14 +5947,14 @@ mod tests {
         // Drive a few calls.
         for _ in 0..3 {
             let _ = server
-                .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+                .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
                 .await;
         }
         let total_before = server.op_log().total_recorded();
         // Querying the log must NOT record itself — otherwise a caller can
         // never get a clean snapshot.
         let result = server
-            .get_recent_tool_calls(Parameters(GetRecentToolCallsParams { limit: Some(10), since_unix_ms: None }))
+            .get_recent_tool_calls(TracedParams(GetRecentToolCallsParams { limit: Some(10), since_unix_ms: None }))
             .await
             .expect("query returns");
         let total_after = server.op_log().total_recorded();
@@ -5859,18 +6042,18 @@ mod tests {
         // Drive a mix of ok and err calls so the per-tool histogram has data.
         for _ in 0..3 {
             let _ = server
-                .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+                .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
                 .await
                 .expect("status ok");
         }
         // get_node with empty id always errors — useful to seed an err entry.
         let _ = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
             .await
             .expect_err("empty id rejected");
 
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         let body = result_text(&result);
@@ -5889,7 +6072,7 @@ mod tests {
     async fn workflowy_status_returns_in_flight_and_rate_limit_fields() {
         let server = new_test_server();
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("workflowy_status must always return");
         let body = result_text(&result);
@@ -5967,7 +6150,7 @@ mod tests {
         let server = new_test_server();
         // Status before any failure: last_failure is null.
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
@@ -5978,13 +6161,13 @@ mod tests {
 
         // Force a failure (empty node_id rejected at the boundary).
         let _ = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
             .await
             .expect_err("empty id rejected");
 
         // Status after failure: last_failure names the tool and reason.
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
@@ -6078,11 +6261,11 @@ mod tests {
         let server = new_test_server();
         // Drive a couple of failures to populate per_tool_health.
         let _ = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
             .await
             .expect_err("empty id rejected");
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
@@ -6153,7 +6336,7 @@ mod tests {
         let server = new_test_server();
         server.client._test_stamp_auth_failure();
         let result = server
-            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .workflowy_status(TracedParams(WorkflowyStatusParams::default()))
             .await
             .expect("status returns");
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
@@ -6179,7 +6362,7 @@ mod tests {
         let server = new_test_server();
         server.client._test_stamp_success();
         let result = server
-            .health_check(Parameters(HealthCheckParams::default()))
+            .health_check(TracedParams(HealthCheckParams::default()))
             .await
             .expect("health_check returns");
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
@@ -6215,7 +6398,7 @@ mod tests {
         // Force a get_node failure (empty id) — the most recent op-log
         // entry is now an Err.
         let _ = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from("") }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
             .await
             .expect_err("empty id rejected");
 
@@ -6236,7 +6419,7 @@ mod tests {
         // unindexed short-hash parent — that hits resolve_node_ref's
         // miss path and records an Err for create_node.
         let _ = server2
-            .create_node(Parameters(CreateNodeParams {
+            .create_node(TracedParams(CreateNodeParams {
                 name: "x".into(),
                 description: None,
                 parent_id: Some(NodeId::from("ffffffffffff")),
@@ -6258,7 +6441,7 @@ mod tests {
         let server = new_test_server();
         let params = GetNodeParams { node_id: NodeId::from("") };
         let err = server
-            .get_node(Parameters(params))
+            .get_node(TracedParams(params))
             .await
             .expect_err("empty node_id must be rejected");
         let msg = err.to_string().to_lowercase();
@@ -6279,7 +6462,7 @@ mod tests {
             limit: Some(1),
             max_depth: None,
         };
-        let result = server.bulk_update(Parameters(params)).await;
+        let result = server.bulk_update(TracedParams(params)).await;
         let err = result.expect_err("complete must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("not yet supported"), "got: {msg}");
@@ -6299,7 +6482,7 @@ mod tests {
             limit: Some(1),
             max_depth: None,
         };
-        let result = server.bulk_update(Parameters(params)).await;
+        let result = server.bulk_update(TracedParams(params)).await;
         let err = result.expect_err("uncomplete must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("not yet supported"), "got: {msg}");
@@ -6319,7 +6502,7 @@ mod tests {
             limit: Some(1),
             max_depth: None,
         };
-        let result = server.bulk_update(Parameters(params)).await;
+        let result = server.bulk_update(TracedParams(params)).await;
         let err = result.expect_err("unknown operations must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("invalid operation"), "got: {msg}");
@@ -6435,7 +6618,7 @@ mod tests {
             description: None,
         };
         let err = server
-            .edit_node(Parameters(params))
+            .edit_node(TracedParams(params))
             .await
             .expect_err("edit_node with no fields must reject");
         let msg = err.to_string().to_lowercase();
@@ -6451,7 +6634,7 @@ mod tests {
             description: None,
         };
         let err = server
-            .edit_node(Parameters(params))
+            .edit_node(TracedParams(params))
             .await
             .expect_err("edit_node with empty id must reject");
         let msg = err.to_string().to_lowercase();
@@ -6471,7 +6654,7 @@ mod tests {
             use_index: None,
         };
         let err = server
-            .find_node(Parameters(params))
+            .find_node(TracedParams(params))
             .await
             .expect_err("unscoped find_node must refuse by default");
         let msg = err.to_string().to_lowercase();
@@ -6490,7 +6673,7 @@ mod tests {
             allow_root_scan: None,
             use_index: None,
         };
-        let err = server.find_node(Parameters(params)).await.expect_err("bad id must reject");
+        let err = server.find_node(TracedParams(params)).await.expect_err("bad id must reject");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("invalid node id"), "got: {msg}");
     }
@@ -6516,7 +6699,7 @@ mod tests {
             use_index: Some(true),
         };
         let result = server
-            .find_node(Parameters(params))
+            .find_node(TracedParams(params))
             .await
             .expect("index path must succeed");
         let body = result
@@ -6534,7 +6717,7 @@ mod tests {
         let server = new_test_server();
         let before = server.cancel_registry.generation();
         let result = server
-            .cancel_all(Parameters(CancelAllParams::default()))
+            .cancel_all(TracedParams(CancelAllParams::default()))
             .await
             .expect("cancel_all never fails");
         let after = server.cancel_registry.generation();
@@ -6634,7 +6817,7 @@ mod tests {
         // fail quickly without blowing the budget.
         let server = new_test_server();
         let result = server
-            .health_check(Parameters(HealthCheckParams::default()))
+            .health_check(TracedParams(HealthCheckParams::default()))
             .await
             .expect("health_check must always return");
         let body = result
@@ -6657,7 +6840,7 @@ mod tests {
             allow_root_scan: None,
         };
         let err = server
-            .build_name_index(Parameters(params))
+            .build_name_index(TracedParams(params))
             .await
             .expect_err("unscoped build_name_index must refuse");
         let msg = err.to_string().to_lowercase();
@@ -6672,7 +6855,7 @@ mod tests {
             new_parent_id: NodeId::from(other_valid_id()),
             priority: None,
         };
-        let err = server.move_node(Parameters(params)).await.expect_err("bad id must reject");
+        let err = server.move_node(TracedParams(params)).await.expect_err("bad id must reject");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("invalid node id"), "got: {msg}");
     }
@@ -6712,7 +6895,7 @@ mod tests {
     async fn audit_mirrors_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
         let result = server
-            .audit_mirrors(Parameters(AuditMirrorsParams {
+            .audit_mirrors(TracedParams(AuditMirrorsParams {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
             }))
@@ -6733,7 +6916,7 @@ mod tests {
     async fn review_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
         let result = server
-            .review(Parameters(ReviewParams {
+            .review(TracedParams(ReviewParams {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
                 days_stale: Some(30),
@@ -6821,7 +7004,7 @@ mod tests {
     async fn export_subtree_rejects_unknown_format() {
         let server = new_test_server();
         let err = server
-            .export_subtree(Parameters(ExportSubtreeParams {
+            .export_subtree(TracedParams(ExportSubtreeParams {
                 node_id: NodeId::from(valid_id()),
                 format: "yaml".to_string(),
                 max_depth: None,
@@ -6835,7 +7018,7 @@ mod tests {
     async fn create_mirror_returns_explanatory_error() {
         let server = new_test_server();
         let err = server
-            .create_mirror(Parameters(CreateMirrorParams {
+            .create_mirror(TracedParams(CreateMirrorParams {
                 canonical_node_id: NodeId::from(valid_id()),
                 target_parent_id: NodeId::from(other_valid_id()),
                 priority: None,
@@ -6850,7 +7033,7 @@ mod tests {
     async fn bulk_tag_rejects_empty_node_ids() {
         let server = new_test_server();
         let err = server
-            .bulk_tag(Parameters(BulkTagParams {
+            .bulk_tag(TracedParams(BulkTagParams {
                 node_ids: Vec::new(),
                 tag: "review".to_string(),
             }))
@@ -6863,7 +7046,7 @@ mod tests {
     async fn bulk_tag_rejects_whitespace_tag() {
         let server = new_test_server();
         let err = server
-            .bulk_tag(Parameters(BulkTagParams {
+            .bulk_tag(TracedParams(BulkTagParams {
                 node_ids: vec![NodeId::from(valid_id())],
                 tag: "two words".to_string(),
             }))
@@ -6876,7 +7059,7 @@ mod tests {
     async fn find_by_tag_and_path_rejects_invalid_root() {
         let server = new_test_server();
         let err = server
-            .find_by_tag_and_path(Parameters(FindByTagAndPathParams {
+            .find_by_tag_and_path(TracedParams(FindByTagAndPathParams {
                 tag: "review".to_string(),
                 path_prefix: "Work".to_string(),
                 root_id: Some(NodeId::from("not-a-uuid")),
@@ -6892,7 +7075,7 @@ mod tests {
     async fn batch_create_nodes_rejects_empty_operations() {
         let server = new_test_server();
         let err = server
-            .batch_create_nodes(Parameters(BatchCreateNodesParams { operations: Vec::new() }))
+            .batch_create_nodes(TracedParams(BatchCreateNodesParams { operations: Vec::new() }))
             .await
             .expect_err("empty batch must reject");
         let msg = err.to_string().to_lowercase();
@@ -6915,7 +7098,7 @@ mod tests {
             priority: None,
         };
         let err = server
-            .batch_create_nodes(Parameters(BatchCreateNodesParams {
+            .batch_create_nodes(TracedParams(BatchCreateNodesParams {
                 operations: vec![good, bad],
             }))
             .await
@@ -6927,7 +7110,7 @@ mod tests {
     async fn transaction_rejects_empty_operations() {
         let server = new_test_server();
         let err = server
-            .transaction(Parameters(TransactionParams { operations: Vec::new() }))
+            .transaction(TracedParams(TransactionParams { operations: Vec::new() }))
             .await
             .expect_err("empty transaction must reject");
         assert!(err.to_string().to_lowercase().contains("empty"));
@@ -6938,7 +7121,7 @@ mod tests {
         let server = new_test_server();
         // First op is invalid; the handler rejects via apply_txn_op.
         let result = server
-            .transaction(Parameters(TransactionParams {
+            .transaction(TracedParams(TransactionParams {
                 operations: vec![TransactionOpParams {
                     op: "frobnicate".to_string(),
                     node_id: None,
@@ -6962,10 +7145,205 @@ mod tests {
         let guard = server.cancel_registry.guard();
         assert!(!guard.is_cancelled());
         server
-            .cancel_all(Parameters(CancelAllParams::default()))
+            .cancel_all(TracedParams(CancelAllParams::default()))
             .await
             .unwrap();
         assert!(guard.is_cancelled(), "cancel_all must flip outstanding guards");
+    }
+
+    // --- Brief 2026-05-02 fixes: uniform error model & observability ---
+    //
+    // The five symptoms the brief named (silent param drops,
+    // unobservable framework failures, oversized insert_content,
+    // unscoped search_nodes, sticky degraded) all share the same
+    // cause — silent failure modes scattered across the boundary
+    // between transport, framework, and handler. The fixes below
+    // unify the contract: every failure is observable (op log),
+    // every parameter mismatch is typed (deny_unknown_fields +
+    // parent_id alias), every payload that would be silently dropped
+    // is refused at the boundary (insert_content cap, search_nodes
+    // gate), and every "degraded" surface self-clears on recovery.
+
+    /// `deny_unknown_fields` converts the silent-drop bug into a typed
+    /// error. Brief 2026-05-02: callers passing `parent_id` to
+    /// `list_children` (which expects `node_id`) used to see workspace
+    /// root listed instead — serde defaulted the missing field to None
+    /// and silently dropped the unknown one. With `deny_unknown_fields`
+    /// + the `parent_id` alias on `GetChildrenParams.node_id`, both
+    /// names now reach the handler and unknown names produce a clear
+    /// deserialize error.
+    #[test]
+    fn get_children_params_accepts_parent_id_alias() {
+        let p: GetChildrenParams =
+            serde_json::from_value(serde_json::json!({ "parent_id": "abc-123" })).unwrap();
+        assert_eq!(p.node_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn get_children_params_accepts_node_id() {
+        let p: GetChildrenParams =
+            serde_json::from_value(serde_json::json!({ "node_id": "abc-123" })).unwrap();
+        assert_eq!(p.node_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn get_children_params_rejects_unknown_field() {
+        let result: std::result::Result<GetChildrenParams, _> =
+            serde_json::from_value(serde_json::json!({ "bogus_field": "x" }));
+        let err = result.expect_err("unknown field must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unknown field") && msg.contains("bogus_field"),
+            "deserialize error must name the rejected field: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_nodes_params_rejects_unknown_field() {
+        let result: std::result::Result<SearchNodesParams, _> =
+            serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "ancestor_id": "abc",
+            }));
+        let err = result.expect_err("unknown field must be rejected");
+        assert!(err.to_string().to_lowercase().contains("unknown field"));
+    }
+
+    #[test]
+    fn search_nodes_params_accepts_allow_root_scan() {
+        let p: SearchNodesParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "allow_root_scan": true,
+        }))
+        .unwrap();
+        assert_eq!(p.allow_root_scan, Some(true));
+    }
+
+    /// Brief 2026-05-02 Test #4: `search_nodes` with `parent_id: null`
+    /// and no `allow_root_scan` opt-in must return a typed error
+    /// before doing any tree walk. Mirrors `find_node`'s gate.
+    #[tokio::test]
+    async fn search_nodes_refuses_root_scan_by_default() {
+        let server = new_test_server();
+        let params = SearchNodesParams {
+            query: "Tasks".to_string(),
+            max_results: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: None,
+        };
+        let err = server
+            .search_nodes(TracedParams(params))
+            .await
+            .expect_err("unscoped search must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace root") || msg.contains("allow_root_scan"),
+            "must explain how to opt in: {msg}"
+        );
+    }
+
+    /// Brief 2026-05-02 Test #3: oversized `insert_content` payloads
+    /// must be refused at the handler boundary with a typed error and
+    /// a chunking instruction, not silently dropped at the transport.
+    #[tokio::test]
+    async fn insert_content_refuses_payload_over_hard_cap() {
+        let server = new_test_server();
+        let lines: Vec<String> = (0..(defaults::MAX_INSERT_CONTENT_LINES + 1))
+            .map(|i| format!("Line {}", i))
+            .collect();
+        let content = lines.join("\n");
+        let params = InsertContentParams {
+            parent_id: NodeId::from("550e8400-e29b-41d4-a716-446655440000"),
+            content,
+        };
+        let err = server
+            .insert_content(TracedParams(params))
+            .await
+            .expect_err("oversized payload must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("payload too large") || msg.contains("exceeds"),
+            "must say payload is too large: {msg}"
+        );
+        assert!(
+            msg.contains(&defaults::MAX_INSERT_CONTENT_LINES.to_string()),
+            "must mention the hard cap: {msg}"
+        );
+    }
+
+    /// Brief 2026-05-02 Test #2: framework-level deserialize failures
+    /// must be observable. Constructing a real `ToolCallContext` in a
+    /// unit test would couple to rmcp internals, so this exercises the
+    /// equivalent shape directly: a bad JSON payload + the recorder
+    /// flow `TracedParams::from_context_part` runs on its failure
+    /// branch. End-to-end MCP coverage is provided by the live tests.
+    #[test]
+    fn traced_params_recorder_path_records_to_op_log() {
+        let server = new_test_server();
+        let bogus = serde_json::json!({"node_id": 42});
+        let parse: std::result::Result<GetNodeParams, _> =
+            serde_json::from_value(bogus.clone());
+        assert!(parse.is_err(), "type mismatch must fail");
+        let recorder = server.op_log.record("get_node", &bogus);
+        recorder.finish_err(format!("invalid parameters: {}", parse.unwrap_err()));
+        let recent = server.op_log.recent(10, None);
+        assert_eq!(recent[0].tool, "get_node");
+        assert!(matches!(recent[0].status, crate::utils::OpStatus::Err));
+        assert!(
+            recent[0].error.as_deref().unwrap_or("").contains("invalid parameters"),
+            "recorded error must name the failure mode"
+        );
+    }
+
+    /// Brief 2026-05-02 Test #5a: `last_unrecovered_failure` self-
+    /// clears once a success on the same tool lands after the failure,
+    /// so the `degraded` warning matches reality after recovery.
+    #[test]
+    fn last_unrecovered_failure_clears_after_success_on_same_tool() {
+        let log = crate::utils::op_log::OpLog::new();
+        log.record("get_node", &serde_json::json!({})).finish_err("upstream timeout");
+        assert!(
+            log.last_unrecovered_failure().is_some(),
+            "fresh failure must be reported"
+        );
+        log.record("get_node", &serde_json::json!({})).finish_ok();
+        assert!(
+            log.last_unrecovered_failure().is_none(),
+            "subsequent success on the same tool must clear the warning"
+        );
+    }
+
+    /// Brief 2026-05-02 Test #5b: a success on a *different* tool
+    /// must not clear another tool's failure warning — the failing
+    /// tool is still broken until it itself returns OK.
+    #[test]
+    fn last_unrecovered_failure_persists_across_other_tools() {
+        let log = crate::utils::op_log::OpLog::new();
+        log.record("get_node", &serde_json::json!({})).finish_err("upstream timeout");
+        log.record("list_children", &serde_json::json!({})).finish_ok();
+        assert!(
+            log.last_unrecovered_failure().is_some(),
+            "success on a different tool must not clear another tool's failure warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_warning_clears_after_get_node_recovery() {
+        let server = new_test_server();
+        let _ = server
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from("") }))
+            .await
+            .expect_err("empty id rejected");
+        assert!(
+            server.degraded_warning_if_recent_failure(30_000).is_some(),
+            "post-failure warning must fire"
+        );
+        server.op_log.record("get_node", &serde_json::json!({})).finish_ok();
+        assert!(
+            server.degraded_warning_if_recent_failure(30_000).is_none(),
+            "warning must clear once get_node has succeeded again"
+        );
     }
 }
 
@@ -7065,7 +7443,7 @@ mod load_tests {
         let server = server_against(&mock).await;
         let started = Instant::now();
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+            .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await;
         let elapsed = started.elapsed();
 
@@ -7098,7 +7476,7 @@ mod load_tests {
         let server = server_against(&mock).await;
         let started = Instant::now();
         let result = server
-            .get_node(Parameters(GetNodeParams { node_id: NodeId::from(id_a()) }))
+            .get_node(TracedParams(GetNodeParams { node_id: NodeId::from(id_a()) }))
             .await;
         let elapsed = started.elapsed();
 
@@ -7137,7 +7515,7 @@ mod load_tests {
         let server_for_call = Arc::clone(&server);
         let call = tokio::spawn(async move {
             server_for_call
-                .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+                .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                 .await
         });
 
@@ -7191,7 +7569,7 @@ mod load_tests {
         for _ in 0..20 {
             let s = Arc::clone(&server);
             handles.push(tokio::spawn(async move {
-                s.list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+                s.list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                     .await
             }));
         }
@@ -7257,7 +7635,7 @@ mod load_tests {
         let s_hung = Arc::clone(&server);
         let hung = tokio::spawn(async move {
             s_hung
-                .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+                .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -7269,7 +7647,7 @@ mod load_tests {
         for _ in 0..5 {
             let s = Arc::clone(&server);
             handles.push(tokio::spawn(async move {
-                s.list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+                s.list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
                     .await
             }));
         }
@@ -7334,7 +7712,7 @@ mod load_tests {
         // propagation backoff plus a fast second call.
         let server = server_against(&mock).await.with_read_budget_ms(2_000);
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+            .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must succeed after propagation retry");
         let body = body_text(&result);
@@ -7396,7 +7774,7 @@ mod load_tests {
         let server = WorkflowyMcpServer::new(client).with_read_budget_ms(2_000);
 
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+            .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must recover after one 503");
         assert!(body_text(&result).contains("child"));
@@ -7433,7 +7811,7 @@ mod load_tests {
         let server = server_against(&mock).await;
         let started = Instant::now();
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+            .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await;
         let elapsed = started.elapsed();
 
@@ -7474,7 +7852,7 @@ mod load_tests {
 
         let server = server_against(&mock).await;
         let result = server
-            .list_children(Parameters(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
+            .list_children(TracedParams(GetChildrenParams { node_id: Some(NodeId::from(id_a())) }))
             .await
             .expect("call must succeed against the parent_id matcher");
         let body = body_text(&result);
@@ -7514,7 +7892,7 @@ mod load_tests {
         // Optional root_id: list_overdue, list_upcoming, daily_review,
         // get_recent_changes, bulk_update, build_name_index, list_todos.
         let err = server
-            .list_overdue(Parameters(ListOverdueParams {
+            .list_overdue(TracedParams(ListOverdueParams {
                 root_id: Some(NodeId::from(unindexed)),
                 include_completed: None,
                 limit: None,
@@ -7531,7 +7909,7 @@ mod load_tests {
         // Optional parent_id: list_todos exercises the same pattern via
         // a different param name.
         let err = server
-            .list_todos(Parameters(ListTodosParams {
+            .list_todos(TracedParams(ListTodosParams {
                 parent_id: Some(NodeId::from(unindexed)),
                 status: None,
                 query: None,
@@ -7549,7 +7927,7 @@ mod load_tests {
         // Required node_id: get_project_summary, find_backlinks,
         // get_subtree, duplicate_node, create_from_template all use this.
         let err = server
-            .get_subtree(Parameters(GetSubtreeParams {
+            .get_subtree(TracedParams(GetSubtreeParams {
                 node_id: NodeId::from(unindexed),
                 max_depth: None,
             }))
@@ -7594,7 +7972,7 @@ mod load_tests {
         let target_uuid = "550e8400-e29b-41d4-a716-446655440000";
 
         let err = server
-            .delete_node(Parameters(DeleteNodeParams {
+            .delete_node(TracedParams(DeleteNodeParams {
                 node_id: NodeId::from(target_uuid),
             }))
             .await
@@ -7605,7 +7983,7 @@ mod load_tests {
         );
 
         let err = server
-            .edit_node(Parameters(EditNodeParams {
+            .edit_node(TracedParams(EditNodeParams {
                 node_id: NodeId::from(target_uuid),
                 name: Some("x".into()),
                 description: Some("y".into()),
@@ -7618,7 +7996,7 @@ mod load_tests {
         );
 
         let err = server
-            .move_node(Parameters(MoveNodeParams {
+            .move_node(TracedParams(MoveNodeParams {
                 node_id: NodeId::from(target_uuid),
                 new_parent_id: NodeId::from(target_uuid),
                 priority: None,
@@ -7679,7 +8057,7 @@ mod load_tests {
         let server = server_with_tight_bulk_budget(&mock).await;
         let started = Instant::now();
         let result = server
-            .path_of(Parameters(PathOfParams {
+            .path_of(TracedParams(PathOfParams {
                 node_id: NodeId::from(id_a()),
                 max_depth: Some(50),
             }))
@@ -7714,7 +8092,7 @@ mod load_tests {
         let server = server_with_tight_bulk_budget(&mock).await;
         let started = Instant::now();
         let result = server
-            .bulk_tag(Parameters(BulkTagParams {
+            .bulk_tag(TracedParams(BulkTagParams {
                 node_ids: vec![NodeId::from(id_a())],
                 tag: "test".to_string(),
             }))
@@ -7755,7 +8133,7 @@ mod load_tests {
         let server = server_with_tight_bulk_budget(&mock).await;
         let started = Instant::now();
         let result = server
-            .transaction(Parameters(TransactionParams {
+            .transaction(TracedParams(TransactionParams {
                 operations: vec![TransactionOpParams {
                     op: "delete".to_string(),
                     node_id: Some(NodeId::from(id_a())),
@@ -7797,7 +8175,7 @@ mod load_tests {
         let server = server_with_tight_bulk_budget(&mock).await;
         let started = Instant::now();
         let result = server
-            .node_at_path(Parameters(NodeAtPathParams {
+            .node_at_path(TracedParams(NodeAtPathParams {
                 path: vec!["Areas".to_string(), "Personal".to_string()],
                 start_parent_id: None,
             }))
@@ -7915,7 +8293,7 @@ mod load_tests {
 
         let started = Instant::now();
         let result = server
-            .insert_content(Parameters(InsertContentParams {
+            .insert_content(TracedParams(InsertContentParams {
                 parent_id: NodeId::from(id_a()),
                 content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
             }))
@@ -7972,7 +8350,7 @@ mod load_tests {
         let server_for_call = Arc::clone(&server);
         let call = tokio::spawn(async move {
             server_for_call
-                .path_of(Parameters(PathOfParams {
+                .path_of(TracedParams(PathOfParams {
                     node_id: NodeId::from(id_a()),
                     max_depth: Some(50),
                 }))
@@ -8037,7 +8415,7 @@ mod load_tests {
             .expect("null must deserialise to None");
         assert!(params.node_id.is_none());
         let result = server
-            .list_children(Parameters(params))
+            .list_children(TracedParams(params))
             .await
             .expect("null node_id must succeed against workspace root");
         let body = body_text(&result);
@@ -8049,7 +8427,7 @@ mod load_tests {
             .expect("missing field must deserialise to None");
         assert!(params.node_id.is_none());
         let result = server
-            .list_children(Parameters(params))
+            .list_children(TracedParams(params))
             .await
             .expect("missing node_id must succeed against workspace root");
         let body = body_text(&result);
@@ -8139,7 +8517,7 @@ mod load_tests {
         let server_for_call = Arc::clone(&server);
         let call = tokio::spawn(async move {
             server_for_call
-                .insert_content(Parameters(InsertContentParams {
+                .insert_content(TracedParams(InsertContentParams {
                     parent_id: NodeId::from(id_a()),
                     content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
                 }))
@@ -8167,4 +8545,5 @@ mod load_tests {
         assert_eq!(v["total_count"], 5, "body: {body}");
         assert!(v["last_inserted_id"].is_string(), "last_inserted_id must be set: {body}");
     }
+
 }

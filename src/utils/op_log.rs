@@ -145,6 +145,37 @@ impl OpLog {
             .cloned()
     }
 
+    /// Most recent failure that has NOT been followed by a success on the
+    /// same tool. Brief 2026-05-02 reported the `degraded` flag sticking
+    /// after recovery: once a failure entered the window, every
+    /// subsequent status query reported degraded even when the failing
+    /// tool had since returned OK. Self-clearing means the diagnostic
+    /// surfaces match what the system actually does — a tool that has
+    /// recovered no longer gates downstream calls.
+    ///
+    /// Returns `None` when either no failures have been recorded or the
+    /// most recent attempt at the failing tool was a success.
+    pub fn last_unrecovered_failure(&self) -> Option<OpLogEntry> {
+        // Newest-first snapshot. The buffer is bounded at `capacity`, so
+        // looking at the whole window is cheap.
+        let recent = self.recent(self.inner.capacity, None);
+        let fail_idx = recent
+            .iter()
+            .position(|e| matches!(e.status, OpStatus::Err))?;
+        let last_fail = recent[fail_idx].clone();
+        // Anything earlier in `recent` is *more* recent in wall-clock
+        // time. If any of those is a success on the failing tool, the
+        // tool has recovered and the warning self-clears.
+        let recovered = recent[..fail_idx]
+            .iter()
+            .any(|e| e.tool == last_fail.tool && matches!(e.status, OpStatus::Ok));
+        if recovered {
+            None
+        } else {
+            Some(last_fail)
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.entries.read().len()
     }

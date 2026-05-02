@@ -48,6 +48,24 @@ pub const MAX_NAME_LENGTH: usize = 5_000;
 pub const MAX_DESCRIPTION_LENGTH: usize = 50_000;
 /// Maximum length for insert_content bodies
 pub const MAX_CONTENT_LENGTH: usize = 500_000;
+/// Maximum number of lines (= nodes to create) accepted by a single
+/// `insert_content` call. Brief 2026-05-02: large payloads (~130 nodes)
+/// were being dropped at the MCP transport layer before the handler
+/// ran, surfacing as a bare `Tool execution failed` with no diagnostic
+/// and no per-tool counter movement. We cannot fix transport drops
+/// from inside the server, but we can stop pretending the bounded
+/// budget is end-to-end: this cap rejects oversized payloads at the
+/// handler boundary with a typed error and a chunking instruction, so
+/// the caller sees an actionable message instead of an unobservable
+/// silent failure. Empirical safe ceiling is ~80 lines per call; we
+/// set the cap at 200 to leave headroom for callers who have measured
+/// their own client and know their transport can carry it.
+pub const MAX_INSERT_CONTENT_LINES: usize = 200;
+/// Soft warn threshold for `insert_content` payload size. Above this,
+/// the success response includes a hint recommending chunking — but
+/// the request still runs. Below the hard cap, above the soft warn:
+/// the user gets an early signal before they hit the wall.
+pub const SOFT_WARN_INSERT_CONTENT_LINES: usize = 80;
 /// Hard cap on max_results for any search/list tool
 pub const HARD_MAX_RESULTS: usize = 100;
 /// Default max_results when not specified
