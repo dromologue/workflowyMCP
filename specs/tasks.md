@@ -218,7 +218,14 @@
 - [x] **T-156 (Pass 5)**: Heavy-workflow primitives
   - `WorkflowyClient::edit_node` splits combined name+description
     updates into two sequential POSTs to dodge the upstream field-loss
-    bug documented in the wflow skill.
+    bug documented in the wflow skill. (2026-05-02 follow-up: the
+    actual root cause turned out to be a wire-field mismatch — the
+    Workflowy API names the description body `note`, and writes were
+    sending the literal key `description`, which the upstream silently
+    dropped. Both branches now send `note`. Split is retained for
+    per-field fault isolation but is no longer load-bearing for
+    correctness. Pinned by `tests::write_field_names` in
+    `src/api/client.rs`.)
   - `WorkflowyClient::move_node` detects parent-related 4xx errors
     (not 5xx) and refreshes the new parent's children listing before
     retrying once.

@@ -26,9 +26,12 @@ async fn main() {
     // Step 1: Create a test node at root (inbox)
     println!("\n1. Creating test bullet in inbox...");
 
+    // Workflowy's wire field for the description body is `note`, not
+    // `description`. Sending `description` returns 200 OK but silently
+    // drops the field — that was the P2.4 field-loss bug.
     let create_body = json!({
         "name": "🦀 Test from Rust MCP Server — delete me",
-        "description": "Created by Rust integration test on 2026-04-03"
+        "note": "Created by Rust integration test on 2026-04-03"
     });
 
     let response = client

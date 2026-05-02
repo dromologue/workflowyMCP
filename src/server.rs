@@ -125,46 +125,58 @@ impl ProximateCause {
 ///
 /// Brief 2026-04-25 Test γ: `proximate_cause` is a discrete enum, not a
 /// free-text hint, so callers can switch on it without parsing.
-/// Tool kinds for `with_tool_budget`. The wrapper picks the wall-clock
-/// budget from the kind, so call sites stay readable and the budget
-/// constants live in one place ([`defaults`]).
+/// Tool kinds for `tool_handler!` / `run_handler`.
+/// The wrapper picks the wall-clock budget from the kind, so call sites
+/// stay readable and the budget constants live in one place
+/// ([`defaults`]).
 ///
 /// The taxonomy is deliberately small (four kinds) because the server
-/// ships ~40 tools and a finer split would just be noise. Diagnostic
-/// tools (`health_check`, `workflowy_status`, `cancel_all`,
-/// `get_recent_tool_calls`, `build_name_index`) own their own short
-/// budgets and don't go through `with_tool_budget` at all.
+/// ships ~30 tools and a finer split would just be noise. **Every
+/// non-diagnostic handler is wrapped in `tool_handler!(name, kind, ...)`
+/// — uniform safety net, no exceptions outside the diagnostic
+/// carve-out below.** The 2026-05-02 4-minute write hangs traced to
+/// single-node writes that bypassed this wrapper before the migration.
+///
+/// Diagnostics — `health_check`, `workflowy_status`, `cancel_all`,
+/// `get_recent_tool_calls`, `build_name_index` — keep `record_op!`
+/// alone because they own short, custom budgets that predate the
+/// taxonomy. `convert_markdown` (pure local transform) and
+/// `create_mirror` (stub) round out the carve-out, plus
+/// `insert_content` (whose inline budget produces a partial-success
+/// resume payload that the wrapper would short-circuit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Walk variant is part of the taxonomy; walks rely on internal walk_subtree budget rather than wrapping at the handler boundary.
 enum ToolKind {
-    /// Single-node read (`get_node`, `list_children`). Budget:
+    /// Single-node read (`get_node`, `list_children`, `since`). Budget:
     /// [`defaults::READ_NODE_TIMEOUT_MS`] (30 s default; tests override
     /// via `read_budget_ms`).
     Read,
-    /// Single-node write (`create_node`, `delete_node`, plus the
-    /// resolver paths inside other handlers). Budget:
-    /// [`defaults::WRITE_NODE_TIMEOUT_MS`] (15 s) — dovetails with the
-    /// per-method deadlines built into the client. The wrapper itself
-    /// is the cancel observer + safety net, the per-method deadline is
-    /// the primary bound.
+    /// Single-node write (`create_node`, `edit_node`, `delete_node`,
+    /// `move_node`). Budget: [`defaults::WRITE_NODE_TIMEOUT_MS`]
+    /// (15 s) — dovetails with the per-method deadlines built into the
+    /// client. The wrapper is the cancel observer plus an outer safety
+    /// net; the per-method client deadline is the primary bound.
     Write,
-    /// Multi-step bulk operation (`insert_content`, `duplicate_node`,
+    /// Multi-step bulk operation (`duplicate_node`,
     /// `create_from_template`, `bulk_update`, `bulk_tag`,
     /// `batch_create_nodes`, `transaction`, `path_of`, `node_at_path`).
     /// Budget: [`defaults::INSERT_CONTENT_TIMEOUT_MS`] (210 s — well
     /// under the MCP client's 4-min hard timeout). Each per-iteration
     /// call runs to its own per-method budget; the bulk wrapper caps
     /// the total wall-clock so a runaway loop returns a structured
-    /// timeout instead of "no result received".
+    /// timeout instead of "no result received". `insert_content` is
+    /// the documented exception to the wrapper rule — it owns inline
+    /// cancel + deadline checks because they produce the partial-
+    /// success resume payload that the outer wrapper would short-
+    /// circuit; see the comment at its handler.
     Bulk,
     /// Tree walk (`search_nodes`, `get_subtree`, `find_node`,
     /// `find_backlinks`, `daily_review`, `list_overdue`,
     /// `list_upcoming`, `list_todos`, `tag_search`,
     /// `get_recent_changes`, `get_project_summary`, `audit_mirrors`,
     /// `review`, `find_by_tag_and_path`, `export_subtree`,
-    /// `smart_insert`, `since`). The walker itself owns
-    /// [`defaults::SUBTREE_FETCH_TIMEOUT_MS`] via `FetchControls` —
-    /// the outer wrapper observes `cancel_all` only, no second
+    /// `resolve_link`, `smart_insert`). The internal `walk_subtree`
+    /// owns [`defaults::SUBTREE_FETCH_TIMEOUT_MS`] via `FetchControls`,
+    /// so the outer wrapper observes `cancel_all` only — no second
     /// deadline.
     Walk,
 }
@@ -295,7 +307,10 @@ fn load_recent_session_logs_blob_for_review() -> String {
 }
 
 /// Wrap a handler body so the call is recorded in the per-call op log.
-/// Use as the outermost expression of every tool handler:
+/// Use as the outermost expression of a *diagnostic* tool handler — one
+/// that owns its own short budget and deliberately bypasses the
+/// `ToolKind` taxonomy (e.g. `health_check`, `workflowy_status`,
+/// `cancel_all`, `get_recent_tool_calls`, `build_name_index`):
 ///
 /// ```ignore
 /// async fn foo(&self, TracedParams(params): TracedParams<FooParams>) -> Result<CallToolResult, McpError> {
@@ -305,6 +320,13 @@ fn load_recent_session_logs_blob_for_review() -> String {
 /// }
 /// ```
 ///
+/// **Every other handler must use [`tool_handler!`] instead** so its
+/// body runs through [`WorkflowyMcpServer::run_handler`] and inherits
+/// the uniform cancel + wall-clock safety net. `record_op!` on its own
+/// records the call but does *not* observe `cancel_all` and does *not*
+/// impose a handler-level deadline — the gap that produced the
+/// 2026-05-02 4-minute write hangs.
+///
 /// The macro hashes the params, opens a recorder, runs the body inside
 /// an async block (so `?` returns from the block, not the outer
 /// function), then finishes the recorder with Ok/Err before returning.
@@ -313,6 +335,40 @@ macro_rules! record_op {
         let __pj = serde_json::to_value(&$params).unwrap_or(serde_json::Value::Null);
         let __recorder = $self.op_log.record($tool, &__pj);
         let __result: Result<CallToolResult, McpError> = async move $body.await;
+        match &__result {
+            Ok(_) => __recorder.finish_ok(),
+            Err(e) => __recorder.finish_err(e.to_string()),
+        }
+        __result
+    }};
+}
+
+/// Standard wrapper for every non-diagnostic tool handler. Combines
+/// [`record_op!`] (op-log attribution) with
+/// [`WorkflowyMcpServer::run_handler`] (cancel-registry observation +
+/// wall-clock deadline keyed off [`ToolKind`]). Single pattern,
+/// uniform safety net — adding a handler without it regresses both the
+/// "cancel_all preempts every tool" invariant and the "no tool can sit
+/// past its kind's wall-clock budget" invariant.
+///
+/// ```ignore
+/// async fn foo(&self, TracedParams(params): TracedParams<FooParams>) -> Result<CallToolResult, McpError> {
+///     tool_handler!(self, "foo", ToolKind::Write, params, {
+///         // existing body, including `?` early returns
+///     })
+/// }
+/// ```
+///
+/// `Walk`-kind handlers run cancel-only — their internal `walk_subtree`
+/// owns the deadline. Diagnostics keep `record_op!` because their
+/// short, custom budgets predate the taxonomy.
+macro_rules! tool_handler {
+    ($self:ident, $tool:literal, $kind:expr, $params:ident, $body:block) => {{
+        let __pj = serde_json::to_value(&$params).unwrap_or(serde_json::Value::Null);
+        let __recorder = $self.op_log.record($tool, &__pj);
+        let __fut = async move $body;
+        let __result: Result<CallToolResult, McpError> =
+            $self.run_handler($tool, $kind, __fut).await;
         match &__result {
             Ok(_) => __recorder.finish_ok(),
             Err(e) => __recorder.finish_err(e.to_string()),
@@ -1259,7 +1315,7 @@ impl WorkflowyMcpServer {
     }
 
     /// Test-only: override the wall-clock budget that
-    /// [`Self::with_read_budget`] applies to single-node read tools.
+    /// [`Self::run_handler`] applies to [`ToolKind::Read`] handlers.
     /// Production goes through [`Self::new`]/[`Self::with_cache`] which
     /// honours [`defaults::READ_NODE_TIMEOUT_MS`]; tests dial this down
     /// to milliseconds so failure paths exercise in test time rather
@@ -1347,77 +1403,6 @@ impl WorkflowyMcpServer {
     /// Dropping the inner future on timeout/cancel cleanly aborts the
     /// reqwest send (closes the connection) and releases the rate-limiter
     /// slot, so the next tool call starts fresh.
-    async fn with_tool_budget<F, T>(
-        &self,
-        kind: ToolKind,
-        fut: F,
-    ) -> std::result::Result<T, WorkflowyError>
-    where
-        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
-    {
-        let budget_ms = match kind {
-            ToolKind::Read => self.read_budget_ms,
-            ToolKind::Write => defaults::WRITE_NODE_TIMEOUT_MS,
-            ToolKind::Bulk => defaults::INSERT_CONTENT_TIMEOUT_MS,
-            ToolKind::Walk => 0,
-        };
-        self.with_tool_budget_ms(kind, fut, budget_ms).await
-    }
-
-    /// Implementation of [`Self::with_tool_budget`] with the budget
-    /// injected. Tests target this entry point directly so they can
-    /// exercise the timeout/cancel paths in milliseconds rather than
-    /// production-scale wall-clock. `budget_ms == 0` (or
-    /// [`ToolKind::Walk`]) skips the deadline arm and observes only the
-    /// cancel registry.
-    async fn with_tool_budget_ms<F, T>(
-        &self,
-        kind: ToolKind,
-        fut: F,
-        budget_ms: u64,
-    ) -> std::result::Result<T, WorkflowyError>
-    where
-        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
-    {
-        let guard = self.cancel_registry.guard();
-        let poll_cancel = async {
-            loop {
-                if guard.is_cancelled() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        };
-        if matches!(kind, ToolKind::Walk) || budget_ms == 0 {
-            // Cancel-only: the inner future owns its deadline.
-            tokio::select! {
-                biased;
-                _ = poll_cancel => Err(WorkflowyError::Cancelled),
-                res = fut => res,
-            }
-        } else {
-            let deadline = tokio::time::sleep(Duration::from_millis(budget_ms));
-            tokio::select! {
-                biased;
-                _ = poll_cancel => Err(WorkflowyError::Cancelled),
-                _ = deadline => Err(WorkflowyError::Timeout),
-                res = fut => res,
-            }
-        }
-    }
-
-    /// Back-compat shim: routes through [`Self::with_tool_budget`] with
-    /// [`ToolKind::Read`]. Kept only to minimise the migration diff for
-    /// `get_node` / `list_children`; new callers should use
-    /// `with_tool_budget` directly so the kind is visible at the call
-    /// site.
-    async fn with_read_budget<F, T>(&self, fut: F) -> std::result::Result<T, WorkflowyError>
-    where
-        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
-    {
-        self.with_tool_budget(ToolKind::Read, fut).await
-    }
-
     /// Handler-flavoured wrapper that returns [`McpError`]. The inner
     /// future is the existing handler body — it produces its own
     /// structured `tool_error` payloads. The wrapper races it against
@@ -1470,9 +1455,16 @@ impl WorkflowyMcpServer {
         }
     }
 
-    /// Back-compat shim used by the load-test module to inject a small
-    /// budget on the `Read` tier without touching the server's
-    /// `read_budget_ms` field. Equivalent to `with_tool_budget_ms(Read, ..)`.
+    /// Test-only helper that exercises the same cancel/deadline-arm
+    /// shape as [`Self::run_handler`] but at the
+    /// `Result<T, WorkflowyError>` granularity that the surviving
+    /// `with_read_budget_*` unit tests need. Inlined here (rather than
+    /// routed through a production helper) because the production
+    /// surface is now `tool_handler!` only — keeping a parallel
+    /// production helper alive solely to satisfy these three tests
+    /// would violate the simplicity principle. If `run_handler`'s
+    /// arm logic ever diverges from this, the tests below will tell
+    /// us in the same review where the divergence lands.
     #[cfg(test)]
     async fn with_read_budget_inner<F, T>(
         &self,
@@ -1482,8 +1474,22 @@ impl WorkflowyMcpServer {
     where
         F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
     {
-        self.with_tool_budget_ms(ToolKind::Read, fut, budget.as_millis() as u64)
-            .await
+        let guard = self.cancel_registry.guard();
+        let poll_cancel = async {
+            loop {
+                if guard.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let deadline = tokio::time::sleep(budget);
+        tokio::select! {
+            biased;
+            _ = poll_cancel => Err(WorkflowyError::Cancelled),
+            _ = deadline => Err(WorkflowyError::Timeout),
+            res = fut => res,
+        }
     }
 
     /// Resolve a `node_id` parameter to a full UUID string. Accepts either
@@ -1829,7 +1835,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<SearchNodesParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "search_nodes", params, {
+        tool_handler!(self, "search_nodes", ToolKind::Walk, params, {
         let max_results = params.max_results.unwrap_or(20);
         let max_depth = params.max_depth.unwrap_or(3);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
@@ -1915,7 +1921,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<GetNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "get_node", params, {
+        tool_handler!(self, "get_node", ToolKind::Read, params, {
         info!(node_id = %params.node_id, "Getting node");
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
@@ -1929,19 +1935,14 @@ impl WorkflowyMcpServer {
         // Both calls go through the propagation-retry path: Workflowy has
         // been observed to return a node ID via a parent's children listing
         // before the same ID is queryable directly. The retry waits up to
-        // ~1.4 s total (200 + 400 + 800 ms) before giving up. The combined
-        // future is wrapped in `with_read_budget` so a hung upstream returns
-        // Timeout in ~30 s rather than burning the full retry-attempt
-        // budget; `cancel_all` also drops it cleanly mid-flight.
-        let combined = async {
-            let node_fut = self.client.get_node_with_propagation_retry(&resolved);
-            let children_fut = self.client.get_children_with_propagation_retry(&resolved);
-            Ok::<_, WorkflowyError>(tokio::join!(node_fut, children_fut))
-        };
-        let (node_res, children_res) = match self.with_read_budget(combined).await {
-            Ok(pair) => pair,
-            Err(e) => return Err(tool_error("get_node", Some(&resolved), e)),
-        };
+        // ~1.4 s total (200 + 400 + 800 ms) before giving up. The
+        // `tool_handler!(ToolKind::Read)` wrapper bounds the entire
+        // handler at the Read budget and observes `cancel_all` so a hung
+        // upstream returns a structured Timeout / Cancelled instead of
+        // wedging — no inner budget needed here.
+        let node_fut = self.client.get_node_with_propagation_retry(&resolved);
+        let children_fut = self.client.get_children_with_propagation_retry(&resolved);
+        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
 
         let node = match node_res {
             Ok(n) => n,
@@ -1983,7 +1984,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<CreateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "create_node", params, {
+        tool_handler!(self, "create_node", ToolKind::Write, params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
         let resolved_parent = match &params.parent_id {
             Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
@@ -2043,7 +2044,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<EditNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "edit_node", params, {
+        tool_handler!(self, "edit_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, "Editing node");
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
@@ -2081,7 +2082,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<DeleteNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "delete_node", params, {
+        tool_handler!(self, "delete_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, "Deleting node");
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
@@ -2105,7 +2106,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<MoveNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "move_node", params, {
+        tool_handler!(self, "move_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
         check_node_id(&params.node_id)?;
         check_node_id(&params.new_parent_id)?;
@@ -2152,7 +2153,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<GetChildrenParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "list_children", params, {
+        tool_handler!(self, "list_children", ToolKind::Read, params, {
         // None / null = workspace root. The tool description and
         // schema are explicit about this so the caller doesn't have
         // to guess; previously a `null` node_id intermittently
@@ -2167,15 +2168,11 @@ impl WorkflowyMcpServer {
         };
         info!(node_id = ?resolved, "Getting children");
 
+        // `tool_handler!(ToolKind::Read)` bounds and cancel-observes the
+        // whole handler — no inner budget needed.
         let fetch_result = match resolved.as_deref() {
-            Some(id) => {
-                self.with_read_budget(self.client.get_children_with_propagation_retry(id))
-                    .await
-            }
-            None => {
-                self.with_read_budget(self.client.get_top_level_nodes())
-                    .await
-            }
+            Some(id) => self.client.get_children_with_propagation_retry(id).await,
+            None => self.client.get_top_level_nodes().await,
         };
 
         let scope_label = resolved.as_deref().unwrap_or("workspace root").to_string();
@@ -2209,7 +2206,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<TagSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "tag_search", params, {
+        tool_handler!(self, "tag_search", ToolKind::Walk, params, {
         let max_results = params.max_results.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(tag = %params.tag, max_depth, "Tag search");
@@ -2266,6 +2263,17 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<InsertContentParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Deliberate exception to the `tool_handler!` consistency rule:
+        // `insert_content` owns inline cancel + deadline checks because
+        // they are what produce the structured partial-success payload
+        // (`status: "partial"`, `created_count`, `last_inserted_id`,
+        // …) callers depend on to resume. Wrapping in
+        // `tool_handler!(Bulk)` would race the same deadline at the
+        // outer boundary and return a bare `Err(Timeout)` first, losing
+        // the resume cursor — `insert_content_returns_partial_on_*`
+        // pin both branches. `record_op!` records the call without
+        // imposing the outer wall-clock arm; the inline checks are the
+        // primary AND only safety net here.
         record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
         check_node_id(&params.parent_id)?;
@@ -2465,7 +2473,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<GetSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "get_subtree", params, {
+        tool_handler!(self, "get_subtree", ToolKind::Walk, params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
         check_node_id(&params.node_id)?;
@@ -2501,7 +2509,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<FindNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "find_node", params, {
+        tool_handler!(self, "find_node", ToolKind::Walk, params, {
         let match_mode = params.match_mode.as_deref().unwrap_or("exact");
         let max_depth = params.max_depth.unwrap_or(3);
         let use_index = params.use_index.unwrap_or(false);
@@ -2693,7 +2701,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<SmartInsertParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "smart_insert", params, {
+        tool_handler!(self, "smart_insert", ToolKind::Walk, params, {
         let max_depth = params.max_depth.unwrap_or(3);
         info!(query = %params.search_query, max_depth, "Smart insert");
 
@@ -2786,7 +2794,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<DailyReviewParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "daily_review", params, {
+        tool_handler!(self, "daily_review", ToolKind::Walk, params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Daily review");
         let resolved_root = match &params.root_id {
@@ -2901,7 +2909,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<GetRecentChangesParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "get_recent_changes", params, {
+        tool_handler!(self, "get_recent_changes", ToolKind::Walk, params, {
         let days = params.days.unwrap_or(7) as i64;
         let include_completed = params.include_completed.unwrap_or(true);
         let limit = params.limit.unwrap_or(50);
@@ -2959,7 +2967,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ListOverdueParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "list_overdue", params, {
+        tool_handler!(self, "list_overdue", ToolKind::Walk, params, {
         let include_completed = params.include_completed.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(5);
@@ -3013,7 +3021,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ListUpcomingParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "list_upcoming", params, {
+        tool_handler!(self, "list_upcoming", ToolKind::Walk, params, {
         let days = params.days.unwrap_or(14) as i64;
         let include_no_due_date = params.include_no_due_date.unwrap_or(false);
         let limit = params.limit.unwrap_or(50);
@@ -3091,7 +3099,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<GetProjectSummaryParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "get_project_summary", params, {
+        tool_handler!(self, "get_project_summary", ToolKind::Walk, params, {
         let include_tags = params.include_tags.unwrap_or(true);
         let recent_days = params.recently_modified_days.unwrap_or(7) as i64;
         info!(node_id = %params.node_id, "Getting project summary");
@@ -3205,7 +3213,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<FindBacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "find_backlinks", params, {
+        tool_handler!(self, "find_backlinks", ToolKind::Walk, params, {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
         let limit = params.limit.unwrap_or(50);
@@ -3264,7 +3272,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ListTodosParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "list_todos", params, {
+        tool_handler!(self, "list_todos", ToolKind::Walk, params, {
         let limit = params.limit.unwrap_or(50);
         let status = params.status.as_deref().unwrap_or("all");
         let max_depth = params.max_depth.unwrap_or(5);
@@ -3325,8 +3333,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<DuplicateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "duplicate_node", params, {
-        self.run_handler("duplicate_node", ToolKind::Bulk, async move {
+        tool_handler!(self, "duplicate_node", ToolKind::Bulk, params, {
         check_node_id(&params.node_id)?;
         check_node_id(&params.target_parent_id)?;
         let resolved_node = self.resolve_node_ref(&params.node_id).await?;
@@ -3424,7 +3431,6 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
         }
-        }).await
         })
     }
 
@@ -3433,8 +3439,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<CreateFromTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "create_from_template", params, {
-        self.run_handler("create_from_template", ToolKind::Bulk, async move {
+        tool_handler!(self, "create_from_template", ToolKind::Bulk, params, {
         check_node_id(&params.template_node_id)?;
         check_node_id(&params.target_parent_id)?;
         let resolved_template = self.resolve_node_ref(&params.template_node_id).await?;
@@ -3527,7 +3532,6 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
         }
-        }).await
         })
     }
 
@@ -3536,8 +3540,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<BulkUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "bulk_update", params, {
-        self.run_handler("bulk_update", ToolKind::Bulk, async move {
+        tool_handler!(self, "bulk_update", ToolKind::Bulk, params, {
         let dry_run = params.dry_run.unwrap_or(false);
         let limit = params.limit.unwrap_or(20);
         let status = params.status.as_deref().unwrap_or("all");
@@ -3694,7 +3697,6 @@ impl WorkflowyMcpServer {
             }
             Err(e) => Err(tool_error("bulk_update", resolved_root.as_deref(), e)),
         }
-        }).await
         })
     }
 
@@ -4095,8 +4097,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<BatchCreateNodesParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "batch_create_nodes", params, {
-        self.run_handler("batch_create_nodes", ToolKind::Bulk, async move {
+        tool_handler!(self, "batch_create_nodes", ToolKind::Bulk, params, {
         if params.operations.is_empty() {
             return Err(McpError::invalid_params(
                 "operations must not be empty".to_string(),
@@ -4175,7 +4176,6 @@ impl WorkflowyMcpServer {
             "results": entries,
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
-        }).await
         })
     }
 
@@ -4184,8 +4184,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<TransactionParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "transaction", params, {
-        self.run_handler("transaction", ToolKind::Bulk, async move {
+        tool_handler!(self, "transaction", ToolKind::Bulk, params, {
             if params.operations.is_empty() {
                 return Err(McpError::invalid_params("operations must not be empty".to_string(), None));
             }
@@ -4231,7 +4230,6 @@ impl WorkflowyMcpServer {
                 "operations": applied_results,
             });
             Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
-        }).await
         })
     }
 
@@ -4240,8 +4238,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<PathOfParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "path_of", params, {
-        self.run_handler("path_of", ToolKind::Bulk, async move {
+        tool_handler!(self, "path_of", ToolKind::Bulk, params, {
             check_node_id(&params.node_id)?;
             let resolved = self.resolve_node_ref(&params.node_id).await?;
             let max_depth = params.max_depth.unwrap_or(50);
@@ -4293,7 +4290,6 @@ impl WorkflowyMcpServer {
                 "truncated": depth >= max_depth,
             });
             Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
-        }).await
         })
     }
 
@@ -4302,8 +4298,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<BulkTagParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "bulk_tag", params, {
-        self.run_handler("bulk_tag", ToolKind::Bulk, async move {
+        tool_handler!(self, "bulk_tag", ToolKind::Bulk, params, {
         if params.node_ids.is_empty() {
             return Err(McpError::invalid_params("node_ids must not be empty".to_string(), None));
         }
@@ -4387,7 +4382,6 @@ impl WorkflowyMcpServer {
             "results": entries,
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
-        }).await
         })
     }
 
@@ -4396,7 +4390,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<SinceParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "since", params, {
+        tool_handler!(self, "since", ToolKind::Read, params, {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
         let node = self.client.get_node(&resolved).await.map_err(|e| {
@@ -4420,7 +4414,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<FindByTagAndPathParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "find_by_tag_and_path", params, {
+        tool_handler!(self, "find_by_tag_and_path", ToolKind::Walk, params, {
         let max_depth = params.max_depth.unwrap_or(5);
         let limit = params.limit.unwrap_or(50);
         if let Some(rid) = &params.root_id { check_node_id(rid)?; }
@@ -4487,7 +4481,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<AuditMirrorsParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "audit_mirrors", params, {
+        tool_handler!(self, "audit_mirrors", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
@@ -4517,7 +4511,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ReviewParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "review", params, {
+        tool_handler!(self, "review", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
@@ -4562,8 +4556,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<NodeAtPathParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "node_at_path", params, {
-        self.run_handler("node_at_path", ToolKind::Bulk, async move {
+        tool_handler!(self, "node_at_path", ToolKind::Bulk, params, {
         if params.path.is_empty() {
             return Err(McpError::invalid_params(
                 "path must contain at least one segment".to_string(),
@@ -4649,7 +4642,6 @@ impl WorkflowyMcpServer {
             "nodes_indexed": visited_nodes.len(),
         });
         Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
-        }).await
         })
     }
 
@@ -4658,7 +4650,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ResolveLinkParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "resolve_link", params, {
+        tool_handler!(self, "resolve_link", ToolKind::Walk, params, {
         let trimmed = params.link.trim();
         // Extract the trailing hex segment from URL-form input.
         let last_seg = trimmed.rsplit('/').next().unwrap_or(trimmed);
@@ -4882,7 +4874,7 @@ impl WorkflowyMcpServer {
         &self,
         TracedParams(params): TracedParams<ExportSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "export_subtree", params, {
+        tool_handler!(self, "export_subtree", ToolKind::Walk, params, {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
         let max_depth = params.max_depth.unwrap_or(10);
@@ -8313,6 +8305,73 @@ mod load_tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "bulk budget (500 ms) must fire well under the 30 s hung mock, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// Architecture invariant: `cancel_all` preempts an in-flight
+    /// `create_node`. Pre-2026-05-02 the basic CRUD writes wrapped only
+    /// in `record_op!` and so could not be preempted by `cancel_all` —
+    /// the gap that turned a wedged write into the 4-minute hang the
+    /// 2026-05-02 session report named. With `tool_handler!` /
+    /// `ToolKind::Write` the wrapper observes the cancel registry the
+    /// same way `path_of` does, and a wedged write returns a structured
+    /// cancelled error within the ~50 ms cancel slice instead of
+    /// stranding the caller.
+    #[tokio::test]
+    async fn cancel_all_preempts_inflight_create_node_via_run_handler() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(json!({"item_id": id_a()})),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = Arc::new(
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .unwrap(),
+        );
+        let server = Arc::new(WorkflowyMcpServer::new(client));
+
+        let server_for_call = Arc::clone(&server);
+        let call = tokio::spawn(async move {
+            server_for_call
+                .create_node(TracedParams(CreateNodeParams {
+                    name: "wedged".to_string(),
+                    description: None,
+                    parent_id: None,
+                    priority: None,
+                }))
+                .await
+        });
+
+        // Let the handler reach the upstream POST before we cancel.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cancel_started = Instant::now();
+        server.cancel_registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("cancel must preempt within the test budget")
+            .expect("task must not panic");
+        let cancel_elapsed = cancel_started.elapsed();
+
+        let err = result.expect_err("cancelled create must surface a tool_error");
+        assert!(
+            err.to_string().to_lowercase().contains("cancel"),
+            "tool error must surface the cancelled cause: {err}"
+        );
+        assert!(
+            cancel_elapsed < Duration::from_millis(500),
+            "cancel must observe the registry within ~50 ms slice, elapsed = {cancel_elapsed:?}"
         );
     }
 

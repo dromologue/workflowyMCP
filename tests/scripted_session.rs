@@ -75,13 +75,29 @@ async fn run_one_session(
         created_ids.push(created.id);
     }
 
-    // 13. Edit one node with both name and description (Pass 5 hardening:
-    //     server splits this into two POSTs; both must succeed).
+    // 13. Edit one node with both name and description, then read it back
+    //     and assert *both* fields landed. The 2026-05-02 brief filed this
+    //     as P2.4 ("partial-update logic"); the actual bug was a wire-field
+    //     mismatch (`description` vs `note`) that made writes silently
+    //     drop the field while returning 200 OK. Without an explicit
+    //     read-after-write check, the regression is invisible.
     if let Some(target) = created_ids.first() {
+        let new_name = format!("scripted-session-r{run}-edited");
+        let new_desc = format!("scripted-session-r{run}-with-description");
         client
-            .edit_node(target, Some(&format!("scripted-session-r{run}-edited")), Some("with description"))
+            .edit_node(target, Some(&new_name), Some(&new_desc))
             .await
             .map_err(|e| format!("edit: {e}"))?;
+        let read_back = client.get_node(target).await.map_err(|e| format!("verify: {e}"))?;
+        if read_back.name != new_name {
+            return Err(format!("edit lost name: got {:?}, expected {:?}", read_back.name, new_name));
+        }
+        if read_back.description.as_deref() != Some(new_desc.as_str()) {
+            return Err(format!(
+                "edit lost description: got {:?}, expected {:?}",
+                read_back.description, new_desc
+            ));
+        }
     }
 
     // 14-23. Ten sequential moves: shuffle nodes between two parents would

@@ -64,6 +64,29 @@ Minimize shared mutable state to reduce complexity.
 - Session state belongs to the MCP client, not the server
 - Design for horizontal scaling even if currently single-instance
 
+### 7. Simplicity
+
+The simplest design that satisfies the contract is the right one. Mechanisms compound: a clever wrapper here, a special case there, and the call graph becomes something only the original author can reason about. Reach for the boring solution first, and let extra structure earn its place by solving a real, current problem rather than an imagined future one.
+
+- One mechanism per concern. If two safety nets cover the same failure mode, delete one.
+- Prefer one shared abstraction over many bespoke ones — but never paper over a real difference with a leaky generic.
+- Inline the obvious. A helper used in one place is not a helper.
+- Trust internal invariants. Validate at system boundaries (user input, external APIs); don't re-validate at every call site.
+- Delete defensive code that protects against scenarios that cannot happen in this codebase.
+- A failure that costs five minutes to diagnose is not paid back by a thousand lines of preventive structure.
+
+### 8. Consistency
+
+Tools, modules, and call sites that are doing the same kind of thing must look the same. A new contributor (human or AI) should be able to read one handler and predict the shape of every other handler in its category. Inconsistency is the dominant source of latent bugs in this codebase: the 2026-05-02 4-minute write hang traced directly to one class of handler (single-node writes) skipping the safety-net wrapper that every other class used.
+
+- Every tool handler runs through the same `tool_handler!` wrapper, classified by `ToolKind`. Diagnostics are the documented exception and own their own short budgets.
+- Every wire-level field name maps to its Rust counterpart at exactly one boundary (the `client.rs` call site for writes, the serde `alias` for reads).
+- Every cancellation-aware operation observes the same `CancelRegistry`. New operations that take time must thread a `CancelGuard`; they do not invent their own cancellation primitive.
+- Every truncated subtree fetch surfaces the same `truncated` + `truncation_reason` + `truncated_at_node_id` triple. New tools that surface truncation reuse the helper, they don't roll their own banner.
+- Every non-trivial error goes through `tool_error(operation, node_id, err)`. New error sites do not return bare `McpError` strings.
+
+When two handlers diverge in pattern, the divergence is either a bug or a load-bearing design choice that earns a comment on the spot — naming the reason the standard pattern doesn't fit. The default is to converge.
+
 ---
 
 ## Structural Constraints

@@ -29,19 +29,28 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 ### Request Flow
 
 ```
-MCP tool call → TracedParams<T> (serde + op_log on failure) → record_op! → handler → run_handler (kind-specific budget + cancel) → WorkflowyClient → retry loop → Workflowy API
+MCP tool call → TracedParams<T> (serde + op_log on failure) → tool_handler! (op_log recorder + run_handler: kind-specific budget + cancel) → handler body → WorkflowyClient → retry loop → Workflowy API
 ```
 
 Two recorder points sit on this path:
 1. **`TracedParams::from_context_part`** records an Err entry to the op
    log when serde rejects the payload — covering the path that the
    rmcp framework would otherwise drop before the handler body runs.
-2. **`record_op!`** (inside every handler) records the handler's own
-   outcome (Ok or Err).
+2. **`tool_handler!`** (the standard wrapper around every
+   non-diagnostic handler body) records the handler's own outcome
+   (Ok or Err) AND wraps the body in `run_handler(name, kind, ...)`
+   so cancel-registry observation and the kind's wall-clock deadline
+   apply uniformly. Diagnostics (`health_check`, `workflowy_status`,
+   `cancel_all`, `get_recent_tool_calls`, `build_name_index`) keep
+   the older `record_op!` macro because they own short, custom
+   budgets that predate the taxonomy.
 
 Together they guarantee every tool call attempt produces exactly one
-op-log entry. Brief 2026-05-02 named the framework-rejection silence
-as the dominant debugging black hole; `TracedParams` closes it.
+op-log entry AND that no handler can sit past its kind's budget or
+ignore `cancel_all`. Brief 2026-05-02 named the framework-rejection
+silence and the unwrapped-write 4-minute hang as the two dominant
+debugging black holes; `TracedParams` plus `tool_handler!` close
+both.
 
 Write operations invalidate the node cache via `self.cache.invalidate_node(id)` (cache is dependency-injected).
 
@@ -93,7 +102,7 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 - Subtree fetches cap at `defaults::MAX_SUBTREE_NODES` (10 000) **and** at `defaults::SUBTREE_FETCH_TIMEOUT_MS` (20 000 ms). Tools surface a `truncated` flag plus a `truncation_reason` (`node_limit` / `timeout` / `cancelled`) when either budget fires; `duplicate_node`, `create_from_template`, and `bulk_update` (delete) refuse to run against a truncated view.
 - `find_node` and `search_nodes` refuse to scan from the workspace root when `parent_id` is omitted. Pass `parent_id`, set `allow_root_scan=true` to accept the full walk, or (find_node only) set `use_index=true` after running `build_name_index` to serve from the opportunistic name index.
 - `insert_content` caps at `defaults::MAX_INSERT_CONTENT_LINES` (200) per call. Above the soft warn threshold (`SOFT_WARN_INSERT_CONTENT_LINES`, 80) the success response includes a chunking hint. The hard cap exists because oversized payloads have been observed to fail at the MCP transport layer before reaching the handler — split into batches of ≤80 and pass each batch's `last_inserted_id` as `parent_id` of the next call to preserve hierarchy.
-- `edit_node` requires at least one of `name` or `description`; an empty patch is rejected at the handler boundary rather than POSTed as `{}`.
+- `edit_node` requires at least one of `name` or `description`; an empty patch is rejected at the handler boundary rather than POSTed as `{}`. The wire field for the description body is `note` (Workflowy's API name); `client.rs` maps `description` → `note` at the boundary on writes, and serde's `alias = "note"` covers reads. Sending `description` literally returns 200 OK with the field silently dropped — that was the 2026-05-02 P2.4 field-loss symptom, and the regression is now pinned by `tests::write_field_names` in `src/api/client.rs`.
 - `move_node` invalidates the cache for the node, the new parent, **and** the old parent (captured via a pre-read). The name index is invalidated for the moved node.
 - `cancel_all` bumps the cancel-registry generation: every outstanding tree walk returns partial results on its next checkpoint with `truncation_reason = "cancelled"`. New calls start fresh.
 - `health_check` calls `GET /nodes` (top-level only) with a 5-second budget; it is safe to use as a liveness probe regardless of tree size.
@@ -105,7 +114,7 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 Unit tests use `#[cfg(test)]` modules alongside source. No live API calls in unit tests. Integration test in `tests/live_insert.rs` requires `WORKFLOWY_API_KEY`.
 
 ```bash
-cargo test --lib                           # unit tests only (283 tests)
+cargo test --lib                           # unit tests only (286 tests)
 cargo test --lib -- test_name              # run specific test
 cargo test --lib -- --nocapture            # with stdout
 ```

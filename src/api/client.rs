@@ -848,7 +848,10 @@ impl WorkflowyClient {
     ) -> Result<CreatedNode> {
         let mut body = json!({ "name": name });
         if let Some(desc) = description {
-            body["description"] = json!(desc);
+            // Wire field is `note`. Sending `description` is silently dropped
+            // upstream — that was the real cause of the 2026-05-02 field-loss
+            // symptom the brief filed as P2.4.
+            body["note"] = json!(desc);
         }
         if let Some(pid) = parent_id {
             body["parent_id"] = json!(pid);
@@ -880,15 +883,21 @@ impl WorkflowyClient {
 
     /// Edit a node's name and/or description.
     ///
-    /// **Wire behaviour.** When both `name` and `description` are
-    /// supplied, the server issues two separate `POST /nodes/{id}`
-    /// requests — one per field — instead of a single combined PATCH.
-    /// This works around an observed upstream issue where a combined
-    /// payload would intermittently lose one field; splitting costs an
-    /// extra round-trip but produces deterministic results. The
-    /// Workflowy MCP skill's wflow workaround documented this, and Pass
-    /// 5 of the reliability plan moves the fix server-side so callers
-    /// don't have to think about it.
+    /// **Wire field names.** Workflowy's REST API names the description
+    /// field `note` on the wire; the Rust surface keeps it as
+    /// `description` and serde's `alias = "note"` covers the read path.
+    /// Writes are hand-constructed here, so the field is mapped to `note`
+    /// at the boundary. Sending `description` produces a 200 OK with the
+    /// field silently dropped — that was the actual root cause of the
+    /// P2.4 field-loss symptom in `briefs/workflowy-mcp-improvements.md`,
+    /// not a partial-update bug.
+    ///
+    /// **Split-payload writes.** When both `name` and `description` are
+    /// supplied the call still issues two separate `POST /nodes/{id}`
+    /// requests, one per field. With the field-name bug fixed the split
+    /// is no longer load-bearing for correctness, but it keeps each
+    /// field's success independent so a transient failure on one cannot
+    /// roll back the other.
     ///
     /// Workflowy uses POST (not PUT) for updates.
     pub async fn edit_node(
@@ -908,7 +917,7 @@ impl WorkflowyClient {
             let _: serde_json::Value = self
                 .request_cancellable("POST", &endpoint, Some(name_body), None, Some(deadline))
                 .await?;
-            let desc_body = json!({ "description": description.unwrap() });
+            let desc_body = json!({ "note": description.unwrap() });
             let _: serde_json::Value = self
                 .request_cancellable("POST", &endpoint, Some(desc_body), None, Some(deadline))
                 .await?;
@@ -921,7 +930,7 @@ impl WorkflowyClient {
             body["name"] = json!(n);
         }
         if let Some(d) = description {
-            body["description"] = json!(d);
+            body["note"] = json!(d);
         }
         let _: serde_json::Value = self
             .request_cancellable("POST", &endpoint, Some(body), None, Some(deadline))
@@ -1689,5 +1698,118 @@ mod tests {
         assert!(fetch.truncated);
         assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
         assert_eq!(fetch.truncated_at_node_id.as_deref(), Some("root-id"));
+    }
+
+    /// Regression tests for the 2026-05-02 description field-loss bug.
+    /// Workflowy's wire field for the description body is `note`. Sending
+    /// `description` returns 200 OK with the field silently dropped. The
+    /// brief filed this as P2.4 ("partial-update logic") but the actual
+    /// root cause was a wire-format mismatch — the split-into-two-POSTs
+    /// workaround masked it because both halves used the wrong key.
+    ///
+    /// These tests pin the wire shape with a body matcher: if the field
+    /// renames back to `description`, the mock won't match, the call
+    /// errors, and the test fails — catching the regression without
+    /// needing a live API.
+    mod write_field_names {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn fast_retry() -> RetryConfig {
+            RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 10,
+                max_delay_ms: 20,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            }
+        }
+
+        fn fast_rate_limit() -> RateLimitConfig {
+            RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            }
+        }
+
+        async fn mock_client(mock: &MockServer) -> WorkflowyClient {
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                fast_retry(),
+                fast_rate_limit(),
+            )
+            .expect("client must build against mock")
+        }
+
+        #[tokio::test]
+        async fn create_node_sends_description_as_note() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/nodes"))
+                .and(body_partial_json(json!({
+                    "name": "n",
+                    "note": "d"
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"item_id": "00000000-0000-0000-0000-000000000001"})),
+                )
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .create_node("n", Some("d"), None, None)
+                .await
+                .expect("create must reach mock — if this fails, the wire field name regressed");
+        }
+
+        #[tokio::test]
+        async fn edit_node_description_only_sends_note() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .and(body_partial_json(json!({"note": "d"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .edit_node("00000000-0000-0000-0000-000000000001", None, Some("d"))
+                .await
+                .expect("edit must reach mock — if this fails, the wire field name regressed");
+        }
+
+        #[tokio::test]
+        async fn edit_node_combined_splits_and_uses_note_for_description() {
+            let mock = MockServer::start().await;
+            // First POST: name only.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .and(body_partial_json(json!({"name": "new"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            // Second POST: note only — pinned to `note`, not `description`.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .and(body_partial_json(json!({"note": "d"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .edit_node("00000000-0000-0000-0000-000000000001", Some("new"), Some("d"))
+                .await
+                .expect("split edit must reach both mocks — if this fails, the wire field name regressed");
+        }
     }
 }

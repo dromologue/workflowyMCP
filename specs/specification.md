@@ -176,12 +176,20 @@ re-implementing them:
    budget of ~12 k nodes — at this rate quasi-full coverage builds up
    over a working day. Both background tasks are no-ops when no save
    path is configured (test paths, custom embeddings).
-7. **`edit_node` field-loss workaround.** When both `name` and
-   `description` are supplied to `edit_node`, the client splits the
-   update into two sequential POSTs (one per field) instead of a
-   combined payload. This works around an observed upstream issue
-   where the combined form intermittently lost one field. Costs an
-   extra round-trip; produces deterministic results.
+7. **`edit_node` wire-field mapping (root cause of P2.4 field loss).**
+   Workflowy's REST API names the description body `note` on the wire;
+   the Rust surface keeps it as `description` and serde's
+   `alias = "note"` covers reads. Writes in `client.rs` map the
+   boundary explicitly: `create_node` sets `body["note"]`, and both
+   branches of `edit_node` (the split combined-edit and the
+   single-field path) send `note`. Sending `description` literally
+   returns 200 OK with the field silently dropped — that was the
+   actual cause of the 2026-05-02 field-loss symptom, not a
+   partial-update bug. The split-into-two-POSTs path is retained for
+   fault isolation between the two fields, but is no longer
+   load-bearing for correctness. Pinned by `tests::write_field_names`
+   in `src/api/client.rs` (wiremock body matchers reject any reversion
+   to `description`).
 8. **`move_node` retry-with-refresh.** On a parent-related 4xx error
    ("parent not found"/"stale parent"), `move_node` re-fetches the
    target parent's children listing and retries the move once. 5xx
@@ -208,33 +216,47 @@ re-implementing them:
     (search succeeds while direct reads fail) is now diagnosable from
     a single status response.
 
-11a. **Per-tool wall-clock budgets.** Every API-touching tool runs
-    against an upstream-independent deadline so a hung Workflowy
-    backend cannot wedge the MCP tool surface for longer than the
-    budget. Walks use `SUBTREE_FETCH_TIMEOUT_MS` (20 s).
-    Single-node reads use `READ_NODE_TIMEOUT_MS` (30 s) via the
-    server-side `with_read_budget` helper. `edit_node` uses
-    `EDIT_NODE_TIMEOUT_MS` (60 s) and shares the same deadline across
-    its split name+description POSTs so a flaky upstream cannot
-    double the budget. **Single-node writes** (`create_node`,
-    `delete_node`) use `WRITE_NODE_TIMEOUT_MS` (15 s) — bounding the
-    retry loop end-to-end means a transient upstream slowness cannot
-    make one node-creation burn the full
-    `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~150 s), which was the
-    root cause of the 4-minute `insert_content` hangs in the
-    2026-05-02 report. **`insert_content`** carries an additional
-    end-to-end budget of `INSERT_CONTENT_TIMEOUT_MS` (210 s — well
-    inside the MCP client's 4-min hard timeout) and returns a
+11a. **Per-tool wall-clock budgets via the unified `tool_handler!`
+    wrapper.** Every non-diagnostic tool wraps its body in
+    `tool_handler!(self, "<name>", ToolKind::*, params, { ... })`,
+    which fuses the op-log recorder with `run_handler` so the same
+    cancel-registry observation and wall-clock deadline arm fire
+    regardless of which tool the caller invokes. The four kinds map to
+    different deadlines: `Read` → `READ_NODE_TIMEOUT_MS` (30 s),
+    `Write` → `WRITE_NODE_TIMEOUT_MS` (15 s), `Bulk` →
+    `INSERT_CONTENT_TIMEOUT_MS` (210 s — well inside the MCP client's
+    4-min hard timeout), `Walk` → cancel-only because the internal
+    `walk_subtree` already owns `SUBTREE_FETCH_TIMEOUT_MS`.
+    `edit_node` additionally uses `EDIT_NODE_TIMEOUT_MS` (60 s) at the
+    client level so its split name+description POSTs share one
+    deadline and cannot double the budget. The 2026-05-02 report
+    surfaced 4-minute write hangs as the dominant symptom; pre-fix
+    the basic CRUD writes (`create_node`, `edit_node`, `delete_node`,
+    `move_node`) and the basic reads (`get_node`, `list_children`,
+    `since`) wrapped only in `record_op!` and so neither observed
+    `cancel_all` nor carried a handler-level deadline above the
+    client-side per-method one. Wrapping every handler in
+    `tool_handler!` closes the gap: a wedged write returns a
+    structured cancelled/timeout error within the cancel slice
+    (~50 ms) or the kind's wall-clock budget, never a 4-minute hang.
+    Diagnostics (`health_check`, `workflowy_status`, `cancel_all`,
+    `get_recent_tool_calls`, `build_name_index`) keep `record_op!`
+    alone because they own short, custom budgets that predate the
+    taxonomy. **`insert_content`** is the one load-bearing exception
+    among non-diagnostic tools: it keeps `record_op!` alone because
+    its inline cancel + deadline checks are what produce the
     structured partial-success payload (`status: "partial"`,
     `reason: "timeout"|"cancelled"`, `created_count`, `total_count`,
-    `last_inserted_id`, `stopped_at_line`) when the budget fires, so
-    callers can resume from where the call stopped instead of seeing
-    "no result received" with no diagnostic. Hitting any budget
-    returns `Timeout`, which `tool_error` translates into a
-    structured response with the `Timeout` proximate cause; the
-    underlying reqwest send is dropped cleanly so the rate-limiter
-    slot and connection-pool slot are immediately available for the
-    next call.
+    `last_inserted_id`, `stopped_at_line`) that callers depend on to
+    resume — wrapping it in `tool_handler!(Bulk)` made the outer
+    deadline arm race the inline one and short-circuit the partial
+    payload to a bare `Err(Timeout)`, regressing
+    `insert_content_returns_partial_on_timeout` /
+    `insert_content_returns_partial_on_cancel`. Hitting any budget
+    returns `Timeout`, which `tool_error` translates into a structured
+    response with the `Timeout` proximate cause; the underlying
+    reqwest send is dropped cleanly so the rate-limiter slot and
+    connection-pool slot are immediately available for the next call.
 
 11b. **Transport-level failures are retryable.** `WorkflowyError::is_retryable`
     classifies both server-side errors (429 + 5xx status codes) **and**
