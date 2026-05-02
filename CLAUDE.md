@@ -82,13 +82,17 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 
 | Category | Tools |
 |----------|-------|
-| Search & Navigation | search_nodes, find_node, get_node, list_children, tag_search, get_subtree, find_backlinks |
-| Content Creation | create_node, insert_content (hierarchical), smart_insert, convert_markdown |
-| Content Modification | edit_node, move_node, delete_node, duplicate_node, create_from_template, bulk_update |
+| Search & Navigation | search_nodes, find_node, get_node, list_children, tag_search, get_subtree, find_backlinks, find_by_tag_and_path, node_at_path, path_of, resolve_link, since |
+| Content Creation | create_node, batch_create_nodes, insert_content (hierarchical), smart_insert, convert_markdown |
+| Content Modification | edit_node, move_node, delete_node, duplicate_node, create_from_template, bulk_update, bulk_tag, transaction |
 | Todo Management | list_todos, complete_node |
 | Due Dates & Scheduling | list_upcoming, list_overdue, daily_review |
 | Project Management | get_project_summary, get_recent_changes |
-| Diagnostics & Ops | health_check, cancel_all, build_name_index |
+| Diagnostics & Ops | health_check, workflowy_status, cancel_all, build_name_index, get_recent_tool_calls, audit_mirrors, review, export_subtree |
+
+### CLI Parity (`wflow-do`)
+
+The `wflow-do` binary at `src/bin/wflow_do.rs` is in **full surface parity** with the MCP tool list above. Every non-diagnostic, non-stub MCP tool has a matching CLI subcommand routed through the same `WorkflowyClient`. New MCP tools must land with their `wflow-do` subcommand in the same commit. The build-time test `cli_covers_every_non_diagnostic_mcp_tool` enumerates the (mcp-tool → cli-subcommand) pairs and fails CI if a tool is added without its CLI counterpart. `convert_markdown` (pure local transform) and `create_mirror` (stub) are intentionally excluded; `cancel_all` and `get_recent_tool_calls` ship as no-op CLI surfaces because the op log only exists in the running MCP server.
 
 ### Workflowy API Constraints
 
