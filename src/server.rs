@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
 use crate::defaults;
+use crate::error::WorkflowyError;
 use crate::types::{WorkflowyNode, NodeId};
 use crate::utils::cache::NodeCache;
 use crate::utils::cancel::CancelRegistry;
@@ -1101,6 +1102,63 @@ impl WorkflowyMcpServer {
             .and_cancel(self.cancel_registry.guard())
     }
 
+    /// Wrap a single-node read future with the server-wide cancel registry
+    /// and the [`defaults::READ_NODE_TIMEOUT_MS`] wall-clock budget.
+    ///
+    /// Why this exists: walks already go through `walk_subtree`, which carries
+    /// both a deadline and a cancel guard. Single-node reads (`get_node`,
+    /// `list_children`, the read paths in `edit_node`/`delete_node`/
+    /// `move_node`/etc.) historically called `client.get_node()` directly,
+    /// which passed `(None, None)` for cancel + deadline — the only bound on
+    /// a hung upstream was `RETRY_MAX_ATTEMPTS × HTTP_TIMEOUT_SECS` (~3.5 min).
+    /// In a real session that produced exactly the symptom users reported:
+    /// one slow upstream call wedged the tool surface for minutes, and
+    /// `cancel_all` could not interrupt it because the in-flight read wasn't
+    /// observing the cancel registry.
+    ///
+    /// Dropping the inner future on timeout/cancel cleanly aborts the reqwest
+    /// send (closes the connection) and releases the rate-limiter slot, so
+    /// the next tool call starts fresh.
+    async fn with_read_budget<F, T>(&self, fut: F) -> std::result::Result<T, WorkflowyError>
+    where
+        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
+    {
+        self.with_read_budget_inner(
+            fut,
+            Duration::from_millis(defaults::READ_NODE_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// Implementation of [`Self::with_read_budget`] with the budget injected.
+    /// Tests target this entry point directly so they can exercise the
+    /// timeout/cancel paths in milliseconds rather than the production 30 s.
+    async fn with_read_budget_inner<F, T>(
+        &self,
+        fut: F,
+        budget: Duration,
+    ) -> std::result::Result<T, WorkflowyError>
+    where
+        F: std::future::Future<Output = std::result::Result<T, WorkflowyError>>,
+    {
+        let guard = self.cancel_registry.guard();
+        let poll_cancel = async {
+            loop {
+                if guard.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let deadline = tokio::time::sleep(budget);
+        tokio::select! {
+            biased;
+            _ = poll_cancel => Err(WorkflowyError::Cancelled),
+            _ = deadline => Err(WorkflowyError::Timeout),
+            res = fut => res,
+        }
+    }
+
     /// Resolve a `node_id` parameter to a full UUID string. Accepts either
     /// the canonical 32-hex-char UUID (with or without hyphens) or one
     /// of the two short-hash forms (12-char URL suffix or 8-char prefix).
@@ -1341,7 +1399,6 @@ impl WorkflowyMcpServer {
     /// `authenticated` signal in the probe response can be derived
     /// independently of "did this probe succeed".
     async fn probe_upstream_with_retry(&self, budget: Duration) -> ProbeOutcome {
-        use crate::error::WorkflowyError;
         let started = Instant::now();
         let half_deadline = started + budget / 2;
         let full_deadline = started + budget;
@@ -1524,10 +1581,19 @@ impl WorkflowyMcpServer {
         // Both calls go through the propagation-retry path: Workflowy has
         // been observed to return a node ID via a parent's children listing
         // before the same ID is queryable directly. The retry waits up to
-        // ~1.4 s total (200 + 400 + 800 ms) before giving up.
-        let node_fut = self.client.get_node_with_propagation_retry(&resolved);
-        let children_fut = self.client.get_children_with_propagation_retry(&resolved);
-        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
+        // ~1.4 s total (200 + 400 + 800 ms) before giving up. The combined
+        // future is wrapped in `with_read_budget` so a hung upstream returns
+        // Timeout in ~30 s rather than burning the full retry-attempt
+        // budget; `cancel_all` also drops it cleanly mid-flight.
+        let combined = async {
+            let node_fut = self.client.get_node_with_propagation_retry(&resolved);
+            let children_fut = self.client.get_children_with_propagation_retry(&resolved);
+            Ok::<_, WorkflowyError>(tokio::join!(node_fut, children_fut))
+        };
+        let (node_res, children_res) = match self.with_read_budget(combined).await {
+            Ok(pair) => pair,
+            Err(e) => return Err(tool_error("get_node", Some(&resolved), e)),
+        };
 
         let node = match node_res {
             Ok(n) => n,
@@ -1743,7 +1809,10 @@ impl WorkflowyMcpServer {
         check_node_id(&params.node_id)?;
         let resolved = self.resolve_node_ref(&params.node_id).await?;
 
-        match self.client.get_children_with_propagation_retry(&resolved).await {
+        match self
+            .with_read_budget(self.client.get_children_with_propagation_retry(&resolved))
+            .await
+        {
             Ok(children) => {
                 if children.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
@@ -6212,6 +6281,132 @@ mod tests {
             .and_then(|c| c.as_text().map(|t| t.text.clone()))
             .unwrap_or_default();
         assert!(body.contains("\"status\":\"cancelled\""), "body: {body}");
+    }
+
+    /// Failure 2 from the 2026-04-30 MCP report: a single-node read against
+    /// a hung upstream wedges the tool surface for ~3.5 min (5 retries × 30 s
+    /// reqwest timeout). `with_read_budget` must collapse that to the
+    /// configured budget by dropping the inner future on deadline.
+    #[tokio::test]
+    async fn with_read_budget_returns_timeout_when_inner_future_hangs() {
+        let server = new_test_server();
+        let started = std::time::Instant::now();
+        let pending_fut = std::future::pending::<std::result::Result<(), WorkflowyError>>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.with_read_budget_inner(pending_fut, Duration::from_millis(150)),
+        )
+        .await
+        .expect("with_read_budget must self-bound, must not exhaust outer test timeout");
+        assert!(
+            matches!(result, Err(WorkflowyError::Timeout)),
+            "expected Timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "deadline must fire promptly, elapsed = {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Failure 2 from the same report: `cancel_all` was hanging because
+    /// in-flight reads weren't observing the cancel registry. With the budget
+    /// helper wrapping every read, `cancel_all` now drops the in-flight
+    /// future on the next 50 ms cancel-poll tick.
+    #[tokio::test]
+    async fn with_read_budget_returns_cancelled_when_cancel_all_fires_mid_flight() {
+        use std::sync::Arc;
+        let server = Arc::new(new_test_server());
+        let server_for_task = Arc::clone(&server);
+        let task = tokio::spawn(async move {
+            let slow_fut = async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<(), WorkflowyError>(())
+            };
+            server_for_task
+                .with_read_budget_inner(slow_fut, Duration::from_secs(120))
+                .await
+        });
+
+        // Let the future enter its sleep, then cancel.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let started = std::time::Instant::now();
+        server.cancel_registry.cancel_all();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("cancellation must be observed within ~50 ms cancel-poll slice")
+            .expect("task should not panic");
+        assert!(
+            matches!(result, Err(WorkflowyError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "cancel must preempt the long sleep, elapsed = {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Happy path: a fast inner future returns its own result without the
+    /// budget firing. Guards the helper against accidentally swallowing
+    /// successful responses on the timeout/cancel arms.
+    #[tokio::test]
+    async fn with_read_budget_returns_ok_for_fast_inner_future() {
+        let server = new_test_server();
+        let result = server
+            .with_read_budget_inner(
+                async { Ok::<u32, WorkflowyError>(42) },
+                Duration::from_secs(60),
+            )
+            .await;
+        assert!(matches!(result, Ok(42)));
+    }
+
+    /// Regression for the 2026-04-30 wedge: `list_children` against an
+    /// unreachable upstream must surface a structured tool error rather than
+    /// hang the tool surface. The test pin is the structured `tool_error`
+    /// payload — that is the contract handlers use to signal a bounded
+    /// failure to the MCP client. The clock bound is asserted with a generous
+    /// outer `tokio::time::timeout` so a regression that re-introduces the
+    /// retry-loop hang trips the test instead of timing out the whole suite.
+    #[tokio::test]
+    async fn list_children_against_unreachable_upstream_returns_bounded_error() {
+        let server = new_test_server();
+        let params = GetChildrenParams { node_id: NodeId::from(valid_id()) };
+        let result = tokio::time::timeout(
+            // Generous bound: reqwest connect failures complete in ms; even
+            // with retries the call must not approach 60 s. Anything beyond
+            // that means the budget is no longer being applied.
+            Duration::from_secs(60),
+            server.list_children(Parameters(params)),
+        )
+        .await
+        .expect("list_children must return within the bounded budget, not the suite timeout");
+        let err = result.expect_err("unreachable upstream must surface a tool_error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("list_children"),
+            "tool error must name the operation: {msg}"
+        );
+    }
+
+    /// Same regression as above for `get_node`. The handler runs the parent
+    /// + children fetches in parallel inside `with_read_budget`, so a hung
+    /// upstream cannot stretch this past the read budget.
+    #[tokio::test]
+    async fn get_node_against_unreachable_upstream_returns_bounded_error() {
+        let server = new_test_server();
+        let params = GetNodeParams { node_id: NodeId::from(valid_id()) };
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            server.get_node(Parameters(params)),
+        )
+        .await
+        .expect("get_node must return within the bounded budget, not the suite timeout");
+        let err = result.expect_err("unreachable upstream must surface a tool_error");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("get_node"), "tool error must name the operation: {msg}");
     }
 
     #[tokio::test]

@@ -61,6 +61,15 @@ pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
 /// upstream returns Timeout in ~60 s rather than burning all 5 retry
 /// attempts × HTTP_TIMEOUT_SECS on each transient read-timeout.
 pub const EDIT_NODE_TIMEOUT_MS: u64 = 60_000;
+/// Wall-clock budget for a single-node read tool call (`get_node`,
+/// `list_children`, and the read paths inside other handlers). Bounds
+/// the whole retry loop end-to-end so a hung upstream cannot wedge the
+/// MCP tool surface for the full 5 attempts × 30 s (~3.5 min) it would
+/// take retry-exhaustion to report. Picked at 30 s because the per-attempt
+/// reqwest timeout is also 30 s — one full-budget HTTP attempt fits, and
+/// a flat-out hung connection returns Timeout to the caller immediately
+/// after, freeing the rate-limiter and connection-pool slot.
+pub const READ_NODE_TIMEOUT_MS: u64 = 30_000;
 
 // --- Tree Traversal ---
 /// Default max_depth for search operations
