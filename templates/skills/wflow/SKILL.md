@@ -1,7 +1,8 @@
 ---
 name: wflow
-description: Integrated second-brain skill for Workflowy + reMarkable + Claude — capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
+description: Integrated second-brain skill built on Workflowy plus any additional services the user has configured (declared in $SECONDBRAIN_DIR/memory/services.md). Capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__bulk_update, mcp__workflowy__find_backlinks
+# Additional service tool namespaces (e.g. mcp__<service>__*) are listed in $SECONDBRAIN_DIR/memory/services.md and must be added to allowed-tools when configured.
 ---
 
 # wflow — second-brain skill (template)
@@ -13,7 +14,7 @@ The skill spans the full second-brain loop:
 1. **Capture** — tasks, links, ink, reading material.
 2. **Triage and prioritisation** — daily / weekly / monthly cascade.
 3. **Synthesis** — distillation of reading and conversation into atomic notes.
-4. **Retrieval** — graph queries across Workflowy and (optionally) reMarkable.
+4. **Retrieval** — graph queries across Workflowy and any additional services the user has configured.
 
 It is invoked **conversationally** — the user does not need to type slash commands. Match by intent, not by exact wording.
 
@@ -38,14 +39,12 @@ When the intent is ambiguous, ask one clarifying question rather than guessing.
 
 ## Server contracts the workflows depend on
 
-Five contracts the workflowy-mcp / remarkable-mcp servers ship — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them.
+Four contracts the workflowy-mcp server ships — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them. Any additional service the user has configured (per `$SECONDBRAIN_DIR/memory/services.md`) ships its own contracts; document those alongside the service entry, not here.
 
 1. **`complete_node` is the native completion path; `bulk_update` accepts `complete` / `uncomplete`.** The legacy `#done` tag-as-completion-marker is deprecated for tasks (`#done` on reading-list entries to mark "I've distilled this source" remains a separate convention). Workflowy's wire field is `note` for descriptions and `completed` for the boolean.
 2. **`Parameters<T>` is the wrapper name on every tool's input.** If parameter-bearing calls suddenly silently misroute (every call acts as if you sent no arguments, only `workflowy_status` works), the server has regressed the wrapper name and the cowork client is validating against an empty schema. Recovery: route through `wflow-do` until the server is rebuilt.
 3. **`use_index=true` is the recovery for walk-budget timeouts on name queries.** `find_node` and `search_nodes` answer from the persistent name index in O(1) with no walk budget. Index is name-only — descriptions need a live walk. Populate via `build_name_index(parent_id=<scope>)` once per fresh session or whenever the index is sparse.
 4. **Every walk-shaped tool emits the same JSON-truncation envelope** (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`). Read these on every walk response — don't silently accept partial results.
-5. **reMarkable OCR auto-mode prefers sampling on capable clients.** No env var needed; sampling beats Tesseract on handwriting by a wide margin. Response carries `ocr_attempts` listing every backend tried with concrete error strings — surface these when all attempts failed; "no text detected" no longer means "image is blank."
-
 The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every non-diagnostic tool has a matching subcommand. Drift fails the build, so the fallback path is always available when transport drops.
 
 ---
@@ -70,10 +69,10 @@ Most preventable write-failure mode. Before any tool call that takes a UUID para
 
 The user has up to four complementary layers:
 
-1. **Workflowy** — system of record and second-brain wiki. Holds tasks, projects, references, the journal, and (optionally) a Distillations subtree.
-2. **reMarkable** *(optional)* — ink capture, marginalia, PDF/EPUB reading.
+1. **Workflowy** — system of record and second-brain wiki. Holds tasks, projects, references, the journal, and (optionally) a Distillations subtree. Required.
+2. **Additional services** *(optional — most users will skip this layer)* — declared in `$SECONDBRAIN_DIR/memory/services.md` if and only if the user wants extra surfaces. Each entry names a service (e.g. an ink-capture device, a document store, a reading-queue API), its MCP namespace, the workflows it participates in, and how to health-check it. The skill is service-agnostic; the file's absence is normal, not a fault.
 3. **Claude** — bidirectional reader and writer.
-4. **secondBrain directory** (`$SECONDBRAIN_DIR/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, and external-facing briefs.
+4. **secondBrain directory** (`$SECONDBRAIN_DIR/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, the services configuration, and external-facing briefs.
 
 The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written both to Workflowy and to `$SECONDBRAIN_DIR/session-logs/`.
 
@@ -91,7 +90,7 @@ Confirm the MCP tool surface this skill needs is actually loaded **before** doin
 
 - **`workflowy:*`** — required for every workflow.
 - **`Filesystem:*`** — required to read drafts and memory files (skip in Claude Code, which uses native `Read`/`Write`/`Bash`).
-- **`remarkable:*`** — required for any workflow that fetches from a reMarkable tablet.
+- **Each additional service** *(only if the user has any)*. Check whether `$SECONDBRAIN_DIR/memory/services.md` exists; if it does, read it once at session start and probe each service's `bootstrap_probe` tool. Skip a service whose `bootstrap_probe` is `none`. Skip services whose `participates_in` doesn't intersect the workflow you're about to run. **If the file doesn't exist, skip this step entirely** — many users will run with Workflowy-only and that's a fully supported configuration.
 
 #### How to probe
 
@@ -99,13 +98,13 @@ Use the **exact server name** as the `tool_search` query — descriptive phrases
 
 - `tool_search(query="Workflowy")`
 - `tool_search(query="Filesystem")`
-- `tool_search(query="remarkable")`
+- For each additional service: `tool_search(query="<exact server name from services.md>")`.
 
 Verify each surface with a read-only call:
 
 - `workflowy:health_check()` — `status: "ok"`, `authenticated: true`.
 - `Filesystem:list_allowed_directories()` — includes the user's SecondBrain path.
-- `remarkable:remarkable_status()` — healthy. Probe only when a reMarkable workflow is queued.
+- For each additional service whose probe is queued: invoke the tool name listed in its `bootstrap_probe` field. Treat anything other than a healthy response as a fail-loud condition.
 
 #### Fail-loud protocol
 
@@ -223,8 +222,8 @@ The detailed implementation of each workflow lives in the user's customised copy
 
 - **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes.
 - **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
-- **Cross-system research** — query across Workflowy and (optionally) reMarkable for everything related to a topic. Surface as a synthesis with citations back to source nodes.
-- **Extract reMarkable annotations** *(optional)* — use the reMarkable MCP to pull marginalia and route them into Distillations.
+- **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
+- **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.
 - **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
 - **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
 

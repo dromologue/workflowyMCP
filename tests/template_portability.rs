@@ -204,6 +204,110 @@ fn template_distillation_taxonomy_is_placeholder_shaped() {
     );
 }
 
+/// The skill template must not embed specific external-service names
+/// (reMarkable, Notion, Obsidian, Linear, Readwise, etc.). Each user
+/// configures their own additional services in
+/// `$SECONDBRAIN_DIR/memory/services.md`; the skill probes whichever
+/// services that file declares. Naming a specific service in the
+/// skill body forces every user to either use that service or read
+/// past instructions that don't apply to them. The 2026-05-03 leak:
+/// reMarkable was a first-class integration in the template (10
+/// inline references); it now lives in `services.md` like any other
+/// optional surface.
+#[test]
+fn template_skill_does_not_embed_specific_external_services() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
+    // Common external-service names that have been or might be a
+    // user's optional surface. Workflowy is required by the skill
+    // and stays. Filesystem is the file-system MCP and stays.
+    // `remarkable-mcp` would be a hyphenated server-name reference
+    // — also banned at top level since the skill should not assume
+    // the service exists.
+    let banned_services = [
+        "reMarkable",
+        "remarkable",
+        "Remarkable",
+        "Notion",
+        "Obsidian",
+        "Bear",
+        "Roam",
+        "Logseq",
+        "Linear",
+        "Jira",
+        "Readwise",
+        "Pocket",
+        "Instapaper",
+    ];
+    let mut violations: Vec<String> = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        // Skip doc-comment lines / examples that explicitly *describe
+        // the pattern* of declaring services in `services.md` —
+        // recognised by mention of "services.md" or "additional
+        // service" in the same line.
+        if trimmed.contains("services.md") || trimmed.contains("additional service") {
+            continue;
+        }
+        for svc in &banned_services {
+            // Word-boundary match — don't flag substrings inside other
+            // words (e.g. "Notion" is fine but the substring "notion"
+            // appears inside many other words; case-sensitive matching
+            // on the proper-noun forms catches the leaks we care
+            // about).
+            if line.contains(svc) {
+                violations.push(format!(
+                    "line {}: service name `{}` named in skill body: {}",
+                    i + 1,
+                    svc,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "templates/skills/wflow/SKILL.md must stay neutral about \
+         external services. Specific services (reMarkable, Notion, \
+         Linear, etc.) are user-specific and live in \
+         `$SECONDBRAIN_DIR/memory/services.md`. The skill's job is to \
+         read that file and probe whatever's declared. Violations:\n  {}",
+        violations.join("\n  "),
+    );
+}
+
+/// The skill `description:` frontmatter field has a 1024-character
+/// hard limit (Claude skill upload rejects over-length entries).
+/// Pin this on the template to prevent regressing — the May-2026
+/// incident pushed the user's canonical to 1202 chars, breaking the
+/// upload path. Same rule applies to the template ahead of any
+/// future expansion.
+#[test]
+fn template_skill_description_under_1024_chars() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
+    let mut in_frontmatter = false;
+    let mut description_line: Option<String> = None;
+    for line in src.lines() {
+        if line.trim() == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter && line.trim_start().starts_with("description:") {
+            description_line = Some(line.to_string());
+            break;
+        }
+    }
+    let description = description_line
+        .expect("templates/skills/wflow/SKILL.md must have a `description:` frontmatter field");
+    assert!(
+        description.len() <= 1024,
+        "templates/skills/wflow/SKILL.md description is {} chars, \
+         must be ≤ 1024 (Claude skill frontmatter hard limit). Trim \
+         and move detail into the body. Current line: `{}...`",
+        description.len(),
+        &description.chars().take(120).collect::<String>(),
+    );
+}
+
 /// Both memory-file templates must declare their canonical_path as
 /// `$SECONDBRAIN_DIR/memory/<file>.md` — never a hardcoded user path.
 /// This was the May-2026 leak in the *user's bundled copies* (which
@@ -214,6 +318,7 @@ fn template_memory_files_declare_env_driven_canonical_path() {
     for rel in [
         "templates/secondbrain/memory/workflowy_node_links.md",
         "templates/secondbrain/memory/distillation_taxonomy.md",
+        "templates/secondbrain/memory/services.md",
     ] {
         let src = read_template(rel);
         // Find the frontmatter `canonical_path:` line.
