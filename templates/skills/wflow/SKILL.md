@@ -50,6 +50,22 @@ The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every n
 
 ---
 
+## UUID Parameter Discipline (read before EVERY write call)
+
+Most preventable write-failure mode. Before any tool call that takes a UUID parameter (`move_node`, `edit_node`, `delete_node`, `complete_node`, `get_node`, `parent_id` on `create_node`, `new_parent_id` on `move_node`, every parameter typed `NodeId`), run this check — every time, no exceptions:
+
+1. **Have the UUID string in front of you.** Full UUID (`550e8400-e29b-41d4-a716-446655440000`), 12-char URL-suffix short hash, or 8-char doc-prefix short hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the write call yet.
+
+2. **NEVER write the literal string `null` between parameter tags for a required UUID.** Some host surfaces (claude.ai web/mobile in particular) have a tendency to emit `null` when the UUID isn't immediately to hand. The MCP server has no fallback that resolves `null` to a previously-touched UUID — the call gets rejected, or worse, lands on the wrong node. If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
+
+3. **If the error reads `invalid parameters at \`.<field>\`: invalid type: null, expected a string`** — you typed `null` for `<field>`. Don't apologise and retry with `null`. Find the actual UUID for that field, then retry. The error names the field on purpose.
+
+4. **Path-less version of the error** (`invalid type: null, expected a string` with no `at \`.<field>\``) means the running MCP binary is pre-2026-05-03. Restart Claude Desktop / re-launch the host process to pick up the path-aware deserializer.
+
+5. **Workaround for surfaces that persistently strip bare-string UUIDs to `null`:** route writes through a tool whose parameters are an `operations` array — `transaction(operations=[{op: "move", node_id: "<uuid>", new_parent_id: "<uuid>"}, ...])` for multi-write batches, `batch_create_nodes(operations=[...])` for multi-creates. The UUIDs sit inside nested array items, dodging the bare-top-level-string encoding bug. Trade-off: one rollback unit per transaction. Last resort: `wflow-do` CLI, which bypasses host-side encoding entirely.
+
+---
+
 ## System overview
 
 The user has up to four complementary layers:
