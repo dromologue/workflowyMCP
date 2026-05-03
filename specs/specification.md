@@ -335,7 +335,7 @@ re-implementing them:
    per-op partial success is acceptable.
 
 13. **Framework-level failures are observable.** Every handler accepts
-    its parameters via `TracedParams<T>`, a drop-in replacement for
+    its parameters via `Parameters<T>`, a drop-in replacement for
     `rmcp::Parameters<T>` that records every deserialization failure
     to the op log *before* returning the typed `McpError` to the
     transport. The rmcp standard wrapper rejects malformed requests
@@ -343,12 +343,12 @@ re-implementing them:
     never moved on "invalid parameters" failures, and the MCP client
     surfaced the bare string `Tool execution failed` with no
     diagnostic. Brief 2026-05-02 named that as the dominant debugging
-    black hole. With `TracedParams` in place, every rejected call
+    black hole. With `Parameters` in place, every rejected call
     appears in the op log, every rejection carries a typed
     `proximate_cause` in its data payload, and `per_tool_health`
     reflects the real failure rate rather than just the failures that
     happened to clear deserialization first. The schema, serde wire
-    format, and destructuring (`TracedParams(p)`) match `Parameters`
+    format, and destructuring (`Parameters(p)`) match `Parameters`
     exactly — the only behavioural difference is observability on the
     failure path.
 
@@ -359,7 +359,7 @@ re-implementing them:
     silently dropped because the struct field was named `node_id`.
     Two changes close the gap: (a) `deny_unknown_fields` converts
     silent drops into typed `unknown field` deserialize errors that
-    `TracedParams` records and surfaces; (b) `GetChildrenParams.node_id`
+    `Parameters` records and surfaces; (b) `GetChildrenParams.node_id`
     accepts `parent_id` as an alias because every other tool in this
     server that scopes to a parent uses that name. Both names now
     reach the handler with the same semantics, and any third name
@@ -419,8 +419,8 @@ half-overlapping signals:
 
 | Failure mode | Observed via | Self-clearing |
 |---|---|---|
-| Invalid parameters | `op_log` (via `TracedParams`) + `per_tool_health` | n/a (per-call) |
-| Unknown field | `op_log` (via `TracedParams`, deserialize error) | n/a |
+| Invalid parameters | `op_log` (via `Parameters`) + `per_tool_health` | n/a (per-call) |
+| Unknown field | `op_log` (via `Parameters`, deserialize error) | n/a |
 | Oversized `insert_content` | typed handler error with `proximate_cause` | n/a |
 | Unscoped tree walk | typed handler error from gate | n/a |
 | Upstream timeout | `op_log` + `tool_error` data + `last_unrecovered_failure` | yes — clears on next OK for same tool |

@@ -19,7 +19,7 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 
 ### Module Structure
 
-- **`src/server.rs`** — MCP tool_router with 38 tool handlers. `#[tool]` proc macros register tools; serde + schemars validate inputs via `TracedParams<T>` wrapper (a drop-in replacement for `rmcp::Parameters<T>` that records framework-level deserialization failures to the op log before returning the typed `McpError`). Uses `NodeId` newtype for all node ID parameters. Every parameter struct carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded error instead of silently defaulting to `None`.
+- **`src/server.rs`** — MCP tool_router with 38 tool handlers. `#[tool]` proc macros register tools; serde + schemars validate inputs via `Parameters<T>` wrapper (a drop-in replacement for `rmcp::Parameters<T>` that records framework-level deserialization failures to the op log before returning the typed `McpError`). Uses `NodeId` newtype for all node ID parameters. Every parameter struct carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded error instead of silently defaulting to `None`. **The wrapper struct must keep its name `Parameters`**: `rmcp-macros 0.16` discovers a tool's parameter type by matching the literal identifier `Parameters` on the last path segment of the function-arg type (`rmcp-macros/src/common.rs:64`). A wrapper named anything else makes the macro fall back to a hardcoded `{"type": "object", "properties": {}}` schema for every parameter-bearing tool — silently strips arguments at the wire (the cowork client then validates against the empty schema and drops them all). Pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties` in `src/server.rs::tests`.
 - **`src/api/client.rs`** — Workflowy API client with exponential backoff retry. `get_subtree_recursive()` fetches tree level-by-level via `/nodes?parent_id=` with configurable depth limit (crucial for 250k+ node trees). Returns `SubtreeFetch { nodes, truncated, limit }`; when the `MAX_SUBTREE_NODES` cap (10 000 by default, `defaults.rs`) is hit the flag is surfaced in every tool response so callers can narrow the scope.
 - **`src/defaults.rs`** — Centralized constants for all magic numbers (cache TTL, retry config, validation limits, tree depth defaults).
 - **`src/types.rs`** — Core types including `NodeId` newtype with `Deref<str>`, `AsRef<str>`, `PartialEq<String>`, and `JsonSchema` impls.
@@ -29,11 +29,11 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
 ### Request Flow
 
 ```
-MCP tool call → TracedParams<T> (serde + op_log on failure) → tool_handler! (op_log recorder + run_handler: kind-specific budget + cancel) → handler body → WorkflowyClient → retry loop → Workflowy API
+MCP tool call → Parameters<T> (serde + op_log on failure) → tool_handler! (op_log recorder + run_handler: kind-specific budget + cancel) → handler body → WorkflowyClient → retry loop → Workflowy API
 ```
 
 Two recorder points sit on this path:
-1. **`TracedParams::from_context_part`** records an Err entry to the op
+1. **`Parameters::from_context_part`** records an Err entry to the op
    log when serde rejects the payload — covering the path that the
    rmcp framework would otherwise drop before the handler body runs.
 2. **`tool_handler!`** (the standard wrapper around every
@@ -49,7 +49,7 @@ Together they guarantee every tool call attempt produces exactly one
 op-log entry AND that no handler can sit past its kind's budget or
 ignore `cancel_all`. Brief 2026-05-02 named the framework-rejection
 silence and the unwrapped-write 4-minute hang as the two dominant
-debugging black holes; `TracedParams` plus `tool_handler!` close
+debugging black holes; `Parameters` plus `tool_handler!` close
 both.
 
 Write operations invalidate the node cache via `self.cache.invalidate_node(id)` (cache is dependency-injected).

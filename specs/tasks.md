@@ -626,6 +626,49 @@
     `degraded_warning_clears_after_get_node_recovery`. All 283 unit
     tests pass.
 
+- [x] **T-167 (Schema-publication bug, 2026-05-03 daily-substack-summary failure)**:
+    Every Workflowy MCP tool exposed by the cowork client shipped a
+    JSON schema with an empty `properties` block and no `required`
+    field. The cowork tool-call serialiser validated arguments
+    against the empty schema and stripped them all, so
+    parameter-bearing calls reached the server with an empty
+    argument object. `get_node` / `search_nodes` etc. rejected the
+    call with a typed `invalid parameters: missing field` error;
+    `list_children` (with the `parent_id` alias accepting an empty
+    payload) silently treated it as a no-arg call and returned the
+    workspace root — the more dangerous mode because no error
+    surfaced. `workflowy_status` (the one parameterless tool)
+    worked, which made the bug invisible to a casual probe.
+  - **Root cause**: `rmcp-macros 0.16` discovers a tool's parameter
+    type by matching the LITERAL identifier `Parameters` on the last
+    path segment of the function-arg type
+    (`rmcp-macros-0.16.0/src/common.rs:64`). The codebase's wrapper
+    was previously named `TracedParams<T>`, which the macro did not
+    recognise — so the `#[tool]` macro fell through to a hardcoded
+    `{"type": "object", "properties": {}}` schema at
+    `rmcp-macros-0.16.0/src/tool.rs:240`. The wrapper's
+    `JsonSchema` impl was correct but never consulted.
+  - **Fix**: the wrapper is renamed to `Parameters<T>` in
+    `src/server.rs` (122 sites). Functionally identical to the
+    pre-rename `TracedParams` — same op-log recording on serde
+    failure, same `from_context_part` discipline — but the
+    identifier now matches what the rmcp macro looks for, so the
+    macro reaches into `Parameters::json_schema` and publishes the
+    full property schema for every tool.
+  - **Regression pin**:
+    `parameter_bearing_tools_publish_non_empty_input_schema_properties`
+    in `src/server.rs::tests` enumerates every registered tool from
+    `tool_router.list_all()`, skips the parameterless ones, and
+    asserts `input_schema.properties` is non-empty for the rest.
+    Plus a representative `search_nodes` check that
+    `required` contains `query`, so a schemars version bump that
+    drops `required` also fails this test loudly.
+  - **Standing rule**: see
+    `feedback_rmcp_parameters_wrapper_name.md` in project memory.
+    Renaming the wrapper away from `Parameters` reintroduces the
+    bug; if upgrading rmcp-macros, re-check
+    `find_parameters_type_in_sig`.
+
 - [x] **T-166 (Native completion state)**: First-class todo completion.
     Pre-T-166 the wflow skill used a `#done` tag-based workaround for
     completion because the Workflowy completion endpoint was not
