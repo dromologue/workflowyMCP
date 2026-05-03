@@ -626,6 +626,67 @@
     `degraded_warning_clears_after_get_node_recovery`. All 283 unit
     tests pass.
 
+- [x] **T-170 (2026-05-03 architecture-review pass, multi-phase)**:
+    Architecture review surfaced four classes of accumulation in the
+    9 191-line `server.rs` plus the 2 592-line `wflow_do.rs`. Five
+    recommendations landed across four commits.
+  - **Phase 1** (commit 39a8712): three helpers + the cache-fix.
+    - `truncation_envelope(truncated, limit, reason)` and
+      `with_truncation_envelope(payload, ...)` — the four-field JSON
+      envelope is now produced by one function. Existing 15 inline
+      sites stay (already pinned by the audit test); new sites go
+      through the helper.
+    - `validate_and_resolve(raw)` — collapsed 30+ instances of
+      `check_node_id(p)?; let r = self.resolve_node_ref(p).await?;`
+      into a single helper. Order is load-bearing (validation must
+      precede resolve), so wrapping it makes the contract harder to
+      forget.
+    - `invalidate_for_mutation(ids)` + pre-call invalidation in all
+      five write handlers (create / edit / delete / complete / move).
+      Closes the cache-invalidation-on-timeout gap: pre-fix, if
+      `tool_handler!`'s timeout arm fired, the post-API invalidation
+      code never ran and the cache stayed stale despite the mutation
+      having landed at the API. Pre-call invalidation makes the
+      contract robust to timeout, cancel, and panic at the cost of
+      one redundant API read on a failed mutation.
+  - **Phase 2** (commit 2a4f48a): `server.rs` → `server/mod.rs` plus
+    `server/params.rs`. The 564-line slab of parameter struct
+    definitions moved to its own file; everything else stays where
+    it is. `mod params; pub use params::*;` keeps existing call
+    sites working without import churn. Net effect: server/mod.rs
+    drops from 9 341 to 8 791 lines; the surface between the
+    wrapper-trait impl and the first handler is now navigable.
+  - **Phase 3** (commit 6fe3a4c): `src/utils/aggregation.rs` extracts
+    the four most-duplicated aggregations — `compute_overdue`,
+    `compute_upcoming`, `compute_recent_changes`, `filter_todos` —
+    into pure functions both surfaces call. `wflow_do.rs::Cmd::*`
+    handlers for those four migrated; `server/mod.rs::list_overdue`
+    migrated as proof of concept. Five new unit tests pin the helpers'
+    behaviour against arbitrary `today` / `now_ms` parameters.
+    Other server handlers can migrate incrementally; `list_upcoming`
+    has an `include_no_due_date` branch the helper doesn't currently
+    cover (extending the helper is the right move when the migration
+    happens).
+  - **Phase 4** (this commit): `tool_invalid_params(operation, node_id, msg)`
+    helper + `ProximateCause::InvalidParams` enum variant. Validation
+    failures now route through a helper that produces the same `data`
+    envelope shape as `tool_error`, so clients see one error envelope
+    for all failure paths. Three representative sites migrated
+    (`find_node` refusal, `find_node` selection out-of-range,
+    `edit_node` empty-update rejection); 37 remaining
+    `McpError::invalid_params` sites are scheduled for incremental
+    migration. The rule going forward: validation errors that know
+    their operation use the helper; only framework-level / parser
+    failures use bare `McpError::invalid_params`.
+  - **Spec sync**: `principles-architecture.md` gains four new
+    Rust-idiom subsections naming the JSON envelope helper, the
+    pre-call cache invalidation rule, the validation-error helper
+    rule, and the cross-surface aggregation rule. Each links to the
+    helper that enforces it.
+  - **Test count**: 303 lib (was 298: +5 aggregation tests) + 12 CLI
+    = 315 tests pass. Five new build-time / integration tests on the
+    helpers; existing tests unchanged.
+
 - [x] **T-169 (Cross-handler JSON-truncation envelope consistency, 2026-05-03 audit follow-up)**:
     Audit prompted by "are these fixes applied consistently across all
     tools?" — the `use_index` recovery hint and the

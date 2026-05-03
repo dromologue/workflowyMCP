@@ -188,6 +188,49 @@ The following Rust patterns are actively enforced in this codebase:
   nodes to display a hierarchical path. New tools that surface
   truncation must reuse this helper rather than rolling their own
   message — divergent banners erode the caller's ability to re-scope.
+- Every walk-shaped tool that emits JSON spreads the four-field
+  envelope (`truncated`, `truncation_limit`, `truncation_reason`,
+  `truncation_recovery_hint`) into its payload. The helper
+  `truncation_envelope(truncated, limit, reason)` produces the map;
+  `with_truncation_envelope(payload, ...)` merges it into a `json!({...})`
+  literal. Pinned by `every_walk_tool_emits_full_truncation_envelope_in_json`.
+
+### Pre-call cache invalidation for mutations
+- Every write handler invalidates cache + name-index entries for the
+  affected nodes BEFORE calling the API, not in the success branch.
+  The `invalidate_for_mutation(&[id, ...])` helper centralises this.
+  Reason: `tool_handler!` enforces a wall-clock budget; if its timeout
+  arm fires the inner future is dropped, and any post-API invalidation
+  code never runs. The mutation may have already landed at the API,
+  leaving the cache stale. Pre-call invalidation makes the contract
+  robust to timeout, cancel, and panic at the cost of one redundant
+  API read on a failed mutation. Surfaced by the 2026-05-03
+  architecture review.
+
+### Validation errors carry the operation context
+- Validation failures route through `tool_invalid_params(operation, node_id, msg)`
+  rather than bare `McpError::invalid_params(msg, None)` — same `data`
+  envelope shape as `tool_error` (`operation`, `node_id`, `hint`,
+  `proximate_cause: "invalid_params"`, `error`). Bare
+  `McpError::invalid_params` is reserved for failures that genuinely
+  don't know which operation produced them (parsing-stage, framework-
+  level). The 2026-05-03 architecture review surfaced 40+ direct
+  `McpError::invalid_params` sites that lost the operation context;
+  migration is incremental — the helper exists, sample sites have
+  been migrated, and the rule applies to all new validation errors.
+
+### One source of truth for cross-surface aggregation
+- Aggregation logic shared between MCP handlers and the `wflow-do` CLI
+  lives in `src/utils/aggregation.rs` as pure functions taking
+  `&[WorkflowyNode]` and producing `Vec<serde_json::Value>`. Today:
+  `compute_overdue`, `compute_upcoming`, `compute_recent_changes`,
+  `filter_todos`. Pre-2026-05-03 each surface implemented these
+  independently; the CLI parity build-time test catches surface drift
+  but not semantic divergence between two parallel implementations.
+  Routing both surfaces through one helper makes them converge by
+  construction; the helpers take their `today` / `now_ms` as
+  parameters rather than reading the system clock so they stay pure
+  and tests can pin behaviour against arbitrary timestamps.
 
 ---
 

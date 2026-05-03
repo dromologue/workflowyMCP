@@ -95,6 +95,10 @@ pub enum ProximateCause {
     Cancelled,
     NotFound,
     AuthFailure,
+    /// Caller-supplied parameter is wrong (missing required field,
+    /// invalid value, etc.). Distinguishes validation failures from
+    /// operational ones — added 2026-05-03 alongside `tool_invalid_params`.
+    InvalidParams,
     Unknown,
 }
 
@@ -110,6 +114,7 @@ impl ProximateCause {
             ProximateCause::Cancelled => "cancelled",
             ProximateCause::NotFound => "not_found",
             ProximateCause::AuthFailure => "auth_failure",
+            ProximateCause::InvalidParams => "invalid_params",
             ProximateCause::Unknown => "unknown",
         }
     }
@@ -195,6 +200,35 @@ fn derive_api_reachable(probe_succeeded: bool, last_success_ms_ago: Option<u64>)
     matches!(
         last_success_ms_ago,
         Some(ms) if ms < defaults::API_REACHABILITY_FRESHNESS_MS
+    )
+}
+
+/// Validation-failure counterpart to [`tool_error`]. Use this when a
+/// caller-supplied parameter is wrong (missing field, invalid value,
+/// constraint violation) and the handler can name itself + the
+/// offending node id. Produces a `data` payload of the same shape as
+/// `tool_error` (`{operation, node_id, hint, proximate_cause, error}`)
+/// so clients see one error envelope regardless of whether the failure
+/// happened during validation or execution. The 2026-05-03 architecture
+/// review surfaced this as a consistency gap: ~50 sites used
+/// `McpError::invalid_params` directly, which loses the operation
+/// context the data envelope carries. This helper closes the gap;
+/// surviving direct `McpError::invalid_params` calls are the rare
+/// shapes where the handler genuinely doesn't know the operation
+/// (parsing-stage, framework-level).
+fn tool_invalid_params(operation: &str, node_id: Option<&str>, msg: impl Into<String>) -> McpError {
+    let msg = msg.into();
+    let data = serde_json::json!({
+        "operation": operation,
+        "node_id": node_id,
+        "hint": "see error field for the validation failure detail",
+        "proximate_cause": ProximateCause::InvalidParams.as_str(),
+        "error": msg,
+    });
+    McpError::new(
+        ErrorCode::INVALID_PARAMS,
+        format!("{}: {} [invalid_params]", operation, msg),
+        Some(data),
     )
 }
 
@@ -1702,9 +1736,10 @@ impl WorkflowyMcpServer {
         // accepts an empty PATCH body and returns success, which would mask
         // caller bugs where a field was dropped somewhere upstream.
         if params.name.is_none() && params.description.is_none() {
-            return Err(McpError::invalid_params(
-                "edit_node requires at least one of `name` or `description`".to_string(),
-                None,
+            return Err(tool_invalid_params(
+                "edit_node",
+                Some(&resolved),
+                "edit_node requires at least one of `name` or `description`",
             ));
         }
 
@@ -2201,9 +2236,10 @@ impl WorkflowyMcpServer {
         // cannot blow the client timeout on a 250k-node tree. Index-backed
         // lookups are exempt because they don't touch the API.
         if resolved_parent.is_none() && !allow_root_scan && !use_index {
-            return Err(McpError::invalid_params(
-                "find_node refuses to scan from the workspace root by default. Pass parent_id to scope the search, set allow_root_scan=true to opt in, or set use_index=true to serve from the opportunistic name index.".to_string(),
+            return Err(tool_invalid_params(
+                "find_node",
                 None,
+                "find_node refuses to scan from the workspace root by default. Pass parent_id to scope the search, set allow_root_scan=true to opt in, or set use_index=true to serve from the opportunistic name index.",
             ));
         }
 
@@ -2264,8 +2300,10 @@ impl WorkflowyMcpServer {
                 } else if matches.len() == 1 || params.selection.is_some() {
                     let idx = params.selection.unwrap_or(1);
                     if idx < 1 || idx > matches.len() {
-                        return Err(McpError::invalid_params(
-                            format!("Selection {} out of range (1-{})", idx, matches.len()), None
+                        return Err(tool_invalid_params(
+                            "find_node",
+                            None,
+                            format!("Selection {} out of range (1-{})", idx, matches.len()),
                         ));
                     }
                     let node = matches[idx - 1];
