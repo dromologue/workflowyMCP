@@ -952,44 +952,18 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::Todos { parent, status, query, depth, limit } => {
-            use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::subtree::{is_completed, is_todo};
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
             let fetch = client
                 .get_subtree_with_controls(parent.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let q = query.as_deref().map(|s| s.to_lowercase());
-            let map = build_node_map(&fetch.nodes);
-            let hits: Vec<_> = fetch
-                .nodes
-                .iter()
-                .filter(|n| {
-                    if !is_todo(n) { return false; }
-                    let completed = is_completed(n);
-                    match status.as_str() {
-                        "pending" if completed => return false,
-                        "completed" if !completed => return false,
-                        _ => {}
-                    }
-                    if let Some(q) = &q {
-                        let in_name = n.name.to_lowercase().contains(q);
-                        let in_desc = n.description.as_deref()
-                            .map(|d| d.to_lowercase().contains(q)).unwrap_or(false);
-                        if !in_name && !in_desc { return false; }
-                    }
-                    true
-                })
-                .take(*limit)
-                .map(|n| json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "completed": is_completed(n),
-                    "completed_at": n.completed_at,
-                    "path": build_node_path_with_map(&n.id, &map),
-                }))
-                .collect();
+            // Aggregation routed through the shared helper so the CLI
+            // and the MCP `list_todos` handler can't drift in semantics
+            // — see `src/utils/aggregation.rs`.
+            let hits = workflowy_mcp_server::utils::aggregation::filter_todos(
+                &fetch.nodes, status, query.as_deref(), *limit,
+            );
             let payload = json!({
                 "scope": parent,
                 "status": status,
@@ -1000,9 +974,6 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::Overdue { root, depth, include_completed } => {
-            use workflowy_mcp_server::utils::date_parser::parse_due_date_from_node;
-            use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::subtree::is_completed;
             let today = chrono::Utc::now().date_naive();
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
@@ -1010,28 +981,9 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             let fetch = client
                 .get_subtree_with_controls(root.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let map = build_node_map(&fetch.nodes);
-            let mut hits: Vec<_> = fetch
-                .nodes
-                .iter()
-                .filter_map(|n| {
-                    if !*include_completed && is_completed(n) { return None; }
-                    let due = parse_due_date_from_node(n)?;
-                    if due >= today { return None; }
-                    let days = (today - due).num_days();
-                    Some(json!({
-                        "id": n.id,
-                        "name": n.name,
-                        "due_date": due.to_string(),
-                        "days_overdue": days,
-                        "completed": is_completed(n),
-                        "path": build_node_path_with_map(&n.id, &map),
-                    }))
-                })
-                .collect();
-            hits.sort_by(|a, b| {
-                b["days_overdue"].as_i64().cmp(&a["days_overdue"].as_i64())
-            });
+            let hits = workflowy_mcp_server::utils::aggregation::compute_overdue(
+                &fetch.nodes, today, *include_completed,
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -1043,38 +995,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::Upcoming { root, days, depth, include_completed } => {
-            use workflowy_mcp_server::utils::date_parser::parse_due_date_from_node;
-            use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::subtree::is_completed;
             let today = chrono::Utc::now().date_naive();
-            let horizon = today + chrono::Duration::days(*days);
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
             let fetch = client
                 .get_subtree_with_controls(root.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let map = build_node_map(&fetch.nodes);
-            let mut hits: Vec<_> = fetch
-                .nodes
-                .iter()
-                .filter_map(|n| {
-                    if !*include_completed && is_completed(n) { return None; }
-                    let due = parse_due_date_from_node(n)?;
-                    if due < today || due > horizon { return None; }
-                    Some(json!({
-                        "id": n.id,
-                        "name": n.name,
-                        "due_date": due.to_string(),
-                        "days_until": (due - today).num_days(),
-                        "completed": is_completed(n),
-                        "path": build_node_path_with_map(&n.id, &map),
-                    }))
-                })
-                .collect();
-            hits.sort_by(|a, b| {
-                a["days_until"].as_i64().cmp(&b["days_until"].as_i64())
-            });
+            let hits = workflowy_mcp_server::utils::aggregation::compute_upcoming(
+                &fetch.nodes, today, *days, *include_completed,
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -1155,33 +1085,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::RecentChanges { root, hours, depth, limit } => {
-            use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::subtree::is_completed;
-            let cutoff_ms = (chrono::Utc::now() - chrono::Duration::hours(*hours)).timestamp_millis();
+            let now_ms = chrono::Utc::now().timestamp_millis();
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
             let fetch = client
                 .get_subtree_with_controls(root.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let map = build_node_map(&fetch.nodes);
-            let mut hits: Vec<_> = fetch
-                .nodes
-                .iter()
-                .filter_map(|n| {
-                    let ts = n.last_modified?;
-                    if ts < cutoff_ms { return None; }
-                    Some(json!({
-                        "id": n.id,
-                        "name": n.name,
-                        "modifiedAt": ts,
-                        "completed": is_completed(n),
-                        "path": build_node_path_with_map(&n.id, &map),
-                    }))
-                })
-                .collect();
-            hits.sort_by(|a, b| b["modifiedAt"].as_i64().cmp(&a["modifiedAt"].as_i64()));
-            hits.truncate(*limit);
+            let hits = workflowy_mcp_server::utils::aggregation::compute_recent_changes(
+                &fetch.nodes, now_ms, *hours, *limit,
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({

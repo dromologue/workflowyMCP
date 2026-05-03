@@ -2667,29 +2667,12 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
+                // Aggregation routed through the shared helper so the
+                // CLI's `wf overdue` and the MCP `list_overdue` can't
+                // drift in semantics — see `src/utils/aggregation.rs`.
                 let today = Utc::now().date_naive();
-                let node_map = build_node_map(&all_nodes);
-
-                let mut overdue: Vec<(&WorkflowyNode, NaiveDate, i64)> = candidates.iter()
-                    .filter_map(|n| {
-                        if !include_completed && is_completed(n) { return None; }
-                        let due = parse_due_date_from_node(n)?;
-                        if due >= today { return None; }
-                        let days_over = (today - due).num_days();
-                        Some((*n, due, days_over))
-                    })
-                    .collect();
-
-                overdue.sort_by(|a, b| b.2.cmp(&a.2));
-                overdue.truncate(limit);
-
-                let items: Vec<serde_json::Value> = overdue.iter().map(|(n, due, days)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "path": path, "due_date": due.to_string(), "days_overdue": days, "completed": is_completed(n) })
-                }).collect();
-
+                let mut items = crate::utils::aggregation::compute_overdue(&all_nodes, today, include_completed);
+                items.truncate(limit);
                 let result = json!({
                     "as_of": today.to_string(),
                     "truncated": truncated,

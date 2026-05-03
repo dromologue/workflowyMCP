@@ -1,4 +1,5 @@
 //! Utilities module exports
+pub mod aggregation;
 pub mod cache;
 pub mod cancel;
 pub mod date_parser;
