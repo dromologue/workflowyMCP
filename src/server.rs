@@ -654,6 +654,27 @@ fn truncation_banner_from_fetch(fetch: &SubtreeFetch) -> String {
     )
 }
 
+/// Recovery hint surfaced on every truncated response (markdown banner
+/// AND JSON envelope). `use_index` is the bypass; this string names it
+/// so callers don't have to read the docs to find the recovery.
+const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) once to populate the persistent name index, then re-issue with use_index=true (search_nodes / find_node) to bypass the walk budget — name-only match, no walk timeout.";
+
+/// JSON-truncation surface invariant: every walk-shaped tool that emits
+/// JSON includes the same four fields next to its `"truncation_limit"`:
+///
+/// - `truncated: bool`
+/// - `truncation_limit: usize` — the node cap that fired
+/// - `truncation_reason: "timeout" | "node_limit" | "cancelled" | null`
+/// - `truncation_recovery_hint: string` — empty when not truncated, otherwise [`TRUNCATION_RECOVERY_HINT`]
+///
+/// Pre-2026-05-03 most JSON tools emitted `truncation_limit` only —
+/// no reason, no hint — so a JSON caller hitting the 20 s walk budget
+/// on a big subtree had no actionable information. The fields are
+/// added inline at every site (no helper) so the audit is grep-able
+/// and the existing `json!({...})` literals stay readable. Pinned by
+/// `every_walk_tool_emits_full_truncation_envelope_in_json` in the
+/// regression test suite.
+
 /// The main MCP server struct
 #[derive(Clone)]
 pub struct WorkflowyMcpServer {
@@ -2690,6 +2711,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "banner": banner,
                         "message": format!("No nodes found matching '{}' (mode: {}). Try match_mode: 'contains'.", params.name, match_mode)
@@ -2712,6 +2734,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "node_id": node.id,
                         "name": node.name,
@@ -2740,6 +2763,7 @@ impl WorkflowyMcpServer {
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "count": matches.len(),
                         "options": options,
@@ -2826,7 +2850,7 @@ impl WorkflowyMcpServer {
         }
 
         match self.walk_subtree(None, max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit, .. }) => {
+            Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, .. }) => {
                 let query = params.search_query.to_lowercase();
                 let matches: Vec<&WorkflowyNode> = nodes.iter().filter(|n| {
                     let in_name = n.name.to_lowercase().contains(&query);
@@ -2855,6 +2879,8 @@ impl WorkflowyMcpServer {
                         "multiple_matches": true,
                         "truncated": truncated,
                         "truncation_limit": limit,
+                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches. Use selection parameter to choose.", matches.len())
@@ -2893,6 +2919,8 @@ impl WorkflowyMcpServer {
                     "success": true,
                     "truncated": truncated,
                     "truncation_limit": limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "created_count": created_count,
                     "target": { "id": target_id, "name": target_name },
                     "message": format!("Inserted {} node(s) under '{}'", created_count, target_name)
@@ -2918,7 +2946,7 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, truncation_reason, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -3000,6 +3028,8 @@ impl WorkflowyMcpServer {
                     "as_of": today.to_string(),
                     "truncated": truncated,
                     "truncation_limit": limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "summary": {
                         "total_nodes": total,
                         "pending_todos": pending_count,
@@ -3036,7 +3066,7 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let now_ms = Utc::now().timestamp_millis();
@@ -3067,6 +3097,8 @@ impl WorkflowyMcpServer {
                     "since": since.to_string(),
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "changes": items
                 });
@@ -3093,7 +3125,7 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -3121,6 +3153,8 @@ impl WorkflowyMcpServer {
                     "as_of": today.to_string(),
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "overdue": items
                 });
@@ -3148,7 +3182,7 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let today = Utc::now().date_naive();
@@ -3199,6 +3233,8 @@ impl WorkflowyMcpServer {
                     "as_of": today.to_string(),
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "upcoming": items
                 });
@@ -3222,7 +3258,7 @@ impl WorkflowyMcpServer {
         let resolved = self.resolve_node_ref(&params.node_id).await?;
 
         match self.walk_subtree(Some(&resolved), 10).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
                     return Err(McpError::invalid_params(
@@ -3297,6 +3333,8 @@ impl WorkflowyMcpServer {
                     "root": { "id": root.id, "name": root.name, "path": root_path },
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "stats": {
                         "total_nodes": total,
                         "todo_total": todo_total,
@@ -3336,7 +3374,7 @@ impl WorkflowyMcpServer {
         info!(node_id = %resolved, max_depth, "Finding backlinks");
 
         match self.walk_subtree(None, max_depth).await {
-            Ok(SubtreeFetch { nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let node_map = build_node_map(&nodes);
                 let target = node_map.get(resolved.as_str());
                 let target_name = target.map(|n| n.name.as_str()).unwrap_or("unknown");
@@ -3372,6 +3410,8 @@ impl WorkflowyMcpServer {
                     "target": { "id": resolved, "name": target_name },
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": backlinks.len(),
                     "backlinks": backlinks
                 });
@@ -3398,7 +3438,7 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
 
                 let node_map = build_node_map(&all_nodes);
@@ -3433,6 +3473,8 @@ impl WorkflowyMcpServer {
                 let result = json!({
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": todos.len(),
                     "todos": todos,
                 });
@@ -3457,6 +3499,10 @@ impl WorkflowyMcpServer {
         info!(node_id = %resolved_node, target = %resolved_target, "Duplicating node");
 
         match self.walk_subtree(Some(&resolved_node), 10).await {
+            // duplicate_node refuses truncated input outright (producing a
+            // partial copy is worse than failing), so the truncation
+            // surface never reaches the JSON response — destructure
+            // matches that contract.
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
@@ -3570,6 +3616,9 @@ impl WorkflowyMcpServer {
         };
 
         match self.walk_subtree(Some(&resolved_template), 10).await {
+            // create_from_template refuses truncated input — same contract
+            // as duplicate_node, no JSON-truncation fields reach the
+            // response.
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
                     return Err(McpError::invalid_params(
@@ -3681,7 +3730,7 @@ impl WorkflowyMcpServer {
 
         let max_depth = params.max_depth.unwrap_or(5);
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
+            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 // Refuse destructive bulk ops on a truncated view — we would
                 // otherwise delete only a partial match set silently.
                 if truncated && params.operation == "delete" && !dry_run {
@@ -3738,6 +3787,8 @@ impl WorkflowyMcpServer {
                         "dry_run": true,
                         "truncated": truncated,
                         "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "matched_count": items.len(),
                         "operation": params.operation,
                         "nodes_matched": items
@@ -3797,6 +3848,8 @@ impl WorkflowyMcpServer {
                     "dry_run": false,
                     "truncated": truncated,
                     "truncation_limit": node_limit,
+                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "matched_count": matched.len(),
                     "affected_count": affected,
                     "operation": params.operation,
@@ -4192,6 +4245,7 @@ impl WorkflowyMcpServer {
                     "truncated": truncated,
                     "truncation_reason": truncation_reason.map(|r| r.as_str()),
                     "truncation_limit": limit,
+                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "elapsed_ms": elapsed_ms,
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
@@ -7554,6 +7608,61 @@ mod tests {
         assert!(
             msg.contains("build_name_index"),
             "error must point at the recovery path: {msg}"
+        );
+    }
+
+    /// Cross-handler consistency invariant. The 2026-05-03 eval-run
+    /// surfaced the same failure mode in 11 different handlers:
+    /// JSON-shaped responses emitted `truncation_limit` only, with no
+    /// `truncation_reason` and no recovery hint, so a JSON caller
+    /// hitting the 20 s walk budget on a big subtree had no actionable
+    /// information. The fix is uniform: every walk-shaped tool's JSON
+    /// payload includes the four-field envelope (truncated,
+    /// truncation_limit, truncation_reason, truncation_recovery_hint).
+    /// This test grep-audits the source to make sure the invariant
+    /// holds at build time — adding a new walk-shaped tool that
+    /// emits `truncation_limit` without the reason + hint will fail
+    /// here before it ships.
+    #[test]
+    fn every_walk_tool_emits_full_truncation_envelope_in_json() {
+        let src = include_str!("server.rs");
+        // Every site that emits `"truncation_limit": <expr>,` must
+        // also have `"truncation_reason"` and `"truncation_recovery_hint"`
+        // in its surrounding json! block. We approximate "surrounding
+        // block" by looking 6 lines on either side — every json! payload
+        // is short enough.
+        let lines: Vec<&str> = src.lines().collect();
+        let mut violations: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("\"truncation_limit\":") {
+                continue;
+            }
+            // Skip the helper-doc comment lines that match the pattern
+            // but aren't real json! emit sites.
+            if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
+                continue;
+            }
+            let lo = i.saturating_sub(6);
+            let hi = (i + 7).min(lines.len());
+            let window: String = lines[lo..hi].join("\n");
+            // The envelope is the four-field set; adjacent lines in the
+            // same json! block must include reason + recovery_hint.
+            let has_reason = window.contains("\"truncation_reason\"");
+            let has_hint = window.contains("\"truncation_recovery_hint\"");
+            if !(has_reason && has_hint) {
+                violations.push(format!(
+                    "line {}: `\"truncation_limit\":` is emitted without the reason + recovery_hint companions in the surrounding json! block",
+                    i + 1,
+                ));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "JSON-truncation envelope inconsistency — every walk-shaped tool's JSON payload must \
+             include truncation_reason + truncation_recovery_hint next to truncation_limit so a \
+             caller hitting the 20 s walk budget gets the same recovery info regardless of which \
+             tool it called. Violations:\n  {}",
+            violations.join("\n  "),
         );
     }
 

@@ -626,6 +626,49 @@
     `degraded_warning_clears_after_get_node_recovery`. All 283 unit
     tests pass.
 
+- [x] **T-169 (Cross-handler JSON-truncation envelope consistency, 2026-05-03 audit follow-up)**:
+    Audit prompted by "are these fixes applied consistently across all
+    tools?" — the `use_index` recovery hint and the
+    `truncation_reason` field were present in the markdown banner
+    `truncation_banner_from_fetch` emits, but only `find_node` and
+    `get_subtree` carried them through into their JSON responses. The
+    remaining 11 walk-shaped tools (daily_review, get_recent_changes,
+    list_overdue, list_upcoming, get_project_summary, find_backlinks,
+    list_todos, smart_insert, bulk_update, build_name_index, the
+    early-exit `find_node` "no matches" branch) emitted
+    `truncation_limit` only — no reason, no hint — so a JSON caller
+    hitting the 20 s walk budget on a big subtree had no actionable
+    information.
+  - **Fix**: every walk-shaped tool's JSON payload now includes the
+    same four fields: `truncated`, `truncation_limit`,
+    `truncation_reason`, `truncation_recovery_hint`. The hint is the
+    same constant (`TRUNCATION_RECOVERY_HINT`) the markdown banner
+    uses, so callers get the same recovery-path string regardless of
+    surface. Inlined at each site rather than spread from a helper so
+    the audit stays grep-able and the existing `json!({...})` literals
+    stay readable.
+  - **Build-time invariant**:
+    `every_walk_tool_emits_full_truncation_envelope_in_json` scans the
+    source for every `"truncation_limit":` emission site and rejects
+    any whose surrounding `json!({...})` block is missing the reason
+    + recovery_hint companions. Adding a new walk-shaped tool that
+    emits a truncation field without the full envelope fails this
+    test before it ships — the same enforcement shape as
+    `cli_covers_every_non_diagnostic_mcp_tool` and
+    `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
+  - **Scope decision (`use_index` adoption)**: only `find_node` and
+    `search_nodes` expose `use_index=true` because the persistent
+    name index stores names only. Tools whose query criterion can't
+    be answered from a name lookup (`tag_search` needs tags,
+    list_overdue / list_upcoming / daily_review need due-date
+    parsing, `find_backlinks` needs description-content matching,
+    `find_by_tag_and_path` needs tags) cannot use `use_index`.
+    Extending the index to tags / dates / descriptions is a separate
+    project. The recovery hint still names `use_index` consistently
+    because the caller's recovery move is the same: search by name
+    via the index, then narrow the live walk for the non-name
+    filtering.
+
 - [x] **T-168 (search_nodes timeout recovery via name-index, 2026-05-03 eval-run failure mode)**:
     The eval run surfaced that every `search_nodes` scoped under
     Distillations timed out at the 20 s subtree-walk budget. Root cause:
