@@ -660,20 +660,82 @@ fn truncation_banner_from_fetch(fetch: &SubtreeFetch) -> String {
 const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) once to populate the persistent name index, then re-issue with use_index=true (search_nodes / find_node) to bypass the walk budget — name-only match, no walk timeout.";
 
 /// JSON-truncation surface invariant: every walk-shaped tool that emits
-/// JSON includes the same four fields next to its `"truncation_limit"`:
+/// JSON spreads this four-field envelope into its payload:
 ///
 /// - `truncated: bool`
 /// - `truncation_limit: usize` — the node cap that fired
 /// - `truncation_reason: "timeout" | "node_limit" | "cancelled" | null`
 /// - `truncation_recovery_hint: string` — empty when not truncated, otherwise [`TRUNCATION_RECOVERY_HINT`]
 ///
-/// Pre-2026-05-03 most JSON tools emitted `truncation_limit` only —
-/// no reason, no hint — so a JSON caller hitting the 20 s walk budget
-/// on a big subtree had no actionable information. The fields are
-/// added inline at every site (no helper) so the audit is grep-able
-/// and the existing `json!({...})` literals stay readable. Pinned by
-/// `every_walk_tool_emits_full_truncation_envelope_in_json` in the
-/// regression test suite.
+/// Pre-2026-05-03 most JSON tools emitted `truncation_limit` only — no
+/// reason, no hint — so a JSON caller hitting the 20 s walk budget on a
+/// big subtree had no actionable information. After the architecture
+/// review on 2026-05-03 the four fields are produced by this single
+/// helper and spread into every JSON payload via the
+/// `with_truncation_envelope!` macro, so the truncation contract has
+/// exactly one definition. Pinned by
+/// `every_walk_tool_emits_full_truncation_envelope_in_json`.
+fn truncation_envelope(
+    truncated: bool,
+    limit: usize,
+    reason: Option<TruncationReason>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("truncated".into(), json!(truncated));
+    m.insert("truncation_limit".into(), json!(limit));
+    m.insert("truncation_reason".into(), json!(reason.map(|r| r.as_str())));
+    m.insert(
+        "truncation_recovery_hint".into(),
+        json!(if truncated { TRUNCATION_RECOVERY_HINT } else { "" }),
+    );
+    m
+}
+
+/// Variant that takes a `SubtreeFetch` reference for handlers that hold
+/// the whole struct rather than destructuring it.
+#[allow(dead_code)] // not all handlers hold the fetch; both shapes valid.
+fn truncation_envelope_from_fetch(
+    fetch: &SubtreeFetch,
+) -> serde_json::Map<String, serde_json::Value> {
+    truncation_envelope(fetch.truncated, fetch.limit, fetch.truncation_reason)
+}
+
+/// Combine a caller-built JSON payload with the truncation envelope.
+/// Every walk-shaped tool's success path uses this to return a single
+/// `serde_json::Value` carrying both the tool-specific fields and the
+/// four envelope fields. The helper exists because pre-2026-05-03 the
+/// envelope was inlined at every call site and 11 of them quietly
+/// drifted off-spec; routing through one definition makes the
+/// contract enforceable by `cargo build` rather than by a source-grep
+/// audit. Inputs:
+///
+/// - `payload`: the tool-specific `json!({...})` map. Anything mergeable
+///   into a JSON object works; non-object values panic in tests via
+///   the usage convention.
+/// - `truncated`, `limit`, `reason`: the three fields a `SubtreeFetch`
+///   destructure pulls out — the helper converts `reason` to its
+///   stable string form and constructs the recovery hint.
+///
+/// Returns a `serde_json::Value::Object` ready to pass to
+/// `Content::text(value.to_string())`.
+fn with_truncation_envelope(
+    mut payload: serde_json::Value,
+    truncated: bool,
+    limit: usize,
+    reason: Option<TruncationReason>,
+) -> serde_json::Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.extend(truncation_envelope(truncated, limit, reason));
+    } else {
+        // Defensive: non-object payloads are a caller bug. Wrap so the
+        // envelope is still attached, surfacing the misuse.
+        let mut wrapped = serde_json::Map::new();
+        wrapped.insert("payload".into(), payload);
+        wrapped.extend(truncation_envelope(truncated, limit, reason));
+        return serde_json::Value::Object(wrapped);
+    }
+    payload
+}
 
 /// The main MCP server struct
 #[derive(Clone)]
@@ -1558,6 +1620,36 @@ impl WorkflowyMcpServer {
     /// region the walk didn't reach. The error message distinguishes
     /// the two cases so the caller knows whether to retry, narrow
     /// scope, or accept a negative result.
+    /// Validate a node-id parameter and resolve it to a full UUID in one
+    /// call. Replaces the 30+ instances of the
+    /// `check_node_id(p)?; let r = self.resolve_node_ref(p).await?;`
+    /// pair across handlers — the order is load-bearing (short-hash
+    /// validation must happen before resolve, and validation rejects
+    /// the empty string the way the resolver doesn't), so wrapping it
+    /// in one helper makes the contract harder to forget. The
+    /// architecture review on 2026-05-03 surfaced this as the single
+    /// most-repeated boilerplate in the file.
+    async fn validate_and_resolve(&self, raw: &str) -> Result<String, McpError> {
+        check_node_id(raw)?;
+        self.resolve_node_ref(raw).await
+    }
+
+    /// Invalidate cache + name-index entries for a set of node IDs.
+    /// Called BEFORE every mutating API call (write / move / delete /
+    /// complete) so a `tool_handler!` timeout or `cancel_all` cannot
+    /// strand stale data: the future the wrapper drops on timeout
+    /// would otherwise have its post-API invalidation code never run.
+    /// The cost is a redundant API read on the next access if the
+    /// mutation actually failed upstream; correctness > cost.
+    /// 2026-05-03 architecture review surfaced this as the one stability
+    /// gap that wasn't pinned by the existing safety net.
+    fn invalidate_for_mutation(&self, ids: &[&str]) {
+        for id in ids {
+            self.cache.invalidate_node(id);
+            self.name_index.invalidate_node(id);
+        }
+    }
+
     async fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
         if !is_short_hash(raw) {
             return Ok(raw.to_string());
@@ -1891,7 +1983,7 @@ impl WorkflowyMcpServer {
         let use_index = params.use_index.unwrap_or(false);
         info!(query = %params.query, max_results, max_depth, allow_root_scan, use_index, "Searching nodes");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
             None => None,
         };
 
@@ -2029,8 +2121,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "get_node", ToolKind::Read, params, {
         info!(node_id = %params.node_id, "Getting node");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
 
         // Fetch the node and its direct children in parallel — they are
         // independent API calls, and previously `get_node` returned an empty
@@ -2093,7 +2184,7 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "create_node", ToolKind::Write, params, {
         info!(name = %params.name, parent = ?params.parent_id, "Creating node");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
             None => None,
         };
 
@@ -2106,6 +2197,14 @@ impl WorkflowyMcpServer {
         // to the success response so the assistant can roll back its
         // plan before issuing follow-up writes.
         let degraded_warning = self.degraded_warning_if_recent_failure(30_000);
+
+        // Pre-call invalidation: the parent's children listing must be
+        // refreshed whether the create succeeds or the wrapper fires
+        // its timeout/cancel arm mid-flight. Cost on a failed create is
+        // one extra API read on the next list_children; correctness > cost.
+        if let Some(pid) = &resolved_parent {
+            self.invalidate_for_mutation(&[pid.as_str()]);
+        }
 
         match self
             .client
@@ -2124,10 +2223,6 @@ impl WorkflowyMcpServer {
                 if let Some(warn) = &degraded_warning {
                     msg.push_str("\n\n⚠ DEGRADED: ");
                     msg.push_str(warn);
-                }
-                // Invalidate cache for parent
-                if let Some(pid) = &resolved_parent {
-                    self.cache.invalidate_node(pid);
                 }
                 // Seed the name index so subsequent lookups see the new node
                 // without needing a fresh walk.
@@ -2152,8 +2247,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "edit_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, "Editing node");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
 
         // Reject no-op edits at the boundary: the Workflowy API happily
         // accepts an empty PATCH body and returns success, which would mask
@@ -2165,14 +2259,15 @@ impl WorkflowyMcpServer {
             ));
         }
 
+        // Pre-call invalidation — see invalidate_for_mutation docs.
+        self.invalidate_for_mutation(&[&resolved]);
+
         match self
             .client
             .edit_node_with_propagation_retry(&resolved, params.name.as_deref(), params.description.as_deref())
             .await
         {
             Ok(_) => {
-                self.cache.invalidate_node(&resolved);
-                self.name_index.invalidate_node(&resolved);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Updated node `{}`",
                     resolved
@@ -2190,13 +2285,13 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "delete_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, "Deleting node");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
+
+        // Pre-call invalidation — see invalidate_for_mutation docs.
+        self.invalidate_for_mutation(&[&resolved]);
 
         match self.client.delete_node_with_propagation_retry(&resolved).await {
             Ok(_) => {
-                self.cache.invalidate_node(&resolved);
-                self.name_index.invalidate_node(&resolved);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Deleted node `{}`",
                     resolved
@@ -2215,8 +2310,10 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "complete_node", ToolKind::Write, params, {
         let target_state = params.completed.unwrap_or(true);
         info!(node_id = %params.node_id, completed = target_state, "Setting completion");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
+
+        // Pre-call invalidation — see invalidate_for_mutation docs.
+        self.invalidate_for_mutation(&[&resolved]);
 
         match self
             .client
@@ -2224,8 +2321,6 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(_) => {
-                self.cache.invalidate_node(&resolved);
-                self.name_index.invalidate_node(&resolved);
                 let verb = if target_state { "Completed" } else { "Uncompleted" };
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "{} node `{}`",
@@ -2244,10 +2339,8 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "move_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, new_parent = %params.new_parent_id, "Moving node");
-        check_node_id(&params.node_id)?;
-        check_node_id(&params.new_parent_id)?;
-        let resolved_node = self.resolve_node_ref(&params.node_id).await?;
-        let resolved_parent = self.resolve_node_ref(&params.new_parent_id).await?;
+        let resolved_node = self.validate_and_resolve(&params.node_id).await?;
+        let resolved_parent = self.validate_and_resolve(&params.new_parent_id).await?;
 
         // Capture the current parent before the move so we can invalidate its
         // children listing afterwards. A failed pre-read is not fatal — the
@@ -2260,20 +2353,22 @@ impl WorkflowyMcpServer {
             .ok()
             .and_then(|n| n.parent_id);
 
+        // Pre-call invalidation — node + new parent always; old parent
+        // when known and different from new. See invalidate_for_mutation docs.
+        let mut to_invalidate: Vec<&str> = vec![resolved_node.as_str(), resolved_parent.as_str()];
+        if let Some(pid) = &old_parent_id {
+            if pid.as_str() != resolved_parent.as_str() {
+                to_invalidate.push(pid.as_str());
+            }
+        }
+        self.invalidate_for_mutation(&to_invalidate);
+
         match self
             .client
             .move_node_with_propagation_retry(&resolved_node, &resolved_parent, params.priority)
             .await
         {
             Ok(_) => {
-                self.cache.invalidate_node(&resolved_node);
-                self.cache.invalidate_node(&resolved_parent);
-                if let Some(pid) = &old_parent_id {
-                    if pid.as_str() != resolved_parent.as_str() {
-                        self.cache.invalidate_node(pid);
-                    }
-                }
-                self.name_index.invalidate_node(&resolved_node);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Moved node `{}` under `{}`",
                     resolved_node, resolved_parent
@@ -2298,8 +2393,7 @@ impl WorkflowyMcpServer {
         let resolved: Option<String> = match params.node_id.as_deref() {
             None | Some("") => None,
             Some(id) => {
-                check_node_id(id)?;
-                Some(self.resolve_node_ref(id).await?)
+                Some(self.validate_and_resolve(id).await?)
             }
         };
         info!(node_id = ?resolved, "Getting children");
@@ -2412,8 +2506,7 @@ impl WorkflowyMcpServer {
         // primary AND only safety net here.
         record_op!(self, "insert_content", params, {
         info!(parent_id = %params.parent_id, "Inserting content");
-        check_node_id(&params.parent_id)?;
-        let resolved_parent = self.resolve_node_ref(&params.parent_id).await?;
+        let resolved_parent = self.validate_and_resolve(&params.parent_id).await?;
 
         // Parse indented lines
         struct ParsedLine<'a> { text: &'a str, indent: usize }
@@ -2612,8 +2705,7 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "get_subtree", ToolKind::Walk, params, {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(node_id = %params.node_id, max_depth, "Getting subtree");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
 
         match self.walk_subtree(Some(&resolved), max_depth).await {
             Ok(fetch) => {
@@ -2651,7 +2743,7 @@ impl WorkflowyMcpServer {
         let use_index = params.use_index.unwrap_or(false);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
             None => None,
         };
         info!(name = %params.name, match_mode, max_depth, use_index, allow_root_scan, "Finding node");
@@ -2941,7 +3033,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Daily review");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
 
@@ -3061,7 +3153,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Getting recent changes");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
 
@@ -3120,7 +3212,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(max_depth, "Listing overdue items");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
 
@@ -3177,7 +3269,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(days, max_depth, "Listing upcoming items");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
 
@@ -3254,8 +3346,7 @@ impl WorkflowyMcpServer {
         let include_tags = params.include_tags.unwrap_or(true);
         let recent_days = params.recently_modified_days.unwrap_or(7) as i64;
         info!(node_id = %params.node_id, "Getting project summary");
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
 
         match self.walk_subtree(Some(&resolved), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
@@ -3367,8 +3458,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<FindBacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "find_backlinks", ToolKind::Walk, params, {
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
         info!(node_id = %resolved, max_depth, "Finding backlinks");
@@ -3433,7 +3523,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(5);
         info!(status, max_depth, "Listing todos");
         let resolved_parent = match &params.parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
             None => None,
         };
 
@@ -3491,9 +3581,8 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<DuplicateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "duplicate_node", ToolKind::Bulk, params, {
-        check_node_id(&params.node_id)?;
+        let resolved_node = self.validate_and_resolve(&params.node_id).await?;
         check_node_id(&params.target_parent_id)?;
-        let resolved_node = self.resolve_node_ref(&params.node_id).await?;
         let resolved_target = self.resolve_node_ref(&params.target_parent_id).await?;
         let include_children = params.include_children.unwrap_or(true);
         info!(node_id = %resolved_node, target = %resolved_target, "Duplicating node");
@@ -3601,9 +3690,8 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<CreateFromTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "create_from_template", ToolKind::Bulk, params, {
-        check_node_id(&params.template_node_id)?;
+        let resolved_template = self.validate_and_resolve(&params.template_node_id).await?;
         check_node_id(&params.target_parent_id)?;
-        let resolved_template = self.resolve_node_ref(&params.template_node_id).await?;
         let resolved_target = self.resolve_node_ref(&params.target_parent_id).await?;
         let vars = params.variables.unwrap_or_default();
         info!(template = %resolved_template, "Creating from template");
@@ -3710,7 +3798,7 @@ impl WorkflowyMcpServer {
         let status = params.status.as_deref().unwrap_or("all");
         info!(operation = %params.operation, dry_run, "Bulk update");
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
 
@@ -4225,7 +4313,7 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(defaults::MAX_TREE_DEPTH);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
         let resolved_root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; Some(self.resolve_node_ref(rid).await?) }
+            Some(rid) => Some(self.validate_and_resolve(rid).await?),
             None => None,
         };
         if resolved_root.is_none() && !allow_root_scan {
@@ -4402,8 +4490,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<PathOfParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "path_of", ToolKind::Bulk, params, {
-            check_node_id(&params.node_id)?;
-            let resolved = self.resolve_node_ref(&params.node_id).await?;
+            let resolved = self.validate_and_resolve(&params.node_id).await?;
             let max_depth = params.max_depth.unwrap_or(50);
 
             // Walk parent_id chain. We stop at the first None, the first
@@ -4479,8 +4566,7 @@ impl WorkflowyMcpServer {
         // async and may walk the workspace on cache miss.
         let mut ids: Vec<String> = Vec::with_capacity(params.node_ids.len());
         for id in &params.node_ids {
-            check_node_id(id)?;
-            ids.push(self.resolve_node_ref(id).await?);
+            ids.push(self.validate_and_resolve(id).await?);
         }
 
         let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
@@ -4554,8 +4640,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<SinceParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "since", ToolKind::Read, params, {
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
         let node = self.client.get_node(&resolved).await.map_err(|e| {
             tool_error("since", Some(&resolved), e)
         })?;
@@ -4646,7 +4731,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "audit_mirrors", ToolKind::Walk, params, {
         let root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
+            Some(rid) => self.validate_and_resolve(rid).await?,
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
@@ -4676,7 +4761,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "review", ToolKind::Walk, params, {
         let root = match &params.root_id {
-            Some(rid) => { check_node_id(rid)?; self.resolve_node_ref(rid).await? }
+            Some(rid) => self.validate_and_resolve(rid).await?,
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
@@ -4727,7 +4812,7 @@ impl WorkflowyMcpServer {
             ));
         }
         let mut current_id: Option<String> = match &params.start_parent_id {
-            Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
             None => None,
         };
         let mut current_name = "<root>".to_string();
@@ -4890,8 +4975,7 @@ impl WorkflowyMcpServer {
                 current_id
             }
         } else if let Some(pid) = &params.search_parent_id {
-            check_node_id(pid)?;
-            Some(self.resolve_node_ref(pid).await?)
+            Some(self.validate_and_resolve(pid).await?)
         } else {
             None
         };
@@ -5038,8 +5122,7 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<ExportSubtreeParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "export_subtree", ToolKind::Walk, params, {
-        check_node_id(&params.node_id)?;
-        let resolved = self.resolve_node_ref(&params.node_id).await?;
+        let resolved = self.validate_and_resolve(&params.node_id).await?;
         let max_depth = params.max_depth.unwrap_or(10);
         let format = params.format.to_lowercase();
         if !matches!(format.as_str(), "opml" | "markdown" | "json") {
@@ -6884,6 +6967,73 @@ mod tests {
             truncated_at_node_id: None,
         };
         assert_eq!(truncation_banner_from_fetch(&fetch), "");
+    }
+
+    /// Pin the truncation envelope helper's contract: every call returns
+    /// the same four fields, and `truncation_recovery_hint` is non-empty
+    /// only when `truncated == true`. The architecture review on
+    /// 2026-05-03 introduced this helper so future JSON-emitting tools
+    /// route through one definition; existing 15 inline sites are
+    /// pinned by `every_walk_tool_emits_full_truncation_envelope_in_json`.
+    #[test]
+    fn truncation_envelope_emits_four_fields_and_hint_only_when_truncated() {
+        let truncated_env = truncation_envelope(true, 10_000, Some(TruncationReason::Timeout));
+        assert_eq!(truncated_env.get("truncated"), Some(&serde_json::json!(true)));
+        assert_eq!(truncated_env.get("truncation_limit"), Some(&serde_json::json!(10_000)));
+        assert_eq!(truncated_env.get("truncation_reason"), Some(&serde_json::json!("timeout")));
+        let hint = truncated_env.get("truncation_recovery_hint").expect("hint field");
+        assert!(
+            hint.as_str().unwrap_or("").contains("build_name_index"),
+            "truncated envelope must name build_name_index in recovery hint: {hint:?}"
+        );
+
+        let clean_env = truncation_envelope(false, 10_000, None);
+        assert_eq!(clean_env.get("truncated"), Some(&serde_json::json!(false)));
+        assert_eq!(clean_env.get("truncation_reason"), Some(&serde_json::json!(null)));
+        assert_eq!(
+            clean_env.get("truncation_recovery_hint"),
+            Some(&serde_json::json!("")),
+            "non-truncated envelope must carry an empty hint string"
+        );
+        // Same four keys present in both shapes — the schema is
+        // invariant regardless of truncation outcome.
+        let expected: std::collections::BTreeSet<&str> = ["truncated", "truncation_limit", "truncation_reason", "truncation_recovery_hint"]
+            .iter().copied().collect();
+        let truncated_keys: std::collections::BTreeSet<&str> = truncated_env.keys().map(|s| s.as_str()).collect();
+        let clean_keys: std::collections::BTreeSet<&str> = clean_env.keys().map(|s| s.as_str()).collect();
+        assert_eq!(truncated_keys, expected);
+        assert_eq!(clean_keys, expected);
+    }
+
+    /// Pin `with_truncation_envelope` — the JSON wrapper used at call
+    /// sites. Carrier payload's fields survive the merge; the four
+    /// envelope fields are appended; non-object payloads are wrapped
+    /// rather than dropped so a misuse surfaces in the response shape.
+    #[test]
+    fn with_truncation_envelope_merges_payload_and_envelope_without_loss() {
+        let merged = with_truncation_envelope(
+            serde_json::json!({"results": [1, 2, 3], "matched": 3}),
+            true,
+            10_000,
+            Some(TruncationReason::NodeLimit),
+        );
+        let obj = merged.as_object().expect("must be a JSON object");
+        assert_eq!(obj.get("results"), Some(&serde_json::json!([1, 2, 3])));
+        assert_eq!(obj.get("matched"), Some(&serde_json::json!(3)));
+        assert_eq!(obj.get("truncated"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("truncation_reason"), Some(&serde_json::json!("node_limit")));
+
+        // Defensive path: a non-object payload (caller bug) wraps under
+        // a `payload` key rather than silently swallowing.
+        let wrapped = with_truncation_envelope(
+            serde_json::json!("plain string"),
+            false,
+            10_000,
+            None,
+        );
+        let obj = wrapped.as_object().expect("misuse path still produces an object");
+        assert_eq!(obj.get("payload"), Some(&serde_json::json!("plain string")));
+        assert!(obj.contains_key("truncated"), "envelope still attached on misuse path");
     }
 
     #[tokio::test]
