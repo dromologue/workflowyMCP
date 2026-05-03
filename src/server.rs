@@ -612,19 +612,26 @@ fn truncation_banner_full(
         Some(path) if !path.is_empty() => format!(" Walk stopped at: {}.", path),
         _ => String::new(),
     };
+    // Recovery hint shared across the timeout / node-cap branches.
+    // 2026-05-03 eval run: every search under Distillations timed out
+    // because the subtree grew past the 10 000-node walk cap. Naming
+    // the recovery path in the banner itself keeps the caller from
+    // having to guess.
+    const INDEX_RECOVERY_HINT: &str = " Recovery: call `build_name_index(parent_id=...)` once to populate the persistent name index, then re-issue with `use_index=true` (search_nodes / find_node) to bypass the walk budget entirely — name-only match, no walk timeout.";
     match reason {
         Some(TruncationReason::Timeout) => format!(
-            "⚠ subtree walk timed out before completion (budget {} ms). Results below reflect whatever was collected — retry with narrower parent_id/max_depth or raise the budget.{}\n\n",
+            "⚠ subtree walk timed out before completion (budget {} ms). Results below reflect whatever was collected — retry with narrower parent_id/max_depth or raise the budget.{}{}\n\n",
             defaults::SUBTREE_FETCH_TIMEOUT_MS,
             suffix,
+            INDEX_RECOVERY_HINT,
         ),
         Some(TruncationReason::Cancelled) => format!(
             "⚠ subtree walk was cancelled; results below are partial.{}\n\n",
             suffix,
         ),
         _ => format!(
-            "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.{}\n\n",
-            limit, suffix,
+            "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.{}{}\n\n",
+            limit, suffix, INDEX_RECOVERY_HINT,
         ),
     }
 }
@@ -768,6 +775,16 @@ pub struct SearchNodesParams {
     /// unscoped walks by default, require an explicit opt-in.
     #[schemars(description = "Opt in to scanning from the workspace root when parent_id is omitted. Disabled by default because unscoped searches on large trees time out; pass parent_id to scope or set this true to accept the full walk.")]
     pub allow_root_scan: Option<bool>,
+    /// 2026-05-03 eval-run finding: searches scoped under big subtrees
+    /// (Distillations grew past the 10 000-node walk cap) reliably time
+    /// out at the 20 s budget, even with `parent_id` set. The recovery
+    /// path is the same one `find_node` already exposes: when the
+    /// persistent name index covers the target, query it directly and
+    /// skip the API walk entirely. Match is name-only (description
+    /// content needs the live walk), and the index must be populated
+    /// — call `build_name_index` first if it isn't.
+    #[schemars(description = "Serve the query from the persistent name index instead of walking the tree. O(1) lookups, no walk-budget timeouts. Match is name-only (description content needs the live walk). Defaults to false — a live walk; set true after `build_name_index` to bypass the 20 s subtree-fetch budget on huge subtrees.")]
+    pub use_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -1841,7 +1858,7 @@ impl WorkflowyMcpServer {
         Ok(fetch)
     }
 
-    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. PASS parent_id to scope the search; on large trees an unscoped (root-of-workspace) walk hits the 20 s subtree budget and times out before reaching most content. The unscoped walk is refused by default: set allow_root_scan=true to opt in, or scope with parent_id. Use max_depth to control depth.")]
+    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. PASS parent_id to scope the search; on large trees an unscoped (root-of-workspace) walk hits the 20 s subtree budget and times out before reaching most content. Two recovery paths: (a) `allow_root_scan=true` to accept the full walk; (b) `use_index=true` to serve the query from the persistent name index in O(1) without any walk — use after `build_name_index` populates the index. Index path is name-only (descriptions need a live walk). Use max_depth to control walk depth.")]
     async fn search_nodes(
         &self,
         Parameters(params): Parameters<SearchNodesParams>,
@@ -1850,11 +1867,65 @@ impl WorkflowyMcpServer {
         let max_results = params.max_results.unwrap_or(20);
         let max_depth = params.max_depth.unwrap_or(3);
         let allow_root_scan = params.allow_root_scan.unwrap_or(false);
-        info!(query = %params.query, max_results, max_depth, allow_root_scan, "Searching nodes");
+        let use_index = params.use_index.unwrap_or(false);
+        info!(query = %params.query, max_results, max_depth, allow_root_scan, use_index, "Searching nodes");
         let resolved_parent = match &params.parent_id {
             Some(pid) => { check_node_id(pid)?; Some(self.resolve_node_ref(pid).await?) }
             None => None,
         };
+
+        // Index fast path. Mirrors `find_node`'s opt-in: when the
+        // caller has populated the name index (via `build_name_index`
+        // or accumulated walks), serve the query in O(1) without
+        // burning the 20 s walk budget. Match is name-only; if the
+        // caller needs description-content matching they must skip
+        // this path. The 2026-05-03 eval run hit this exact failure
+        // mode — Distillations grew past the 10 000-node walk cap, so
+        // every search under it timed out — and `use_index` is the
+        // recovery path the truncation banner now points at.
+        if use_index {
+            if !self.name_index.is_populated() {
+                return Err(McpError::invalid_params(
+                    "search_nodes use_index=true requires the persistent name \
+                     index to be populated. Call `build_name_index(parent_id=...)` \
+                     first to walk a subtree into the index, or omit use_index \
+                     and accept the live-walk path."
+                        .to_string(),
+                    None,
+                ));
+            }
+            let hits = self.name_index.lookup(&params.query, "contains");
+            let hits: Vec<_> = if let Some(parent) = resolved_parent.as_deref() {
+                hits.into_iter()
+                    .filter(|e| e.parent_id.as_deref() == Some(parent))
+                    .collect()
+            } else {
+                hits
+            };
+            let mut hits = hits;
+            hits.truncate(max_results);
+            let body = if hits.is_empty() {
+                format!(
+                    "No nodes found matching '{}' in the persistent name index \
+                     ({} entries). The index covers names only — content in node \
+                     descriptions requires a live walk (omit use_index and pass \
+                     parent_id or allow_root_scan=true).",
+                    params.query,
+                    self.name_index.size(),
+                )
+            } else {
+                let items: Vec<String> = hits.iter()
+                    .map(|e| format!("- **{}** (id: `{}`)", e.name, e.node_id))
+                    .collect();
+                format!(
+                    "Found {} node(s) matching '{}' (via name index — name match only, no description content):\n\n{}",
+                    hits.len(),
+                    params.query,
+                    items.join("\n"),
+                )
+            };
+            return Ok(CallToolResult::success(vec![Content::text(body)]));
+        }
 
         // Refuse unscoped walks by default, mirroring find_node. Brief
         // 2026-05-02: search_nodes with parent_id=null on a large tree
@@ -1865,8 +1936,11 @@ impl WorkflowyMcpServer {
         if resolved_parent.is_none() && !allow_root_scan {
             return Err(McpError::invalid_params(
                 "search_nodes refuses to walk from the workspace root by default. \
-                 Pass parent_id to scope the search, or set allow_root_scan=true to \
-                 accept a full walk (bounded by the 20s subtree budget).".to_string(),
+                 Pass parent_id to scope the search, set allow_root_scan=true to \
+                 accept a full walk (bounded by the 20 s subtree budget), or set \
+                 use_index=true to serve from the persistent name index without \
+                 a walk."
+                    .to_string(),
                 None,
             ));
         }
@@ -7380,6 +7454,7 @@ mod tests {
             parent_id: None,
             max_depth: None,
             allow_root_scan: None,
+            use_index: None,
         };
         let err = server
             .search_nodes(Parameters(params))
@@ -7389,6 +7464,122 @@ mod tests {
         assert!(
             msg.contains("workspace root") || msg.contains("allow_root_scan"),
             "must explain how to opt in: {msg}"
+        );
+        // 2026-05-03 hint: error must also surface use_index as a recovery
+        // path so callers don't have to read the schema description.
+        assert!(
+            msg.contains("use_index"),
+            "refusal message must surface the use_index recovery path: {msg}"
+        );
+    }
+
+    /// 2026-05-03 eval-run regression: searches scoped under
+    /// Distillations reliably timed out at the 20 s walk budget once the
+    /// subtree grew past the 10 000-node cap. The fix is `use_index=true`,
+    /// which serves the query from the persistent name index in O(1)
+    /// without burning the walk budget. Pre-fix, search_nodes had no
+    /// index path at all — only `find_node` did.
+    #[tokio::test]
+    async fn search_nodes_use_index_returns_index_hits_without_walking() {
+        let server = new_test_server();
+        // Seed the name index directly with two entries so the index
+        // lookup has something to find. No HTTP, no walk budget.
+        server.name_index.ingest(&[
+            WorkflowyNode {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                name: "Cynefin and the chaotic domain".to_string(),
+                parent_id: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+                ..Default::default()
+            },
+            WorkflowyNode {
+                id: "22222222-2222-2222-2222-222222222222".to_string(),
+                name: "Wardley Mapping primer".to_string(),
+                parent_id: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let params = SearchNodesParams {
+            query: "cynefin".to_string(),
+            max_results: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: Some(true),
+            use_index: Some(true),
+        };
+        let result = server
+            .search_nodes(Parameters(params))
+            .await
+            .expect("use_index must answer without walking the API");
+        let body = result
+            .content
+            .iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(
+            body.contains("Cynefin and the chaotic domain"),
+            "index hit must appear in the response: {body}"
+        );
+        assert!(
+            !body.contains("Wardley"),
+            "non-matching index entry must not leak: {body}"
+        );
+        assert!(
+            body.contains("name index") && body.contains("name match"),
+            "response must signal the name-only / index-served path: {body}"
+        );
+    }
+
+    /// `use_index=true` against an empty index is a typed error, not a
+    /// silent fall-through to the live walk. The caller chose the fast
+    /// path; if it isn't usable they need to know to call
+    /// `build_name_index` first.
+    #[tokio::test]
+    async fn search_nodes_use_index_errors_when_index_is_empty() {
+        let server = new_test_server();
+        // No ingest — name index is empty.
+        let params = SearchNodesParams {
+            query: "anything".to_string(),
+            max_results: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: Some(true),
+            use_index: Some(true),
+        };
+        let err = server
+            .search_nodes(Parameters(params))
+            .await
+            .expect_err("empty index + use_index=true must return a typed error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("build_name_index"),
+            "error must point at the recovery path: {msg}"
+        );
+    }
+
+    /// Truncation banner regression: timeout / node-cap responses must
+    /// include the `use_index` / `build_name_index` recovery hint so
+    /// callers can route around big-subtree timeouts (the 2026-05-03
+    /// eval-run failure mode) without having to read the docs.
+    #[test]
+    fn truncation_banner_surfaces_index_recovery_hint_on_timeout() {
+        let banner = truncation_banner_with_reason(
+            true, defaults::MAX_SUBTREE_NODES, Some(TruncationReason::Timeout),
+        );
+        assert!(
+            banner.contains("use_index"),
+            "timeout banner must name use_index as a recovery path: {banner}"
+        );
+        assert!(
+            banner.contains("build_name_index"),
+            "timeout banner must name build_name_index: {banner}"
+        );
+        let banner_cap = truncation_banner_with_reason(
+            true, defaults::MAX_SUBTREE_NODES, Some(TruncationReason::NodeLimit),
+        );
+        assert!(
+            banner_cap.contains("use_index"),
+            "node-cap banner must also surface the recovery path: {banner_cap}"
         );
     }
 

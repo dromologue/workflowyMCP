@@ -626,6 +626,46 @@
     `degraded_warning_clears_after_get_node_recovery`. All 283 unit
     tests pass.
 
+- [x] **T-168 (search_nodes timeout recovery via name-index, 2026-05-03 eval-run failure mode)**:
+    The eval run surfaced that every `search_nodes` scoped under
+    Distillations timed out at the 20 s subtree-walk budget. Root cause:
+    Distillations grew past `MAX_SUBTREE_NODES` (10 000) so the walker
+    truncates before reaching most content, and `search_nodes` had no
+    fast path — it always walked. `find_node` already exposed
+    `use_index=true` for this exact case; `search_nodes` did not. The
+    fix mirrors the `find_node` gate.
+  - **`use_index: Option<bool>` on `SearchNodesParams`**: when true,
+    serves the query from the persistent name index in O(1) (no walk,
+    no walk-budget timeout). Match is name-only — descriptions still
+    need a live walk. Empty index + `use_index=true` returns a typed
+    error pointing at `build_name_index` rather than silently falling
+    through.
+  - **Truncation banner** now names the recovery path on timeout /
+    node-cap responses: "call `build_name_index(parent_id=...)` once,
+    then re-issue with `use_index=true` to bypass the walk budget."
+    Callers don't have to read the docs to find the recovery.
+  - **Tool description** updated to surface both opt-ins
+    (`allow_root_scan`, `use_index`) up front.
+  - **Refusal message** for unscoped walks now lists `use_index` as
+    a third recovery path alongside `parent_id` and `allow_root_scan`.
+  - **Tests**:
+    - `search_nodes_use_index_returns_index_hits_without_walking`
+      seeds two index entries and asserts the matching one comes back
+      while the non-matching one doesn't, with a "name index / name
+      match" signal in the response.
+    - `search_nodes_use_index_errors_when_index_is_empty` pins the
+      typed error pointing at `build_name_index` so the recovery path
+      is reachable from the error itself.
+    - `truncation_banner_surfaces_index_recovery_hint_on_timeout`
+      pins both timeout and node-cap variants of the banner naming
+      `use_index` and `build_name_index`.
+    - `search_nodes_refuses_root_scan_by_default` extended to verify
+      the refusal message also surfaces `use_index`.
+  - **Journal `list_children` timeout (eval 1)**: investigated, not
+    structural — the live retry returned cleanly with 2 children
+    (year nodes). The Read budget did its job within ~30 s when the
+    upstream was transiently slow. No code change needed.
+
 - [x] **T-167 (Schema-publication bug, 2026-05-03 daily-substack-summary failure)**:
     Every Workflowy MCP tool exposed by the cowork client shipped a
     JSON schema with an empty `properties` block and no `required`
