@@ -36,6 +36,20 @@ When the intent is ambiguous, ask one clarifying question rather than guessing.
 
 ---
 
+## Server contracts the workflows depend on
+
+Five contracts the workflowy-mcp / remarkable-mcp servers ship — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them.
+
+1. **`complete_node` is the native completion path; `bulk_update` accepts `complete` / `uncomplete`.** The legacy `#done` tag-as-completion-marker is deprecated for tasks (`#done` on reading-list entries to mark "I've distilled this source" remains a separate convention). Workflowy's wire field is `note` for descriptions and `completed` for the boolean.
+2. **`Parameters<T>` is the wrapper name on every tool's input.** If parameter-bearing calls suddenly silently misroute (every call acts as if you sent no arguments, only `workflowy_status` works), the server has regressed the wrapper name and the cowork client is validating against an empty schema. Recovery: route through `wflow-do` until the server is rebuilt.
+3. **`use_index=true` is the recovery for walk-budget timeouts on name queries.** `find_node` and `search_nodes` answer from the persistent name index in O(1) with no walk budget. Index is name-only — descriptions need a live walk. Populate via `build_name_index(parent_id=<scope>)` once per fresh session or whenever the index is sparse.
+4. **Every walk-shaped tool emits the same JSON-truncation envelope** (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`). Read these on every walk response — don't silently accept partial results.
+5. **reMarkable OCR auto-mode prefers sampling on capable clients.** No env var needed; sampling beats Tesseract on handwriting by a wide margin. Response carries `ocr_attempts` listing every backend tried with concrete error strings — surface these when all attempts failed; "no text detected" no longer means "image is blank."
+
+The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every non-diagnostic tool has a matching subcommand. Drift fails the build, so the fallback path is always available when transport drops.
+
+---
+
 ## System overview
 
 The user has up to four complementary layers:

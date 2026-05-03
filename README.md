@@ -82,16 +82,42 @@ who clones it gets a clean starting point.
 
 ## Tool reference
 
-The server exposes 26 tools. `node_id` accepts any of: full UUID (with or
+The server exposes 40 tools. `node_id` accepts any of: full UUID (with or
 without hyphens), 12-char URL-suffix short hash, or 8-char prefix.
 
 | Category | Tools |
 |----------|-------|
 | Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path` |
-| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
+| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
 | Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
 | Project management | `get_project_summary`, `get_recent_changes` |
 | Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `audit_mirrors`, `review`, `get_recent_tool_calls` |
+
+**Native task completion.** `complete_node(node_id)` toggles the
+Workflowy `completed` boolean — the legacy `#done` tag-as-completion
+workaround is deprecated for tasks. `bulk_update(operation: "complete"|"uncomplete", filter: …)`
+toggles a filtered set in one call; `transaction` accepts the same ops
+with rollback. Wire payload is `POST /nodes/{id}` with
+`{"completed": true|false}`.
+
+**Truncation envelope.** Every walk-shaped tool that emits JSON includes
+the same four fields when its 20 s walk budget fires:
+
+```json
+{
+  "truncated": true,
+  "truncation_limit": 10000,
+  "truncation_reason": "timeout",
+  "truncation_recovery_hint": "Call build_name_index(parent_id=...) … then re-issue with use_index=true …"
+}
+```
+
+Read `truncation_reason` and `truncation_recovery_hint` on every walk
+response. For name-based queries (`search_nodes`, `find_node`),
+`use_index=true` answers in O(1) from the persistent name index without
+burning the walk budget — populate it first with
+`build_name_index(parent_id=<scope>)`. Index path is name-only;
+description-content matching still needs a live walk.
 
 For large workspaces, prefer `node_at_path` (path of names → UUID, ~1 second
 on any tree size) and `resolve_link` (Workflowy URL + optional parent path
@@ -127,28 +153,53 @@ caller can resume — no "no result received" without diagnostic.
 
 For the full list (transport-timeout retry, `authenticated`/`api_reachable`
 decoupling, `null` parameter handling, etc.) see
-[`specs/specification.md`](specs/specification.md). 272 lib tests pin the
-contracts, including 21 wiremock-driven failure-mode tests that run in
-under 2 seconds.
+[`specs/specification.md`](specs/specification.md). 296 lib + 12 CLI
+tests pin the contracts, including 21 wiremock-driven failure-mode tests
+that run in under 2 seconds, plus four build-time invariant tests:
+
+- `parameter_bearing_tools_publish_non_empty_input_schema_properties`
+  fails the build if a tool's published schema has empty `properties`
+  (the rmcp `Parameters<T>` wrapper rename trap).
+- `every_walk_tool_emits_full_truncation_envelope_in_json` fails the
+  build if a walk-shaped tool emits `truncation_limit` without the
+  reason + recovery_hint companions.
+- `cli_covers_every_non_diagnostic_mcp_tool` fails the build if a new
+  MCP tool ships without its matching `wflow-do` subcommand.
+- `cancel_all_preempts_inflight_create_node_via_run_handler` and the
+  `path_of` companion pin the cancel-registry safety net.
 
 ---
 
 ## CLI: `wflow-do`
 
 A second binary exposes the same operations as a plain shell command.
-Useful as a fallback when the MCP transport drops.
+**Full surface parity** with the MCP server — every non-diagnostic tool
+has a matching subcommand, enforced at build time. Useful as a fallback
+when the MCP transport drops or when you want a Bash-driven workflow.
 
 ```bash
 target/release/wflow-do status                              # liveness
-target/release/wflow-do search --query "concept maps"
+target/release/wflow-do search --query "concept maps"       # substring filter
+target/release/wflow-do find "Tasks" --use-index            # O(1) index lookup
+target/release/wflow-do complete <uuid>                     # mark task done
+target/release/wflow-do bulk-update complete --tag urgent   # bulk-toggle by filter
 target/release/wflow-do --dry-run delete <uuid>             # preview
 target/release/wflow-do reindex --root <UUID> --root <UUID> # pre-warm index
 ```
 
-Subcommands: `status`, `get`, `children`, `create`, `move`, `delete`,
-`edit`, `search`, `audit-mirrors`, `review`, `index`, `reindex`. Use
-`--json` for raw output, `--dry-run` (write verbs only) to preview without
-calling the API.
+Forty subcommands grouped: read & navigate (`status`, `health-check`,
+`get`, `children`, `subtree`, `find`, `search`, `tag-search`,
+`backlinks`, `find-by-tag-and-path`, `node-at-path`, `path-of`,
+`resolve-link`, `since`); todos & scheduling (`todos`, `overdue`,
+`upcoming`, `daily-review`, `recent-changes`, `project-summary`);
+single-node writes (`create`, `move`, `delete`, `edit`, `complete`);
+bulk writes (`insert`, `smart-insert`, `duplicate`, `template`,
+`bulk-update`, `bulk-tag`, `batch-create`, `transaction`, `export`);
+graph hygiene (`audit-mirrors`, `review`, `index`, `reindex`,
+`build-name-index`); diagnostics (`cancel-all`, `recent-tools`).
+
+Use `--json` for raw output, `--dry-run` (write verbs only) to preview
+without calling the API.
 
 ---
 
