@@ -447,6 +447,77 @@ The contract callers can rely on:
 - **`degraded` means there is unrecovered breakage right now.** It
   does not mean "we saw a failure once". After the failing tool
   returns OK, the warning clears.
+- **Deserialization errors name the offending field.**
+  `Parameters::from_context_part` runs every payload through
+  `serde_path_to_error::deserialize`, so a rejected JSON value
+  reaches the caller as `invalid parameters at \`.<field>\`:
+  <reason>` rather than a path-less `<reason>`. A host (LLM or MCP
+  client) that sends `null` for a required `NodeId` sees the field
+  name and can self-correct on the next call. Pinned by
+  `null_required_uuid_field_error_names_the_field`.
+- **Every error path emits the structured envelope with no exemptions
+  inside handler bodies.** Validation failures route through
+  `tool_invalid_params(operation, node_id, msg)`; operational
+  failures route through `tool_error(operation, node_id, err)`. Both
+  produce the same `{operation, node_id, hint, proximate_cause,
+  error}` shape so callers see one error model. Two helpers
+  (`check_node_id`, the short-hash-resolve helper) keep the bare
+  `McpError::invalid_params` form because they don't know the
+  operation name at the call site; nothing else is allow-listed.
+  Pinned by
+  `handler_body_validation_uses_structured_envelope_not_bare_invalid_params`
+  and
+  `operational_failures_route_through_tool_error_not_bare_internal_error`
+  — both grep-audit the source so a future contributor adding a
+  bare `McpError::invalid_params(...)` inside a handler body, or
+  any bare `McpError::internal_error(...)`, fails the build before
+  it ships.
+
+---
+
+## Repository Template Portability
+
+The repo ships templates that other users clone, populate, and run.
+Three classes of leak have happened in past sessions and are now
+explicitly forbidden by tests in `tests/template_portability.rs`:
+
+1. **No machine-specific paths in `templates/skills/wflow/SKILL.md`.**
+   The skill must reference `$SECONDBRAIN_DIR` for every user-data
+   location, never hardcode `~/code/SecondBrain`, `/Users/<name>/...`,
+   or any equivalent. A new user's `$SECONDBRAIN_DIR` may point at
+   Google Drive, Dropbox, iCloud, or any other path the user wired
+   through their MCP host config — the skill must follow the env var.
+   Pinned by `template_skill_has_no_machine_specific_user_paths` and
+   `template_skill_references_env_driven_secondbrain_path`.
+
+2. **No author-specific frameworks named in the skill body.** Pillar
+   names, theme names, intellectual frameworks (e.g. IOTA, ELSA,
+   Drift into Failure, How we Lead/Decide/Learn/Build) are
+   user-specific data and live in
+   `$SECONDBRAIN_DIR/memory/distillation_taxonomy.md`. The skill
+   describes the synthesis workflow generically and reads the user's
+   actual taxonomy from that file. The frontmatter `description:`
+   may *describe that user-specific frameworks live in the data
+   file*; the skill body must stay neutral. Pinned by
+   `template_skill_does_not_embed_author_specific_frameworks`.
+
+3. **Memory templates use placeholders, not real UUIDs.**
+   `templates/secondbrain/memory/workflowy_node_links.md` and
+   `templates/secondbrain/memory/distillation_taxonomy.md` ship as
+   fill-in-the-blank shapes (`<TBD>`, `<UUID>`, `<Pillar 1>`, blank
+   table cells). Real Workflowy UUIDs in a template would silently
+   anchor a new user to the original author's tree. Both files'
+   `canonical_path:` frontmatter must reference
+   `$SECONDBRAIN_DIR/memory/<file>.md`, never a hardcoded path.
+   Pinned by `template_workflowy_node_links_is_placeholder_shaped`,
+   `template_distillation_taxonomy_is_placeholder_shaped`, and
+   `template_memory_files_declare_env_driven_canonical_path`.
+
+These tests run as part of `cargo test` (integration test target
+`template_portability`). They are content-shape tests on shipped
+files, not server-runtime tests — they protect the user-facing
+template surface, complementing the in-handler envelope pins above
+that protect the runtime surface.
 
 ---
 

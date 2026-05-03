@@ -99,6 +99,31 @@ convergence, troubleshooting — lives in [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 
+## User-specific files (what you create)
+
+The repo is generic. Everything specific to your Workflowy tree, your
+intellectual frameworks, and your in-progress work lives outside it. These
+are the files you populate (or accept the bundled defaults from the wflow
+skill, then customise):
+
+| File | Lives at | What it holds | Why it's external |
+|------|----------|---------------|-------------------|
+| `workflowy_node_links.md` | `$SECONDBRAIN_DIR/memory/` (canonical) and `~/.claude/skills/wflow/` (bundled fallback for surfaces that can't read `$SECONDBRAIN_DIR`) | Cached UUIDs for your structural Workflowy nodes (Inbox, Tasks, Reading List, Distillations, Themes, etc.) plus a **Triage Sources** table that defines which nodes Workflow 6 sweeps. Editing this list is how you add a new triage target — capture sub-node, Slack-saved-items mirror — without changing the skill. | The skill is portable; your tree isn't. The skill references this file so different users can have entirely different Workflowy structures. |
+| `distillation_taxonomy.md` | `$SECONDBRAIN_DIR/memory/` (canonical) and `~/.claude/skills/wflow/` (bundled fallback) | Your distillation pillars (the top-level conceptual buckets you organise atomic notes into), themes (cross-cutting tags), inbound routing rules (which topic goes to which pillar), and the named frameworks you work with. | The skill describes the synthesis workflow generically and reads your actual taxonomy from this file. Pillars and frameworks are deeply personal; embedding one user's into the skill would force everyone else to inherit them. |
+| `name_index.json` | `$WORKFLOWY_INDEX_PATH` (typically `$SECONDBRAIN_DIR/memory/name_index.json`) | Auto-managed by the MCP server. Persistent name index that turns Workflowy URL fragments and short-hashes into full UUIDs in O(1). Survives restarts; checkpoints every 30 s; refreshes via background walks every 30 minutes. | You don't write this file directly — the server maintains it. But it lives in your secondBrain so it's portable across your machines (e.g. via Google Drive / Dropbox / iCloud). |
+| `drafts/`, `session-logs/`, `briefs/` | `$SECONDBRAIN_DIR/` | Your in-flight distillation work (`drafts/`), per-session audit trails (`session-logs/`), and external-facing handoff documents (`briefs/`). | The skill's end-of-session discipline writes to these locations. They're per-user by definition. |
+| `tasks/todo.local.md` | inside this repo (gitignored) | Cross-session engineering follow-ups for the workflowy-mcp-server itself — issues you noticed, ideas to revisit, items the previous habit would have filed as Workflowy "system tasks." | Engineering todos belong with the code, not in your Workflowy outline; gitignored so each contributor's local list stays out of the tracked tree. |
+
+**Precedence rule.** When the skill needs data from the two memory files,
+it prefers the canonical at `$SECONDBRAIN_DIR/memory/<file>.md`. If that
+path isn't readable (e.g. claude.ai web with no Filesystem allowlist), it
+falls back to the bundled copy at `~/.claude/skills/wflow/<file>.md`. The
+bundled copy is overwritten on each skill ZIP rebuild, so canonical edits
+need to be re-bundled before they reach surfaces that depend on the
+fallback.
+
+---
+
 ## What ships in this repo
 
 ```
@@ -110,7 +135,8 @@ workflowyMCP/
 ├── templates/
 │   ├── secondbrain/          ← skeleton copied to $SECONDBRAIN_DIR
 │   │   ├── README.md
-│   │   ├── memory/workflowy_node_links.md   (template; user fills in)
+│   │   ├── memory/workflowy_node_links.md     (template; user fills in)
+│   │   ├── memory/distillation_taxonomy.md    (template; user fills in)
 │   │   ├── drafts/  session-logs/  briefs/
 │   └── skills/wflow/SKILL.md ← the operating manual the assistant follows
 └── src/                       ← Rust MCP server source

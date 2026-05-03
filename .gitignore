@@ -19,3 +19,8 @@ Evals/
 !README.md
 !BOOTSTRAP.md
 !CLAUDE.md
+
+# Local cross-session todo file. Replaces the previous habit of filing
+# follow-ups as Workflowy "system tasks" — keep them in the repo, out of
+# the tracked tree. New session? Re-read this first.
+tasks/todo.local.md

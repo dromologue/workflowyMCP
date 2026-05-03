@@ -26,7 +26,7 @@ Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio tr
   - `validate_and_resolve(raw) -> Result<String, McpError>` — collapses the validate-then-resolve pair every handler taking a node_id needs.
   - `invalidate_for_mutation(&[id, ...])` — pre-call cache + name-index invalidation. Every write handler uses it BEFORE the API call so a wrapper-level timeout/cancel can't strand stale data.
   - `truncation_envelope(truncated, limit, reason)` and `with_truncation_envelope(payload, ...)` — the four-field JSON envelope for walk-shaped responses (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`).
-  - `tool_error(op, node_id, err)` and `tool_invalid_params(op, node_id, msg)` — structured error helpers. The first for operational failures, the second for validation failures. Both produce the same `data` envelope shape so clients see one error model.
+  - `tool_error(op, node_id, err)` and `tool_invalid_params(op, node_id, msg)` — structured error helpers. The first for operational failures, the second for validation failures. Both produce the same `data` envelope shape so clients see one error model. **Universal contract: every error path emits the structured envelope.** Validation failures route through `tool_invalid_params` (allow-listed only in two helpers — `check_node_id` at line ~441 and the short-hash-resolve helper at line ~1207 — where the operation name isn't statically known); operational failures route through `tool_error` with no exemptions. Pinned by `handler_body_validation_uses_structured_envelope_not_bare_invalid_params` and `operational_failures_route_through_tool_error_not_bare_internal_error` — adding a new bare `McpError::invalid_params(...)` inside a handler body, or any bare `McpError::internal_error(...)`, fails the build before it ships.
 
 - **`src/utils/aggregation.rs`** — pure aggregation functions shared between MCP handlers and the `wflow-do` CLI: `compute_overdue`, `compute_upcoming`, `compute_recent_changes`, `filter_todos`. Take `today` / `now_ms` as parameters rather than reading the system clock. Single source of truth — both surfaces call the same function so they can't drift in semantics.
 - **`src/api/client.rs`** — Workflowy API client with exponential backoff retry. `get_subtree_recursive()` fetches tree level-by-level via `/nodes?parent_id=` with configurable depth limit (crucial for 250k+ node trees). Returns `SubtreeFetch { nodes, truncated, limit }`; when the `MAX_SUBTREE_NODES` cap (10 000 by default, `defaults.rs`) is hit the flag is surfaced in every tool response so callers can narrow the scope.
@@ -45,6 +45,17 @@ Two recorder points sit on this path:
 1. **`Parameters::from_context_part`** records an Err entry to the op
    log when serde rejects the payload — covering the path that the
    rmcp framework would otherwise drop before the handler body runs.
+   Deserialization runs through `serde_path_to_error::deserialize` so
+   the error message carries the offending field path (e.g. `invalid
+   parameters at \`.new_parent_id\`: invalid type: null, expected a
+   string`). Without the path, a host (LLM or MCP client) sending
+   `null` for a required `NodeId` saw only "invalid type: null,
+   expected a string" with no field name and no way to self-correct;
+   the 2026-05-03 `move_node` incident motivated the switch. Pinned
+   by `null_required_uuid_field_error_names_the_field`. Failures
+   route through `tool_invalid_params` so the wire error carries the
+   same `{operation, node_id, hint, proximate_cause, error}` envelope
+   as every other validation failure.
 2. **`tool_handler!`** (the standard wrapper around every
    non-diagnostic handler body) records the handler's own outcome
    (Ok or Err) AND wraps the body in `run_handler(name, kind, ...)`

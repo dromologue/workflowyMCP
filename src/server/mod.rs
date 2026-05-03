@@ -852,20 +852,36 @@ where
     ) -> std::result::Result<Self, McpError> {
         let arguments = context.arguments.take().unwrap_or_default();
         let json_value = serde_json::Value::Object(arguments);
-        match serde_json::from_value::<T>(json_value.clone()) {
+        // Use serde_path_to_error so the error names the offending
+        // field. Bare `serde_json::from_value::<T>` produces messages
+        // like "invalid type: null, expected a string" without the
+        // path — when a host (e.g. an LLM) sends `{"node_id": null,
+        // "new_parent_id": "abc..."}` the caller has no way to know
+        // which field was wrong. The path-tracking variant produces
+        // "invalid type: null, expected a string at `.node_id`",
+        // which makes the failure self-correcting at the host.
+        let result: std::result::Result<T, _> =
+            serde_path_to_error::deserialize(&json_value);
+        match result {
             Ok(value) => Ok(Parameters(value)),
             Err(e) => {
+                let path = e.path().to_string();
+                let inner = e.into_inner();
+                let msg = if path.is_empty() || path == "." {
+                    format!("invalid parameters: {}", inner)
+                } else {
+                    format!("invalid parameters at `{}`: {}", path, inner)
+                };
                 // Record the rejection so per_tool_health reflects every
                 // attempt, not just the ones that reached the handler
                 // body. Without this the counters under-count by exactly
                 // the failure mode the LLM cannot recover from.
-                let msg = format!("invalid parameters: {}", e);
                 let recorder = context
                     .service
                     .op_log
                     .record(context.name.to_string(), &json_value);
                 recorder.finish_err(&msg);
-                Err(tool_error(context.name.as_ref(), None, msg))
+                Err(tool_invalid_params(context.name.as_ref(), None, msg))
             }
         }
     }
@@ -1481,13 +1497,13 @@ impl WorkflowyMcpServer {
         // recovery path the truncation banner now points at.
         if use_index {
             if !self.name_index.is_populated() {
-                return Err(McpError::invalid_params(
+                return Err(tool_invalid_params(
+                    "search_nodes",
+                    None,
                     "search_nodes use_index=true requires the persistent name \
                      index to be populated. Call `build_name_index(parent_id=...)` \
                      first to walk a subtree into the index, or omit use_index \
-                     and accept the live-walk path."
-                        .to_string(),
-                    None,
+                     and accept the live-walk path.",
                 ));
             }
             let hits = self.name_index.lookup(&params.query, "contains");
@@ -1530,14 +1546,14 @@ impl WorkflowyMcpServer {
         // recovery path. The fix is the same gate find_node has:
         // require either parent_id, or an explicit opt-in.
         if resolved_parent.is_none() && !allow_root_scan {
-            return Err(McpError::invalid_params(
+            return Err(tool_invalid_params(
+                "search_nodes",
+                None,
                 "search_nodes refuses to walk from the workspace root by default. \
                  Pass parent_id to scope the search, set allow_root_scan=true to \
                  accept a full walk (bounded by the 20 s subtree budget), or set \
                  use_index=true to serve from the persistent name index without \
-                 a walk."
-                    .to_string(),
-                None,
+                 a walk.",
             ));
         }
 
@@ -1653,7 +1669,7 @@ impl WorkflowyMcpServer {
             "children": children,
         });
         let json = serde_json::to_string_pretty(&payload).map_err(|e| {
-            McpError::internal_error(format!("Serialization error: {}", e), None)
+            tool_error("get_node", Some(&resolved), format!("Serialization error: {}", e))
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
         })
@@ -2202,7 +2218,7 @@ impl WorkflowyMcpServer {
                 let root_name = fetch.nodes.first().map(|n| n.name.as_str()).unwrap_or("unknown").to_string();
                 let total = fetch.nodes.len();
                 let json = serde_json::to_string_pretty(&fetch.nodes).map_err(|e| {
-                    McpError::internal_error(format!("Serialization error: {}", e), None)
+                    tool_error("get_subtree", Some(&resolved), format!("Serialization error: {}", e))
                 })?;
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "{}Subtree for '{}' ({} nodes):\n\n{}",
@@ -2425,7 +2441,7 @@ impl WorkflowyMcpServer {
 
         let content = params.content.trim();
         if content.is_empty() {
-            return Err(McpError::invalid_params("Content cannot be empty".to_string(), None));
+            return Err(tool_invalid_params("smart_insert", None, "Content cannot be empty"));
         }
 
         match self.walk_subtree(None, max_depth).await {
@@ -2445,7 +2461,7 @@ impl WorkflowyMcpServer {
                     } else {
                         format!("No nodes found matching '{}'", params.search_query)
                     };
-                    return Err(McpError::invalid_params(hint, None));
+                    return Err(tool_invalid_params("smart_insert", None, hint));
                 }
 
                 if matches.len() > 1 && params.selection.is_none() {
@@ -2469,8 +2485,10 @@ impl WorkflowyMcpServer {
 
                 let idx = params.selection.unwrap_or(1);
                 if idx < 1 || idx > matches.len() {
-                    return Err(McpError::invalid_params(
-                        format!("Selection {} out of range (1-{})", idx, matches.len()), None
+                    return Err(tool_invalid_params(
+                        "smart_insert",
+                        None,
+                        format!("Selection {} out of range (1-{})", idx, matches.len()),
                     ));
                 }
                 let target = matches[idx - 1];
@@ -2822,8 +2840,10 @@ impl WorkflowyMcpServer {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
-                    return Err(McpError::invalid_params(
-                        format!("Node '{}' not found or has no subtree", params.node_id), None
+                    return Err(tool_invalid_params(
+                        "get_project_summary",
+                        Some(params.node_id.as_str()),
+                        format!("Node '{}' not found or has no subtree", params.node_id),
                     ));
                 }
 
@@ -3064,12 +3084,13 @@ impl WorkflowyMcpServer {
             // matches that contract.
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
-                    return Err(McpError::invalid_params(
+                    return Err(tool_invalid_params(
+                        "duplicate_node",
+                        Some(params.node_id.as_str()),
                         format!(
                             "Cannot duplicate: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
                             node_limit
                         ),
-                        None,
                     ));
                 }
                 let subtree: Vec<&WorkflowyNode> = if include_children {
@@ -3079,7 +3100,11 @@ impl WorkflowyMcpServer {
                 };
 
                 if subtree.is_empty() {
-                    return Err(McpError::invalid_params(format!("Node '{}' not found", params.node_id), None));
+                    return Err(tool_invalid_params(
+                        "duplicate_node",
+                        Some(params.node_id.as_str()),
+                        format!("Node '{}' not found", params.node_id),
+                    ));
                 }
 
                 // Build depth-first ordering from subtree
@@ -3179,17 +3204,22 @@ impl WorkflowyMcpServer {
             // response.
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
                 if truncated {
-                    return Err(McpError::invalid_params(
+                    return Err(tool_invalid_params(
+                        "create_from_template",
+                        Some(params.template_node_id.as_str()),
                         format!(
                             "Cannot instantiate template: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
                             node_limit
                         ),
-                        None,
                     ));
                 }
                 let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
                 if subtree.is_empty() {
-                    return Err(McpError::invalid_params(format!("Template '{}' not found", params.template_node_id), None));
+                    return Err(tool_invalid_params(
+                        "create_from_template",
+                        Some(params.template_node_id.as_str()),
+                        format!("Template '{}' not found", params.template_node_id),
+                    ));
                 }
 
                 let mut id_map: HashMap<String, String> = HashMap::new();
@@ -3278,12 +3308,18 @@ impl WorkflowyMcpServer {
         // `complete_node` uses for single-node toggles.
         let valid_ops = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
         if !valid_ops.contains(&params.operation.as_str()) {
-            return Err(McpError::invalid_params(
-                format!("Invalid operation '{}'. Must be one of: {}", params.operation, valid_ops.join(", ")), None
+            return Err(tool_invalid_params(
+                "bulk_update",
+                None,
+                format!("Invalid operation '{}'. Must be one of: {}", params.operation, valid_ops.join(", ")),
             ));
         }
         if (params.operation == "add_tag" || params.operation == "remove_tag") && params.operation_tag.is_none() {
-            return Err(McpError::invalid_params("operation_tag required for add_tag/remove_tag".to_string(), None));
+            return Err(tool_invalid_params(
+                "bulk_update",
+                None,
+                "operation_tag required for add_tag/remove_tag",
+            ));
         }
 
         let max_depth = params.max_depth.unwrap_or(5);
@@ -3292,12 +3328,13 @@ impl WorkflowyMcpServer {
                 // Refuse destructive bulk ops on a truncated view — we would
                 // otherwise delete only a partial match set silently.
                 if truncated && params.operation == "delete" && !dry_run {
-                    return Err(McpError::invalid_params(
+                    return Err(tool_invalid_params(
+                        "bulk_update",
+                        None,
                         format!(
                             "Refusing to bulk-delete against a truncated subtree (capped at {} nodes). Narrow with root_id or reduce max_depth.",
                             node_limit
                         ),
-                        None,
                     ));
                 }
 
@@ -3331,8 +3368,10 @@ impl WorkflowyMcpServer {
                 }).collect();
 
                 if matched.len() > limit {
-                    return Err(McpError::invalid_params(
-                        format!("Matched {} nodes but limit is {}. Increase limit or narrow filter.", matched.len(), limit), None
+                    return Err(tool_invalid_params(
+                        "bulk_update",
+                        None,
+                        format!("Matched {} nodes but limit is {}. Increase limit or narrow filter.", matched.len(), limit),
                     ));
                 }
 
@@ -3787,9 +3826,10 @@ impl WorkflowyMcpServer {
             None => None,
         };
         if resolved_root.is_none() && !allow_root_scan {
-            return Err(McpError::invalid_params(
-                "build_name_index refuses an unscoped walk by default. Pass root_id to scope it, or set allow_root_scan=true to accept a full walk (bounded by the subtree-fetch budget).".to_string(),
+            return Err(tool_invalid_params(
+                "build_name_index",
                 None,
+                "build_name_index refuses an unscoped walk by default. Pass root_id to scope it, or set allow_root_scan=true to accept a full walk (bounded by the subtree-fetch budget).",
             ));
         }
         info!(root_id = ?resolved_root, max_depth, allow_root_scan, "Building name index");
@@ -3820,9 +3860,10 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "batch_create_nodes", ToolKind::Bulk, params, {
         if params.operations.is_empty() {
-            return Err(McpError::invalid_params(
-                "operations must not be empty".to_string(),
+            return Err(tool_invalid_params(
+                "batch_create_nodes",
                 None,
+                "operations must not be empty",
             ));
         }
         // Validate every node id eagerly so we don't waste round-trips
@@ -3907,7 +3948,7 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "transaction", ToolKind::Bulk, params, {
             if params.operations.is_empty() {
-                return Err(McpError::invalid_params("operations must not be empty".to_string(), None));
+                return Err(tool_invalid_params("transaction", None, "operations must not be empty"));
             }
 
             // Each entry: (description-of-completed-op, inverse-action)
@@ -4020,13 +4061,14 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "bulk_tag", ToolKind::Bulk, params, {
         if params.node_ids.is_empty() {
-            return Err(McpError::invalid_params("node_ids must not be empty".to_string(), None));
+            return Err(tool_invalid_params("bulk_tag", None, "node_ids must not be empty"));
         }
         let tag = params.tag.trim();
         if tag.is_empty() || tag.contains(char::is_whitespace) {
-            return Err(McpError::invalid_params(
-                "tag must be non-empty and contain no whitespace".to_string(),
+            return Err(tool_invalid_params(
+                "bulk_tag",
                 None,
+                "tag must be non-empty and contain no whitespace",
             ));
         }
         let needle = format!("#{}", tag.trim_start_matches('#'));
@@ -4276,9 +4318,10 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "node_at_path", ToolKind::Bulk, params, {
         if params.path.is_empty() {
-            return Err(McpError::invalid_params(
-                "path must contain at least one segment".to_string(),
+            return Err(tool_invalid_params(
+                "node_at_path",
                 None,
+                "path must contain at least one segment",
             ));
         }
         let mut current_id: Option<String> = match &params.start_parent_id {
@@ -4292,9 +4335,10 @@ impl WorkflowyMcpServer {
         for (idx, segment) in params.path.iter().enumerate() {
             let needle = segment.trim().to_lowercase();
             if needle.is_empty() {
-                return Err(McpError::invalid_params(
-                    format!("path segment at index {} is empty", idx),
+                return Err(tool_invalid_params(
+                    "node_at_path",
                     None,
+                    format!("path segment at index {} is empty", idx),
                 ));
             }
             let children = match &current_id {
@@ -4338,7 +4382,9 @@ impl WorkflowyMcpServer {
                     } else {
                         traversed.join(" / ")
                     };
-                    return Err(McpError::invalid_params(
+                    return Err(tool_invalid_params(
+                        "node_at_path",
+                        None,
                         format!(
                             "path segment '{}' not found under '{}'. Children seen ({}): {}.",
                             segment,
@@ -4346,7 +4392,6 @@ impl WorkflowyMcpServer {
                             children.len(),
                             sibling_names.join(", ")
                         ),
-                        None,
                     ));
                 }
             }
@@ -4395,12 +4440,13 @@ impl WorkflowyMcpServer {
         }
 
         if !(unhyphen.len() == 12 || unhyphen.len() == 8) || !unhyphen.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(McpError::invalid_params(
+            return Err(tool_invalid_params(
+                "resolve_link",
+                None,
                 format!(
                     "could not extract a Workflowy short hash from '{}'. Expected a 12-char URL-suffix hash, 8-char prefix, or full UUID.",
                     params.link
                 ),
-                None,
             ));
         }
 
@@ -4432,12 +4478,13 @@ impl WorkflowyMcpServer {
                     match hit {
                         Some(node) => current_id = Some(node.id.clone()),
                         None => {
-                            return Err(McpError::invalid_params(
+                            return Err(tool_invalid_params(
+                                "resolve_link",
+                                None,
                                 format!(
                                     "search_parent_path segment '{}' not found under the partial path resolved so far",
                                     segment
                                 ),
-                                None,
                             ));
                         }
                     }
@@ -4485,12 +4532,13 @@ impl WorkflowyMcpServer {
             Some(crate::api::TruncationReason::Cancelled) => "cancelled",
             None => "none",
         };
-        Err(McpError::invalid_params(
+        Err(tool_invalid_params(
+            "resolve_link",
+            None,
             format!(
                 "Short-hash '{}' not found under {} after walking {} nodes in {} ms (truncation: {}). Try: (a) supplying a more specific search_parent_path that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling node_at_path with the full hierarchical path if you know it.",
                 short, scope_str, summary.nodes_walked, summary.elapsed_ms, reason_str,
             ),
-            None,
         ))
         })
     }
@@ -4596,9 +4644,10 @@ impl WorkflowyMcpServer {
         let max_depth = params.max_depth.unwrap_or(10);
         let format = params.format.to_lowercase();
         if !matches!(format.as_str(), "opml" | "markdown" | "json") {
-            return Err(McpError::invalid_params(
+            return Err(tool_invalid_params(
+                "export_subtree",
+                Some(params.node_id.as_str()),
                 format!("unknown format '{}'; expected opml | markdown | json", params.format),
-                None,
             ));
         }
 
@@ -4607,7 +4656,7 @@ impl WorkflowyMcpServer {
                 let banner = truncation_banner_from_fetch(&fetch);
                 let body = match format.as_str() {
                     "json" => serde_json::to_string_pretty(&fetch.nodes).map_err(|e| {
-                        McpError::internal_error(format!("JSON encoding failed: {}", e), None)
+                        tool_error("export_subtree", Some(&resolved), format!("JSON encoding failed: {}", e))
                     })?,
                     "markdown" => render_subtree_markdown(&fetch.nodes, &resolved),
                     "opml" => render_subtree_opml(&fetch.nodes, &resolved),
@@ -4626,9 +4675,10 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<CreateMirrorParams>,
     ) -> Result<CallToolResult, McpError> {
         record_op!(self, "create_mirror", params, {
-        Err(McpError::invalid_params(
-            "create_mirror is not implemented: Workflowy's public REST API does not expose mirror creation. Use a `mirror_of: <uuid>` note on the duplicate node as a documentation convention; updates do not propagate. Tracked in tasks/reliability-and-ergonomics.md (Pass 6).".to_string(),
-            None,
+        Err(tool_invalid_params(
+            "create_mirror",
+            Some(params.canonical_node_id.as_str()),
+            "create_mirror is not implemented: Workflowy's public REST API does not expose mirror creation. Use a `mirror_of: <uuid>` note on the duplicate node as a documentation convention; updates do not propagate. Tracked in tasks/reliability-and-ergonomics.md (Pass 6).",
         ))
         })
     }
@@ -4702,7 +4752,7 @@ impl WorkflowyMcpServer {
                     None => None,
                 };
                 let name = op.name.as_deref().ok_or_else(|| {
-                    McpError::invalid_params("create requires `name`".to_string(), None)
+                    tool_invalid_params("transaction", None, "create requires `name`")
                 })?;
                 let created = self
                     .client
@@ -4731,13 +4781,14 @@ impl WorkflowyMcpServer {
             }
             "edit" => {
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    McpError::invalid_params("edit requires `node_id`".to_string(), None)
+                    tool_invalid_params("transaction", None, "edit requires `node_id`")
                 })?;
                 let node_id = self.resolve_node_ref(node_id_raw).await?;
                 if op.name.is_none() && op.description.is_none() {
-                    return Err(McpError::invalid_params(
-                        "edit requires at least one of `name`/`description`".to_string(),
+                    return Err(tool_invalid_params(
+                        "transaction",
                         None,
+                        "edit requires at least one of `name`/`description`",
                     ));
                 }
                 // Capture the prior state so we can restore it on
@@ -4761,7 +4812,7 @@ impl WorkflowyMcpServer {
             }
             "delete" => {
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    McpError::invalid_params("delete requires `node_id`".to_string(), None)
+                    tool_invalid_params("transaction", None, "delete requires `node_id`")
                 })?;
                 let node_id = self.resolve_node_ref(node_id_raw).await?;
                 self.client.delete_node(&node_id).await.map_err(|e| {
@@ -4778,10 +4829,10 @@ impl WorkflowyMcpServer {
             }
             "move" => {
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    McpError::invalid_params("move requires `node_id`".to_string(), None)
+                    tool_invalid_params("transaction", None, "move requires `node_id`")
                 })?;
                 let new_parent_raw = op.new_parent_id.as_ref().ok_or_else(|| {
-                    McpError::invalid_params("move requires `new_parent_id`".to_string(), None)
+                    tool_invalid_params("transaction", None, "move requires `new_parent_id`")
                 })?;
                 let node_id = self.resolve_node_ref(node_id_raw).await?;
                 let new_parent = self.resolve_node_ref(new_parent_raw).await?;
@@ -4809,9 +4860,10 @@ impl WorkflowyMcpServer {
             "complete" | "uncomplete" => {
                 let target_state = op.op == "complete";
                 let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    McpError::invalid_params(
-                        format!("{} requires `node_id`", op.op),
+                    tool_invalid_params(
+                        "transaction",
                         None,
+                        format!("{} requires `node_id`", op.op),
                     )
                 })?;
                 let node_id = self.resolve_node_ref(node_id_raw).await?;
@@ -4842,9 +4894,10 @@ impl WorkflowyMcpServer {
                 });
                 Ok((summary, inverse))
             }
-            other => Err(McpError::invalid_params(
-                format!("unknown transaction op '{}'; expected create/edit/delete/move/complete/uncomplete", other),
+            other => Err(tool_invalid_params(
+                "transaction",
                 None,
+                format!("unknown transaction op '{}'; expected create/edit/delete/move/complete/uncomplete", other),
             )),
         }
     }
@@ -4858,7 +4911,7 @@ impl WorkflowyMcpServer {
                 self.client
                     .delete_node(&node_id)
                     .await
-                    .map_err(|e| McpError::internal_error(format!("rollback delete failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback delete failed: {}", e)))?;
                 if let Some(pid) = &parent_id {
                     self.cache.invalidate_node(pid);
                 }
@@ -4869,7 +4922,7 @@ impl WorkflowyMcpServer {
                 self.client
                     .edit_node(&node_id, prev_name.as_deref(), prev_description.as_deref())
                     .await
-                    .map_err(|e| McpError::internal_error(format!("rollback edit failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback edit failed: {}", e)))?;
                 self.cache.invalidate_node(&node_id);
                 self.name_index.invalidate_node(&node_id);
                 Ok(json!({ "rolled_back": "edit", "id": node_id }))
@@ -4879,7 +4932,7 @@ impl WorkflowyMcpServer {
                     self.client
                         .move_node(&node_id, &pid, prev_priority)
                         .await
-                        .map_err(|e| McpError::internal_error(format!("rollback move failed: {}", e), None))?;
+                        .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback move failed: {}", e)))?;
                     self.cache.invalidate_node(&node_id);
                     self.cache.invalidate_node(&pid);
                     Ok(json!({ "rolled_back": "move", "id": node_id, "to": pid }))
@@ -4891,7 +4944,7 @@ impl WorkflowyMcpServer {
                 self.client
                     .set_completion(&node_id, prev_completed)
                     .await
-                    .map_err(|e| McpError::internal_error(format!("rollback completion failed: {}", e), None))?;
+                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback completion failed: {}", e)))?;
                 self.cache.invalidate_node(&node_id);
                 self.name_index.invalidate_node(&node_id);
                 Ok(json!({ "rolled_back": "completion", "id": node_id, "restored_to": prev_completed }))
@@ -7294,6 +7347,154 @@ mod tests {
              include truncation_reason + truncation_recovery_hint next to truncation_limit so a \
              caller hitting the 20 s walk budget gets the same recovery info regardless of which \
              tool it called. Violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Parameter-deserialization error regression: when a required
+    /// `NodeId` field is sent as `null`, the error message must name
+    /// the field so the host (an LLM, an MCP client) can self-correct.
+    /// Bare `serde_json::from_value::<T>` produces messages like
+    /// "invalid type: null, expected a string" with no path; the 2026
+    /// -05-03 incident — `move_node` rejecting calls with `invalid
+    /// type: null, expected a string` and the user unable to tell
+    /// whether `node_id` or `new_parent_id` was the dropped field —
+    /// motivated the switch to `serde_path_to_error::deserialize` in
+    /// `Parameters::from_context_part`. This test pins the field name
+    /// in the error so the regression cannot recur silently.
+    #[test]
+    fn null_required_uuid_field_error_names_the_field() {
+        // Mirror what the wrapper does on the failure path: route the
+        // payload through serde_path_to_error so the error path is
+        // observable. (We don't construct a full ToolCallContext here
+        // because the wrapper's logic is the deserialization step.)
+        let payload = serde_json::json!({
+            "node_id": "550e8400-e29b-41d4-a716-446655440000",
+            "new_parent_id": null,
+        });
+        let result: std::result::Result<MoveNodeParams, _> =
+            serde_path_to_error::deserialize(&payload);
+        let err = result.expect_err(
+            "null on a required NodeId must reject — pinning the failure shape",
+        );
+        let path = err.path().to_string();
+        assert!(
+            path.contains("new_parent_id"),
+            "error path must name the offending field so the host can self-correct, got `{}`",
+            path,
+        );
+
+        // Also pin the symmetric case: node_id null with new_parent_id
+        // present must name node_id.
+        let payload = serde_json::json!({
+            "node_id": null,
+            "new_parent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let result: std::result::Result<MoveNodeParams, _> =
+            serde_path_to_error::deserialize(&payload);
+        let err = result.expect_err("null on node_id must reject");
+        let path = err.path().to_string();
+        assert!(
+            path.contains("node_id"),
+            "symmetric case: error path must name node_id, got `{}`",
+            path,
+        );
+    }
+
+    /// Error-envelope consistency invariant: handler-body validation
+    /// failures route through `tool_invalid_params` (which emits the
+    /// `{operation, node_id, hint, proximate_cause, error}` envelope),
+    /// not `McpError::invalid_params` (which emits a bare message and
+    /// loses the operation context). The 2026-05-03 audit found 35
+    /// in-handler sites that bypassed the envelope; this test grep-
+    /// audits the source so a future contributor adding a new
+    /// handler-body validation site against the bare form fails the
+    /// build instead of silently introducing the inconsistency. Two
+    /// helpers (`check_node_id` and the short-hash-resolve helper)
+    /// genuinely don't know the operation name and stay on the bare
+    /// form; they're allow-listed by line.
+    #[test]
+    fn handler_body_validation_uses_structured_envelope_not_bare_invalid_params() {
+        let src = include_str!("mod.rs");
+        // Two helpers are explicitly allowed on the bare form because
+        // they're called from many handlers and the operation name is
+        // not statically known at the call site. Anchored on the full
+        // line content so a refactor that moves them surfaces here.
+        // Anchor on `Err(McpError::invalid_params(` so the test's
+        // own internal `.contains(...)` expressions don't self-match.
+        // Build the needle at runtime via concat so this very line
+        // doesn't contain the literal anchored form either.
+        let anchor = format!("{}{}{}", "Err(", "McpError::", "invalid_params(");
+        let allow: &[&str] = &[
+            "e.to_string(), None))", // check_node_id
+            "body, None))",          // walk_for_short_hash_and_resolve
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(&anchor) {
+                continue;
+            }
+            // Skip doc comments referencing the old form.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if allow.iter().any(|a| line.contains(a)) {
+                continue;
+            }
+            violations.push(format!("line {}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            violations.is_empty(),
+            "Handler-body validation must use `tool_invalid_params(operation, node_id, msg)` \
+             so every error response carries the same `{{operation, node_id, hint, \
+             proximate_cause, error}}` envelope. Bare `McpError::invalid_params` is allowed \
+             only in the two helpers that don't know the operation name (`check_node_id`, \
+             `walk_for_short_hash_and_resolve`). New violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Operational-error envelope consistency invariant: every
+    /// runtime failure (serialization, upstream error, rollback
+    /// failure) routes through `tool_error(operation, node_id, err)`,
+    /// never `McpError::internal_error` directly. The bare form
+    /// produced messages that some clients truncated to "Tool
+    /// execution failed" with no proximate cause; the structured
+    /// envelope (`{operation, node_id, hint, proximate_cause, error}`)
+    /// is what every other runtime failure already emits. The 2026-
+    /// 05-03 audit closed eight remaining sites (3 serialization,
+    /// 4 transaction-rollback, 1 export). This test grep-audits the
+    /// source so a future contributor adding a new bare
+    /// `McpError::internal_error` fails the build.
+    #[test]
+    fn operational_failures_route_through_tool_error_not_bare_internal_error() {
+        let src = include_str!("mod.rs");
+        // Anchor on `McpError::internal_error(` — there are no
+        // helper-level exemptions for this one (unlike
+        // invalid_params, which has `check_node_id` and the
+        // short-hash-resolve helper).
+        let anchor = format!("{}{}", "McpError::", "internal_error(");
+        let mut violations: Vec<String> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(&anchor) {
+                continue;
+            }
+            // Skip doc comments referencing the old form (e.g. the
+            // helper-doc note at ~line 128 documenting the migration).
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            violations.push(format!("line {}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            violations.is_empty(),
+            "Operational failures must use `tool_error(operation, node_id, err)` so every \
+             error response carries the same `{{operation, node_id, hint, proximate_cause, \
+             error}}` envelope as every other runtime failure. Bare `McpError::internal_error` \
+             produces messages that some clients truncate to 'Tool execution failed' with no \
+             proximate cause. New violations:\n  {}",
             violations.join("\n  "),
         );
     }
