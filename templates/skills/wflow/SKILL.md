@@ -236,6 +236,7 @@ Every session that mutated the second-brain should:
 1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `$SECONDBRAIN_DIR/session-logs/YYYY-MM-DD-<brief-name>.md`.
 2. Move any pending drafts from `drafts/` to `session-logs/` once their writes have landed.
 3. Update `memory/workflowy_node_links.md` if the user moved or renamed a structural node during the session.
+4. **If this session resumes a previously-partial one, create a new sibling session-log node — don't edit the original.** Name the new node `[YYYY-MM-DD] — [original brief title] (resumption: complete)`. The original log captures the failure mode and routing decisions; the resumption log captures the resolution and final tally. Both stay readable, the audit trail is two-stage, and any later session reading the subtree sees the full arc instead of a description that's been overwritten. Same rule applies to the local `$SECONDBRAIN_DIR/session-logs/` mirror — write a new dated file with a `-resumption` or `-completion` suffix; don't overwrite the partial log.
 
 If the MCP wedges mid-session (a write returns `Tool execution failed` and `workflowy_status` shows degraded health):
 
