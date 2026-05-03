@@ -12,7 +12,10 @@ The contract:
 - **Repo content stays generic.** The template files in this repo never
   contain user-specific node IDs, drafts, or session data.
 - **User-specific data lives outside the repo.** Everything user-shaped — node
-  IDs, drafts, briefs, session logs — lands in `~/code/secondBrain/`. Always.
+  IDs, drafts, briefs, session logs — lands in the user's secondBrain
+  directory at whatever path they choose. The path is exposed to the
+  server through `$SECONDBRAIN_DIR`; the repo carries no opinion about
+  where on disk it lives.
 - **The wflow skill is the operating manual.** Once setup is complete, the
   assistant follows [`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md)
   for every Workflowy interaction.
@@ -69,6 +72,18 @@ echo "WORKFLOWY_API_KEY=<the key>" > .env
 claude mcp add workflowy -- $(pwd)/target/release/workflowy-mcp-server
 ```
 
+After the entry is added, edit `~/.claude.json` and set the `env` block
+on the `workflowy` server so the index path and secondBrain root agree
+with Step 3:
+
+```json
+"env": {
+  "WORKFLOWY_API_KEY": "<the key>",
+  "SECONDBRAIN_DIR": "/absolute/path/to/secondBrain",
+  "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json"
+}
+```
+
 Verify with `claude mcp list` — the `workflowy` entry should report
 `✓ Connected`.
 
@@ -82,13 +97,21 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
   "mcpServers": {
     "workflowy": {
       "command": "/absolute/path/to/workflowy-mcp-server/target/release/workflowy-mcp-server",
-      "env": { "WORKFLOWY_API_KEY": "<the key>" }
+      "env": {
+        "WORKFLOWY_API_KEY": "<the key>",
+        "SECONDBRAIN_DIR": "/absolute/path/to/secondBrain",
+        "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json"
+      }
     }
   }
 }
 ```
 
 Restart Claude Desktop.
+
+Both env vars are optional — without them the server runs read-only-ish
+(no persistent index, the `review` tool's bucket-d skipped). They become
+mandatory the moment you do Step 3.
 
 ### Verify
 
@@ -101,20 +124,27 @@ If the user only wanted the bare MCP, stop here.
 
 ---
 
-## Step 3 — Bootstrap `~/code/secondBrain/`
+## Step 3 — Bootstrap the secondBrain directory
 
 This directory holds **everything user-specific**: cached node IDs, drafts,
 session logs, briefs. The template ships skeleton subdirectories only.
 
+Ask the user where they want the directory to live (e.g.
+`~/code/secondBrain`, a Dropbox folder, an iCloud or Google Drive folder
+they want synced across machines). Export the path as `SECONDBRAIN_DIR`
+in their shell profile so every tool that reads it agrees, then create
+and seed the directory:
+
 ```bash
-mkdir -p ~/code/secondBrain
-cp -R ~/code/workflowy-mcp-server/templates/secondbrain/* ~/code/secondBrain/
+export SECONDBRAIN_DIR="<the path the user chose>"        # add to ~/.zshrc or ~/.bashrc too
+mkdir -p "$SECONDBRAIN_DIR"
+cp -R ~/code/workflowy-mcp-server/templates/secondbrain/* "$SECONDBRAIN_DIR/"
 ```
 
 The resulting layout:
 
 ```
-~/code/secondBrain/
+$SECONDBRAIN_DIR/
 ├── README.md                       ← copy of the template; describes each subdir
 ├── memory/
 │   └── workflowy_node_links.md    ← cached node IDs (you fill in Step 4)
@@ -123,12 +153,16 @@ The resulting layout:
 └── briefs/                         ← documents for collaborators / future sessions
 ```
 
+When wiring the MCP host (Step 2), make sure the `env` block also sets
+`SECONDBRAIN_DIR` and `WORKFLOWY_INDEX_PATH=$SECONDBRAIN_DIR/memory/name_index.json`
+so the server, `wflow-do` CLI, and review tool all agree on the path.
+
 The persistent name index (`memory/name_index.json`) appears the first time
 the MCP server checkpoints — usually within 30 seconds of the first read.
 
-**Check before continuing:** `~/code/secondBrain/` exists with all four
-subdirectories and a `README.md`. `memory/workflowy_node_links.md` is the
-template (with `<TBD>` placeholders), not user data yet.
+**Check before continuing:** the secondBrain directory exists with all
+four subdirectories and a `README.md`. `memory/workflowy_node_links.md`
+is the template (with `<TBD>` placeholders), not user data yet.
 
 ---
 
@@ -148,7 +182,7 @@ these are mandatory — only fill rows for nodes the user actually has.
 
 For each, use `find_node` (with `parent_id` scoped to the workspace root) or
 `search_nodes` to discover the full UUID, then write the row into
-`~/code/secondBrain/memory/workflowy_node_links.md`. Verify each ID with
+`$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Verify each ID with
 `get_node`.
 
 **Important:** every value in this file is the user's specific data. Never
@@ -165,7 +199,7 @@ The wflow skill is the operating manual the assistant follows for every
 Workflowy interaction in subsequent sessions. The template lives at
 [`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) and is
 already generic — it reads user-specific node IDs from
-`~/code/secondBrain/memory/workflowy_node_links.md` at runtime.
+`$SECONDBRAIN_DIR/memory/workflowy_node_links.md` at runtime.
 
 ### Claude Code
 
@@ -212,13 +246,15 @@ makes every URL the user pastes resolve O(1) thereafter.
 ```
 
 Each root walk is bounded by `RESOLVE_WALK_TIMEOUT_MS` (5 minutes by
-default). The CLI writes back to `~/code/secondBrain/memory/name_index.json`
-which the running MCP server picks up automatically.
+default). The CLI writes back to whatever `$WORKFLOWY_INDEX_PATH` points
+at (typically `$SECONDBRAIN_DIR/memory/name_index.json`); the running
+MCP server picks the file up automatically as long as both processes
+read the same env var.
 
 For trees under 5 k nodes, skip this step — the lazy walk handles
 everything in the first session.
 
-**Check before continuing:** `~/code/secondBrain/memory/name_index.json`
+**Check before continuing:** the file at `$WORKFLOWY_INDEX_PATH`
 exists, is non-empty, and reports a node count comparable to the user's
 expected workspace size.
 
@@ -231,8 +267,8 @@ expected workspace size.
   see whether it's an auth issue (`authenticated: false`) or a transient
   outage (`api_reachable: false` but `authenticated: true`).
 - **`Short-hash X is not in the name index`.** The lazy walk should fire
-  automatically. If it does not, confirm `~/code/secondBrain/memory/` is
-  writable and `WORKFLOWY_INDEX_PATH` is unset (or points at that path).
+  automatically. If it does not, confirm `$WORKFLOWY_INDEX_PATH` points
+  at a writable location and that the MCP host has the env var set.
   For huge trees, re-run Step 6 with the appropriate `--root` UUIDs.
 - **`insert_content` returns `status: "partial"`.** The bulk budget fired
   before the call completed. The response carries `created_count`,
@@ -252,5 +288,5 @@ sessions should treat
 [`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) (or its
 installed copy) as the source of truth for the user's second-brain
 workflow. The wflow skill assumes the bootstrap has run; if a session finds
-`~/code/secondBrain/memory/workflowy_node_links.md` is still full of `<TBD>`
+`$SECONDBRAIN_DIR/memory/workflowy_node_links.md` is still full of `<TBD>`
 placeholders, restart this bootstrap from Step 4.

@@ -75,9 +75,11 @@ findings in four classes against the wflow Mirror Discipline convention:
 - (c) Cross-pillar concept maps with `last_modified` older than
   `days_stale` (default 90).
 - (d) Source-MOC-shaped nodes whose description URLs/DOIs appear in any
-  session-log file under `~/code/SecondBrain/session-logs/` modified in
-  the last 7 days. Bucket (d) is skipped (returns empty) when the
-  directory is unreachable.
+  session-log file under `$SECONDBRAIN_DIR/session-logs/` modified in
+  the last 7 days. Bucket (d) is skipped (returns empty) when the env
+  var is unset or the directory is unreachable; the repository ships no
+  machine-specific default so each user wires the path through their
+  MCP host config.
 
 Both tools return `{scope, scanned, truncated, truncation_reason, ...}`
 plus the typed payload (`findings` array or `buckets` object). The
@@ -162,10 +164,10 @@ re-implementing them:
    write invalidates the affected entry.
 6a. **Persistent name index.** The name index survives server
    restarts. On startup, `WorkflowyMcpServer::with_cache_and_persistence`
-   reads `$WORKFLOWY_INDEX_PATH` (default
-   `$HOME/code/secondBrain/memory/name_index.json`) and rehydrates
-   every entry it finds; a missing or unreadable file is logged and
-   the server starts empty. Mutations set a dirty flag; a background
+   reads `$WORKFLOWY_INDEX_PATH` (unset or empty disables persistence;
+   the repo ships no fallback path) and rehydrates every entry it
+   finds; a missing or unreadable file is logged and the server starts
+   empty. Mutations set a dirty flag; a background
    task flushes to disk every `defaults::INDEX_SAVE_INTERVAL_SECS`
    (30 s) using a write-then-rename protocol so a crash mid-save
    never produces a half-written file. A second background task

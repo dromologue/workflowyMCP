@@ -69,7 +69,7 @@ Write operations invalidate the node cache via `self.cache.invalidate_node(id)` 
 - **Rate Limiter** (`utils/rate_limiter.rs`): Token bucket, 10 req/sec, burst 20.
 - **Job Queue** (`utils/job_queue.rs`): Background job lifecycle with TTL cleanup (tokio::spawn). Max 1000 job history.
 - **Cancel Registry** (`utils/cancel.rs`): Generation-counter cancellation primitive. `cancel_all` bumps the counter so every outstanding `CancelGuard` returns `is_cancelled = true` at its next checkpoint; guards taken afterwards are fresh.
-- **Name Index** (`utils/name_index.rs`): Case-insensitive `name -> [entry]` map plus short-hash → UUID maps (12-char URL-suffix and 8-char doc prefix), fed by every subtree walk. Backed by `parking_lot::RwLock`; invalidated per-node on every write. **Persisted to disk** at `$WORKFLOWY_INDEX_PATH` (default `$HOME/code/secondBrain/memory/name_index.json`): rehydrated on server startup, checkpointed every 30 s when dirty via write-then-rename, refreshed by a 30-minute background walk (calibrated against 250 k-node trees so quasi-full coverage builds up over a working day rather than a working week). **Auto-walks on short-hash miss**: `resolve_node_ref` fires a workspace walk with `RESOLVE_WALK_TIMEOUT_MS` budget when a short hash isn't cached; a watcher polls the index every 100 ms and cancels the walk as soon as the target appears. Callers no longer need to run `build_name_index` manually before passing a Workflowy URL fragment.
+- **Name Index** (`utils/name_index.rs`): Case-insensitive `name -> [entry]` map plus short-hash → UUID maps (12-char URL-suffix and 8-char doc prefix), fed by every subtree walk. Backed by `parking_lot::RwLock`; invalidated per-node on every write. **Persisted to disk** at `$WORKFLOWY_INDEX_PATH` (unset or empty disables persistence — the index then lives only in memory; the repo ships no machine-specific default path so each user wires it through their MCP host config): rehydrated on server startup, checkpointed every 30 s when dirty via write-then-rename, refreshed by a 30-minute background walk (calibrated against 250 k-node trees so quasi-full coverage builds up over a working day rather than a working week). **Auto-walks on short-hash miss**: `resolve_node_ref` fires a workspace walk with `RESOLVE_WALK_TIMEOUT_MS` budget when a short hash isn't cached; a watcher polls the index every 100 ms and cancels the walk as soon as the target appears. Callers no longer need to run `build_name_index` manually before passing a Workflowy URL fragment.
 - **Date Parser** (`utils/date_parser.rs`): Extracts due dates from node text. Priority: `due:YYYY-MM-DD` > `#due-YYYY-MM-DD` > bare date.
 - **Tag Parser** (`utils/tag_parser.rs`): Extracts `#tags` and `@mentions` from node text.
 - **Node Paths** (`utils/node_paths.rs`): Builds hierarchical display paths by following parent_id chains.
@@ -137,17 +137,18 @@ cargo test --lib -- --nocapture            # with stdout
 
 Environment variables loaded from `.env` via dotenv (`src/config.rs`):
 - `WORKFLOWY_API_KEY` (required)
-- `WORKFLOWY_INDEX_PATH` (optional) — disk path for the persistent name index. Default `$HOME/code/secondBrain/memory/name_index.json`. Empty string disables persistence.
+- `WORKFLOWY_INDEX_PATH` (optional) — disk path for the persistent name index. Unset or empty disables persistence. The repository ships no machine-specific default; each user (or MCP host config) wires the path explicitly.
+- `SECONDBRAIN_DIR` (optional) — root of the user's operational `secondBrain` directory (drafts, session logs, briefs, memory). The `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip).
 
 ## Templates and setup
 
 The repo ships generic templates so a fresh user (or LLM agent bootstrapping one) can stand up the same workflow without inheriting the original author's specific node IDs:
 
-- `docs/SETUP.md` — step-by-step guide for an LLM to install the MCP and provision the user's `~/code/secondBrain/` directory.
+- `docs/SETUP.md` — step-by-step guide for an LLM to install the MCP and provision the user's secondBrain directory.
 - `templates/skills/wflow/SKILL.md` — generic copy of the wflow skill with no user-specific node IDs.
 - `templates/secondbrain/` — skeleton of the operational secondBrain directory (README, memory schema, drafts/session-logs/briefs subdirs).
 
-User-specific data (cached node IDs, drafts, session logs, briefs) lives only in `~/code/secondBrain/` — never in this repo.
+User-specific data (cached node IDs, drafts, session logs, briefs) lives in whatever path the user sets via `$SECONDBRAIN_DIR` — never in this repo. The repo carries no opinion about where on disk that lives.
 
 ## Key Dependencies
 

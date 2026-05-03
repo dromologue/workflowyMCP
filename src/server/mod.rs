@@ -298,22 +298,22 @@ fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Displa
     )
 }
 
-/// Read recent session-log files (~/code/SecondBrain/session-logs/,
+/// Read recent session-log files (under `$SECONDBRAIN_DIR/session-logs`,
 /// modified in the last 7 days) into a single string. Bucket (d) of the
 /// `review` tool scans this for URL/DOI matches against source-MOC
-/// descriptions. Returns "" when the directory doesn't exist or no
-/// files are recent enough — the lib's `build_review` skips bucket (d)
-/// gracefully on an empty blob, so this never panics or errors.
+/// descriptions. Returns "" when `$SECONDBRAIN_DIR` is unset, the
+/// directory doesn't exist, or no files are recent enough — the lib's
+/// `build_review` skips bucket (d) gracefully on an empty blob, so this
+/// never panics or errors.
 ///
 /// Lives on the server side (not in `audit.rs`) because the lib is
 /// pure-data — no I/O, no clock, no env. Both the MCP `review` handler
 /// and the `wflow-do review` CLI subcommand load the blob through their
 /// own filesystem helper and pass it in.
 fn load_recent_session_logs_blob_for_review() -> String {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(dir) = crate::defaults::session_logs_dir() else {
         return String::new();
     };
-    let dir = std::path::PathBuf::from(format!("{}/code/SecondBrain/session-logs", home));
     if !dir.exists() {
         return String::new();
     }
@@ -4224,7 +4224,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under ~/code/SecondBrain/session-logs/ in the last 7 days. Default scope: Distillations.")]
+    #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under `$SECONDBRAIN_DIR/session-logs/` in the last 7 days (skipped if the env var is unset). Default scope: Distillations.")]
     async fn review(
         &self,
         Parameters(params): Parameters<ReviewParams>,
@@ -4240,9 +4240,9 @@ impl WorkflowyMcpServer {
 
         // Bucket (d) needs the recent session-log text. The lib is
         // pure-data and never touches disk; load the blob here and
-        // pass it through. If $HOME/code/SecondBrain/session-logs/
-        // doesn't exist, blob is "" and bucket (d) is empty — the
-        // documented graceful-skip behaviour.
+        // pass it through. If $SECONDBRAIN_DIR is unset (or its
+        // session-logs subdirectory doesn't exist), the blob is ""
+        // and bucket (d) is empty — the documented graceful-skip.
         let blob = load_recent_session_logs_blob_for_review();
 
         match self.walk_subtree(Some(&root), max_depth).await {
@@ -4966,24 +4966,19 @@ Diagnostics & ops:
     }
 }
 
-/// Resolve the on-disk path for the persistent name index. Honours the
-/// [`defaults::INDEX_PATH_ENV`] override; falls back to
-/// `$HOME/code/secondBrain/memory/name_index.json`. Returns `None`
-/// when both the override and `$HOME` are unavailable, in which case
-/// the server runs without persistence (and the index lives only in
-/// memory, the historical behaviour).
+/// Resolve the on-disk path for the persistent name index from the
+/// [`defaults::INDEX_PATH_ENV`] env var. Returns `None` when the var is
+/// unset or empty, in which case the server runs without persistence
+/// and the index lives only in memory for the lifetime of the process.
+/// The repository carries no machine-specific default path: each user
+/// (or MCP host) wires the location through their own config.
 fn resolve_index_save_path() -> Option<std::path::PathBuf> {
-    if let Ok(custom) = std::env::var(defaults::INDEX_PATH_ENV) {
-        let trimmed = custom.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        return Some(std::path::PathBuf::from(trimmed));
+    let raw = std::env::var(defaults::INDEX_PATH_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    let home = std::env::var("HOME").ok()?;
-    let mut p = std::path::PathBuf::from(home);
-    p.push(defaults::DEFAULT_INDEX_RELATIVE_PATH);
-    Some(p)
+    Some(std::path::PathBuf::from(trimmed))
 }
 
 /// Spawn a background task that flushes the dirty name index to disk
@@ -5723,6 +5718,23 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn resolve_index_save_path_returns_none_when_env_unset() {
+        // Pin the no-fallback contract: the repo carries no
+        // machine-specific default, so an unset env var must yield
+        // None rather than guessing a HOME-relative path.
+        let key = defaults::INDEX_PATH_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            resolve_index_save_path().is_none(),
+            "unset env must disable persistence (no implicit fallback)"
+        );
+        if let Some(v) = prev {
+            std::env::set_var(key, v);
         }
     }
 

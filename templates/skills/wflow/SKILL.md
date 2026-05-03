@@ -6,7 +6,7 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, m
 
 # wflow — second-brain skill (template)
 
-This is the generic skill template shipped by the workflowy-mcp-server repo. It deliberately contains **no user-specific node IDs** — those live in `~/code/secondBrain/memory/workflowy_node_links.md`. On first use, walk the user through populating that file (see Bootstrap below).
+This is the generic skill template shipped by the workflowy-mcp-server repo. It deliberately contains **no user-specific node IDs** — those live in `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. On first use, walk the user through populating that file (see Bootstrap below).
 
 The skill spans the full second-brain loop:
 
@@ -57,9 +57,9 @@ The user has up to four complementary layers:
 1. **Workflowy** — system of record and second-brain wiki. Holds tasks, projects, references, the journal, and (optionally) a Distillations subtree.
 2. **reMarkable** *(optional)* — ink capture, marginalia, PDF/EPUB reading.
 3. **Claude** — bidirectional reader and writer.
-4. **secondBrain directory** (`~/code/secondBrain/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, and external-facing briefs.
+4. **secondBrain directory** (`$SECONDBRAIN_DIR/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, and external-facing briefs.
 
-The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written both to Workflowy and to `~/code/secondBrain/session-logs/`.
+The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written both to Workflowy and to `$SECONDBRAIN_DIR/session-logs/`.
 
 ---
 
@@ -101,7 +101,7 @@ If any required tool is unreachable:
 
 ### Step 1 — secondBrain draft check
 
-Read `~/code/secondBrain/drafts/`. Files there are pending writes from a previous session that didn't complete — most often because the Workflowy MCP was unstable. If a draft is present:
+Read `$SECONDBRAIN_DIR/drafts/`. Files there are pending writes from a previous session that didn't complete — most often because the Workflowy MCP was unstable. If a draft is present:
 
 1. Read the draft to understand the routing plan and execution sequence.
 2. After Step 2 completes, confirm with the user whether to resume execution against the existing plan or set it aside.
@@ -114,7 +114,7 @@ Read `~/code/secondBrain/drafts/`. Files there are pending writes from a previou
 
 #### Persistent name index + path-based discovery
 
-The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/name_index.json` (override via `WORKFLOWY_INDEX_PATH`). It survives restarts; a 30-minute background task refreshes it; mutations checkpoint every 30 seconds.
+The MCP server keeps a disk-persisted name index at `$WORKFLOWY_INDEX_PATH` (conventionally `$SECONDBRAIN_DIR/memory/name_index.json`; unset disables persistence). It survives restarts; a 30-minute background task refreshes it; mutations checkpoint every 30 seconds.
 
 **The fast retrieval surface to reach for first:**
 
@@ -127,7 +127,7 @@ The MCP server keeps a disk-persisted name index at `~/code/secondBrain/memory/n
 
 #### Direct local index access (fastest possible lookup)
 
-The persistent index file at `~/code/secondBrain/memory/name_index.json` is plain JSON and can be queried **without going through the MCP at all**. Reach for this path before any MCP tool when:
+The persistent index file at `$WORKFLOWY_INDEX_PATH` (conventionally `$SECONDBRAIN_DIR/memory/name_index.json`) is plain JSON and can be queried **without going through the MCP at all**. Reach for this path before any MCP tool when:
 
 - the MCP transport has been showing drops this session,
 - you need to verify a UUID without making an API call, or
@@ -148,7 +148,7 @@ Schema:
 Useful one-liners via Bash + jq:
 
 ```bash
-INDEX=~/code/secondBrain/memory/name_index.json
+INDEX="$WORKFLOWY_INDEX_PATH"   # conventionally $SECONDBRAIN_DIR/memory/name_index.json
 
 # Resolve a Workflowy URL short hash to its full UUID
 jq -r --arg h "<short-hash>" '.nodes[] | select(.id | endswith($h)) | .id' "$INDEX"
@@ -169,7 +169,7 @@ When a file lookup misses, fall back to `node_at_path` / `resolve_link` / the MC
 Try these paths in order; use the first one found by the `Read` tool:
 
 1. `.auto-memory/workflowy_node_links.md` (Cowork sessions — relative to session mount)
-2. `$HOME/code/secondBrain/memory/workflowy_node_links.md` (canonical for non-Cowork sessions)
+2. `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` (canonical for non-Cowork sessions)
 3. `$HOME/.claude/projects/*/memory/workflowy_node_links.md` (Claude Code project memory)
 4. `$HOME/.claude/memory/workflowy_node_links.md` (legacy global fallback)
 
@@ -218,14 +218,14 @@ The detailed implementation of each workflow lives in the user's customised copy
 
 Every session that mutated the second-brain should:
 
-1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `~/code/secondBrain/session-logs/YYYY-MM-DD-<brief-name>.md`.
+1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `$SECONDBRAIN_DIR/session-logs/YYYY-MM-DD-<brief-name>.md`.
 2. Move any pending drafts from `drafts/` to `session-logs/` once their writes have landed.
 3. Update `memory/workflowy_node_links.md` if the user moved or renamed a structural node during the session.
 
 If the MCP wedges mid-session (a write returns `Tool execution failed` and `workflowy_status` shows degraded health):
 
 1. Stop writes immediately.
-2. Save the in-flight plan as a markdown file in `~/code/secondBrain/drafts/` with the date prefix and a clear "RESUME EXECUTION" header.
+2. Save the in-flight plan as a markdown file in `$SECONDBRAIN_DIR/drafts/` with the date prefix and a clear "RESUME EXECUTION" header.
 3. Tell the user the next session will resume from the draft.
 
 ---

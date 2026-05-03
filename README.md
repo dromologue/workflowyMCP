@@ -10,12 +10,13 @@ There are two ways to use it:
    tools directly. No templates, no opinions.
 2. **Second brain.** Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The
    assistant follows the script: builds the binary, wires the host, sets up
-   `~/code/secondBrain/` for your specific data, and installs the wflow
-   skill that drives every subsequent session.
+   your secondBrain directory at whatever path you choose (exposed to the
+   server via `$SECONDBRAIN_DIR`), and installs the wflow skill that
+   drives every subsequent session.
 
 The methodology in option 2 is opinionated; the server itself is not. The
 repo only ships generic templates — your node IDs, drafts, and session logs
-live in `~/code/secondBrain/`, never in this repo.
+live wherever `$SECONDBRAIN_DIR` points, never in this repo.
 
 ---
 
@@ -43,12 +44,53 @@ That's it for plain MCP usage.
 
 ---
 
+## Environment variables
+
+The server reads three env vars at runtime. The repository ships no
+machine-specific defaults: a path you don't set is a feature you don't
+use. Set them in the `env` block of your MCP host config (Claude Code:
+`~/.claude.json`; Claude Desktop: `claude_desktop_config.json`) and,
+when you also use the `wflow-do` CLI from a shell, in your shell
+profile (`~/.zshrc` or `~/.bashrc`).
+
+| Variable | Required? | What it controls |
+|----------|-----------|------------------|
+| `WORKFLOWY_API_KEY` | Yes | Bearer token for the Workflowy API. |
+| `SECONDBRAIN_DIR` | Optional | Absolute path to your operational secondBrain directory (drafts, session logs, briefs, memory). When set, the `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip). |
+| `WORKFLOWY_INDEX_PATH` | Optional | Absolute path to the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Unset or empty disables persistence — the index then lives only in memory for the lifetime of each process. |
+
+Example MCP host `env` block (Claude Code or Desktop):
+
+```json
+"env": {
+  "WORKFLOWY_API_KEY": "<your token>",
+  "SECONDBRAIN_DIR": "/absolute/path/to/secondBrain",
+  "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json"
+}
+```
+
+Example shell profile (so the CLI agrees with the MCP server):
+
+```bash
+export SECONDBRAIN_DIR="/absolute/path/to/secondBrain"
+export WORKFLOWY_INDEX_PATH="$SECONDBRAIN_DIR/memory/name_index.json"
+```
+
+Neither path needs to be inside the user's home directory — a Dropbox /
+iCloud / Google Drive folder works as long as the host process can
+read and write it. Paths with spaces are fine in the MCP `env` block
+(JSON quoting handles it) and in the shell profile (the export line
+quotes the value).
+
+---
+
 ## Set up the second brain (recommended)
 
 Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The assistant runs through
-six steps: build, wire the host, bootstrap `~/code/secondBrain/`, populate
-your structural node IDs, install the wflow skill, and (optionally)
-pre-warm the persistent name index. After bootstrap, the assistant follows
+six steps: build, wire the host, bootstrap your secondBrain directory at
+the path you set in `$SECONDBRAIN_DIR`, populate your structural node IDs,
+install the wflow skill, and (optionally) pre-warm the persistent name
+index. After bootstrap, the assistant follows
 [`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) as the
 operating manual.
 
@@ -66,7 +108,7 @@ workflowyMCP/
 ├── docs/SETUP.md             ← long-form bootstrap notes
 ├── specs/specification.md    ← authoritative behavioural spec
 ├── templates/
-│   ├── secondbrain/          ← skeleton of ~/code/secondBrain/
+│   ├── secondbrain/          ← skeleton copied to $SECONDBRAIN_DIR
 │   │   ├── README.md
 │   │   ├── memory/workflowy_node_links.md   (template; user fills in)
 │   │   ├── drafts/  session-logs/  briefs/
@@ -74,9 +116,9 @@ workflowyMCP/
 └── src/                       ← Rust MCP server source
 ```
 
-User-specific data (node IDs, drafts, session logs, briefs) belongs in
-`~/code/secondBrain/`. The repo content stays generic so the next person
-who clones it gets a clean starting point.
+User-specific data (node IDs, drafts, session logs, briefs) belongs at
+whatever path you set via `$SECONDBRAIN_DIR`. The repo content stays
+generic so the next person who clones it gets a clean starting point.
 
 ---
 

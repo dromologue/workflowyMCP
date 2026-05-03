@@ -174,13 +174,41 @@ pub const RESOLVE_WALK_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 /// large tree can be exhaustively walked while still bounding worst
 /// case memory use.
 pub const RESOLVE_WALK_NODE_CAP: usize = 100_000;
-/// Environment variable that overrides the default on-disk path for
-/// the persistent name index. Empty string means "disabled".
+/// Environment variable that sets the on-disk path for the persistent
+/// name index. Unset or empty disables persistence — the index then
+/// lives only in memory for the lifetime of the process.
 pub const INDEX_PATH_ENV: &str = "WORKFLOWY_INDEX_PATH";
-/// Subdirectory under `$HOME/code/secondBrain/memory` that holds the
-/// persistent index. Documented in the repo's setup guide so a fresh
-/// user knows where to expect their cache to land.
-pub const DEFAULT_INDEX_RELATIVE_PATH: &str = "code/secondBrain/memory/name_index.json";
+
+/// Environment variable that sets the on-disk root of the operational
+/// `secondBrain` directory (drafts, session logs, briefs, memory).
+/// Unset or empty disables every feature that reads from it (e.g. the
+/// `review` tool's bucket-d session-log scan and the `wflow-do index`
+/// default output path); the repository ships no machine-specific
+/// fallback so each user wires the path through their MCP host config.
+pub const SECONDBRAIN_DIR_ENV: &str = "SECONDBRAIN_DIR";
+
+/// Resolve the on-disk root of the operational secondBrain directory
+/// from `$SECONDBRAIN_DIR`. Returns `None` when the env var is unset or
+/// empty — callers must treat that as "feature disabled" rather than
+/// guessing a default location, so the repo carries no user-specific
+/// path. Cheap enough to call per request: no caching, so a `setenv`
+/// from the host MCP config takes effect on the next call.
+pub fn secondbrain_dir() -> Option<std::path::PathBuf> {
+    let raw = std::env::var(SECONDBRAIN_DIR_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// `$SECONDBRAIN_DIR/session-logs` when the env var is set; `None`
+/// otherwise. The `review` tool (bucket d) and the `wflow-do index`
+/// subcommand both treat `None` as "no session-log directory exists"
+/// and skip gracefully.
+pub fn session_logs_dir() -> Option<std::path::PathBuf> {
+    secondbrain_dir().map(|p| p.join("session-logs"))
+}
 
 #[cfg(test)]
 mod tests {
@@ -204,6 +232,49 @@ mod tests {
         assert!(SUBTREE_FETCH_CONCURRENCY >= 1 && SUBTREE_FETCH_CONCURRENCY <= 50);
         assert!(HEALTH_CHECK_TIMEOUT_MS >= 500 && HEALTH_CHECK_TIMEOUT_MS <= 10_000);
         assert!(AUTH_FAILURE_WINDOW_SECS >= 60 && AUTH_FAILURE_WINDOW_SECS <= 60 * 60);
+    }
+
+    #[test]
+    fn secondbrain_dir_returns_env_value_when_set() {
+        let key = SECONDBRAIN_DIR_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/wflow-secondbrain-test");
+        let got = secondbrain_dir().expect("env path");
+        assert_eq!(got.to_string_lossy(), "/tmp/wflow-secondbrain-test");
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn secondbrain_dir_returns_none_when_env_empty_or_unset() {
+        // Pin the no-fallback contract: no machine-specific default
+        // path lives in the source. An unset or empty env var must
+        // yield None so callers treat the feature as disabled rather
+        // than guessing a HOME-relative location.
+        let key = SECONDBRAIN_DIR_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "");
+        assert!(secondbrain_dir().is_none(), "empty env disables");
+        std::env::remove_var(key);
+        assert!(secondbrain_dir().is_none(), "unset env disables");
+        if let Some(v) = prev {
+            std::env::set_var(key, v);
+        }
+    }
+
+    #[test]
+    fn session_logs_dir_appends_session_logs_subdir() {
+        let key = SECONDBRAIN_DIR_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/wflow-secondbrain-test");
+        let got = session_logs_dir().expect("env path");
+        assert_eq!(got.to_string_lossy(), "/tmp/wflow-secondbrain-test/session-logs");
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]

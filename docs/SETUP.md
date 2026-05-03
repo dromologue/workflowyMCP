@@ -5,10 +5,10 @@ This guide is written for an LLM (Claude, GPT, etc.) bootstrapping a fresh user 
 The goal is a working installation in which:
 
 1. The MCP server resolves Workflowy URLs and short-hash node IDs without manual setup.
-2. The user has an `~/code/secondBrain/` directory holding their cached node IDs, drafts, session logs, and any briefs that don't belong inside Workflowy itself.
-3. The wflow skill (or equivalent) is installed at `~/.claude/skills/wflow/` and reads from `~/code/secondBrain/`.
+2. The user has a `secondBrain` directory at a path of their choice (exposed via `$SECONDBRAIN_DIR`) holding their cached node IDs, drafts, session logs, and any briefs that don't belong inside Workflowy itself.
+3. The wflow skill (or equivalent) is installed at `~/.claude/skills/wflow/` and reads from `$SECONDBRAIN_DIR`.
 
-The repository ships generic templates only. The user's specific node IDs, session content, and briefs live in `~/code/secondBrain/` — never in this repo.
+The repository ships generic templates only. The user's specific node IDs, session content, and briefs live in `$SECONDBRAIN_DIR` — never in this repo. The repo carries no opinion about where on disk that path points; users typically choose `~/code/secondBrain` for local-only setups, or a Dropbox / iCloud / Google Drive folder when they want cross-machine sync.
 
 ---
 
@@ -39,12 +39,14 @@ Create a `.env` in the repo root:
 WORKFLOWY_API_KEY=<the user's API token>
 ```
 
-Optional environment variables:
+Optional environment variables (no machine-specific defaults — the
+repo ships no fallback paths):
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `WORKFLOWY_INDEX_PATH` | `$HOME/code/secondBrain/memory/name_index.json` | Disk path for the persistent name index. Set to empty string to disable persistence. |
-| `RUST_LOG` | `info` | Tracing filter (e.g. `debug`, `workflowy_mcp_server=trace`). |
+| Variable | Behaviour when unset | Purpose |
+|----------|----------------------|---------|
+| `SECONDBRAIN_DIR` | The `review` tool's bucket-d session-log scan and the `wflow-do index` default output are disabled (graceful skip). | Absolute path to the user's secondBrain directory. |
+| `WORKFLOWY_INDEX_PATH` | The persistent name index is disabled — index lives only in memory for the lifetime of each process. | Disk path for the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. |
+| `RUST_LOG` | `info` level. | Tracing filter (e.g. `debug`, `workflowy_mcp_server=trace`). |
 
 Wire the binary into the user's MCP-host config (Claude Desktop, the IDE extension, etc.). The exact path varies by host — for Claude Desktop on macOS it is `~/Library/Application Support/Claude/claude_desktop_config.json`. The relevant block:
 
@@ -54,11 +56,21 @@ Wire the binary into the user's MCP-host config (Claude Desktop, the IDE extensi
     "workflowy": {
       "command": "<absolute path to>/target/release/workflowy-mcp-server",
       "env": {
-        "WORKFLOWY_API_KEY": "<token>"
+        "WORKFLOWY_API_KEY": "<token>",
+        "SECONDBRAIN_DIR": "<absolute path to user's secondBrain>",
+        "WORKFLOWY_INDEX_PATH": "<same root>/memory/name_index.json"
       }
     }
   }
 }
+```
+
+If the user also runs the `wflow-do` CLI from a shell, mirror the same
+two paths into `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+export SECONDBRAIN_DIR="<absolute path>"
+export WORKFLOWY_INDEX_PATH="$SECONDBRAIN_DIR/memory/name_index.json"
 ```
 
 Restart the host after editing the config. Verify the connection by asking it to call `workflowy_status` — the result should report `healthy`.
@@ -69,17 +81,21 @@ Restart the host after editing the config. Verify the connection by asking it to
 
 ## Step 2 — Bootstrap the secondBrain directory
 
-If the user wants the full workflow, copy the templated layout into their home:
+If the user wants the full workflow, ask them where they want the
+directory to live and copy the template into that path. Export the
+chosen path as `$SECONDBRAIN_DIR` so subsequent steps can refer to it
+unambiguously:
 
 ```bash
-mkdir -p ~/code/secondBrain
-cp -R ~/code/workflowy-mcp-server/templates/secondbrain/* ~/code/secondBrain/
+export SECONDBRAIN_DIR="<the path the user chose>"   # also add to ~/.zshrc
+mkdir -p "$SECONDBRAIN_DIR"
+cp -R ~/code/workflowy-mcp-server/templates/secondbrain/* "$SECONDBRAIN_DIR/"
 ```
 
 The result has this layout:
 
 ```
-~/code/secondBrain/
+$SECONDBRAIN_DIR/
 ├── README.md                       ← describes what each subdir is for
 ├── memory/
 │   └── workflowy_node_links.md    ← cached structural node IDs (you fill this)
@@ -107,7 +123,7 @@ Walk the user through identifying their structural nodes. The expected categorie
 - **Resources** — long-term reference material.
 - **Distillations** (optional) — the layer for atomic notes synthesised from reading and conversation. Only relevant if the user follows the second-brain discipline described in `templates/skills/wflow/SKILL.md`.
 
-For each one, use `find_node` (with `parent_id` scoped to root) or `search_nodes` to discover the full UUID, then write the row into `~/code/secondBrain/memory/workflowy_node_links.md`. The template at `templates/secondbrain/memory/workflowy_node_links.md` is the schema; replace the `<TBD>` placeholders.
+For each one, use `find_node` (with `parent_id` scoped to root) or `search_nodes` to discover the full UUID, then write the row into `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. The template at `templates/secondbrain/memory/workflowy_node_links.md` is the schema; replace the `<TBD>` placeholders.
 
 **Important:** every value in this file is the user's specific data. Never check it into a public repo.
 
@@ -124,7 +140,7 @@ mkdir -p ~/.claude/skills/wflow
 cp ~/code/workflowy-mcp-server/templates/skills/wflow/SKILL.md ~/.claude/skills/wflow/SKILL.md
 ```
 
-The template is generic — it references `~/code/secondBrain/` paths and reads node IDs dynamically from `workflowy_node_links.md`. No user-specific node IDs live in the skill itself.
+The template is generic — it references `$SECONDBRAIN_DIR` paths and reads node IDs dynamically from `workflowy_node_links.md`. No user-specific node IDs live in the skill itself.
 
 If the user wants their own customisations (extra workflows, project-specific routing rules), edit the copy at `~/.claude/skills/wflow/SKILL.md`. Treat that file as the user's, not the template's — pull updates from the repo template manually when desired.
 
@@ -136,7 +152,7 @@ If the user wants their own customisations (extra workflows, project-specific ro
 
 The MCP server walks lazily when a short-hash misses its cache. On large trees (50 k+ nodes) the lazy walk can't cover everything in one shot, so paying the cost up front via the `wflow-do reindex` CLI is the cleanest setup.
 
-First, identify the user's top-level subtree UUIDs (already cached in `~/code/secondBrain/memory/workflowy_node_links.md` from Step 3). Then:
+First, identify the user's top-level subtree UUIDs (already cached in `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` from Step 3). Then:
 
 ```bash
 ~/code/workflowy-mcp-server/target/release/wflow-do reindex \
@@ -147,17 +163,17 @@ First, identify the user's top-level subtree UUIDs (already cached in `~/code/se
   --root <any-other-major-subtree-UUIDs>
 ```
 
-Each root walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minutes by default), so the full pass for a half-dozen roots runs in 5-25 minutes depending on tree shape. The CLI hydrates from the existing `~/code/secondBrain/memory/name_index.json`, walks each root, and saves the merged index back. Re-run the same command later to extend coverage; the persistent index makes the work cumulative.
+Each root walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minutes by default), so the full pass for a half-dozen roots runs in 5-25 minutes depending on tree shape. The CLI hydrates from the existing index file at `$WORKFLOWY_INDEX_PATH`, walks each root, and saves the merged index back. Re-run the same command later to extend coverage; the persistent index makes the work cumulative.
 
 For smaller trees (≤ 5 k nodes) you can also ask the MCP-driven assistant to run `build_name_index allow_root_scan=true` once — equivalent in effect, just routed through MCP rather than the CLI.
 
-**Check before continuing:** `~/code/secondBrain/memory/name_index.json` exists and is non-empty. With the persistent index in place, every Workflowy URL the user pastes resolves cleanly. For nodes the index hasn't reached yet, the assistant can fall back to `node_at_path` (path of names → UUID in ~1 second) or `resolve_link` (URL + parent-path hint → full node info).
+**Check before continuing:** the file at `$WORKFLOWY_INDEX_PATH` exists and is non-empty. With the persistent index in place, every Workflowy URL the user pastes resolves cleanly. For nodes the index hasn't reached yet, the assistant can fall back to `node_at_path` (path of names → UUID in ~1 second) or `resolve_link` (URL + parent-path hint → full node info).
 
 ---
 
 ## Step 6 — Multi-surface deployment
 
-The MCP server's persistent name index is the cross-session memory layer. It works automatically across every surface that calls the same binary — Claude Code, Claude Desktop, the IDE extension, anything else that speaks MCP. Each host spawns its own process, but they all read and write the same `~/code/secondBrain/memory/name_index.json`, so updates from one session land on disk via the 30-second checkpoint and are inherited by the next session on any surface.
+The MCP server's persistent name index is the cross-session memory layer. It works automatically across every surface that calls the same binary — Claude Code, Claude Desktop, the IDE extension, anything else that speaks MCP. Each host spawns its own process, but they all read and write the same file at `$WORKFLOWY_INDEX_PATH`, so updates from one session land on disk via the 30-second checkpoint and are inherited by the next session on any surface (provided every host's MCP `env` block sets the same path).
 
 The **skill markdown** (the wflow workflow itself) does not auto-port the same way. `~/.claude/skills/wflow/SKILL.md` is a Claude Code convention; other hosts don't auto-discover that path. Pick the approach that matches the user's surfaces:
 
@@ -169,9 +185,9 @@ Already covered by Step 4 — the skill at `~/.claude/skills/wflow/SKILL.md` is 
 
 Two viable approaches, in order of preference:
 
-**Option A — Project custom instructions.** Open a Project in the desktop app, paste the contents of `templates/skills/wflow/SKILL.md` into its custom instructions. The skill template reads user-specific node IDs at runtime from `~/code/secondBrain/memory/workflowy_node_links.md` via the filesystem MCP, so a single paste covers every project that uses the same Workflowy graph.
+**Option A — Project custom instructions.** Open a Project in the desktop app, paste the contents of `templates/skills/wflow/SKILL.md` into its custom instructions. The skill template reads user-specific node IDs at runtime from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` via the filesystem MCP, so a single paste covers every project that uses the same Workflowy graph.
 
-**Option B — Filesystem MCP read at session start.** If the host has the filesystem MCP allowlisting `~/code/secondBrain/` and `~/.claude/skills/wflow/`, the user can simply ask "read `~/.claude/skills/wflow/SKILL.md` and follow that workflow." No porting needed; the markdown is the canonical source. This works well if the user opens many short Claude Desktop sessions and doesn't want to maintain Project instructions.
+**Option B — Filesystem MCP read at session start.** If the host has the filesystem MCP allowlisting `$SECONDBRAIN_DIR` and `~/.claude/skills/wflow/`, the user can simply ask "read `~/.claude/skills/wflow/SKILL.md` and follow that workflow." No porting needed; the markdown is the canonical source. This works well if the user opens many short Claude Desktop sessions and doesn't want to maintain Project instructions.
 
 Verify the workflowy MCP entry exists in `~/Library/Application Support/Claude/claude_desktop_config.json` and points at the release binary you built in Step 1. Restart Claude Desktop after edits — the host reads the config once at launch.
 
@@ -184,11 +200,11 @@ Upload `templates/skills/wflow/SKILL.md` as a Skill via Settings → Capabilitie
 | Layer | Sync mechanism | User action when something changes |
 |-------|----------------|-----------------------------------|
 | Persistent name index (`name_index.json`) | Auto via disk; 30 s checkpoint | None |
-| Cached structural IDs (`workflowy_node_links.md`) | Single file in `~/code/secondBrain/`; every surface reads the same copy | None — but update the file when a structural node moves |
-| Drafts and session logs | Same — single canonical directory | Discipline: write back to `~/code/secondBrain/session-logs/` |
+| Cached structural IDs (`workflowy_node_links.md`) | Single file in `$SECONDBRAIN_DIR`; every surface reads the same copy | None — but update the file when a structural node moves |
+| Drafts and session logs | Same — single canonical directory | Discipline: write back to `$SECONDBRAIN_DIR/session-logs/` |
 | Skill markdown (workflow logic) | **Manual** — repo template is upstream, each surface holds a cached copy | Re-paste / re-upload when the template changes substantively |
 
-The cleanest mental model: `~/code/secondBrain/` is the canonical source of truth for cross-session state. The repo's `templates/skills/wflow/SKILL.md` is the canonical source for workflow logic. Each surface holds whatever cached copies are necessary; the data layer self-syncs, the markdown layer needs a manual mirror only when the upstream template changes.
+The cleanest mental model: `$SECONDBRAIN_DIR` is the canonical source of truth for cross-session state. The repo's `templates/skills/wflow/SKILL.md` is the canonical source for workflow logic. Each surface holds whatever cached copies are necessary; the data layer self-syncs, the markdown layer needs a manual mirror only when the upstream template changes.
 
 ---
 
@@ -197,11 +213,11 @@ The cleanest mental model: `~/code/secondBrain/` is the canonical source of trut
 | Where | Purpose | User-specific? |
 |-------|---------|----------------|
 | This repo | MCP server source, templates, setup docs | No |
-| `~/code/secondBrain/memory/workflowy_node_links.md` | Cached structural node IDs | Yes |
-| `~/code/secondBrain/memory/name_index.json` | Persistent name index (auto-managed) | Yes |
-| `~/code/secondBrain/drafts/` | In-flight distillation drafts | Yes |
-| `~/code/secondBrain/session-logs/` | Per-session audit trails | Yes |
-| `~/code/secondBrain/briefs/` | Documents for collaborators | Yes |
+| `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` | Cached structural node IDs | Yes |
+| `$WORKFLOWY_INDEX_PATH` (typically `$SECONDBRAIN_DIR/memory/name_index.json`) | Persistent name index (auto-managed) | Yes |
+| `$SECONDBRAIN_DIR/drafts/` | In-flight distillation drafts | Yes |
+| `$SECONDBRAIN_DIR/session-logs/` | Per-session audit trails | Yes |
+| `$SECONDBRAIN_DIR/briefs/` | Documents for collaborators | Yes |
 | `~/.claude/skills/wflow/SKILL.md` | The wflow skill (copy of the template, then user-customised) | Becomes user's |
 
 Anything user-specific must never be committed back into this repo.
@@ -210,7 +226,7 @@ Anything user-specific must never be committed back into this repo.
 
 ## Troubleshooting
 
-- **"Short-hash X is not in the name index" on a fresh install.** The auto-walk should fire automatically; if it does not, confirm the `WORKFLOWY_INDEX_PATH` env variable is unset or points to a writable path, and that the MCP host has permission to read/write `~/code/secondBrain/memory/`.
+- **"Short-hash X is not in the name index" on a fresh install.** The auto-walk should fire automatically; if it does not, confirm `$WORKFLOWY_INDEX_PATH` is set to a writable path and the MCP host has permission to read/write the directory it lives in.
 - **Server hangs on `tag_search`.** The deadline-honouring fix landed in commit `d378f56`. Confirm the binary is built from that commit or later.
 - **`build_name_index` reports `truncation_reason: "timeout"`.** The tree is larger than a single 5-minute walk can cover; subsequent passes converge. The background refresher (every 30 minutes) accumulates coverage. For trees ≥ 50 k nodes, scope `build_name_index` to a specific subtree (`parent_id` = Projects, Areas, etc.) — indexing one subtree deeply is faster than indexing the whole root shallowly. Once a subtree is indexed, every short hash inside it resolves O(1) and survives restarts.
 

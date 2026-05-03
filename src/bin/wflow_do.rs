@@ -368,17 +368,19 @@ enum Cmd {
         #[arg(long, default_value_t = 90)]
         days_stale: i64,
     },
-    /// Generate `~/code/SecondBrain/session-logs/INDEX.md` (or `--out` override) from the local logs.
+    /// Generate `INDEX.md` from the local logs. Default output is
+    /// `$SECONDBRAIN_DIR/session-logs/INDEX.md`; pass `--out` to
+    /// override. Errors if neither is provided.
     Index {
         #[arg(long)]
         out: Option<String>,
     },
     /// Walk one or more subtrees and merge what's found into the persistent
-    /// name index at `$WORKFLOWY_INDEX_PATH` (default
-    /// `$HOME/code/secondBrain/memory/name_index.json`). Each subtree is
-    /// walked with the resolution budget; partial walks still write the
-    /// nodes they reached. Useful for one-shot deep indexing from the
-    /// shell, independent of any running MCP session.
+    /// name index at `$WORKFLOWY_INDEX_PATH`. Unset or empty disables
+    /// persistence (the walk runs in memory). Each subtree is walked
+    /// with the resolution budget; partial walks still write the nodes
+    /// they reached. Useful for one-shot deep indexing from the shell,
+    /// independent of any running MCP session.
     Reindex {
         /// One or more parent node IDs to walk. If omitted, walks the
         /// workspace root (which on huge trees will truncate; prefer
@@ -1691,11 +1693,17 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             }
         }
         Cmd::Index { out } => {
-            let default = format!(
-                "{}/code/SecondBrain/session-logs/INDEX.md",
-                std::env::var("HOME").unwrap_or_else(|_| ".".into())
-            );
-            let target = out.as_deref().unwrap_or(&default);
+            let default = workflowy_mcp_server::defaults::session_logs_dir()
+                .map(|p| p.join("INDEX.md").to_string_lossy().into_owned());
+            let target = match (out.as_deref(), default.as_deref()) {
+                (Some(o), _) => o,
+                (None, Some(d)) => d,
+                (None, None) => {
+                    return Err(
+                        "no output path: pass --out or set SECONDBRAIN_DIR".into(),
+                    );
+                }
+            };
             let dir = std::path::Path::new(target).parent().ok_or("invalid out path")?;
             let entries = scan_session_logs(dir)?;
             let body = render_index(&entries);
@@ -1735,19 +1743,14 @@ async fn cmd_reindex(
         Some(s) if s.is_empty() => None,
         Some(s) => Some(std::path::PathBuf::from(s)),
         None => {
-            // Match the default the MCP server uses so a CLI reindex
-            // and a server-side walk agree on the persisted file.
+            // Match the env-var path the MCP server uses so a CLI
+            // reindex and a server-side walk agree on the persisted
+            // file. Unset / empty env means persistence is disabled —
+            // the CLI keeps the index in memory for this run only.
             std::env::var(defaults::INDEX_PATH_ENV)
                 .ok()
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var("HOME").ok().map(|home| {
-                        let mut p = std::path::PathBuf::from(home);
-                        p.push(defaults::DEFAULT_INDEX_RELATIVE_PATH);
-                        p
-                    })
-                })
         }
     };
 
@@ -1841,14 +1844,13 @@ use workflowy_mcp_server::audit::{audit_mirrors, build_review, ReviewReport};
 const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Read recent session-log files (last 7 days) into a single blob the
-/// review function can scan for URL/DOI matches. Returns `""` if the
-/// `~/code/SecondBrain/session-logs/` directory doesn't exist — the
-/// review function then skips bucket (d) gracefully.
+/// review function can scan for URL/DOI matches. Returns `""` if
+/// `$SECONDBRAIN_DIR` is unset or its `session-logs` subdirectory
+/// doesn't exist — the review function then skips bucket (d) gracefully.
 fn load_recent_session_logs_blob() -> String {
-    let Some(home) = std::env::var("HOME").ok() else {
+    let Some(dir) = workflowy_mcp_server::defaults::session_logs_dir() else {
         return String::new();
     };
-    let dir = std::path::PathBuf::from(format!("{}/code/SecondBrain/session-logs", home));
     if !dir.exists() {
         return String::new();
     }

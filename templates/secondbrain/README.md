@@ -2,7 +2,7 @@
 
 This directory holds the part of your second brain that lives *outside* Workflowy — the cached node IDs, in-flight drafts, session logs, and briefs intended for collaborators or future Claude sessions. The second brain proper (your knowledge graph of atomic notes, distillations, and structural nodes) lives in Workflowy.
 
-The MCP server at `~/code/workflowy-mcp-server` reads from and writes to this directory. The wflow skill at `~/.claude/skills/wflow/SKILL.md` reads `memory/workflowy_node_links.md` on every bootstrap.
+The MCP server reads this directory through the `$SECONDBRAIN_DIR` env var (set in your MCP host config, e.g. Claude Code's `~/.claude.json` or Claude Desktop's `claude_desktop_config.json`). The persistent name index lives at `$WORKFLOWY_INDEX_PATH`, conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Both env vars are optional — leave them unset and the dependent features (the persistent index, the `review` tool's bucket-d session-log scan) simply skip. The wflow skill at `~/.claude/skills/wflow/SKILL.md` reads `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` on every bootstrap.
 
 ## Layout
 
