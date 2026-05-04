@@ -475,6 +475,80 @@ The contract callers can rely on:
 
 ---
 
+## Workflow Orchestration Contract (2026-05-04)
+
+The workflows in `src/workflows.rs` are the single source of truth for
+behaviour shared between the MCP `server` and the `wflow-do` CLI. The
+2026-05-04 lift extracted five workflows after the failure-report
+2026-05-03 follow-up flagged the duplication:
+
+| Workflow function | Replaces | Used by |
+|---|---|---|
+| `create_mirror_via_convention` | server stub + nothing in CLI | `create_mirror` tool, `wflow-do create-mirror` |
+| `insert_content_via_indented` | server `insert_content` body + CLI `Cmd::Insert` body | `insert_content` tool, `wflow-do insert` |
+| `run_transaction` (+ `apply_txn_step`, `run_txn_inverse`) | server `apply_txn_op` + `run_inverse` + `TxnInverse` enum + CLI `apply_txn_step` + `run_inverse_step` | `transaction` tool, `wflow-do transaction` |
+| `apply_bulk_op` | server `bulk_update` apply loop + CLI `bulk-update` apply loop | `bulk_update` tool, `wflow-do bulk-update` |
+| `smart_insert_under_target` | server `smart_insert` insert loop (which was flat-only — DIVERGENCE) + CLI smart-insert insert loop (indent-aware) | `smart_insert` tool, `wflow-do smart-insert` |
+
+### Contract every workflow obeys
+
+1. **Inputs**: `&WorkflowyClient` + typed inputs + `&WorkflowContext<'_>`.
+2. **Outputs**: `Ok((TypedResult, MutationFootprint))` on success;
+   `Err(WorkflowyError)` on failure. `WorkflowyError::InvalidInput` is
+   reserved for caller-supplied parameter problems and routes through
+   `workflow_error_to_mcp` to `tool_invalid_params` on the MCP side.
+3. **Side effects declared**: workflows return a `MutationFootprint`
+   listing IDs needing cache + name-index invalidation; the MCP wrapper
+   applies them via `apply_footprint`, the CLI discards them.
+4. **Cancel + deadline come from `WorkflowContext`**. The MCP passes
+   its `cancel_registry.guard()` and the kind's wall-clock deadline;
+   the CLI passes `WorkflowContext::default()` (None, None). Workflows
+   that observe both signals between iterations
+   (`insert_content_via_indented`) gain partial-success behaviour for
+   free in both surfaces.
+
+### Behaviours pinned by workflow tests
+
+- `create_mirror_via_convention_rejects_self_mirror_without_api_call`
+  — mirror-of-self is rejected before any API call.
+- `workflow_context_default_signals_no_cancel_and_no_deadline` and
+  `workflow_context_deadline_is_past_when_now_is_after` — context
+  helpers behave correctly with and without arguments.
+- `mutation_footprint_records_invalidations` — the declarative
+  footprint accumulates IDs and merges via `extend()`.
+- `insert_content_empty_payload_is_zero_cost_complete` — empty
+  payload short-circuits to `Complete { created_count: 0 }` without
+  touching the API.
+- `insert_content_above_cap_returns_invalid_input` — payload above
+  `MAX_INSERT_CONTENT_LINES` fails with `InvalidInput`.
+- `insert_content_pre_cancelled_returns_partial_zero` and
+  `insert_content_past_deadline_returns_partial_timeout` — partial
+  success cursor lands at zero with the right reason.
+- `bulk_op_parse_accepts_exact_wire_strings_only` — wire strings are
+  the public contract; case-sensitive.
+- `apply_bulk_op_rejects_tag_op_without_operation_tag` — required
+  arguments are checked before any API call.
+- `smart_insert_under_target_rejects_empty_content` — empty bodies
+  reject before walks.
+- `parse_indented_content_handles_indents_and_blanks` — 2-space-per-
+  level parsing, empty lines dropped, whitespace trimmed.
+
+### MCP-CLI parity properties
+
+- Both surfaces share workflow code; behavioural drift is impossible
+  by construction.
+- The MCP wraps with `tool_handler!` (cancel, op-log, deadline,
+  envelope) and applies the footprint; the CLI prints to stdout/JSON.
+- The MCP's structured-error envelope (`proximate_cause`,
+  `operation`, `hint`) is produced by translating
+  `WorkflowyError::InvalidInput` to `tool_invalid_params` and every
+  other variant to `tool_error`.
+- The CLI's error path is `Box<dyn Error>` from `?` — the workflow's
+  error message (which already mentions field names and constraints)
+  is what the user sees.
+
+---
+
 ## Repository Template Portability
 
 The repo ships templates that other users clone, populate, and run.

@@ -49,23 +49,26 @@ pub const MAX_DESCRIPTION_LENGTH: usize = 50_000;
 /// Maximum length for insert_content bodies
 pub const MAX_CONTENT_LENGTH: usize = 500_000;
 /// Maximum number of lines (= nodes to create) accepted by a single
-/// `insert_content` call. Brief 2026-05-02: large payloads (~130 nodes)
-/// were being dropped at the MCP transport layer before the handler
-/// ran, surfacing as a bare `Tool execution failed` with no diagnostic
-/// and no per-tool counter movement. We cannot fix transport drops
-/// from inside the server, but we can stop pretending the bounded
-/// budget is end-to-end: this cap rejects oversized payloads at the
-/// handler boundary with a typed error and a chunking instruction, so
-/// the caller sees an actionable message instead of an unobservable
-/// silent failure. Empirical safe ceiling is ~80 lines per call; we
-/// set the cap at 200 to leave headroom for callers who have measured
-/// their own client and know their transport can carry it.
-pub const MAX_INSERT_CONTENT_LINES: usize = 200;
-/// Soft warn threshold for `insert_content` payload size. Above this,
-/// the success response includes a hint recommending chunking — but
-/// the request still runs. Below the hard cap, above the soft warn:
-/// the user gets an early signal before they hit the wall.
-pub const SOFT_WARN_INSERT_CONTENT_LINES: usize = 80;
+/// `insert_content` call. Brief 2026-05-02 introduced the cap; failure
+/// report 2026-05-03 lowered it from 200 to 80 on 2026-05-04.
+///
+/// Original framing: oversized payloads (~130 nodes) were dropped at
+/// the MCP transport layer before the handler ran — bare
+/// `Tool execution failed` with no diagnostic and no per-tool counter
+/// movement. We cannot fix transport drops; we can refuse to pretend
+/// the bounded-budget contract is end-to-end. The cap rejects
+/// oversized payloads at the handler boundary with a typed error and a
+/// chunking instruction.
+///
+/// Why 80 specifically: the failure-report 2026-05-03 session observed
+/// a 130-line call failing twice in a row at the transport, then every
+/// ~40-line chunk succeeding. The 200-line ceiling was theoretical
+/// headroom that no observed caller could reliably reach — payloads
+/// above ~80 failed intermittently with no diagnostic. Lowering the
+/// cap to the empirical safe ceiling makes the contract honest:
+/// callers either succeed atomically at ≤80 or get a structured
+/// "split into ≤80-line batches" error.
+pub const MAX_INSERT_CONTENT_LINES: usize = 80;
 /// Hard cap on max_results for any search/list tool
 pub const HARD_MAX_RESULTS: usize = 100;
 /// Default max_results when not specified

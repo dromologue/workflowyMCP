@@ -232,6 +232,63 @@ The following Rust patterns are actively enforced in this codebase:
   parameters rather than reading the system clock so they stay pure
   and tests can pin behaviour against arbitrary timestamps.
 
+### Workflow orchestration shared between MCP and CLI (`src/workflows.rs`)
+
+Workflows that need an API client AND are surfaced by both binaries
+live in `src/workflows.rs`. The 2026-05-04 lift extracted
+`create_mirror_via_convention`, `insert_content_via_indented`,
+`run_transaction`, `apply_bulk_op`, and `smart_insert_under_target`
+into this module after the failure-report 2026-05-03 follow-up flagged
+the duplication ("why do we have two code bases for the CLI and the
+Server"). `audit::*` and `utils::aggregation::*` cover the pure-
+function half of the same idea; `workflows::*` covers the half that
+takes a client.
+
+Every workflow function obeys the same contract:
+
+1. **Inputs**: `&WorkflowyClient` + typed inputs (resolved IDs preferred)
+   + `&WorkflowContext<'_>`.
+2. **Output**: `Ok((TypedResult, MutationFootprint))` on success,
+   `Err(WorkflowyError)` on failure. `WorkflowyError::InvalidInput`
+   is reserved for caller-supplied parameter problems; the MCP wrapper
+   translates it to `tool_invalid_params`, the CLI prints the message.
+3. **Side effects declared, not applied**. The workflow returns a
+   `MutationFootprint` listing which node IDs need cache + name-index
+   invalidation; the MCP wrapper applies them via `apply_footprint`,
+   the CLI discards them. Pre-lift each handler hand-wrote
+   `invalidate_for_mutation(&[id, ...])` arguments and one slip
+   produced silent cache-staleness; the declarative footprint makes
+   missed invalidations a workflow bug instead.
+4. **Cancel + deadline come from the context**. `WorkflowContext`
+   carries `Option<&CancelGuard>` and `Option<Instant>` deadline. The
+   MCP passes its `cancel_registry.guard()` and the `ToolKind` budget;
+   the CLI passes `WorkflowContext::default()` (None, None). Workflows
+   that observe both signals between iterations
+   (`insert_content_via_indented`) gain partial-success behaviour for
+   free in both surfaces.
+5. **Wrappers translate errors uniformly**. The MCP handler calls
+   `workflow_error_to_mcp(operation, node_id, err)` once instead of
+   matching the WorkflowyError variants inline; the CLI propagates
+   via `?` and stringifies. Adding a new workflow means writing a
+   one-line translator call, not a repeat of the match arms.
+
+The pattern delivers two properties:
+
+- **One bug fix lands in both surfaces.** The 2026-05-04 transaction
+  lift collapsed `apply_txn_op` (server) and `apply_txn_step` (CLI)
+  into one `run_transaction`; pre-lift drift between the two
+  rollback shapes is gone by construction.
+- **Test depth lives once.** Workflow tests cover the orchestration
+  semantics (validation, cap enforcement, cancel/deadline behaviour,
+  rollback, partial-success); the MCP and CLI keep thin smoke tests
+  pinning their respective wrapping (envelope shapes, exit codes).
+
+When the orchestration genuinely diverges between MCP and CLI (e.g.
+walks that need cancel-aware budgets only the MCP carries), keep the
+divergent step on each surface and lift only the step that doesn't
+diverge. The lift goal is "no duplicate logic", not "one function for
+everything".
+
 ---
 
 ## Anti-Patterns to Avoid

@@ -150,16 +150,21 @@ generic so the next person who clones it gets a clean starting point.
 
 ## Tool reference
 
-The server exposes 40 tools. `node_id` accepts any of: full UUID (with or
+The server exposes 41 tools. `node_id` accepts any of: full UUID (with or
 without hyphens), 12-char URL-suffix short hash, or 8-char prefix.
+`parent_id` (and any other parent-scoped argument) accepts `null` or
+omission as "workspace root" across the whole tool surface — `create_node`,
+`batch_create_nodes`, `insert_content`, `list_children`, and the rest
+behave the same way.
 
 | Category | Tools |
 |----------|-------|
 | Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path` |
 | Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
+| Mirror discipline | `create_mirror` (convention-based: duplicates the canonical's name into a new parent and writes `mirror_of:` to the new node's note), `audit_mirrors` |
 | Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
 | Project management | `get_project_summary`, `get_recent_changes` |
-| Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `audit_mirrors`, `review`, `get_recent_tool_calls` |
+| Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `review`, `get_recent_tool_calls` |
 
 **Native task completion.** `complete_node(node_id)` toggles the
 Workflowy `completed` boolean — the legacy `#done` tag-as-completion
@@ -167,6 +172,28 @@ workaround is deprecated for tasks. `bulk_update(operation: "complete"|"uncomple
 toggles a filtered set in one call; `transaction` accepts the same ops
 with rollback. Wire payload is `POST /nodes/{id}` with
 `{"completed": true|false}`.
+
+**Mirror creation (convention).** Workflowy's REST API does not expose
+native mirror creation, so `create_mirror(canonical_node_id, target_parent_id)`
+implements the documented `mirror_of:` / `canonical_of:` note convention
+that `audit_mirrors` already understands: a new node is created under
+the target parent with the same name as the canonical, and its
+description carries `mirror_of: <canonical_uuid>`. Edits to the
+canonical do **not** propagate to the mirror — the link is structural
+and human-curated, not live. Pass an optional `pillar` to write a
+`canonical_of: <pillar>` marker to the canonical when it lacks one;
+existing markers are never overwritten. The mirror's create + the
+optional canonical edit run through the shared
+[`crate::workflows::create_mirror_via_convention`](src/workflows.rs)
+function, the same code path the `wflow-do create-mirror` CLI calls.
+
+**`insert_content` payload cap.** The hard cap is 80 lines per call,
+lowered from 200 on 2026-05-04 after the failure-report 2026-05-03
+session observed ≥80-line payloads failing at the MCP transport layer
+with no diagnostic. Above the cap, the call returns a typed error with
+a chunking instruction; chunk to ≤80 lines and pass the previous
+batch's `last_inserted_id` as the next call's `parent_id` to keep the
+hierarchy stitched together.
 
 **Truncation envelope.** Every walk-shaped tool that emits JSON includes
 the same four fields when its 20 s walk budget fires:
@@ -220,10 +247,12 @@ expiry, bulk operations return a structured partial-success payload
 caller can resume — no "no result received" without diagnostic.
 
 For the full list (transport-timeout retry, `authenticated`/`api_reachable`
-decoupling, `null` parameter handling, etc.) see
-[`specs/specification.md`](specs/specification.md). 296 lib + 12 CLI
-tests pin the contracts, including 21 wiremock-driven failure-mode tests
-that run in under 2 seconds, plus four build-time invariant tests:
+decoupling, `null` parameter handling, the 2026-05-04 `move_node`
+unification that collapsed the previous wrapper-vs-bare divergence,
+etc.) see [`specs/specification.md`](specs/specification.md). 314 lib +
+12 CLI tests pin the contracts, including 21 wiremock-driven
+failure-mode tests that run in under 2 seconds, plus build-time
+invariant tests:
 
 - `parameter_bearing_tools_publish_non_empty_input_schema_properties`
   fails the build if a tool's published schema has empty `properties`
@@ -235,6 +264,10 @@ that run in under 2 seconds, plus four build-time invariant tests:
   MCP tool ships without its matching `wflow-do` subcommand.
 - `cancel_all_preempts_inflight_create_node_via_run_handler` and the
   `path_of` companion pin the cancel-registry safety net.
+- `move_node_embeds_propagation_retry_loop` pins the 2026-05-04
+  unification: the move retry now lives inside `client.move_node`
+  itself, so every caller (handler, transaction, CLI) gets identical
+  resilience without having to remember which wrapper to call.
 
 ---
 
@@ -244,6 +277,14 @@ A second binary exposes the same operations as a plain shell command.
 **Full surface parity** with the MCP server — every non-diagnostic tool
 has a matching subcommand, enforced at build time. Useful as a fallback
 when the MCP transport drops or when you want a Bash-driven workflow.
+
+The CLI and the MCP server share more than the API client: workflow
+orchestration that used to be duplicated (`create_mirror` on 2026-05-04,
+with more to come) now lives in [`src/workflows.rs`](src/workflows.rs).
+Both surfaces call the same workflow function and wrap the typed result
+in their own envelope (structured `tool_error` for the MCP handler,
+stdout/JSON for the CLI). Adding a new tool means writing the
+orchestration once.
 
 ```bash
 target/release/wflow-do status                              # liveness
@@ -255,7 +296,7 @@ target/release/wflow-do --dry-run delete <uuid>             # preview
 target/release/wflow-do reindex --root <UUID> --root <UUID> # pre-warm index
 ```
 
-Forty subcommands grouped: read & navigate (`status`, `health-check`,
+Forty-one subcommands grouped: read & navigate (`status`, `health-check`,
 `get`, `children`, `subtree`, `find`, `search`, `tag-search`,
 `backlinks`, `find-by-tag-and-path`, `node-at-path`, `path-of`,
 `resolve-link`, `since`); todos & scheduling (`todos`, `overdue`,
@@ -263,8 +304,9 @@ Forty subcommands grouped: read & navigate (`status`, `health-check`,
 single-node writes (`create`, `move`, `delete`, `edit`, `complete`);
 bulk writes (`insert`, `smart-insert`, `duplicate`, `template`,
 `bulk-update`, `bulk-tag`, `batch-create`, `transaction`, `export`);
-graph hygiene (`audit-mirrors`, `review`, `index`, `reindex`,
-`build-name-index`); diagnostics (`cancel-all`, `recent-tools`).
+graph hygiene (`audit-mirrors`, `create-mirror`, `review`, `index`,
+`reindex`, `build-name-index`); diagnostics (`cancel-all`,
+`recent-tools`).
 
 Use `--json` for raw output, `--dry-run` (write verbs only) to preview
 without calling the API.
@@ -276,7 +318,7 @@ without calling the API.
 ```bash
 cargo build              # debug
 cargo build --release    # optimised
-cargo test --lib         # 272 unit tests
+cargo test --lib         # 314 unit tests
 cargo check              # type-check only
 ```
 

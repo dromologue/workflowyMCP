@@ -155,8 +155,18 @@ pub struct TagSearchParams {
 #[serde(deny_unknown_fields)]
 #[schemars(description = "Insert content as hierarchical nodes from indented text")]
 pub struct InsertContentParams {
-    #[schemars(description = "Parent node ID to insert content under")]
-    pub parent_id: NodeId,
+    /// Parent node ID. Omit OR set to `null` to insert at the workspace
+    /// root — both behave the same. Failure-report 2026-05-03: until
+    /// 2026-05-04 this field was a non-optional `NodeId`, so a caller
+    /// passing `null` (matching the null-means-root convention used by
+    /// `create_node`, `batch_create_nodes`, `list_children`) hit
+    /// "invalid type: null, expected a string" at the schema layer
+    /// before the handler ran. Other tools accepted null, this one
+    /// didn't — that asymmetry was the root cause of the 39 % success
+    /// rate the report tracked. Fixed by aligning to the
+    /// `Option<NodeId>` shape every other parent-scoped tool uses.
+    #[schemars(description = "Parent node ID to insert content under. Omit OR pass null to insert at the workspace root — same behaviour as create_node and batch_create_nodes.")]
+    pub parent_id: Option<NodeId>,
     #[schemars(description = "Content in 2-space indented text format. Each line becomes a node, indentation creates hierarchy")]
     pub content: String,
 }
@@ -533,14 +543,16 @@ pub struct ExportSubtreeParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(description = "Stub for native Workflowy mirror creation. Workflowy's public REST surface does not expose mirror creation; this tool returns an informative error so callers don't silently fall back to a 'mirror_of: <uuid>' note convention.")]
+#[schemars(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this tool implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (optionally, when `pillar` is supplied) the canonical's description gains `canonical_of: <pillar>` if it lacks one. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Use this when you want a single canonical surfaced from multiple places in the workspace and want `audit_mirrors` to surface drift.")]
 pub struct CreateMirrorParams {
-    #[schemars(description = "Canonical node to mirror")]
+    #[schemars(description = "UUID or short hash of the canonical node to mirror. The mirror's name is copied verbatim from this node at creation time.")]
     pub canonical_node_id: NodeId,
-    #[schemars(description = "Parent under which the mirror should appear")]
-    pub target_parent_id: NodeId,
-    #[schemars(description = "Optional priority/sort key")]
+    #[schemars(description = "Parent under which the mirror should appear (UUID, short hash, or null for workspace root)")]
+    pub target_parent_id: Option<NodeId>,
+    #[schemars(description = "Optional priority/sort key for the mirror among its siblings (lower = earlier)")]
     pub priority: Option<i32>,
+    #[schemars(description = "Optional pillar token (opaque, e.g. 'lead', 'build') to write to the canonical's `canonical_of:` marker if it lacks one. Skipped when omitted; if the canonical already has a canonical_of marker it is never overwritten.")]
+    pub pillar: Option<String>,
 }
 
 /// Parameters for `audit_mirrors`. Defaults `root_id` to the user's

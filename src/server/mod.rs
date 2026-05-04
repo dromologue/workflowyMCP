@@ -216,6 +216,33 @@ fn derive_api_reachable(probe_succeeded: bool, last_success_ms_ago: Option<u64>)
 /// surviving direct `McpError::invalid_params` calls are the rare
 /// shapes where the handler genuinely doesn't know the operation
 /// (parsing-stage, framework-level).
+/// Translate a `WorkflowyError` returned from a `crate::workflows::*`
+/// function into the MCP `McpError` envelope shape every handler
+/// emits. The single rule: `WorkflowyError::InvalidInput` becomes
+/// `tool_invalid_params` (proximate_cause `invalid_params`); every
+/// other variant routes through `tool_error` whose classifier picks
+/// the right `proximate_cause` from the error string.
+///
+/// Why this exists: pre-2026-05-04 every handler that called a
+/// workflow function hand-wrote the `match err { InvalidInput =>
+/// tool_invalid_params, _ => tool_error }` arms and got the operation
+/// name slightly wrong each time (`"create_mirror"` here, `"insert_content"`
+/// there). Centralising the translation collapses each handler's
+/// error path to one line and makes the wrapper-around-workflow
+/// pattern uniform across every tool that delegates to `workflows::`.
+fn workflow_error_to_mcp(
+    operation: &str,
+    node_id: Option<&str>,
+    err: WorkflowyError,
+) -> McpError {
+    match err {
+        WorkflowyError::InvalidInput { reason } => {
+            tool_invalid_params(operation, node_id, reason)
+        }
+        other => tool_error(operation, node_id, other),
+    }
+}
+
 fn tool_invalid_params(operation: &str, node_id: Option<&str>, msg: impl Into<String>) -> McpError {
     let msg = msg.into();
     let data = serde_json::json!({
@@ -1149,6 +1176,22 @@ impl WorkflowyMcpServer {
         }
     }
 
+    /// Apply a [`crate::workflows::MutationFootprint`] to this server's
+    /// cache + name index. Every handler that delegates to a
+    /// `workflows::*` function calls this with the returned footprint
+    /// instead of hand-writing `invalidate_for_mutation` arguments —
+    /// the workflow declares its side effects, the wrapper applies
+    /// them, and a missed invalidation becomes a workflow bug
+    /// (testable) instead of a silent cache-staleness bug.
+    fn apply_footprint(&self, footprint: &crate::workflows::MutationFootprint) {
+        for id in &footprint.invalidated_nodes {
+            self.cache.invalidate_node(id);
+        }
+        for id in &footprint.invalidated_name_index {
+            self.name_index.invalidate_node(id);
+        }
+    }
+
     async fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
         if !is_short_hash(raw) {
             return Ok(raw.to_string());
@@ -1865,7 +1908,7 @@ impl WorkflowyMcpServer {
 
         match self
             .client
-            .move_node_with_propagation_retry(&resolved_node, &resolved_parent, params.priority)
+            .move_node(&resolved_node, &resolved_parent, params.priority)
             .await
         {
             Ok(_) => {
@@ -1988,7 +2031,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it. PAYLOAD CAP: ≤200 lines per call (hard, refused with a typed error above this); ≤80 lines is the safe ceiling that has not been observed to fail at the MCP transport layer. Above 80 lines the success response includes a chunking hint. Bounded by an end-to-end budget (~210 s) so a flaky upstream cannot wedge the call past the MCP client's 4-min hard timeout. On timeout the response carries a structured partial-success payload (created_count, total_count, last_inserted_id, error) instead of returning bare 'no result received' — the caller can resume from where it stopped. Pattern: split large content into batches keyed by top-level subtree, call insert_content per batch; the LAST_INSERTED_ID returned by each batch can be passed as parent_id to the next so the hierarchy stitches back together cleanly.")]
+    #[tool(description = "Insert hierarchical content under a parent node. Content uses 2-space indentation for hierarchy — each indent level creates a child of the node above it. parent_id may be a UUID, a short hash, omitted, or null — the last two place the content at the workspace root, matching create_node and batch_create_nodes. PAYLOAD CAP: ≤80 lines per call. The 2026-05-04 cap reduction (formerly 200) tracks the empirically safe ceiling: payloads above ~80 lines were observed failing at the MCP transport layer with no diagnostic. Above the cap, the call returns a typed error with a chunking instruction; chunk to ≤80 lines and pass each batch's last_inserted_id as the next call's parent_id to keep the hierarchy stitched together. Bounded by an end-to-end budget (~210 s) so a flaky upstream cannot wedge the call past the MCP client's 4-min hard timeout. On timeout the response carries a structured partial-success payload (created_count, total_count, last_inserted_id, error) instead of returning bare 'no result received' — the caller can resume from where it stopped.")]
     async fn insert_content(
         &self,
         Parameters(params): Parameters<InsertContentParams>,
@@ -2005,195 +2048,95 @@ impl WorkflowyMcpServer {
         // imposing the outer wall-clock arm; the inline checks are the
         // primary AND only safety net here.
         record_op!(self, "insert_content", params, {
-        info!(parent_id = %params.parent_id, "Inserting content");
-        let resolved_parent = self.validate_and_resolve(&params.parent_id).await?;
+        // None / null = workspace root. The schema accepts both
+        // shapes; the workflow accepts an `Option<&str>` parent so
+        // both surfaces share the same root semantics.
+        let resolved_parent: Option<String> = match params.parent_id.as_deref() {
+            None | Some("") => None,
+            Some(id) => Some(self.validate_and_resolve(id).await?),
+        };
+        info!(parent_id = ?resolved_parent, "Inserting content");
+        let parent_label: String = resolved_parent
+            .clone()
+            .unwrap_or_else(|| "workspace root".to_string());
 
-        // Parse indented lines
-        struct ParsedLine<'a> { text: &'a str, indent: usize }
-        let parsed: Vec<ParsedLine> = params.content.lines().filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() { return None; }
-            let leading = line.len() - line.trim_start().len();
-            Some(ParsedLine { text: trimmed, indent: leading / 2 })
-        }).collect();
-
+        let parsed = crate::workflows::parse_indented_content(&params.content);
         if parsed.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text("No content to insert (all lines empty)".to_string())]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No content to insert (all lines empty)".to_string(),
+            )]));
         }
 
-        // Hard cap on payload size. Brief 2026-05-02: oversized
-        // `insert_content` calls were silently dropped at the MCP
-        // transport before reaching this handler — bare
-        // "Tool execution failed" with no per-tool counter movement.
-        // We cannot fix transport drops, but we can refuse to pretend
-        // the bounded-budget contract is end-to-end. Above the cap,
-        // return a typed error with chunking instructions so the
-        // caller's recovery path is obvious instead of guess-and-retry.
-        if parsed.len() > defaults::MAX_INSERT_CONTENT_LINES {
-            let total = parsed.len();
-            let cap = defaults::MAX_INSERT_CONTENT_LINES;
-            return Err(tool_error(
-                "insert_content",
-                Some(&resolved_parent),
-                format!(
-                    "payload too large: {} lines exceeds the {}-line cap. Split the content \
-                     into batches of ≤{} top-level subtrees and call insert_content once per \
-                     batch — each call into a fresh node returned by the previous batch (or the \
-                     same parent_id) preserves the hierarchy. The cap exists because oversized \
-                     payloads have been observed to fail at the MCP transport layer before \
-                     reaching this handler, surfacing as undiagnosable 'Tool execution failed' \
-                     with no per-tool counter movement.",
-                    total, cap, defaults::SOFT_WARN_INSERT_CONTENT_LINES,
-                ),
-            ));
-        }
-
-        // End-to-end deadline. Honoured by every per-line create plus a
-        // pre-line check so a row queued behind the rate limiter
-        // observes the budget without making an HTTP attempt that
-        // would have to time out on its own. The budget reads from
-        // `self.bulk_budget_ms` (defaulting to
-        // [`defaults::INSERT_CONTENT_TIMEOUT_MS`]) so tests can dial it
-        // down via `with_bulk_budget_ms`, sharing the override surface
-        // with every other bulk handler.
+        // The bulk-deadline + cancel guard the workflow honours
+        // mid-orchestration. Both come from MCP-side infrastructure
+        // (cancel registry + the per-tool wall-clock budget); the
+        // workflow takes them via WorkflowContext.
         let total_budget = Duration::from_millis(self.bulk_budget_ms);
         let overall_deadline = Instant::now() + total_budget;
         let cancel_guard = self.cancel_registry.guard();
+        let ctx = crate::workflows::WorkflowContext::new(Some(&cancel_guard), Some(overall_deadline));
 
-        let total = parsed.len();
-        let mut parent_stack: Vec<String> = vec![resolved_parent.clone()];
-        let mut created_count: usize = 0;
-        let mut last_inserted_id: Option<String> = None;
-        // None on success; Some(reason) on partial-success exit.
-        let mut bailout_reason: Option<String> = None;
-        let mut bailout_line: Option<String> = None;
-
-        for line in &parsed {
-            // Pre-line budget + cancel checks. A guard taken before the
-            // rate limiter avoids burning a token on a doomed call.
-            if cancel_guard.is_cancelled() {
-                bailout_reason = Some("cancelled".to_string());
-                break;
+        let (outcome, footprint) = match crate::workflows::insert_content_via_indented(
+            &self.client,
+            resolved_parent.as_deref(),
+            parsed,
+            &ctx,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(pid) = resolved_parent.as_deref() {
+                    self.cache.invalidate_node(pid);
+                }
+                return Err(workflow_error_to_mcp(
+                    "insert_content",
+                    resolved_parent.as_deref(),
+                    e,
+                ));
             }
-            if Instant::now() >= overall_deadline {
-                bailout_reason = Some("timeout".to_string());
-                bailout_line = Some(line.text.to_string());
-                break;
+        };
+        self.apply_footprint(&footprint);
+
+        match outcome {
+            crate::workflows::InsertContentOutcome::Complete {
+                created_count, ..
+            } => {
+                let msg = format!(
+                    "Inserted {} node(s) under `{}`",
+                    created_count, parent_label
+                );
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
-
-            // Clamp indent to valid range
-            let indent = line.indent.min(parent_stack.len().saturating_sub(1));
-            let parent_id = parent_stack[indent].clone();
-
-            // Per-call deadline = the tighter of the overall deadline
-            // and the standard write budget. The client's own
-            // `create_node` already bounds at WRITE_NODE_TIMEOUT_MS;
-            // passing the overall deadline keeps the last few rows
-            // from bursting the total budget.
-            match self
-                .client
-                .create_node_cancellable(
-                    line.text,
-                    None,
-                    Some(&parent_id),
-                    None,
-                    Some(&cancel_guard),
-                    Some(overall_deadline),
-                )
-                .await
-            {
-                Ok(created) => {
-                    created_count += 1;
-                    last_inserted_id = Some(created.id.clone());
-                    let next_level = indent + 1;
-                    if next_level < parent_stack.len() {
-                        parent_stack[next_level] = created.id;
-                        parent_stack.truncate(next_level + 1);
-                    } else {
-                        parent_stack.push(created.id);
-                    }
-                }
-                Err(WorkflowyError::Cancelled) => {
-                    bailout_reason = Some("cancelled".to_string());
-                    bailout_line = Some(line.text.to_string());
-                    break;
-                }
-                Err(WorkflowyError::Timeout) => {
-                    bailout_reason = Some("timeout".to_string());
-                    bailout_line = Some(line.text.to_string());
-                    break;
-                }
-                Err(e) => {
-                    // Deadline takes precedence: if the budget has
-                    // already expired, the error is a downstream
-                    // consequence (a connection torn down by the
-                    // racing `tokio::select` arm, an upstream session
-                    // closed, etc.) and the contract is partial-
-                    // success on timeout — not a hard error that the
-                    // caller can't tell apart from a real failure.
-                    if cancel_guard.is_cancelled() {
-                        bailout_reason = Some("cancelled".to_string());
-                        bailout_line = Some(line.text.to_string());
-                        break;
-                    }
-                    if Instant::now() >= overall_deadline {
-                        bailout_reason = Some("timeout".to_string());
-                        bailout_line = Some(line.text.to_string());
-                        break;
-                    }
-                    error!(error = %e, line = line.text, "Failed to insert line");
-                    return Err(tool_error(
-                        "insert_content",
-                        Some(&parent_id),
-                        format!("inserting '{}' (after {}/{} lines): {}", line.text, created_count, total, e),
-                    ));
-                }
-            }
-        }
-
-        self.cache.invalidate_node(&resolved_parent);
-
-        // Partial-success path: report what we got done so the caller
-        // can resume from the last inserted node rather than guessing
-        // whether the call actually wrote anything.
-        if let Some(reason) = bailout_reason {
-            let payload = json!({
-                "status": "partial",
-                "reason": reason,
-                "created_count": created_count,
-                "total_count": total,
-                "parent_id": resolved_parent,
-                "last_inserted_id": last_inserted_id,
-                "stopped_at_line": bailout_line,
-                "message": format!(
-                    "insert_content stopped at {}/{} lines ({}). Last inserted: {}. Resume by re-running with the remaining lines under last_inserted_id (or the original parent if last_inserted_id is null).",
-                    created_count,
-                    total,
-                    reason,
-                    last_inserted_id.as_deref().unwrap_or("none"),
-                ),
-            });
-            return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
-        }
-
-        let mut msg = format!(
-            "Inserted {} node(s) under `{}`",
-            created_count, resolved_parent
-        );
-        // Soft-warn: above the safe ceiling but under the hard cap.
-        // The call succeeded, but the next one this size may not, so
-        // the caller learns the practical limit before they hit it.
-        if created_count > defaults::SOFT_WARN_INSERT_CONTENT_LINES {
-            msg.push_str(&format!(
-                "\n\n⚠ Payload was {} lines, above the {}-line soft warn threshold. \
-                 Consider splitting into smaller batches for the next call — the \
-                 {}-line hard cap rejects oversized payloads at the handler boundary.",
+            crate::workflows::InsertContentOutcome::Partial {
+                parent_id,
+                reason,
                 created_count,
-                defaults::SOFT_WARN_INSERT_CONTENT_LINES,
-                defaults::MAX_INSERT_CONTENT_LINES,
-            ));
+                total_count,
+                last_inserted_id,
+                stopped_at_line,
+            } => {
+                let payload = json!({
+                    "status": "partial",
+                    "reason": reason.as_str(),
+                    "created_count": created_count,
+                    "total_count": total_count,
+                    "parent_id": parent_id,
+                    "last_inserted_id": last_inserted_id,
+                    "stopped_at_line": stopped_at_line,
+                    "message": format!(
+                        "insert_content stopped at {}/{} lines ({}). Last inserted: {}. \
+                         Resume by re-running with the remaining lines under \
+                         last_inserted_id (or the original parent if last_inserted_id is null).",
+                        created_count,
+                        total_count,
+                        reason.as_str(),
+                        last_inserted_id.as_deref().unwrap_or("none"),
+                    ),
+                });
+                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            }
         }
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
         })
     }
 
@@ -2495,22 +2438,32 @@ impl WorkflowyMcpServer {
                 let target_id = target.id.clone();
                 let target_name = target.name.clone();
 
-                // Insert content lines as flat nodes under target
-                let lines: Vec<&str> = content.lines().collect();
-                let mut created_count = 0;
-                for line in &lines {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() { continue; }
-                    match self.client.create_node(trimmed, None, Some(&target_id), None).await {
-                        Ok(_) => created_count += 1,
-                        Err(e) => {
-                            error!(error = %e, "Failed to insert line in smart_insert");
-                            return Err(tool_error("smart_insert", Some(&target_id), format!("inserting '{}': {}", trimmed, e)));
-                        }
-                    }
-                }
-
-                self.cache.invalidate_node(&target_id);
+                // Delegate to the shared workflow, which respects
+                // 2-space-indented hierarchy. Pre-2026-05-04 this
+                // handler inserted lines flat (no indent awareness)
+                // while the CLI respected indentation; aligning both
+                // surfaces on `insert_content_via_indented` collapses
+                // the divergence.
+                let cancel_guard = self.cancel_registry.guard();
+                let total_budget = Duration::from_millis(self.bulk_budget_ms);
+                let overall_deadline = Instant::now() + total_budget;
+                let ctx = crate::workflows::WorkflowContext::new(
+                    Some(&cancel_guard),
+                    Some(overall_deadline),
+                );
+                let (outcome, footprint) = crate::workflows::smart_insert_under_target(
+                    &self.client,
+                    &target_id,
+                    content,
+                    &ctx,
+                )
+                .await
+                .map_err(|e| workflow_error_to_mcp("smart_insert", Some(&target_id), e))?;
+                self.apply_footprint(&footprint);
+                let created_count = match &outcome {
+                    crate::workflows::InsertContentOutcome::Complete { created_count, .. } => *created_count,
+                    crate::workflows::InsertContentOutcome::Partial { created_count, .. } => *created_count,
+                };
 
                 let result = json!({
                     "success": true,
@@ -2519,6 +2472,7 @@ impl WorkflowyMcpServer {
                     "truncation_reason": truncation_reason.map(|r| r.as_str()),
                     "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "created_count": created_count,
+                    "outcome": serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null),
                     "target": { "id": target_id, "name": target_name },
                     "message": format!("Inserted {} node(s) under '{}'", created_count, target_name)
                 });
@@ -3302,19 +3256,25 @@ impl WorkflowyMcpServer {
             None => None,
         };
 
-        // Validate operation. `complete`/`uncomplete` are first-class as
-        // of the completion-state work — they route through
-        // `client.set_completion`, the same code path
-        // `complete_node` uses for single-node toggles.
-        let valid_ops = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
-        if !valid_ops.contains(&params.operation.as_str()) {
-            return Err(tool_invalid_params(
-                "bulk_update",
-                None,
-                format!("Invalid operation '{}'. Must be one of: {}", params.operation, valid_ops.join(", ")),
-            ));
-        }
-        if (params.operation == "add_tag" || params.operation == "remove_tag") && params.operation_tag.is_none() {
+        // Operation validation lives in the shared workflow
+        // (`crate::workflows::BulkOp`). Parsing here so the wrapper
+        // can surface InvalidInput on an unknown kind without first
+        // running a tree walk; the workflow re-checks tag-required
+        // ops once the apply step starts.
+        let bulk_op = crate::workflows::BulkOp::parse(&params.operation)
+            .ok_or_else(|| {
+                let valid = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
+                tool_invalid_params(
+                    "bulk_update",
+                    None,
+                    format!(
+                        "Invalid operation '{}'. Must be one of: {}",
+                        params.operation,
+                        valid.join(", "),
+                    ),
+                )
+            })?;
+        if bulk_op.requires_tag() && params.operation_tag.is_none() {
             return Err(tool_invalid_params(
                 "bulk_update",
                 None,
@@ -3393,53 +3353,35 @@ impl WorkflowyMcpServer {
                     return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
                 }
 
-                // Execute operations
-                let mut affected = 0;
-                let mut affected_nodes: Vec<serde_json::Value> = Vec::new();
-                // Collect parent IDs of mutated nodes so we can invalidate them
-                // precisely instead of nuking the whole cache.
-                let mut touched_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-                for node in &matched {
-                    let success = match params.operation.as_str() {
-                        "delete" => self.client.delete_node(&node.id).await.is_ok(),
-                        "add_tag" => {
-                            let tag = params.operation_tag.as_ref().expect("validated non-None above");
-                            let new_name = format!("{} #{}", node.name, tag.trim_start_matches('#'));
-                            self.client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
-                        }
-                        "remove_tag" => {
-                            let tag = params.operation_tag.as_ref().expect("validated non-None above").trim_start_matches('#');
-                            let tag_re = Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(tag)))
-                                .expect("escaped pattern is always valid regex");
-                            let new_name = tag_re.replace_all(&node.name, "").to_string();
-                            self.client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
-                        }
-                        "complete" => self.client.set_completion(&node.id, true).await.is_ok(),
-                        "uncomplete" => self.client.set_completion(&node.id, false).await.is_ok(),
-                        _ => false,
-                    };
-                    if success {
-                        affected += 1;
-                        let path = build_node_path_with_map(&node.id, &node_map);
-                        affected_nodes.push(json!({ "id": node.id, "name": node.name, "path": path }));
-                        self.cache.invalidate_node(&node.id);
-                        self.name_index.invalidate_node(&node.id);
-                        if let Some(pid) = &node.parent_id {
-                            touched_parents.insert(pid.clone());
-                        }
-                    }
-                }
-
-                // Targeted cache invalidation: touch each mutated node's parent
-                // (so its children listing refreshes) plus the scoped root if
-                // the caller provided one. No global cache wipe.
-                for pid in &touched_parents {
-                    self.cache.invalidate_node(pid);
-                }
+                // Execute via the shared workflow. The apply step is
+                // identical between MCP and CLI; only the surrounding
+                // walk + filter + envelope rendering differs.
+                let matched_owned: Vec<WorkflowyNode> =
+                    matched.iter().map(|n| (*n).clone()).collect();
+                let ctx = crate::workflows::WorkflowContext::default();
+                let (apply_result, footprint) = crate::workflows::apply_bulk_op(
+                    &self.client,
+                    bulk_op,
+                    &matched_owned,
+                    params.operation_tag.as_deref(),
+                    &ctx,
+                )
+                .await
+                .map_err(|e| workflow_error_to_mcp("bulk_update", resolved_root.as_deref(), e))?;
+                self.apply_footprint(&footprint);
                 if let Some(rid) = &resolved_root {
                     self.cache.invalidate_subtree(rid);
                 }
+                let affected_nodes: Vec<serde_json::Value> = apply_result
+                    .affected_ids
+                    .iter()
+                    .filter_map(|id| {
+                        matched_owned.iter().find(|n| n.id == *id).map(|n| {
+                            let path = build_node_path_with_map(&n.id, &node_map);
+                            json!({ "id": n.id, "name": n.name, "path": path })
+                        })
+                    })
+                    .collect();
 
                 let result = json!({
                     "dry_run": false,
@@ -3447,9 +3389,9 @@ impl WorkflowyMcpServer {
                     "truncation_limit": node_limit,
                     "truncation_reason": truncation_reason.map(|r| r.as_str()),
                     "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
-                    "matched_count": matched.len(),
-                    "affected_count": affected,
-                    "operation": params.operation,
+                    "matched_count": apply_result.matched_count,
+                    "affected_count": apply_result.affected_count,
+                    "operation": bulk_op.as_str(),
                     "nodes_affected": affected_nodes
                 });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
@@ -3941,56 +3883,68 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that.")]
+    #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that. Orchestration runs through `crate::workflows::run_transaction`, the same code path the `wflow-do transaction` CLI uses.")]
     async fn transaction(
         &self,
         Parameters(params): Parameters<TransactionParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "transaction", ToolKind::Bulk, params, {
-            if params.operations.is_empty() {
-                return Err(tool_invalid_params("transaction", None, "operations must not be empty"));
+            // Pre-resolve every short-hash on this side so the workflow
+            // sees full UUIDs only. The CLI passes raw strings (no
+            // name index); the workflow doesn't care which surface
+            // resolved them. Op-kind validation lives in the workflow
+            // (an unknown kind there triggers rollback, matching the
+            // pre-lift behaviour pinned by
+            // `transaction_rejects_unknown_op_kind`).
+            let mut resolved_ops: Vec<crate::workflows::TxnOp> =
+                Vec::with_capacity(params.operations.len());
+            for op in &params.operations {
+                let node_id = match &op.node_id {
+                    Some(raw) => Some(self.resolve_node_ref(raw).await?),
+                    None => None,
+                };
+                let parent_id = match &op.parent_id {
+                    Some(raw) => Some(self.resolve_node_ref(raw).await?),
+                    None => None,
+                };
+                let new_parent_id = match &op.new_parent_id {
+                    Some(raw) => Some(self.resolve_node_ref(raw).await?),
+                    None => None,
+                };
+                resolved_ops.push(crate::workflows::TxnOp {
+                    op: op.op.clone(),
+                    node_id,
+                    parent_id,
+                    new_parent_id,
+                    name: op.name.clone(),
+                    description: op.description.clone(),
+                    priority: op.priority,
+                });
             }
 
-            // Each entry: (description-of-completed-op, inverse-action)
-            let mut applied: Vec<TxnInverse> = Vec::new();
-            let mut applied_results: Vec<serde_json::Value> = Vec::new();
+            let cancel_guard = self.cancel_registry.guard();
+            let total_budget = Duration::from_millis(self.bulk_budget_ms);
+            let overall_deadline = Instant::now() + total_budget;
+            let ctx = crate::workflows::WorkflowContext::new(
+                Some(&cancel_guard),
+                Some(overall_deadline),
+            );
+            let (outcome, footprint) = crate::workflows::run_transaction(
+                &self.client,
+                resolved_ops,
+                &ctx,
+            )
+            .await
+            .map_err(|e| workflow_error_to_mcp("transaction", None, e))?;
+            self.apply_footprint(&footprint);
 
-            for (idx, op) in params.operations.iter().enumerate() {
-                let outcome = self.apply_txn_op(op).await;
-                match outcome {
-                    Ok((summary, inverse)) => {
-                        applied_results.push(json!({ "index": idx, "ok": true, "summary": summary }));
-                        if let Some(inv) = inverse {
-                            applied.push(inv);
-                        }
-                    }
-                    Err(err) => {
-                        // Roll back in reverse order. Each inverse failure is
-                        // logged but does not abort the rollback — we want to
-                        // get as much state back as possible.
-                        let mut rollback_log: Vec<serde_json::Value> = Vec::new();
-                        while let Some(inv) = applied.pop() {
-                            match self.run_inverse(inv).await {
-                                Ok(summary) => rollback_log.push(json!({ "ok": true, "summary": summary })),
-                                Err(e) => rollback_log.push(json!({ "ok": false, "error": e.to_string() })),
-                            }
-                        }
-                        let payload = json!({
-                            "status": "rolled_back",
-                            "failed_at_index": idx,
-                            "error": err.to_string(),
-                            "applied_before_failure": applied_results,
-                            "rollback": rollback_log,
-                        });
-                        return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
-                    }
-                }
-            }
-
-            let payload = json!({
-                "status": "applied",
-                "operations": applied_results,
-            });
+            let payload = serde_json::to_value(&outcome).map_err(|e| {
+                tool_error(
+                    "transaction",
+                    None,
+                    format!("failed to serialise outcome: {e}"),
+                )
+            })?;
             Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
         })
     }
@@ -4669,17 +4623,58 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Stub for native Workflowy mirror creation. Workflowy's public REST API does not expose mirror creation, so this tool always returns an explanatory error. The user-facing 'mirror_of: <uuid>' note convention remains the documented workaround. Removing this stub once upstream adds the endpoint is tracked in the multi-pass plan (T-157).")]
+    #[tool(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (when `pillar` is supplied and the canonical lacks one) the canonical gains a `canonical_of: <pillar>` marker. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Returns a JSON envelope with mirror_id, canonical_id, target_parent_id, name, and audit_status (OK or ORPHAN_canonical_lacks_marker).")]
     async fn create_mirror(
         &self,
         Parameters(params): Parameters<CreateMirrorParams>,
     ) -> Result<CallToolResult, McpError> {
-        record_op!(self, "create_mirror", params, {
-        Err(tool_invalid_params(
-            "create_mirror",
-            Some(params.canonical_node_id.as_str()),
-            "create_mirror is not implemented: Workflowy's public REST API does not expose mirror creation. Use a `mirror_of: <uuid>` note on the duplicate node as a documentation convention; updates do not propagate. Tracked in tasks/reliability-and-ergonomics.md (Pass 6).",
-        ))
+        tool_handler!(self, "create_mirror", ToolKind::Bulk, params, {
+        // Resolve both endpoints through the same path every other
+        // tool uses so short hashes / UUIDs / null target_parent are
+        // accepted with consistent error envelopes.
+        let canonical_id = self.validate_and_resolve(&params.canonical_node_id).await?;
+        let target_parent: Option<String> = match params.target_parent_id.as_deref() {
+            None | Some("") => None,
+            Some(id) => Some(self.validate_and_resolve(id).await?),
+        };
+
+        // The workflow declares its mutation footprint; the wrapper
+        // applies it to the server's cache + name index post-call.
+        // No more hand-written `invalidate_for_mutation` arguments at
+        // the handler — the workflow function is the single source of
+        // truth for both the orchestration AND the side effects.
+        let cancel_guard = self.cancel_registry.guard();
+        let ctx = crate::workflows::WorkflowContext::new(Some(&cancel_guard), None);
+        let (result, footprint) = crate::workflows::create_mirror_via_convention(
+            &self.client,
+            &canonical_id,
+            target_parent.as_deref(),
+            params.priority,
+            params.pillar.as_deref(),
+            &ctx,
+        )
+        .await
+        .map_err(|e| workflow_error_to_mcp("create_mirror", Some(&canonical_id), e))?;
+        self.apply_footprint(&footprint);
+
+        let payload = json!({
+            "status": "ok",
+            "mirror_id": result.mirror_id,
+            "canonical_id": result.canonical_id,
+            "target_parent_id": result.target_parent_id,
+            "name": result.name,
+            "audit_status": result.audit_status,
+            "annotated_canonical": result.annotated_canonical,
+            "message": format!(
+                "Created mirror `{}` of canonical `{}` under `{}`. \
+                 audit_status={}",
+                result.mirror_id,
+                result.canonical_id,
+                result.target_parent_id.as_deref().unwrap_or("workspace root"),
+                result.audit_status,
+            ),
+        });
+        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
         })
     }
 
@@ -4706,252 +4701,11 @@ impl WorkflowyMcpServer {
     }
 }
 
-/// Inverse of a successful transaction step. Applied in reverse order
-/// during rollback. Not every operation has a clean inverse — see
-/// [`WorkflowyMcpServer::apply_txn_op`] for which operations support
-/// rollback and which only run forward.
-enum TxnInverse {
-    /// Roll back a `create` by deleting the new node.
-    DeleteCreated { node_id: String, parent_id: Option<String> },
-    /// Roll back an `edit` by reapplying the previous name/description.
-    RestoreEdit {
-        node_id: String,
-        prev_name: Option<String>,
-        prev_description: Option<String>,
-    },
-    /// Roll back a `move` by moving the node back to its previous parent.
-    UnMove {
-        node_id: String,
-        prev_parent_id: Option<String>,
-        prev_priority: Option<i32>,
-    },
-    /// Roll back a `complete`/`uncomplete` by toggling the boolean back.
-    /// `prev_completed` is captured pre-flight via `get_node`; if the
-    /// pre-read failed the inverse is dropped (partial rollback is
-    /// better than aborting the rest of the rollback queue).
-    RestoreCompletion {
-        node_id: String,
-        prev_completed: bool,
-    },
-}
-
-/// Out-of-router helpers for `transaction`. Kept outside the
-/// `#[tool_router]` impl so they don't get registered as tools.
-impl WorkflowyMcpServer {
-    /// Execute one transaction op. Returns a human-readable summary plus
-    /// the inverse to replay on rollback (`None` if the op is not
-    /// invertible — currently only `delete`).
-    async fn apply_txn_op(
-        &self,
-        op: &TransactionOpParams,
-    ) -> Result<(serde_json::Value, Option<TxnInverse>), McpError> {
-        match op.op.as_str() {
-            "create" => {
-                let parent_id = match &op.parent_id {
-                    Some(pid) => Some(self.resolve_node_ref(pid).await?),
-                    None => None,
-                };
-                let name = op.name.as_deref().ok_or_else(|| {
-                    tool_invalid_params("transaction", None, "create requires `name`")
-                })?;
-                let created = self
-                    .client
-                    .create_node(name, op.description.as_deref(), parent_id.as_deref(), op.priority)
-                    .await
-                    .map_err(|e| tool_error("transaction.create", parent_id.as_deref(), e))?;
-                if let Some(pid) = &parent_id {
-                    self.cache.invalidate_node(pid);
-                }
-                self.name_index.ingest(&[WorkflowyNode {
-                    id: created.id.clone(),
-                    name: created.name.clone(),
-                    parent_id: parent_id.clone(),
-                    ..Default::default()
-                }]);
-                let summary = json!({
-                    "op": "create",
-                    "id": created.id.clone(),
-                    "name": created.name.clone(),
-                });
-                let inverse = TxnInverse::DeleteCreated {
-                    node_id: created.id,
-                    parent_id,
-                };
-                Ok((summary, Some(inverse)))
-            }
-            "edit" => {
-                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    tool_invalid_params("transaction", None, "edit requires `node_id`")
-                })?;
-                let node_id = self.resolve_node_ref(node_id_raw).await?;
-                if op.name.is_none() && op.description.is_none() {
-                    return Err(tool_invalid_params(
-                        "transaction",
-                        None,
-                        "edit requires at least one of `name`/`description`",
-                    ));
-                }
-                // Capture the prior state so we can restore it on
-                // rollback. A failed pre-read disables the rollback for
-                // this op rather than aborting — partial rollback is
-                // better than none.
-                let prev = self.client.get_node(&node_id).await.ok();
-                self.client
-                    .edit_node(&node_id, op.name.as_deref(), op.description.as_deref())
-                    .await
-                    .map_err(|e| tool_error("transaction.edit", Some(&node_id), e))?;
-                self.cache.invalidate_node(&node_id);
-                self.name_index.invalidate_node(&node_id);
-                let summary = json!({ "op": "edit", "id": node_id.clone() });
-                let inverse = prev.map(|n| TxnInverse::RestoreEdit {
-                    node_id,
-                    prev_name: Some(n.name),
-                    prev_description: n.description,
-                });
-                Ok((summary, inverse))
-            }
-            "delete" => {
-                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    tool_invalid_params("transaction", None, "delete requires `node_id`")
-                })?;
-                let node_id = self.resolve_node_ref(node_id_raw).await?;
-                self.client.delete_node(&node_id).await.map_err(|e| {
-                    tool_error("transaction.delete", Some(&node_id), e)
-                })?;
-                self.cache.invalidate_node(&node_id);
-                self.name_index.invalidate_node(&node_id);
-                let summary = json!({ "op": "delete", "id": node_id });
-                // Delete is intentionally NOT invertible — recreating a
-                // deleted subtree (with stable ids and modification
-                // timestamps) is not something this server can promise.
-                // Caller should sequence deletes last in a transaction.
-                Ok((summary, None))
-            }
-            "move" => {
-                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    tool_invalid_params("transaction", None, "move requires `node_id`")
-                })?;
-                let new_parent_raw = op.new_parent_id.as_ref().ok_or_else(|| {
-                    tool_invalid_params("transaction", None, "move requires `new_parent_id`")
-                })?;
-                let node_id = self.resolve_node_ref(node_id_raw).await?;
-                let new_parent = self.resolve_node_ref(new_parent_raw).await?;
-                let prev = self.client.get_node(&node_id).await.ok();
-                let prev_parent_id = prev.as_ref().and_then(|n| n.parent_id.clone());
-                let prev_priority = prev.as_ref().and_then(|n| n.priority).map(|p| p as i32);
-                self.client
-                    .move_node(&node_id, &new_parent, op.priority)
-                    .await
-                    .map_err(|e| tool_error("transaction.move", Some(&node_id), e))?;
-                self.cache.invalidate_node(&node_id);
-                self.cache.invalidate_node(&new_parent);
-                if let Some(pid) = &prev_parent_id {
-                    self.cache.invalidate_node(pid);
-                }
-                self.name_index.invalidate_node(&node_id);
-                let summary = json!({ "op": "move", "id": node_id.clone(), "to": new_parent.clone() });
-                let inverse = TxnInverse::UnMove {
-                    node_id,
-                    prev_parent_id,
-                    prev_priority,
-                };
-                Ok((summary, Some(inverse)))
-            }
-            "complete" | "uncomplete" => {
-                let target_state = op.op == "complete";
-                let node_id_raw = op.node_id.as_ref().ok_or_else(|| {
-                    tool_invalid_params(
-                        "transaction",
-                        None,
-                        format!("{} requires `node_id`", op.op),
-                    )
-                })?;
-                let node_id = self.resolve_node_ref(node_id_raw).await?;
-                // Capture prior state so we can flip back on rollback.
-                // A failed pre-read disables the rollback for this op
-                // rather than aborting (same policy as `edit`).
-                let prev = self.client.get_node(&node_id).await.ok();
-                let prev_completed = prev.as_ref().map(|n| n.completed_at.is_some());
-                self.client
-                    .set_completion(&node_id, target_state)
-                    .await
-                    .map_err(|e| {
-                        tool_error(
-                            if target_state { "transaction.complete" } else { "transaction.uncomplete" },
-                            Some(&node_id),
-                            e,
-                        )
-                    })?;
-                self.cache.invalidate_node(&node_id);
-                self.name_index.invalidate_node(&node_id);
-                let summary = json!({
-                    "op": op.op,
-                    "id": node_id.clone(),
-                });
-                let inverse = prev_completed.map(|p| TxnInverse::RestoreCompletion {
-                    node_id,
-                    prev_completed: p,
-                });
-                Ok((summary, inverse))
-            }
-            other => Err(tool_invalid_params(
-                "transaction",
-                None,
-                format!("unknown transaction op '{}'; expected create/edit/delete/move/complete/uncomplete", other),
-            )),
-        }
-    }
-
-    /// Apply a single inverse during rollback. Each path is best-effort:
-    /// failures during rollback are surfaced to the caller in the
-    /// transaction response but do not stop the rollback from continuing.
-    async fn run_inverse(&self, inv: TxnInverse) -> Result<serde_json::Value, McpError> {
-        match inv {
-            TxnInverse::DeleteCreated { node_id, parent_id } => {
-                self.client
-                    .delete_node(&node_id)
-                    .await
-                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback delete failed: {}", e)))?;
-                if let Some(pid) = &parent_id {
-                    self.cache.invalidate_node(pid);
-                }
-                self.name_index.invalidate_node(&node_id);
-                Ok(json!({ "rolled_back": "create", "id": node_id }))
-            }
-            TxnInverse::RestoreEdit { node_id, prev_name, prev_description } => {
-                self.client
-                    .edit_node(&node_id, prev_name.as_deref(), prev_description.as_deref())
-                    .await
-                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback edit failed: {}", e)))?;
-                self.cache.invalidate_node(&node_id);
-                self.name_index.invalidate_node(&node_id);
-                Ok(json!({ "rolled_back": "edit", "id": node_id }))
-            }
-            TxnInverse::UnMove { node_id, prev_parent_id, prev_priority } => {
-                if let Some(pid) = prev_parent_id {
-                    self.client
-                        .move_node(&node_id, &pid, prev_priority)
-                        .await
-                        .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback move failed: {}", e)))?;
-                    self.cache.invalidate_node(&node_id);
-                    self.cache.invalidate_node(&pid);
-                    Ok(json!({ "rolled_back": "move", "id": node_id, "to": pid }))
-                } else {
-                    Ok(json!({ "skipped": "move", "id": node_id, "reason": "previous parent unknown" }))
-                }
-            }
-            TxnInverse::RestoreCompletion { node_id, prev_completed } => {
-                self.client
-                    .set_completion(&node_id, prev_completed)
-                    .await
-                    .map_err(|e| tool_error("transaction", Some(&node_id), format!("rollback completion failed: {}", e)))?;
-                self.cache.invalidate_node(&node_id);
-                self.name_index.invalidate_node(&node_id);
-                Ok(json!({ "rolled_back": "completion", "id": node_id, "restored_to": prev_completed }))
-            }
-        }
-    }
-}
+// `apply_txn_op`, `run_inverse`, and the `TxnInverse` enum lived here
+// until the 2026-05-04 transaction lift moved the orchestration into
+// `crate::workflows::run_transaction`. The MCP `transaction` handler
+// and the `wflow-do transaction` CLI both delegate to that single
+// implementation.
 
 #[tool_handler]
 impl ServerHandler for WorkflowyMcpServer {
@@ -5232,8 +4986,39 @@ mod tests {
             "content": "Line 1\n  Child 1\n  Child 2\nLine 2"
         }))
         .unwrap();
-        assert_eq!(params.parent_id, "target-node");
+        assert_eq!(
+            params.parent_id.as_ref().map(|n| n.as_ref()),
+            Some("target-node"),
+        );
         assert!(params.content.contains("Child 1"));
+    }
+
+    /// Failure-report 2026-05-03 fix #1: every parent-scoped tool
+    /// must accept `parent_id: null` as "workspace root", and the
+    /// `insert_content` shape was the divergent one rejecting null
+    /// at the schema layer. Pin the new contract: null deserializes
+    /// to None, and an omitted field deserializes to None.
+    #[test]
+    fn insert_content_params_accepts_null_parent_id() {
+        let with_null: InsertContentParams = serde_json::from_value(json!({
+            "parent_id": null,
+            "content": "root level"
+        }))
+        .expect("null parent_id must deserialize as None");
+        assert!(with_null.parent_id.is_none(), "null must map to None");
+
+        let omitted: InsertContentParams = serde_json::from_value(json!({
+            "content": "root level"
+        }))
+        .expect("omitted parent_id must deserialize as None");
+        assert!(omitted.parent_id.is_none(), "omitted must map to None");
+
+        let with_value: InsertContentParams = serde_json::from_value(json!({
+            "parent_id": "550e8400-e29b-41d4-a716-446655440000",
+            "content": "scoped"
+        }))
+        .expect("valid uuid must deserialize as Some");
+        assert!(with_value.parent_id.is_some());
     }
 
     #[test]
@@ -6085,17 +5870,29 @@ mod tests {
         assert!(lf["reason"].as_str().is_some(), "reason missing: {lf}");
     }
 
-    /// Brief 2026-04-25 Pattern 6: the propagation-retry helpers must
-    /// exist on the API client for delete/edit/move so handlers can
-    /// route through them. Anchors the contract — if a future refactor
-    /// removes one of these methods, the test fails before deploy.
+    /// Brief 2026-04-25 Pattern 6 + 2026-05-04 unification: every
+    /// user-facing mutation gets propagation-retry on 404. For
+    /// `delete_node`, `edit_node`, `set_completion` the retry lives in
+    /// a `*_with_propagation_retry` wrapper that the handlers route
+    /// through, while the bare method is reserved for callers that
+    /// want one-shot semantics (transaction pre-reads, bulk-walk
+    /// per-node `is_ok()` apply paths). For `move_node` the failure
+    /// report 2026-05-03 documented a divergence symptom — handler
+    /// used the wrapper, `transaction.move` used the bare, and the
+    /// per-tool counters showed move_node failing 11% while transaction
+    /// move succeeded 100%. The fix collapsed the two move entry
+    /// points into one self-retrying `client.move_node` so every move
+    /// caller (handler, transaction, CLI) gets identical resilience.
+    /// `move_node` is therefore intentionally absent from this list —
+    /// the propagation-retry now lives inside the bare method, pinned
+    /// separately by `move_node_embeds_propagation_retry_loop`.
     #[test]
     fn propagation_retry_helpers_exist_for_all_mutations() {
         let src = include_str!("../api/client.rs");
         for needle in &[
             "delete_node_with_propagation_retry",
             "edit_node_with_propagation_retry",
-            "move_node_with_propagation_retry",
+            "set_completion_with_propagation_retry",
             // Pre-existing helpers from T-159 — guard against accidental removal.
             "get_node_with_propagation_retry",
             "get_children_with_propagation_retry",
@@ -6109,13 +5906,54 @@ mod tests {
         for handler in &[
             "delete_node_with_propagation_retry",
             "edit_node_with_propagation_retry",
-            "move_node_with_propagation_retry",
+            "set_completion_with_propagation_retry",
         ] {
             assert!(
                 server_src.contains(handler),
                 "handler must route through {} (Pattern 6)", handler
             );
         }
+    }
+
+    /// Pin: `client.move_node` embeds the 404 propagation-retry loop
+    /// directly. Until the 2026-05-04 unification this lived in a
+    /// `move_node_with_propagation_retry` wrapper, while `transaction.move`
+    /// and `bulk_update` rolled-back paths called the bare `move_node` —
+    /// the divergence the failure-report 2026-05-03 traced to an 11%
+    /// success rate on the move_node tool while transaction move
+    /// succeeded at 100%. Adding a new move entry point that bypasses
+    /// the embedded retry would re-open the same divergence; this test
+    /// is the regression brake.
+    #[test]
+    fn move_node_embeds_propagation_retry_loop() {
+        let src = include_str!("../api/client.rs");
+        // The doc comment names the unification.
+        assert!(
+            src.contains("Failure-report 2026-05-03 unification"),
+            "client.move_node must explain why retry is embedded — that comment is the contract"
+        );
+        // The body must contain the 404 retry loop locally.
+        let move_body_start = src.find("pub async fn move_node(")
+            .expect("move_node method must exist");
+        let move_body = &src[move_body_start..];
+        let next_method = move_body.find("\n    pub ").unwrap_or(move_body.len());
+        let move_body = &move_body[..next_method];
+        assert!(
+            move_body.contains("MAX_PROP_RETRIES") && move_body.contains("is_404_like"),
+            "move_node body must embed the propagation-retry loop directly, not delegate to a wrapper"
+        );
+        // No legacy wrapper survives — otherwise callers may still
+        // route through it and the divergence re-emerges. Only check
+        // `client.rs` (the API surface); this test file naturally
+        // mentions the deleted name in comments and assertion text.
+        // The match is on the method-definition shape so a bare
+        // mention in a doc comment doesn't false-positive.
+        let legacy_definition = "fn move_node_with_propagation_retry";
+        assert!(
+            !src.contains(legacy_definition),
+            "the legacy move-node retry wrapper must stay deleted; \
+             reintroducing it lets callers diverge again"
+        );
     }
 
     /// Brief 2026-04-25 follow-up Test γ: every tool_error carries a
@@ -6976,19 +6814,60 @@ mod tests {
         assert!(err.to_string().to_lowercase().contains("unknown format"));
     }
 
+    /// Failure-report 2026-05-04 fix: `create_mirror` was a stub that
+    /// always returned `not implemented`. Option 1 (convention-based
+    /// mirror) replaced it: duplicate the canonical's name into a new
+    /// node under target_parent and write `mirror_of: <canonical>` to
+    /// its description. The shape is now testable without a live API.
+    /// This test pins the validation surface — when the canonical node
+    /// id is the same as the target_parent (mirror-of-self), the
+    /// handler must reject up-front with a structured envelope rather
+    /// than calling out to the API and producing a downstream surprise.
     #[tokio::test]
-    async fn create_mirror_returns_explanatory_error() {
+    async fn create_mirror_rejects_self_mirror() {
         let server = new_test_server();
+        let id = valid_id();
         let err = server
             .create_mirror(Parameters(CreateMirrorParams {
-                canonical_node_id: NodeId::from(valid_id()),
-                target_parent_id: NodeId::from(other_valid_id()),
+                canonical_node_id: NodeId::from(id),
+                target_parent_id: Some(NodeId::from(id)),
                 priority: None,
+                pillar: None,
             }))
             .await
-            .expect_err("create_mirror is documented as not implemented");
+            .expect_err("mirror-of-self must reject");
         let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("not implemented") || msg.contains("does not expose"), "got: {msg}");
+        assert!(
+            msg.contains("cannot mirror itself") || msg.contains("cannot equal"),
+            "rejection must explain the constraint: {msg}"
+        );
+        // Same structured envelope as every other tool error.
+        let json = serde_json::to_value(&err).expect("McpError serialises");
+        assert_eq!(
+            json["data"]["proximate_cause"], "invalid_params",
+            "self-mirror must classify as invalid_params: {json}"
+        );
+        assert_eq!(json["data"]["operation"], "create_mirror");
+    }
+
+    /// Pin the parameter shape so the schema published to the MCP
+    /// client matches what the handler reads. `target_parent_id` was
+    /// originally `NodeId` (non-optional) — the 2026-05-04 update
+    /// loosened it to `Option<NodeId>` so callers can mirror under the
+    /// workspace root via null, matching `create_node`. Adding
+    /// `pillar` is a separate change that a deserialise-and-check
+    /// confirms is wired through schemars correctly.
+    #[test]
+    fn create_mirror_params_accept_null_target_parent_and_optional_pillar() {
+        let v = serde_json::json!({
+            "canonical_node_id": "550e8400-e29b-41d4-a716-446655440000",
+            "target_parent_id": null,
+            "pillar": "lead",
+        });
+        let params: CreateMirrorParams =
+            serde_json::from_value(v).expect("null target_parent_id must deserialise");
+        assert!(params.target_parent_id.is_none());
+        assert_eq!(params.pillar.as_deref(), Some("lead"));
     }
 
     #[tokio::test]
@@ -7536,7 +7415,7 @@ mod tests {
             .collect();
         let content = lines.join("\n");
         let params = InsertContentParams {
-            parent_id: NodeId::from("550e8400-e29b-41d4-a716-446655440000"),
+            parent_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
             content,
         };
         let err = server
@@ -8576,7 +8455,7 @@ mod load_tests {
         let started = Instant::now();
         let result = server
             .insert_content(Parameters(InsertContentParams {
-                parent_id: NodeId::from(id_a()),
+                parent_id: Some(NodeId::from(id_a())),
                 content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
             }))
             .await
@@ -8993,7 +8872,7 @@ mod load_tests {
         let call = tokio::spawn(async move {
             server_for_call
                 .insert_content(Parameters(InsertContentParams {
-                    parent_id: NodeId::from(id_a()),
+                    parent_id: Some(NodeId::from(id_a())),
                     content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
                 }))
                 .await

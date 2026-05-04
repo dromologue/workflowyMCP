@@ -39,13 +39,16 @@ When the intent is ambiguous, ask one clarifying question rather than guessing.
 
 ## Server contracts the workflows depend on
 
-Four contracts the workflowy-mcp server ships — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them. Any additional service the user has configured (per `$SECONDBRAIN_DIR/memory/services.md`) ships its own contracts; document those alongside the service entry, not here.
+Seven contracts the workflowy-mcp server ships — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them. Any additional service the user has configured (per `$SECONDBRAIN_DIR/memory/services.md`) ships its own contracts; document those alongside the service entry, not here.
 
 1. **`complete_node` is the native completion path; `bulk_update` accepts `complete` / `uncomplete`.** The legacy `#done` tag-as-completion-marker is deprecated for tasks (`#done` on reading-list entries to mark "I've distilled this source" remains a separate convention). Workflowy's wire field is `note` for descriptions and `completed` for the boolean.
 2. **`Parameters<T>` is the wrapper name on every tool's input.** If parameter-bearing calls suddenly silently misroute (every call acts as if you sent no arguments, only `workflowy_status` works), the server has regressed the wrapper name and the cowork client is validating against an empty schema. Recovery: route through `wflow-do` until the server is rebuilt.
 3. **`use_index=true` is the recovery for walk-budget timeouts on name queries.** `find_node` and `search_nodes` answer from the persistent name index in O(1) with no walk budget. Index is name-only — descriptions need a live walk. Populate via `build_name_index(parent_id=<scope>)` once per fresh session or whenever the index is sparse.
 4. **Every walk-shaped tool emits the same JSON-truncation envelope** (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`). Read these on every walk response — don't silently accept partial results.
-The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every non-diagnostic tool has a matching subcommand. Drift fails the build, so the fallback path is always available when transport drops.
+5. **`parent_id: null` (or omitted) means workspace root, uniformly.** `create_node`, `batch_create_nodes`, `insert_content`, `list_children`, and every other parent-scoped tool accept null with the same semantics. Pre-2026-05-04 `insert_content` rejected null at the schema layer ("invalid type: null, expected a string"); the failure-report fix aligned its shape to the rest of the family.
+6. **`insert_content` hard cap is 80 lines per call, lowered from 200 on 2026-05-04.** Above the cap, the call returns a typed error with a chunking instruction; chunk to ≤80 lines and pass the previous batch's `last_inserted_id` as the next call's `parent_id` to keep the hierarchy stitched together. The cap tracks the empirically safe transport ceiling.
+7. **`move_node` is unified across the bare tool, `transaction.move`, and the CLI.** Until 2026-05-04 the bare handler used a propagation-retry wrapper while `transaction.move` used a plain method, producing the divergence the failure-report 2026-05-03 traced (11 % vs 100 % success rate). The retry now lives inside `client.move_node` itself, so every move caller gets identical resilience.
+The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every non-diagnostic tool has a matching subcommand. Drift fails the build, so the fallback path is always available when transport drops. Workflow orchestration that used to be duplicated between server and CLI (`create_mirror`, with more to follow) is being lifted into a shared `crate::workflows` module so a fix lands in both surfaces.
 
 ---
 
@@ -220,7 +223,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 
 ### Synthesise (slower, compounding)
 
-- **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes.
+- **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes via `create_mirror(canonical_node_id, target_parent_id, pillar?)` — the mirror's name is copied from the canonical and its description gets `mirror_of: <canonical_uuid>` so `audit_mirrors` can surface drift later. Pass `pillar` when the canonical lacks a `canonical_of:` marker; existing markers are never overwritten.
 - **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
 - **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
 - **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.

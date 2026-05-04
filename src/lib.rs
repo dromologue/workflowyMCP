@@ -11,5 +11,6 @@ pub mod server;
 pub mod types;
 pub mod utils;
 pub mod validation;
+pub mod workflows;
 
 pub use error::{Result, WorkflowyError};

@@ -1074,21 +1074,68 @@ impl WorkflowyClient {
         }
     }
 
-    /// Move-with-retry counterpart. Routes 404s on either the moved
-    /// node or the new parent through the propagation-retry loop;
-    /// parent-related 4xx still goes through the existing
-    /// refresh-and-retry path inside [`Self::move_node`] itself, so
-    /// both kinds of upstream lag are covered.
-    pub async fn move_node_with_propagation_retry(
+    /// Move a node to a new parent.
+    ///
+    /// **Failure-report 2026-05-03 unification.** Until 2026-05-04 there
+    /// were two move entry points on this client: a bare `move_node` that
+    /// did one POST plus a parent-error refresh-and-retry, and a
+    /// `move_node_with_propagation_retry` wrapper that added a 3-attempt
+    /// 404 retry on top. The bare handler routed through the wrapper; the
+    /// `transaction.move` op routed through the bare. The session report
+    /// recorded `move_node` failing 11% of the time and `transaction`
+    /// move succeeding 100% — the divergence was mechanical, not
+    /// behavioural. Unified here: both kinds of propagation lag (404 on
+    /// the moved node, parent-related 4xx on the new parent) are handled
+    /// inside this method, so every caller — server handler, transaction
+    /// op, CLI — gets the same resilience without having to remember
+    /// which wrapper to call.
+    ///
+    /// Workflowy uses POST (not PUT) for move. The retry policy:
+    /// - 404 on the moved node: up to 3 attempts with exponential backoff
+    ///   (200ms / 400ms), covering the case where the node was created
+    ///   moments earlier and upstream hasn't propagated the new id yet.
+    /// - parent-related 4xx ("parent not found", "stale parent"): refresh
+    ///   the new parent's children listing once (which forces upstream to
+    ///   re-evaluate its view of parent state), then retry the same
+    ///   attempt. The refresh is part of one logical attempt, not a
+    ///   separate one — it doesn't consume a 404-retry slot.
+    /// - 5xx and other transient errors: handled by the request layer's
+    ///   own backoff, which is separate from this propagation logic.
+    pub async fn move_node(
         &self,
         node_id: &str,
         new_parent_id: &str,
         priority: Option<i32>,
     ) -> Result<()> {
         const MAX_PROP_RETRIES: u32 = 3;
+        let mut body = json!({ "parent_id": new_parent_id });
+        if let Some(pri) = priority {
+            body["priority"] = json!(pri);
+        }
+        let endpoint = format!("/nodes/{}/move", node_id);
+
         let mut attempt: u32 = 0;
         loop {
-            match self.move_node(node_id, new_parent_id, priority).await {
+            let outcome = match self
+                .request::<serde_json::Value>("POST", &endpoint, Some(body.clone()))
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) if is_parent_related_error(&e) => {
+                    // Parent-related 4xx: refresh and retry the same logical
+                    // attempt. Doesn't consume a 404-retry slot.
+                    let _ = self.get_children(new_parent_id).await;
+                    match self
+                        .request::<serde_json::Value>("POST", &endpoint, Some(body.clone()))
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(e2) => Err(e2),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match outcome {
                 Ok(()) => return Ok(()),
                 Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
                     let delay_ms = 200u64 * (1u64 << attempt);
@@ -1105,43 +1152,6 @@ impl WorkflowyClient {
                 }
                 Err(e) => return Err(e),
             }
-        }
-    }
-
-    /// Move a node to a new parent.
-    ///
-    /// Workflowy uses POST (not PUT) for move. On a parent-related 4xx
-    /// (e.g. "parent not found", "stale parent"), retry once after
-    /// re-fetching the new parent's children listing — the wflow skill
-    /// documented this as needed because IDs handed back by the server
-    /// can stale faster than callers can use them. The retry refreshes
-    /// any in-memory state the upstream relies on without changing the
-    /// caller-visible contract: a single move request still returns
-    /// either Ok or one Err.
-    pub async fn move_node(
-        &self,
-        node_id: &str,
-        new_parent_id: &str,
-        priority: Option<i32>,
-    ) -> Result<()> {
-        let mut body = json!({ "parent_id": new_parent_id });
-        if let Some(pri) = priority {
-            body["priority"] = json!(pri);
-        }
-        let endpoint = format!("/nodes/{}/move", node_id);
-
-        match self.request::<serde_json::Value>("POST", &endpoint, Some(body.clone())).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_parent_related_error(&e) => {
-                // Refresh the new parent's children listing (which forces
-                // upstream to re-evaluate its view of the parent's state),
-                // then retry the move once. If the second attempt also
-                // fails, surface that error unchanged.
-                let _ = self.get_children(new_parent_id).await;
-                let _: serde_json::Value = self.request("POST", &endpoint, Some(body)).await?;
-                Ok(())
-            }
-            Err(e) => Err(e),
         }
     }
 

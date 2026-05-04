@@ -244,9 +244,11 @@ enum Cmd {
     },
     /// Insert hierarchical 2-space-indented content under a parent.
     /// Mirrors MCP `insert_content`. Reads content from stdin if `--content`
-    /// is not supplied.
+    /// is not supplied. Omit `parent_id` to insert at the workspace root —
+    /// matches the null-means-root convention used by `create` and the
+    /// MCP `insert_content` tool since the failure-report 2026-05-03 fix.
     Insert {
-        parent_id: String,
+        parent_id: Option<String>,
         /// Inline content; if omitted, reads from stdin.
         #[arg(long)]
         content: Option<String>,
@@ -360,6 +362,28 @@ enum Cmd {
     AuditMirrors {
         #[arg(long)]
         root: Option<String>,
+    },
+    /// Create a convention-based mirror of a canonical node under a
+    /// new parent. Mirrors MCP `create_mirror`. The mirror's name is
+    /// copied verbatim from the canonical, and its description carries
+    /// `mirror_of: <canonical_uuid>`. Workflowy's REST API does not
+    /// expose native mirror creation; this is the documented note
+    /// convention `audit_mirrors` already understands. Edits to the
+    /// canonical do NOT propagate to the mirror.
+    CreateMirror {
+        /// UUID or short hash of the canonical node to mirror.
+        canonical_node_id: String,
+        /// UUID, short hash, or omitted for workspace root.
+        #[arg(long = "to")]
+        target_parent_id: Option<String>,
+        /// Position among siblings of the new mirror (lower = earlier).
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Optional pillar token to write to the canonical's
+        /// `canonical_of:` marker if it lacks one. Skipped when
+        /// omitted; existing markers are never overwritten.
+        #[arg(long)]
+        pillar: Option<String>,
     },
     /// Surface what's worth re-reading: revisit-due, multi-pillar, stale, source-MOC reuse.
     Review {
@@ -492,6 +516,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::BuildNameIndex { .. } => "build-name-index",
         Cmd::RecentTools { .. } => "recent-tools",
         Cmd::AuditMirrors { .. } => "audit-mirrors",
+        Cmd::CreateMirror { .. } => "create-mirror",
         Cmd::Review { .. } => "review",
         Cmd::Index { .. } => "index",
         Cmd::Reindex { .. } => "reindex",
@@ -527,7 +552,7 @@ fn dry_run_line(cmd: &Cmd) -> Option<String> {
         )),
         Cmd::Insert { parent_id, content } => Some(format!(
             "DRY-RUN insert parent_id={} content_lines={}",
-            parent_id,
+            parent_id.as_deref().unwrap_or("<workspace root>"),
             content.as_deref().map(|c| c.lines().count()).unwrap_or(0),
         )),
         Cmd::SmartInsert { search_query, content, .. } => Some(format!(
@@ -627,7 +652,11 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             }
         }
         Cmd::Move { node_id, to, priority } => {
-            client.move_node_with_propagation_retry(node_id, to, *priority).await?;
+            // `client.move_node` itself embeds the propagation-retry loop
+            // since the 2026-05-04 unification — see the docstring at the
+            // method definition. Both this CLI surface and the MCP
+            // `move_node` tool handler call this single entry point.
+            client.move_node(node_id, to, *priority).await?;
             if cli.json {
                 println!("{}", json!({ "ok": true, "node_id": node_id, "new_parent": to }));
             } else {
@@ -1154,50 +1183,31 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     buf
                 }
             };
-            // Parse 2-space indented hierarchical content.
-            struct Parsed { text: String, indent: usize }
-            let parsed: Vec<Parsed> = body.lines().filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() { return None; }
-                let leading = line.len() - line.trim_start().len();
-                Some(Parsed { text: trimmed.to_string(), indent: leading / 2 })
-            }).collect();
+            // Shared workflow handles parsing, cap enforcement,
+            // partial-success reporting. CLI passes a default
+            // (no-cancel, no-deadline) context so the workflow runs
+            // to completion or fails on the first hard error.
+            let parsed = workflowy_mcp_server::workflows::parse_indented_content(&body);
             if parsed.is_empty() {
                 println!("insert: nothing to insert (no non-blank lines)");
                 return Ok(());
             }
-            if parsed.len() > defaults::MAX_INSERT_CONTENT_LINES {
-                return Err(format!(
-                    "insert: payload {} lines exceeds the {}-line cap; split into batches and chain via the returned last_inserted_id",
-                    parsed.len(), defaults::MAX_INSERT_CONTENT_LINES,
-                ).into());
-            }
-            let mut parent_stack: Vec<String> = vec![parent_id.clone()];
-            let mut created = 0usize;
-            let mut last_inserted_id: Option<String> = None;
-            for line in &parsed {
-                let indent = line.indent.min(parent_stack.len().saturating_sub(1));
-                let pid = parent_stack[indent].clone();
-                let n = client
-                    .create_node(&line.text, None, Some(&pid), None)
-                    .await?;
-                created += 1;
-                last_inserted_id = Some(n.id.clone());
-                let next_level = indent + 1;
-                if next_level < parent_stack.len() {
-                    parent_stack[next_level] = n.id;
-                    parent_stack.truncate(next_level + 1);
-                } else {
-                    parent_stack.push(n.id);
-                }
-            }
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) =
+                workflowy_mcp_server::workflows::insert_content_via_indented(
+                    &client,
+                    parent_id.as_deref(),
+                    parsed,
+                    &ctx,
+                )
+                .await?;
+            // The CLI surfaces both the Complete and Partial shapes —
+            // unlike pre-2026-05-04, where the CLI had no partial
+            // surface at all. Both shapes are JSON so shell pipelines
+            // can route on `status`.
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "parent_id": parent_id,
-                    "created_count": created,
-                    "last_inserted_id": last_inserted_id,
-                }))?
+                serde_json::to_string_pretty(&serde_json::to_value(&outcome)?)?
             );
         }
         Cmd::SmartInsert { search_query, content, depth } => {
@@ -1233,35 +1243,34 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     buf
                 }
             };
-            // Reuse the Insert path by recursively calling the same routine.
-            // Easier than copying: just inline the create-loop here.
-            struct Parsed { text: String, indent: usize }
-            let parsed: Vec<Parsed> = body.lines().filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() { return None; }
-                let leading = line.len() - line.trim_start().len();
-                Some(Parsed { text: trimmed.to_string(), indent: leading / 2 })
-            }).collect();
-            let mut stack = vec![parent.id.clone()];
-            let mut created = 0usize;
-            for line in &parsed {
-                let indent = line.indent.min(stack.len().saturating_sub(1));
-                let pid = stack[indent].clone();
-                let n = client.create_node(&line.text, None, Some(&pid), None).await?;
-                created += 1;
-                let next_level = indent + 1;
-                if next_level < stack.len() {
-                    stack[next_level] = n.id;
-                    stack.truncate(next_level + 1);
-                } else {
-                    stack.push(n.id);
-                }
-            }
+            // Insertion delegated to the shared workflow — same
+            // code path the MCP `smart_insert` handler uses, so
+            // both surfaces respect 2-space indentation uniformly.
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) =
+                workflowy_mcp_server::workflows::smart_insert_under_target(
+                    &client,
+                    &parent.id,
+                    &body,
+                    &ctx,
+                )
+                .await?;
+            let created = match &outcome {
+                workflowy_mcp_server::workflows::InsertContentOutcome::Complete {
+                    created_count,
+                    ..
+                } => *created_count,
+                workflowy_mcp_server::workflows::InsertContentOutcome::Partial {
+                    created_count,
+                    ..
+                } => *created_count,
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "matched_parent": { "id": parent.id, "name": parent.name },
                     "created_count": created,
+                    "outcome": outcome,
                 }))?
             );
         }
@@ -1426,34 +1435,32 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 })
                 .take(*limit)
                 .collect();
-            let mut affected = 0usize;
-            for n in &matched {
-                let ok = match operation.as_str() {
-                    "delete" => client.delete_node(&n.id).await.is_ok(),
-                    "complete" => client.set_completion(&n.id, true).await.is_ok(),
-                    "uncomplete" => client.set_completion(&n.id, false).await.is_ok(),
-                    "add_tag" => {
-                        let tag = operation_tag.as_ref().expect("validated above");
-                        let new_name = format!("{} #{}", n.name, tag.trim_start_matches('#'));
-                        client.edit_node(&n.id, Some(&new_name), None).await.is_ok()
-                    }
-                    "remove_tag" => {
-                        let tag = operation_tag.as_ref().expect("validated above").trim_start_matches('#');
-                        let pat = regex::Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(tag)))
-                            .expect("escaped pattern is always valid regex");
-                        let new_name = pat.replace_all(&n.name, "").to_string();
-                        client.edit_node(&n.id, Some(&new_name), None).await.is_ok()
-                    }
-                    _ => false,
-                };
-                if ok { affected += 1; }
-            }
+            // Apply step delegated to the shared workflow — same
+            // code path the MCP `bulk_update` handler uses.
+            let bulk_op = workflowy_mcp_server::workflows::BulkOp::parse(operation)
+                .ok_or_else(|| {
+                    format!(
+                        "bulk-update: unknown operation {:?} (expected delete/complete/uncomplete/add_tag/remove_tag)",
+                        operation,
+                    )
+                })?;
+            let owned_matched: Vec<workflowy_mcp_server::types::WorkflowyNode> =
+                matched.iter().map(|n| (*n).clone()).collect();
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (apply_result, _footprint) = workflowy_mcp_server::workflows::apply_bulk_op(
+                &client,
+                bulk_op,
+                &owned_matched,
+                operation_tag.as_deref(),
+                &ctx,
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "operation": operation,
-                    "matched_count": matched.len(),
-                    "affected_count": affected,
+                    "operation": bulk_op.as_str(),
+                    "matched_count": apply_result.matched_count,
+                    "affected_count": apply_result.affected_count,
                 }))?
             );
         }
@@ -1514,50 +1521,38 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::Transaction { input } => {
-            // Sequential apply with best-effort inverse rollback. Mirrors the
-            // server's `transaction` tool semantics: on first error, replay
-            // inverse ops in reverse order. Inverse coverage matches
-            // server.rs::TxnInverse — create / edit / move / complete are
-            // invertible; delete is not.
+            // Both sequential apply and best-effort rollback live in
+            // `crate::workflows::run_transaction` — same code path the
+            // MCP `transaction` tool uses. The CLI just parses the
+            // input JSON into TxnOps and projects the typed outcome
+            // into stdout.
             let body = read_input_or_stdin(input.as_deref())?;
-            let ops: Vec<serde_json::Value> = serde_json::from_str(&body)
+            let raw_ops: Vec<serde_json::Value> = serde_json::from_str(&body)
                 .map_err(|e| format!("transaction: input must be a JSON array — {}", e))?;
-            let mut applied: Vec<(String, serde_json::Value)> = Vec::new();
-            let mut summaries: Vec<serde_json::Value> = Vec::new();
-            for raw in ops.iter() {
-                let op_kind = raw["op"].as_str().unwrap_or("");
-                let result = apply_txn_step(&client, raw).await;
-                match result {
-                    Ok((summary, inverse)) => {
-                        summaries.push(summary.clone());
-                        if let Some(inv) = inverse {
-                            applied.push((op_kind.to_string(), inv));
-                        }
-                    }
-                    Err(e) => {
-                        // Rollback in reverse order.
-                        let mut rollback: Vec<serde_json::Value> = Vec::new();
-                        for (kind, inv) in applied.iter().rev() {
-                            match run_inverse_step(&client, inv).await {
-                                Ok(v) => rollback.push(v),
-                                Err(re) => rollback.push(json!({"rollback_failed": kind, "error": re.to_string()})),
-                            }
-                        }
-                        return Err(format!(
-                            "transaction failed at op[{}] ({}); rolled back {} of {}: {}\nrollback details: {}",
-                            summaries.len(), op_kind, rollback.len(), applied.len(), e,
-                            serde_json::to_string(&rollback).unwrap_or_default(),
-                        ).into());
-                    }
-                }
+            let mut ops: Vec<workflowy_mcp_server::workflows::TxnOp> =
+                Vec::with_capacity(raw_ops.len());
+            for raw in &raw_ops {
+                let kind_str = raw["op"].as_str().ok_or("transaction: each op needs `op`")?;
+                ops.push(workflowy_mcp_server::workflows::TxnOp {
+                    op: kind_str.to_string(),
+                    node_id: raw["node_id"].as_str().map(str::to_string),
+                    parent_id: raw["parent_id"].as_str().map(str::to_string),
+                    new_parent_id: raw["new_parent_id"].as_str().map(str::to_string),
+                    name: raw["name"].as_str().map(str::to_string),
+                    description: raw["description"].as_str().map(str::to_string),
+                    priority: raw["priority"].as_i64().map(|p| p as i32),
+                });
             }
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) =
+                workflowy_mcp_server::workflows::run_transaction(&client, ops, &ctx).await?;
+            // Both `Applied` and `RolledBack` variants serialise via
+            // serde with a `status` discriminator. Same shape as the
+            // MCP envelope so callers piping JSON between the two
+            // surfaces don't need a translation layer.
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "applied_count": summaries.len(),
-                    "summaries": summaries,
-                }))?
+                serde_json::to_string_pretty(&serde_json::to_value(&outcome)?)?
             );
         }
         Cmd::Export { node_id, format, depth } => {
@@ -1663,6 +1658,45 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     println!("{} {} \"{}\" -> {}", f.status, f.node_id, f.name, f.issue);
                 }
                 println!("---\n{} findings across {} nodes", findings.len(), fetch.nodes.len());
+            }
+        }
+        Cmd::CreateMirror { canonical_node_id, target_parent_id, priority, pillar } => {
+            // The orchestration lives in `crate::workflows` so this
+            // CLI and the MCP `create_mirror` tool share a single
+            // source of truth. The CLI just translates the typed
+            // result into stdout.
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (result, _footprint) = workflowy_mcp_server::workflows::create_mirror_via_convention(
+                &client,
+                canonical_node_id,
+                target_parent_id.as_deref(),
+                *priority,
+                pillar.as_deref(),
+                &ctx,
+            )
+            .await?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "mirror_id": result.mirror_id,
+                        "canonical_id": result.canonical_id,
+                        "target_parent_id": result.target_parent_id,
+                        "name": result.name,
+                        "audit_status": result.audit_status,
+                        "annotated_canonical": result.annotated_canonical,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Created mirror {} of canonical {} under {} (audit_status={})",
+                    result.mirror_id,
+                    result.canonical_id,
+                    result.target_parent_id.as_deref().unwrap_or("workspace root"),
+                    result.audit_status,
+                );
+                println!("{}", result.mirror_id);
             }
         }
         Cmd::Review { root, days_stale } => {
@@ -2012,129 +2046,10 @@ fn read_input_or_stdin(path: Option<&str>) -> Result<String, Box<dyn std::error:
     }
 }
 
-/// One transaction step, applied directly through the client. Mirrors
-/// `WorkflowyMcpServer::apply_txn_op` but without the rmcp / tool_error
-/// machinery (the CLI surfaces errors via `Box<dyn Error>`). Returns the
-/// summary for the success log plus an optional `(kind, inverse-payload)`
-/// pair captured for rollback. Inverse coverage matches the server's
-/// `TxnInverse` enum.
-async fn apply_txn_step(
-    client: &Arc<WorkflowyClient>,
-    raw: &serde_json::Value,
-) -> Result<(serde_json::Value, Option<serde_json::Value>), Box<dyn std::error::Error>> {
-    let op = raw["op"].as_str().ok_or("transaction: each op needs `op`")?;
-    let node_id = raw["node_id"].as_str();
-    match op {
-        "create" => {
-            let name = raw["name"].as_str()
-                .ok_or("transaction.create: requires `name`")?;
-            let parent_id = raw["parent_id"].as_str();
-            let description = raw["description"].as_str();
-            let priority = raw["priority"].as_i64().map(|p| p as i32);
-            let created = client.create_node(name, description, parent_id, priority).await?;
-            let summary = json!({"op": "create", "id": created.id, "name": created.name});
-            let inverse = json!({"op": "delete-created", "node_id": created.id});
-            Ok((summary, Some(inverse)))
-        }
-        "edit" => {
-            let id = node_id.ok_or("transaction.edit: requires `node_id`")?;
-            let name = raw["name"].as_str();
-            let description = raw["description"].as_str();
-            if name.is_none() && description.is_none() {
-                return Err("transaction.edit: name or description required".into());
-            }
-            let prev = client.get_node(id).await.ok();
-            client.edit_node(id, name, description).await?;
-            let summary = json!({"op": "edit", "id": id});
-            let inverse = prev.map(|p| json!({
-                "op": "restore-edit", "node_id": id,
-                "prev_name": p.name, "prev_description": p.description,
-            }));
-            Ok((summary, inverse))
-        }
-        "delete" => {
-            let id = node_id.ok_or("transaction.delete: requires `node_id`")?;
-            client.delete_node(id).await?;
-            let summary = json!({"op": "delete", "id": id});
-            // Delete is intentionally not invertible.
-            Ok((summary, None))
-        }
-        "move" => {
-            let id = node_id.ok_or("transaction.move: requires `node_id`")?;
-            let new_parent = raw["new_parent_id"].as_str()
-                .ok_or("transaction.move: requires `new_parent_id`")?;
-            let priority = raw["priority"].as_i64().map(|p| p as i32);
-            let prev = client.get_node(id).await.ok();
-            let prev_parent = prev.as_ref().and_then(|p| p.parent_id.clone());
-            let prev_priority = prev.as_ref().and_then(|p| p.priority).map(|p| p as i32);
-            client.move_node(id, new_parent, priority).await?;
-            let summary = json!({"op": "move", "id": id, "to": new_parent});
-            let inverse = json!({
-                "op": "un-move", "node_id": id,
-                "prev_parent_id": prev_parent, "prev_priority": prev_priority,
-            });
-            Ok((summary, Some(inverse)))
-        }
-        "complete" | "uncomplete" => {
-            let id = node_id.ok_or(format!("transaction.{}: requires `node_id`", op))?;
-            let target = op == "complete";
-            let prev = client.get_node(id).await.ok();
-            let prev_completed = prev.as_ref().map(|p| p.completed_at.is_some());
-            client.set_completion(id, target).await?;
-            let summary = json!({"op": op, "id": id});
-            let inverse = prev_completed.map(|p| json!({
-                "op": "restore-completion", "node_id": id, "prev_completed": p,
-            }));
-            Ok((summary, inverse))
-        }
-        other => Err(format!(
-            "transaction: unknown op {:?} (expected create/edit/delete/move/complete/uncomplete)",
-            other
-        ).into()),
-    }
-}
-
-/// Apply one inverse op recorded by `apply_txn_step`. Same shape as
-/// `WorkflowyMcpServer::run_inverse`.
-async fn run_inverse_step(
-    client: &Arc<WorkflowyClient>,
-    inv: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let kind = inv["op"].as_str().unwrap_or("");
-    match kind {
-        "delete-created" => {
-            let id = inv["node_id"].as_str().ok_or("delete-created: missing node_id")?;
-            client.delete_node(id).await?;
-            Ok(json!({"rolled_back": "create", "id": id}))
-        }
-        "restore-edit" => {
-            let id = inv["node_id"].as_str().ok_or("restore-edit: missing node_id")?;
-            let prev_name = inv["prev_name"].as_str();
-            let prev_description = inv["prev_description"].as_str();
-            client.edit_node(id, prev_name, prev_description).await?;
-            Ok(json!({"rolled_back": "edit", "id": id}))
-        }
-        "un-move" => {
-            let id = inv["node_id"].as_str().ok_or("un-move: missing node_id")?;
-            let prev_parent_id = inv["prev_parent_id"].as_str();
-            let prev_priority = inv["prev_priority"].as_i64().map(|p| p as i32);
-            match prev_parent_id {
-                Some(pid) => {
-                    client.move_node(id, pid, prev_priority).await?;
-                    Ok(json!({"rolled_back": "move", "id": id, "to": pid}))
-                }
-                None => Ok(json!({"skipped": "move", "id": id, "reason": "previous parent unknown"})),
-            }
-        }
-        "restore-completion" => {
-            let id = inv["node_id"].as_str().ok_or("restore-completion: missing node_id")?;
-            let prev = inv["prev_completed"].as_bool().unwrap_or(false);
-            client.set_completion(id, prev).await?;
-            Ok(json!({"rolled_back": "completion", "id": id, "restored_to": prev}))
-        }
-        other => Err(format!("rollback: unknown inverse kind {:?}", other).into()),
-    }
-}
+// Until 2026-05-04 the CLI carried its own `apply_txn_step` and
+// `run_inverse_step` helpers — JSON-blob equivalents of the server's
+// `apply_txn_op` and `run_inverse`. Both are now collapsed into
+// `crate::workflows::run_transaction`, which both surfaces call.
 
 /// Render a subtree as nested 2-space-indented Markdown bullets. Walks
 /// `parent_id` chains starting from `root_id` so the order matches the
@@ -2266,7 +2181,7 @@ mod tests {
             // Diagnostics
             "health-check", "cancel-all", "build-name-index", "recent-tools",
             // Existing diagnostics + index
-            "audit-mirrors", "review", "index", "reindex",
+            "audit-mirrors", "create-mirror", "review", "index", "reindex",
         ] {
             assert!(help.contains(sub), "help missing subcommand: {sub}\n{help}");
         }
@@ -2279,11 +2194,13 @@ mod tests {
     /// caught here at build time — the audit list is the source of truth.
     #[test]
     fn cli_covers_every_non_diagnostic_mcp_tool() {
-        // Every non-diagnostic / non-stub MCP tool has a CLI counterpart.
+        // Every non-diagnostic MCP tool has a CLI counterpart.
         // `convert_markdown` is a pure local transform with no API and is
-        // intentionally excluded; `create_mirror` is a stub that always
-        // errors and is intentionally excluded. Diagnostics that exist
-        // only in-process on the MCP server (`recent-tools`, `cancel-all`)
+        // intentionally excluded. (`create_mirror` was a stub through
+        // 2026-05-04; the failure-report follow-up replaced it with a
+        // real implementation, and the `create-mirror` CLI subcommand
+        // landed in the same commit.) Diagnostics that exist only
+        // in-process on the MCP server (`recent-tools`, `cancel-all`)
         // ship as no-op CLI wrappers so the surface is uniform.
         let expected_pairs: &[(&str, &str)] = &[
             ("get_node", "get"),
@@ -2319,6 +2236,7 @@ mod tests {
             ("transaction", "transaction"),
             ("export_subtree", "export"),
             ("audit_mirrors", "audit-mirrors"),
+            ("create_mirror", "create-mirror"),
             ("review", "review"),
             ("health_check", "health-check"),
             ("workflowy_status", "status"),
