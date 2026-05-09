@@ -1,7 +1,107 @@
-//! Subtree collection and todo detection utilities.
+//! Subtree collection, todo detection, and subtree-shape renderers
+//! shared between the MCP `export_subtree` handler and the `wflow-do
+//! export` CLI subcommand. The renderers are pure functions over a
+//! `&[WorkflowyNode]` slice so both surfaces call the same code (the
+//! 2026-05-09 duplication audit caught two byte-identical copies in
+//! `server/mod.rs` and `bin/wflow_do.rs`).
 
 use std::collections::HashMap;
 use crate::types::WorkflowyNode;
+
+/// Render a subtree as nested Markdown bullets. Depth is determined by
+/// following parent_id chains within the supplied node set, so the
+/// output mirrors the actual tree shape regardless of the order
+/// `nodes` was returned in.
+pub fn render_subtree_markdown(nodes: &[WorkflowyNode], root_id: &str) -> String {
+    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.clone()).or_default().push(n);
+        }
+    }
+    let mut out = String::new();
+    fn walk(
+        node: &WorkflowyNode,
+        depth: usize,
+        children_of: &HashMap<String, Vec<&WorkflowyNode>>,
+        out: &mut String,
+    ) {
+        let indent = "  ".repeat(depth);
+        out.push_str(&format!("{}- {}\n", indent, node.name));
+        if let Some(desc) = &node.description {
+            for line in desc.lines() {
+                out.push_str(&format!("{}    {}\n", indent, line));
+            }
+        }
+        if let Some(children) = children_of.get(&node.id) {
+            for child in children {
+                walk(child, depth + 1, children_of, out);
+            }
+        }
+    }
+    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
+        walk(root, 0, &children_of, &mut out);
+    }
+    out
+}
+
+/// Render a subtree as OPML — Workflowy and other outliners can
+/// re-import this losslessly enough for backup/exchange. We escape the
+/// four XML metacharacters and emit each node as a single-line
+/// `<outline>` element.
+pub fn render_subtree_opml(nodes: &[WorkflowyNode], root_id: &str) -> String {
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.clone()).or_default().push(n);
+        }
+    }
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n  <body>\n");
+    fn walk(
+        node: &WorkflowyNode,
+        depth: usize,
+        children_of: &HashMap<String, Vec<&WorkflowyNode>>,
+        out: &mut String,
+    ) {
+        let indent = "  ".repeat(depth + 2);
+        let name = xml_escape(&node.name);
+        let desc = node
+            .description
+            .as_deref()
+            .map(xml_escape)
+            .unwrap_or_default();
+        let descendants = children_of.get(&node.id);
+        let self_closing = descendants.is_none() && desc.is_empty();
+        if self_closing {
+            out.push_str(&format!("{}<outline text=\"{}\"/>\n", indent, name));
+        } else {
+            if desc.is_empty() {
+                out.push_str(&format!("{}<outline text=\"{}\">\n", indent, name));
+            } else {
+                out.push_str(&format!("{}<outline text=\"{}\" _note=\"{}\">\n", indent, name, desc));
+            }
+            if let Some(children) = descendants {
+                for child in children {
+                    walk(child, depth + 1, children_of, out);
+                }
+            }
+            out.push_str(&format!("{}</outline>\n", indent));
+        }
+    }
+    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
+        walk(root, 0, &children_of, &mut out);
+    }
+    out.push_str("  </body>\n</opml>\n");
+    out
+}
 
 /// Collect all nodes in a subtree (root + all descendants).
 pub fn get_subtree_nodes<'a>(root_id: &str, nodes: &'a [WorkflowyNode]) -> Vec<&'a WorkflowyNode> {

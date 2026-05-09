@@ -111,13 +111,29 @@ pub const WRITE_NODE_TIMEOUT_MS: u64 = 15_000;
 /// described in the 2026-05-02 report.
 pub const API_REACHABILITY_FRESHNESS_MS: u64 = 30_000;
 /// Wall-clock budget for a whole `insert_content` operation. The MCP
-/// client (Claude Desktop) hard-times out at 4 min; we return a
-/// structured partial-success well before that so the caller learns
-/// what was inserted instead of seeing a "no result received" with
-/// no diagnostic. Combined with `WRITE_NODE_TIMEOUT_MS` per single
-/// create, this guarantees `insert_content` either completes or
-/// returns deterministic partial-success data.
-pub const INSERT_CONTENT_TIMEOUT_MS: u64 = 210_000;
+/// client (Claude Desktop, claude.ai web) hard-times out at 4 min; we
+/// return a structured partial-success well before that so the caller
+/// learns what was inserted instead of seeing a "no result received"
+/// with no diagnostic. The value was 210_000 (3.5 min) through
+/// 2026-05-09 — close enough to the transport cap that a single slow
+/// HTTP write at the end of the budget could race the client's
+/// timeout and lose the partial-success envelope. The 2026-05-09
+/// failure-report (sub-cap payload, parent_id=null, 4-min hang with
+/// no diagnostic) matched that race exactly. Lowered to 180_000 (3
+/// min) to give a 60-second margin under the transport cap so the
+/// partial-success envelope is reachable on every surface — including
+/// claude.ai web, where the report originated. Combined with
+/// `WRITE_NODE_TIMEOUT_MS` per single create, this guarantees
+/// `insert_content` either completes or returns deterministic
+/// partial-success data well before the client gives up.
+///
+/// Pinned by `bulk_budget_leaves_mcp_transport_margin` ([C-server-008]).
+pub const INSERT_CONTENT_TIMEOUT_MS: u64 = 180_000;
+/// MCP transport hard-timeout window (Claude Desktop / claude.ai web).
+/// We never use this directly — but tests assert
+/// `INSERT_CONTENT_TIMEOUT_MS` stays comfortably below it so the
+/// partial-success envelope is reachable before the client gives up.
+pub const MCP_TRANSPORT_HARD_TIMEOUT_MS: u64 = 240_000;
 
 // --- Tree Traversal ---
 /// Default max_depth for search operations
@@ -235,6 +251,31 @@ mod tests {
         assert!(SUBTREE_FETCH_CONCURRENCY >= 1 && SUBTREE_FETCH_CONCURRENCY <= 50);
         assert!(HEALTH_CHECK_TIMEOUT_MS >= 500 && HEALTH_CHECK_TIMEOUT_MS <= 10_000);
         assert!(AUTH_FAILURE_WINDOW_SECS >= 60 && AUTH_FAILURE_WINDOW_SECS <= 60 * 60);
+    }
+
+    /// [C-server-008] The bulk-tool budget (governing every Bulk-kind
+    /// handler including `insert_content`) must leave a comfortable
+    /// margin under the MCP transport's hard timeout so that the
+    /// structured partial-success / timeout envelopes are reachable
+    /// before the client gives up. The 2026-05-09 failure-report
+    /// observed a sub-cap `insert_content` payload hanging the full
+    /// 4 minutes with no diagnostic — a race between the previous
+    /// 210 s budget and the 240 s transport cap. 60 seconds of
+    /// margin is the minimum (allows the partial-success envelope to
+    /// serialise + traverse the wire without competing with the
+    /// transport cap).
+    #[test]
+    fn bulk_budget_leaves_mcp_transport_margin() {
+        const MIN_MARGIN_MS: u64 = 60_000;
+        assert!(
+            INSERT_CONTENT_TIMEOUT_MS + MIN_MARGIN_MS <= MCP_TRANSPORT_HARD_TIMEOUT_MS,
+            "INSERT_CONTENT_TIMEOUT_MS = {} ms must leave at least {} ms margin under \
+             MCP_TRANSPORT_HARD_TIMEOUT_MS = {} ms so partial-success envelopes are \
+             reachable before the client times out",
+            INSERT_CONTENT_TIMEOUT_MS,
+            MIN_MARGIN_MS,
+            MCP_TRANSPORT_HARD_TIMEOUT_MS,
+        );
     }
 
     #[test]

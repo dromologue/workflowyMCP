@@ -170,6 +170,32 @@ impl MutationFootprint {
 }
 
 // ---------------------------------------------------------------------
+// scope_resolved (shared between MCP responses and CLI dry-run output)
+// ---------------------------------------------------------------------
+
+/// Render a resolved parent-scope as the canonical `scope_resolved`
+/// string the MCP tool family emits and the CLI's `--dry-run` paths
+/// surface. The format is stable and case-sensitive: `"workspace_root"`
+/// when the resolved scope is `None` (caller passed null or omitted),
+/// otherwise `"scoped:<full-uuid>"`. Callers may match on the literal
+/// prefix.
+///
+/// Lifted into `workflows.rs` on 2026-05-09 so the MCP server and the
+/// `wflow-do` CLI use the same renderer — the failure-report
+/// 2026-05-09 fix added `scope_resolved` to the response shape, and a
+/// duplication audit caught the MCP and CLI rendering it
+/// independently. Single source of truth means the scope label cannot
+/// drift between the two surfaces.
+///
+/// Pinned by [C-server-006] / [C-server-007].
+pub fn scope_resolved_label(resolved: Option<&str>) -> String {
+    match resolved {
+        None => "workspace_root".to_string(),
+        Some(uuid) => format!("scoped:{}", uuid),
+    }
+}
+
+// ---------------------------------------------------------------------
 // create_mirror
 // ---------------------------------------------------------------------
 
@@ -189,6 +215,26 @@ pub struct CreateMirrorResult {
     /// callers can route on this without re-running the audit.
     pub audit_status: &'static str,
     pub annotated_canonical: bool,
+}
+
+/// Outcome of a `create_mirror_dry_run`. The "what would happen"
+/// preview the failure-report 2026-05-09 asked for: resolves the
+/// canonical (so the mirror name is accurate) plus the canonical's
+/// existing `canonical_of:` marker (so the would-annotate decision is
+/// authoritative), without writing. Both surfaces serialise this same
+/// struct so the dry_run preview is identical wherever it's invoked.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMirrorDryRun {
+    pub canonical_id: String,
+    pub target_parent_id: Option<String>,
+    /// The mirror's name as a future production call would set it
+    /// (verbatim copy of the canonical's name).
+    pub mirror_name: String,
+    pub canonical_already_marked: bool,
+    pub would_annotate_canonical: bool,
+    /// The pillar token after `pillar.trim().filter(non_empty)`. None
+    /// means no annotation regardless of the canonical's marker state.
+    pub pillar: Option<String>,
 }
 
 /// Create a convention-based mirror of `canonical_id` under
@@ -211,6 +257,48 @@ pub struct CreateMirrorResult {
 /// Cancel/deadline are accepted via `ctx` for API uniformity but the
 /// orchestration is short enough that the outer wrapper's cancel
 /// already covers it; no inline checks needed.
+/// Read-only preview of `create_mirror_via_convention`. Same
+/// resolution work as the production call (mirror-of-self refusal,
+/// canonical name lookup, canonical_of marker probe), zero mutation.
+/// Both the MCP handler's `dry_run=true` path and the CLI's
+/// `--dry-run` flag delegate here so the preview is identical
+/// regardless of surface — the failure-report 2026-05-09 fix asked
+/// for "would-be canonical_id and target_parent_id without writing"
+/// and this is the single function that produces it.
+pub async fn create_mirror_dry_run(
+    client: &WorkflowyClient,
+    canonical_id: &str,
+    target_parent_id: Option<&str>,
+    pillar: Option<&str>,
+) -> Result<CreateMirrorDryRun> {
+    if let Some(parent) = target_parent_id {
+        if parent == canonical_id {
+            return Err(WorkflowyError::InvalidInput {
+                reason: "target_parent_id cannot equal canonical_node_id — \
+                         a node cannot mirror itself into its own subtree"
+                    .to_string(),
+            });
+        }
+    }
+    let canonical = client.get_node(canonical_id).await?;
+    let canonical_desc = canonical.description.clone().unwrap_or_default();
+    let canonical_already_marked =
+        crate::audit::extract_marker(&canonical_desc, "canonical_of:").is_some();
+    let pillar_norm = pillar
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let would_annotate = pillar_norm.is_some() && !canonical_already_marked;
+    Ok(CreateMirrorDryRun {
+        canonical_id: canonical_id.to_string(),
+        target_parent_id: target_parent_id.map(str::to_string),
+        mirror_name: canonical.name,
+        canonical_already_marked,
+        would_annotate_canonical: would_annotate,
+        pillar: pillar_norm,
+    })
+}
+
 pub async fn create_mirror_via_convention(
     client: &WorkflowyClient,
     canonical_id: &str,
@@ -1103,6 +1191,42 @@ mod tests {
         assert!(
             msg.contains("cannot mirror itself") || msg.contains("cannot equal"),
             "validation message must explain the constraint: {msg}"
+        );
+    }
+
+    /// [C-wf-013] `create_mirror_dry_run` rejects self-mirror with the
+    /// same `InvalidInput` envelope as the production call, before any
+    /// API touch. Pinned so the dry-run preview is as authoritative as
+    /// the real call — failure-report 2026-05-09 fix asked for a
+    /// preview that catches the same constraints.
+    #[tokio::test]
+    async fn create_mirror_dry_run_rejects_self_mirror_without_api_call() {
+        let client = WorkflowyClient::new(
+            "http://invalid.local".to_string(),
+            "test-key".to_string(),
+        )
+        .expect("test client builds");
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let err = create_mirror_dry_run(&client, id, Some(id), None)
+            .await
+            .expect_err("dry-run self-mirror must reject");
+        assert!(
+            matches!(err, WorkflowyError::InvalidInput { .. }),
+            "dry-run self-mirror must surface as InvalidInput, got: {err:?}"
+        );
+    }
+
+    /// [C-wf-014] `scope_resolved_label` produces the stable two-form
+    /// label every MCP tool emits: `workspace_root` for None,
+    /// `scoped:<uuid>` for Some. Pinned because a future contributor
+    /// changing the format silently breaks every diagnostic surface
+    /// that callers rely on to audit null-parent resolution.
+    #[test]
+    fn scope_resolved_label_two_branches_render_stable_format() {
+        assert_eq!(scope_resolved_label(None), "workspace_root");
+        assert_eq!(
+            scope_resolved_label(Some("550e8400-e29b-41d4-a716-446655440000")),
+            "scoped:550e8400-e29b-41d4-a716-446655440000",
         );
     }
 

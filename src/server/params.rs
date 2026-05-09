@@ -543,16 +543,24 @@ pub struct ExportSubtreeParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this tool implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (optionally, when `pillar` is supplied) the canonical's description gains `canonical_of: <pillar>` if it lacks one. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Use this when you want a single canonical surfaced from multiple places in the workspace and want `audit_mirrors` to surface drift.")]
+#[schemars(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this tool implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (optionally, when `pillar` is supplied) the canonical's description gains `canonical_of: <pillar>` if it lacks one. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Use this when you want a single canonical surfaced from multiple places in the workspace and want `audit_mirrors` to surface drift. The response carries `scope_resolved` so callers can verify what the server actually targeted; pass `dry_run=true` to preview the resolved canonical/target without writing.")]
 pub struct CreateMirrorParams {
     #[schemars(description = "UUID or short hash of the canonical node to mirror. The mirror's name is copied verbatim from this node at creation time.")]
     pub canonical_node_id: NodeId,
-    #[schemars(description = "Parent under which the mirror should appear (UUID, short hash, or null for workspace root)")]
+    #[schemars(description = "Parent under which the mirror should appear (UUID, short hash, or null for workspace root). Null = workspace root, no exceptions — the response's `scope_resolved` field names what the server actually resolved.")]
     pub target_parent_id: Option<NodeId>,
     #[schemars(description = "Optional priority/sort key for the mirror among its siblings (lower = earlier)")]
     pub priority: Option<i32>,
     #[schemars(description = "Optional pillar token (opaque, e.g. 'lead', 'build') to write to the canonical's `canonical_of:` marker if it lacks one. Skipped when omitted; if the canonical already has a canonical_of marker it is never overwritten.")]
     pub pillar: Option<String>,
+    /// 2026-05-09 failure-report addition: when batching mirror passes
+    /// across a synthesis the caller wants to verify resolution before
+    /// committing eight writes. `dry_run=true` resolves canonical_id +
+    /// target_parent_id, looks up the canonical's name, decides whether
+    /// the optional pillar would annotate, and returns that envelope —
+    /// no mutation, no side effects.
+    #[schemars(description = "Resolve canonical and target without writing. Default false. When true the server returns the would-be mirror name, target_parent_id, and pillar-annotation decision; nothing is created and no canonical is annotated. Pair with the production call once the resolved scope is verified.")]
+    pub dry_run: Option<bool>,
 }
 
 /// Parameters for `audit_mirrors`. Defaults `root_id` to the user's

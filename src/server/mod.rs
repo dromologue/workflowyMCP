@@ -483,102 +483,13 @@ fn is_short_hash(s: &str) -> bool {
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Render a subtree as nested Markdown bullets. Depth is determined
-/// by following parent_id chains within the supplied node set, so the
-/// output mirrors the actual tree shape regardless of the order
-/// `nodes` was returned in.
-fn render_subtree_markdown(nodes: &[WorkflowyNode], root_id: &str) -> String {
-    use std::collections::HashMap;
-    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
-    for n in nodes {
-        if let Some(pid) = &n.parent_id {
-            children_of.entry(pid.clone()).or_default().push(n);
-        }
-    }
-    let mut out = String::new();
-    fn walk(
-        node: &WorkflowyNode,
-        depth: usize,
-        children_of: &std::collections::HashMap<String, Vec<&WorkflowyNode>>,
-        out: &mut String,
-    ) {
-        let indent = "  ".repeat(depth);
-        out.push_str(&format!("{}- {}\n", indent, node.name));
-        if let Some(desc) = &node.description {
-            for line in desc.lines() {
-                out.push_str(&format!("{}    {}\n", indent, line));
-            }
-        }
-        if let Some(children) = children_of.get(&node.id) {
-            for child in children {
-                walk(child, depth + 1, children_of, out);
-            }
-        }
-    }
-    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
-        walk(root, 0, &children_of, &mut out);
-    }
-    out
-}
-
-/// Render a subtree as OPML — Workflowy and other outliners can
-/// re-import this losslessly enough for backup/exchange. We escape
-/// the four XML metacharacters and emit each node as a single-line
-/// `<outline>` element.
-fn render_subtree_opml(nodes: &[WorkflowyNode], root_id: &str) -> String {
-    use std::collections::HashMap;
-    fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    }
-    let mut children_of: HashMap<String, Vec<&WorkflowyNode>> = HashMap::new();
-    for n in nodes {
-        if let Some(pid) = &n.parent_id {
-            children_of.entry(pid.clone()).or_default().push(n);
-        }
-    }
-    let mut out = String::new();
-    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n  <body>\n");
-    fn walk(
-        node: &WorkflowyNode,
-        depth: usize,
-        children_of: &std::collections::HashMap<String, Vec<&WorkflowyNode>>,
-        out: &mut String,
-    ) {
-        let indent = "  ".repeat(depth + 2);
-        let name = xml_escape(&node.name);
-        let desc = node
-            .description
-            .as_deref()
-            .map(xml_escape)
-            .unwrap_or_default();
-        let descendants = children_of.get(&node.id);
-        let self_closing = descendants.is_none() && desc.is_empty();
-        if self_closing {
-            out.push_str(&format!("{}<outline text=\"{}\"/>\n", indent, name));
-        } else {
-            if desc.is_empty() {
-                out.push_str(&format!("{}<outline text=\"{}\">\n", indent, name));
-            } else {
-                out.push_str(&format!("{}<outline text=\"{}\" _note=\"{}\">\n", indent, name, desc));
-            }
-            if let Some(children) = descendants {
-                for child in children {
-                    walk(child, depth + 1, children_of, out);
-                }
-            }
-            out.push_str(&format!("{}</outline>\n", indent));
-        }
-    }
-    if let Some(root) = nodes.iter().find(|n| n.id == root_id) {
-        walk(root, 0, &children_of, &mut out);
-    }
-    out.push_str("  </body>\n</opml>\n");
-    out
-}
+// `render_subtree_markdown` and `render_subtree_opml` lived here
+// through 2026-05-09 alongside byte-identical copies in
+// `bin/wflow_do.rs`. The duplication-audit lift moved them to
+// `utils/subtree::{render_subtree_markdown, render_subtree_opml}` so
+// both surfaces call the single source. Pinned by
+// `subtree_renderers_live_in_utils_not_duplicated`.
+use crate::utils::subtree::{render_subtree_markdown, render_subtree_opml};
 
 /// RAII guard that bumps an in-flight counter on construction and
 /// decrements on drop. Ensures `workflowy_status` reports an accurate
@@ -719,6 +630,15 @@ fn truncation_banner_from_fetch(fetch: &SubtreeFetch) -> String {
 /// AND JSON envelope). `use_index` is the bypass; this string names it
 /// so callers don't have to read the docs to find the recovery.
 const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) once to populate the persistent name index, then re-issue with use_index=true (search_nodes / find_node) to bypass the walk budget — name-only match, no walk timeout.";
+
+/// Diagnostic-surface invariant: every tool that resolves a parent_id /
+/// node_id against the workspace returns a `scope_resolved` field naming
+/// what it actually targeted. The renderer itself lives in
+/// [`crate::workflows::scope_resolved_label`] so the MCP server and
+/// the `wflow-do` CLI emit byte-identical scope labels. This `use` is
+/// the one-line re-export every handler imports — the actual logic is
+/// in the workflows module per the duplication-audit rule.
+use crate::workflows::scope_resolved_label;
 
 /// JSON-truncation surface invariant: every walk-shaped tool that emits
 /// JSON spreads this four-field envelope into its payload:
@@ -1560,6 +1480,8 @@ impl WorkflowyMcpServer {
             };
             let mut hits = hits;
             hits.truncate(max_results);
+            let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
+            let prefix = format!("scope_resolved: {}\n\n", scope_resolved);
             let body = if hits.is_empty() {
                 format!(
                     "No nodes found matching '{}' in the persistent name index \
@@ -1580,7 +1502,7 @@ impl WorkflowyMcpServer {
                     items.join("\n"),
                 )
             };
-            return Ok(CallToolResult::success(vec![Content::text(body)]));
+            return Ok(CallToolResult::success(vec![Content::text(format!("{}{}", prefix, body))]));
         }
 
         // Refuse unscoped walks by default, mirroring find_node. Brief
@@ -1646,7 +1568,8 @@ impl WorkflowyMcpServer {
                     )
                 };
 
-                let result_text = format!("{}{}", banner, body);
+                let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
+                let result_text = format!("scope_resolved: {}\n\n{}{}", scope_resolved, banner, body);
                 Ok(CallToolResult::success(vec![Content::text(result_text)]))
             }
             Err(e) => {
@@ -1759,9 +1682,10 @@ impl WorkflowyMcpServer {
                     .as_deref()
                     .map(|p| format!("under `{}`", p))
                     .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
+                let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 let mut msg = format!(
-                    "Created node '{}' (id: `{}`) {}",
-                    params.name, created.id, placement
+                    "scope_resolved: {}\n\nCreated node '{}' (id: `{}`) {}",
+                    scope_resolved, params.name, created.id, placement
                 );
                 if let Some(warn) = &degraded_warning {
                     msg.push_str("\n\n⚠ DEGRADED: ");
@@ -1923,7 +1847,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "List all children of a Workflowy node.")]
+    #[tool(description = "List all children of a Workflowy node. Pass node_id (or its alias parent_id) as a UUID, short hash, omitted, or null — the last two list the workspace root's top-level nodes. The response prefixes a `scope_resolved:` line naming what was actually targeted (`workspace_root` or `scoped:<uuid>`) so callers can audit null-handling without inspecting the wire.")]
     async fn list_children(
         &self,
         Parameters(params): Parameters<GetChildrenParams>,
@@ -1933,7 +1857,10 @@ impl WorkflowyMcpServer {
         // schema are explicit about this so the caller doesn't have
         // to guess; previously a `null` node_id intermittently
         // surfaced "Tool execution failed" depending on which path
-        // serde took.
+        // serde took. The 2026-05-09 failure-report flagged that
+        // even with the right semantics, callers couldn't *verify*
+        // what the server resolved — the `scope_resolved:` prefix
+        // below names it explicitly.
         let resolved: Option<String> = match params.node_id.as_deref() {
             None | Some("") => None,
             Some(id) => {
@@ -1950,12 +1877,14 @@ impl WorkflowyMcpServer {
         };
 
         let scope_label = resolved.as_deref().unwrap_or("workspace root").to_string();
+        let scope_resolved = scope_resolved_label(resolved.as_deref());
+        let prefix = format!("scope_resolved: {}\n\n", scope_resolved);
         match fetch_result {
             Ok(children) => {
                 if children.is_empty() {
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "`{}` has no children",
-                        scope_label
+                        "{}`{}` has no children",
+                        prefix, scope_label
                     ))]))
                 } else {
                     let items: Vec<String> = children
@@ -1963,7 +1892,8 @@ impl WorkflowyMcpServer {
                         .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
                         .collect();
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "{} children of `{}`:\n\n{}",
+                        "{}{} children of `{}`:\n\n{}",
+                        prefix,
                         children.len(),
                         scope_label,
                         items.join("\n")
@@ -2099,13 +2029,14 @@ impl WorkflowyMcpServer {
         };
         self.apply_footprint(&footprint);
 
+        let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
         match outcome {
             crate::workflows::InsertContentOutcome::Complete {
                 created_count, ..
             } => {
                 let msg = format!(
-                    "Inserted {} node(s) under `{}`",
-                    created_count, parent_label
+                    "scope_resolved: {}\n\nInserted {} node(s) under `{}`",
+                    scope_resolved, created_count, parent_label
                 );
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
@@ -2119,6 +2050,7 @@ impl WorkflowyMcpServer {
             } => {
                 let payload = json!({
                     "status": "partial",
+                    "scope_resolved": scope_resolved,
                     "reason": reason.as_str(),
                     "created_count": created_count,
                     "total_count": total_count,
@@ -2216,7 +2148,8 @@ impl WorkflowyMcpServer {
                 hits
             };
             if !hits.is_empty() || !allow_root_scan {
-                return Ok(self.render_find_node_index_result(&params, match_mode, hits));
+                let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
+                return Ok(self.render_find_node_index_result(&params, match_mode, hits, &scope_resolved));
             }
             // allow_root_scan=true and index empty -> fall through to live walk.
         }
@@ -2242,9 +2175,11 @@ impl WorkflowyMcpServer {
                 let limit = fetch.limit;
                 let truncation_reason = fetch.truncation_reason;
 
+                let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 if matches.is_empty() {
                     let mut result = json!({
                         "found": false,
+                        "scope_resolved": scope_resolved,
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
@@ -2270,6 +2205,7 @@ impl WorkflowyMcpServer {
                     let path = build_node_path_with_map(&node.id, &node_map);
                     let result = json!({
                         "found": true,
+                        "scope_resolved": scope_resolved,
                         "truncated": truncated,
                         "truncation_limit": limit,
                         "truncation_reason": truncation_reason.map(|r| r.as_str()),
@@ -2298,6 +2234,7 @@ impl WorkflowyMcpServer {
                     }).collect();
                     let result = json!({
                         "found": false,
+                        "scope_resolved": scope_resolved,
                         "multiple_matches": true,
                         "truncated": truncated,
                         "truncation_limit": limit,
@@ -2321,10 +2258,12 @@ impl WorkflowyMcpServer {
         params: &FindNodeParams,
         match_mode: &str,
         hits: Vec<crate::utils::name_index::NameIndexEntry>,
+        scope_resolved: &str,
     ) -> CallToolResult {
         if hits.is_empty() {
             let result = json!({
                 "found": false,
+                "scope_resolved": scope_resolved,
                 "index_served": true,
                 "message": format!("No nodes matching '{}' in name index (mode: {}). Retry without use_index for a live walk, or run build_name_index to populate.", params.name, match_mode)
             });
@@ -2343,6 +2282,7 @@ impl WorkflowyMcpServer {
             let hit = &hits[idx - 1];
             let result = json!({
                 "found": true,
+                "scope_resolved": scope_resolved,
                 "index_served": true,
                 "node_id": hit.node_id,
                 "name": hit.name,
@@ -2365,6 +2305,7 @@ impl WorkflowyMcpServer {
             .collect();
         let result = json!({
             "found": false,
+            "scope_resolved": scope_resolved,
             "index_served": true,
             "multiple_matches": true,
             "count": hits.len(),
@@ -3839,6 +3780,19 @@ impl WorkflowyMcpServer {
             .filter_map(|o| o.parent_id.clone())
             .collect();
 
+        // Capture each op's resolved parent before the API call
+        // consumes `resolved_ops` so we can emit a per-op
+        // `scope_resolved` alongside the create result. Alignment
+        // with the response order is maintained by indexing — the
+        // batch returns results in input order. The 2026-05-09
+        // failure-report observed callers unable to verify whether a
+        // null parent_id had landed at workspace root or somewhere
+        // else; surfacing the resolved parent per-op closes the gap.
+        let resolved_parents: Vec<Option<String>> = resolved_ops
+            .iter()
+            .map(|o| o.parent_id.clone())
+            .collect();
+
         let results = self.client.batch_create_nodes(resolved_ops).await;
 
         let mut succeeded = 0usize;
@@ -3846,26 +3800,37 @@ impl WorkflowyMcpServer {
         let entries: Vec<serde_json::Value> = results
             .into_iter()
             .enumerate()
-            .map(|(i, r)| match r {
-                Ok(created) => {
-                    succeeded += 1;
-                    self.name_index.ingest(&[WorkflowyNode {
-                        id: created.id.clone(),
-                        name: created.name.clone(),
-                        parent_id: created.parent_id.clone(),
-                        ..Default::default()
-                    }]);
-                    json!({
-                        "index": i,
-                        "ok": true,
-                        "id": created.id,
-                        "name": created.name,
-                        "parent_id": created.parent_id,
-                    })
-                }
-                Err(e) => {
-                    failed += 1;
-                    json!({ "index": i, "ok": false, "error": e.to_string() })
+            .map(|(i, r)| {
+                let scope_resolved = scope_resolved_label(
+                    resolved_parents.get(i).and_then(|p| p.as_deref()),
+                );
+                match r {
+                    Ok(created) => {
+                        succeeded += 1;
+                        self.name_index.ingest(&[WorkflowyNode {
+                            id: created.id.clone(),
+                            name: created.name.clone(),
+                            parent_id: created.parent_id.clone(),
+                            ..Default::default()
+                        }]);
+                        json!({
+                            "index": i,
+                            "ok": true,
+                            "id": created.id,
+                            "name": created.name,
+                            "parent_id": created.parent_id,
+                            "scope_resolved": scope_resolved,
+                        })
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        json!({
+                            "index": i,
+                            "ok": false,
+                            "error": e.to_string(),
+                            "scope_resolved": scope_resolved,
+                        })
+                    }
                 }
             })
             .collect();
@@ -4624,7 +4589,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (when `pillar` is supplied and the canonical lacks one) the canonical gains a `canonical_of: <pillar>` marker. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Returns a JSON envelope with mirror_id, canonical_id, target_parent_id, name, and audit_status (OK or ORPHAN_canonical_lacks_marker).")]
+    #[tool(description = "Create a convention-based mirror of a canonical node under a new parent. Workflowy's public REST API does not expose native mirror creation, so this implements the documented `mirror_of:` / `canonical_of:` note convention that `audit_mirrors` already understands: a new node is created under target_parent with the same name as the canonical, its description carries `mirror_of: <canonical_uuid>`, and (when `pillar` is supplied and the canonical lacks one) the canonical gains a `canonical_of: <pillar>` marker. Edits to the canonical do NOT propagate to the mirror — the link is structural and human-curated, not live. Returns a JSON envelope with mirror_id, canonical_id, target_parent_id, name, scope_resolved, and audit_status (OK or ORPHAN_canonical_lacks_marker). Pass `dry_run=true` to preview the resolved canonical/target/mirror-name without writing — useful when batching multiple mirror passes across a synthesis.")]
     async fn create_mirror(
         &self,
         Parameters(params): Parameters<CreateMirrorParams>,
@@ -4638,6 +4603,46 @@ impl WorkflowyMcpServer {
             None | Some("") => None,
             Some(id) => Some(self.validate_and_resolve(id).await?),
         };
+        let scope_resolved = scope_resolved_label(target_parent.as_deref());
+        let dry_run = params.dry_run.unwrap_or(false);
+
+        // Dry-run path: delegate to `create_mirror_dry_run` so this
+        // surface and the `wflow-do create-mirror --dry-run` CLI
+        // share a single resolution path. The MCP wrapper just adds
+        // the structured error envelope and the JSON response shape;
+        // the orchestration itself lives once. Failure-report
+        // 2026-05-09 cited unverifiable target_parent resolution as
+        // the single biggest cause of opaque mirror outcomes — this
+        // path is the read-only preview the report asked for.
+        if dry_run {
+            let preview = crate::workflows::create_mirror_dry_run(
+                &self.client,
+                &canonical_id,
+                target_parent.as_deref(),
+                params.pillar.as_deref(),
+            )
+            .await
+            .map_err(|e| workflow_error_to_mcp("create_mirror", Some(&canonical_id), e))?;
+            let payload = json!({
+                "status": "dry_run",
+                "scope_resolved": scope_resolved,
+                "canonical_id": preview.canonical_id,
+                "target_parent_id": preview.target_parent_id,
+                "mirror_name": preview.mirror_name,
+                "canonical_already_marked": preview.canonical_already_marked,
+                "would_annotate_canonical": preview.would_annotate_canonical,
+                "pillar": preview.pillar,
+                "message": format!(
+                    "dry_run: would create mirror named `{}` under `{}` of canonical `{}`. \
+                     would_annotate_canonical={}.",
+                    preview.mirror_name,
+                    preview.target_parent_id.as_deref().unwrap_or("workspace root"),
+                    preview.canonical_id,
+                    preview.would_annotate_canonical,
+                ),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+        }
 
         // The workflow declares its mutation footprint; the wrapper
         // applies it to the server's cache + name index post-call.
@@ -4660,6 +4665,7 @@ impl WorkflowyMcpServer {
 
         let payload = json!({
             "status": "ok",
+            "scope_resolved": scope_resolved,
             "mirror_id": result.mirror_id,
             "canonical_id": result.canonical_id,
             "target_parent_id": result.target_parent_id,
@@ -6835,6 +6841,7 @@ mod tests {
                 target_parent_id: Some(NodeId::from(id)),
                 priority: None,
                 pillar: None,
+                dry_run: None,
             }))
             .await
             .expect_err("mirror-of-self must reject");
@@ -7376,6 +7383,122 @@ mod tests {
              error}}` envelope as every other runtime failure. Bare `McpError::internal_error` \
              produces messages that some clients truncate to 'Tool execution failed' with no \
              proximate cause. New violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// [C-server-006] `scope_resolved_label` is the single renderer
+    /// for the diagnostic `scope_resolved` field. Format is stable:
+    /// `"workspace_root"` for `None`, otherwise `"scoped:<full-uuid>"`.
+    /// The 2026-05-09 failure-report observed callers unable to verify
+    /// what the server resolved when they passed null parent_id; this
+    /// label is what every list/find/create/mirror response now
+    /// surfaces. Anyone changing the format here changes the contract
+    /// the entire tool family emits — this test pins both branches.
+    #[test]
+    fn scope_resolved_label_renders_stable_strings() {
+        assert_eq!(
+            crate::workflows::scope_resolved_label(None),
+            "workspace_root",
+            "null/omitted parent_id must surface as workspace_root",
+        );
+        assert_eq!(
+            crate::workflows::scope_resolved_label(Some("550e8400-e29b-41d4-a716-446655440000")),
+            "scoped:550e8400-e29b-41d4-a716-446655440000",
+            "explicit parent must surface as scoped:<uuid>",
+        );
+    }
+
+    /// [C-server-007] Every tool that resolves a parent_id emits the
+    /// `scope_resolved` token in its response — text-formatted tools
+    /// prefix `scope_resolved: <label>`, JSON tools include a
+    /// `scope_resolved` key. This grep-audits the source to fail the
+    /// build if a new tool is added without honouring the contract.
+    /// The set is the union of: list_children, search_nodes,
+    /// find_node, create_node, batch_create_nodes, insert_content,
+    /// create_mirror.
+    #[test]
+    fn every_scoped_tool_emits_scope_resolved_in_response() {
+        let src = include_str!("mod.rs");
+        // Tools that must emit scope_resolved. The token "scope_resolved"
+        // must appear inside the function body — we don't pin the exact
+        // line, just that it's there.
+        let expected = [
+            "fn list_children(",
+            "fn search_nodes(",
+            "fn find_node(",
+            "fn create_node(",
+            "fn batch_create_nodes(",
+            "fn insert_content(",
+            "fn create_mirror(",
+        ];
+        let mut missing: Vec<&str> = Vec::new();
+        for needle in &expected {
+            // Find the function header.
+            let Some(start) = src.find(needle) else {
+                missing.push(needle);
+                continue;
+            };
+            // Cap the search at the next `#[tool(` so we don't scan
+            // past the handler body.
+            let after = &src[start..];
+            let next_tool = after
+                .find("#[tool(")
+                .unwrap_or(after.len().min(60_000));
+            let body = &after[..next_tool];
+            if !body.contains("scope_resolved") {
+                missing.push(needle);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Each scoped tool must emit `scope_resolved` so callers can audit \
+             null-parent resolution without inspecting the wire payload. \
+             Missing in: {:?}",
+            missing,
+        );
+    }
+
+    /// [C-server-009] Subtree renderers + the `scope_resolved` label
+    /// renderer must live once. Pre-2026-05-09 the markdown / OPML
+    /// renderers were duplicated between `server/mod.rs` and
+    /// `bin/wflow_do.rs` with subtly different output formats; the
+    /// duplication-audit lift moved the canonical implementations to
+    /// `utils::subtree::{render_subtree_markdown, render_subtree_opml}`
+    /// and `workflows::scope_resolved_label`. This test grep-audits
+    /// the two surfaces so a future contributor cannot reintroduce
+    /// a parallel `fn render_subtree_markdown(` / `fn
+    /// render_subtree_opml(` / `fn scope_resolved_label(` body
+    /// outside the canonical modules. Calling-site `use` lines are
+    /// allowed (the surfaces re-export the shared functions).
+    #[test]
+    fn no_duplicated_renderer_or_scope_label_definitions_outside_canonical_modules() {
+        let server_src = include_str!("mod.rs");
+        let cli_src = include_str!("../bin/wflow_do.rs");
+        // Build the anchors at runtime via concat so this very test
+        // body doesn't contain the literal "fn <name>(" form and
+        // self-match. The grep audits surface every other occurrence.
+        let names = ["render_subtree_markdown", "render_subtree_opml", "scope_resolved_label"];
+        let needles: Vec<String> = names.iter().map(|n| format!("{}{}{}", "fn ", n, "(")).collect();
+        let mut violations: Vec<String> = Vec::new();
+        for (label, body) in [("server/mod.rs", server_src), ("bin/wflow_do.rs", cli_src)] {
+            for (i, line) in body.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                for n in &needles {
+                    if line.contains(n.as_str()) {
+                        violations.push(format!("{}:{}: {}", label, i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "These functions live in shared modules and must not be redefined in \
+             server/mod.rs or bin/wflow_do.rs. Re-export from `utils::subtree::*` or \
+             `workflows::scope_resolved_label` instead. New violations:\n  {}",
             violations.join("\n  "),
         );
     }

@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 35 contracts, 28 unique pinning tests.
+**Coverage:** 43 contracts, 34 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -33,6 +33,7 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-disc-011` | Explicit-check discipline | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 | `C-disc-012` | Cross-system retrieval requires both name AND content search per source | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 | `C-disc-013` | Uniform per-pillar mirroring | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-014` | Audit `scope_resolved` after every scoped call | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 
 ## Server runtime (`C-server-*`)
 
@@ -43,6 +44,11 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-server-003` | `Parameters<T>` is the wrapper name on every tool's input | `parameter_bearing_tools_publish_non_empty_input_schema_properties` | `src/server/mod.rs` |
 | `C-server-004` | Every walk-shaped tool's JSON output carries the four-field truncation envelope | `every_walk_tool_emits_full_truncation_envelope_in_json` | `src/server/mod.rs` |
 | `C-server-005` | `move_node` propagation retry is inlined into `client.move_node` | `move_node_embeds_propagation_retry_loop` | `src/server/mod.rs` |
+| `C-server-006` | Null parent_id / node_id resolves uniformly to workspace root across the tool family | `scope_resolved_label_renders_stable_strings`<br>`scope_resolved_label_two_branches_render_stable_format` | `src/server/mod.rs`<br>`src/workflows.rs` |
+| `C-server-007` | Every scoped tool emits `scope_resolved` in its response | `every_scoped_tool_emits_scope_resolved_in_response` | `src/server/mod.rs` |
+| `C-server-008` | `INSERT_CONTENT_TIMEOUT_MS` leaves â¥ 60 s margin under `MCP_TRANSPORT_HARD_TIMEOUT_MS` | `bulk_budget_leaves_mcp_transport_margin` | `src/defaults.rs` |
+| `C-server-009` | Subtree renderers + `scope_resolved_label` live in shared modules, never duplicated in the surface binaries | `no_duplicated_renderer_or_scope_label_definitions_outside_canonical_modules` | `src/server/mod.rs` |
+| `C-server-010` | `create_mirror` supports `dry_run=true` for read-only resolution preview | `create_mirror_dry_run_rejects_self_mirror_without_api_call` | `src/workflows.rs` |
 
 ## Workflow orchestration (`C-wf-*`)
 
@@ -60,4 +66,6 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-wf-010` | `bulk_update` tag operations require `operation_tag` before any API call | `apply_bulk_op_rejects_tag_op_without_operation_tag` | `src/workflows.rs` |
 | `C-wf-011` | `smart_insert` rejects empty content before walking | `smart_insert_under_target_rejects_empty_content` | `src/workflows.rs` |
 | `C-wf-012` | Indented content parser handles 2-space-per-level indentation, drops empty lines, trims whitespace | `parse_indented_content_handles_indents_and_blanks` | `src/workflows.rs` |
+| `C-wf-013` | `create_mirror_dry_run` rejects self-mirror with `InvalidInput` before any API call | `create_mirror_dry_run_rejects_self_mirror_without_api_call` | `src/workflows.rs` |
+| `C-wf-014` | `scope_resolved_label` is the single renderer for the diagnostic `scope_resolved` token; format is `"workspace_root"` for None and `"scoped:<uuid>"` for Some | `scope_resolved_label_two_branches_render_stable_format` | `src/workflows.rs` |
 

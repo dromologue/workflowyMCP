@@ -384,6 +384,7 @@ fn template_skill_carries_required_discipline_phrases() {
         ("Explicit-check discipline", "C-disc-011 Explicit-check discipline (state every check, including negative)"),
         ("name AND content search", "C-disc-012 Cross-system retrieval requires both name AND content search"),
         ("Uniform per-pillar mirroring", "C-disc-013 Uniform per-pillar mirroring (no per-atom drift)"),
+        ("Audit `scope_resolved`", "C-disc-014 Audit scope_resolved after every scoped call (closes 2026-05-09 failure-report null-resolution gap)"),
     ];
     let mut missing: Vec<String> = Vec::new();
     for (phrase, contract) in required {

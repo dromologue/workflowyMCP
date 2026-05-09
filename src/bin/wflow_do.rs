@@ -384,6 +384,13 @@ enum Cmd {
         /// omitted; existing markers are never overwritten.
         #[arg(long)]
         pillar: Option<String>,
+        /// Resolve canonical and target without writing. Prints what
+        /// the production call would create — mirror name (copied from
+        /// the canonical), resolved target_parent_id, and whether the
+        /// pillar annotation would be applied. Pair with the
+        /// production call once the resolved scope is verified.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Surface what's worth re-reading: revisit-due, multi-pillar, stale, source-MOC reuse.
     Review {
@@ -1660,11 +1667,54 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 println!("---\n{} findings across {} nodes", findings.len(), fetch.nodes.len());
             }
         }
-        Cmd::CreateMirror { canonical_node_id, target_parent_id, priority, pillar } => {
+        Cmd::CreateMirror { canonical_node_id, target_parent_id, priority, pillar, dry_run } => {
             // The orchestration lives in `crate::workflows` so this
             // CLI and the MCP `create_mirror` tool share a single
             // source of truth. The CLI just translates the typed
             // result into stdout.
+            //
+            // `--dry-run` delegates to `create_mirror_dry_run` so the
+            // CLI and the MCP tool's `dry_run=true` path resolve
+            // through the same code. The CLI wraps the typed result
+            // in stdout output; the MCP wraps it in a JSON envelope
+            // with `scope_resolved`. Single source of truth, no
+            // duplicate orchestration.
+            if *dry_run {
+                let preview = workflowy_mcp_server::workflows::create_mirror_dry_run(
+                    &client,
+                    canonical_node_id,
+                    target_parent_id.as_deref(),
+                    pillar.as_deref(),
+                )
+                .await?;
+                let scope_resolved = workflowy_mcp_server::workflows::scope_resolved_label(
+                    preview.target_parent_id.as_deref(),
+                );
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "dry_run",
+                            "scope_resolved": scope_resolved,
+                            "canonical_id": preview.canonical_id,
+                            "target_parent_id": preview.target_parent_id,
+                            "mirror_name": preview.mirror_name,
+                            "canonical_already_marked": preview.canonical_already_marked,
+                            "would_annotate_canonical": preview.would_annotate_canonical,
+                            "pillar": preview.pillar,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "dry_run: would create mirror named \"{}\" under {} (scope_resolved={}, would_annotate_canonical={})",
+                        preview.mirror_name,
+                        preview.target_parent_id.as_deref().unwrap_or("workspace root"),
+                        scope_resolved,
+                        preview.would_annotate_canonical,
+                    );
+                }
+                return Ok(());
+            }
             let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
             let (result, _footprint) = workflowy_mcp_server::workflows::create_mirror_via_convention(
                 &client,
@@ -2051,95 +2101,15 @@ fn read_input_or_stdin(path: Option<&str>) -> Result<String, Box<dyn std::error:
 // `apply_txn_op` and `run_inverse`. Both are now collapsed into
 // `crate::workflows::run_transaction`, which both surfaces call.
 
-/// Render a subtree as nested 2-space-indented Markdown bullets. Walks
-/// `parent_id` chains starting from `root_id` so the order matches the
-/// tree shape regardless of how the input was returned.
-fn render_subtree_markdown(
-    nodes: &[workflowy_mcp_server::types::WorkflowyNode],
-    root_id: &str,
-) -> String {
-    use std::collections::HashMap;
-    let mut by_parent: HashMap<&str, Vec<&workflowy_mcp_server::types::WorkflowyNode>> = HashMap::new();
-    for n in nodes {
-        if let Some(pid) = &n.parent_id {
-            by_parent.entry(pid.as_str()).or_default().push(n);
-        }
-    }
-    let mut out = String::new();
-    let mut stack: Vec<(&str, usize)> = vec![(root_id, 0)];
-    while let Some((id, depth)) = stack.pop() {
-        if let Some(node) = nodes.iter().find(|n| n.id == id) {
-            for _ in 0..depth { out.push_str("  "); }
-            out.push_str("- ");
-            out.push_str(&node.name);
-            out.push('\n');
-            if let Some(desc) = &node.description {
-                if !desc.is_empty() {
-                    for _ in 0..(depth + 1) { out.push_str("  "); }
-                    out.push_str("> ");
-                    out.push_str(desc);
-                    out.push('\n');
-                }
-            }
-            if let Some(children) = by_parent.get(id) {
-                // Push in reverse so we visit in declared order via pop.
-                for child in children.iter().rev() {
-                    stack.push((child.id.as_str(), depth + 1));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Render a subtree as OPML. Same parent-walk strategy as the markdown
-/// renderer; XML-encodes `&`, `<`, `>` so a node name containing markup
-/// doesn't produce invalid OPML.
-fn render_subtree_opml(
-    nodes: &[workflowy_mcp_server::types::WorkflowyNode],
-    root_id: &str,
-) -> String {
-    use std::collections::HashMap;
-    let mut by_parent: HashMap<&str, Vec<&workflowy_mcp_server::types::WorkflowyNode>> = HashMap::new();
-    for n in nodes {
-        if let Some(pid) = &n.parent_id {
-            by_parent.entry(pid.as_str()).or_default().push(n);
-        }
-    }
-    fn encode(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-    }
-    let mut out = String::from("<?xml version=\"1.0\"?>\n<opml version=\"2.0\">\n  <body>\n");
-    fn emit(
-        out: &mut String,
-        id: &str,
-        depth: usize,
-        nodes: &[workflowy_mcp_server::types::WorkflowyNode],
-        by_parent: &std::collections::HashMap<&str, Vec<&workflowy_mcp_server::types::WorkflowyNode>>,
-    ) {
-        let Some(node) = nodes.iter().find(|n| n.id == id) else { return };
-        let indent = "  ".repeat(depth + 2);
-        let mut attrs = format!("text=\"{}\"", encode(&node.name));
-        if let Some(d) = &node.description {
-            if !d.is_empty() {
-                attrs.push_str(&format!(" _note=\"{}\"", encode(d)));
-            }
-        }
-        let children = by_parent.get(id).map(|v| v.as_slice()).unwrap_or(&[]);
-        if children.is_empty() {
-            out.push_str(&format!("{}<outline {} />\n", indent, attrs));
-        } else {
-            out.push_str(&format!("{}<outline {}>\n", indent, attrs));
-            for c in children {
-                emit(out, c.id.as_str(), depth + 1, nodes, by_parent);
-            }
-            out.push_str(&format!("{}</outline>\n", indent));
-        }
-    }
-    emit(&mut out, root_id, 0, nodes, &by_parent);
-    out.push_str("  </body>\n</opml>\n");
-    out
-}
+// Through 2026-05-09 the CLI carried its own copy of
+// `render_subtree_markdown` / `render_subtree_opml` alongside parallel
+// implementations in `server/mod.rs`. The duplication-audit lift moved
+// the canonical renderers into `utils::subtree::{render_subtree_markdown,
+// render_subtree_opml}` so the MCP `export_subtree` tool and the
+// `wflow-do export` CLI subcommand call the same code. Re-exported
+// here so the local `Cmd::Export` arm can reach the renderer with
+// the same name.
+use workflowy_mcp_server::utils::subtree::{render_subtree_markdown, render_subtree_opml};
 
 #[cfg(test)]
 mod tests {
@@ -2308,6 +2278,11 @@ mod tests {
         }
     }
 
+    /// CLI smoke test for the shared renderer. The 2026-05-09
+    /// duplication-audit lift moved `render_subtree_markdown` from the
+    /// CLI's local module to `utils::subtree`; this test asserts that
+    /// `Cmd::Export` continues to reach the same output through the
+    /// re-export, matching the format the server-side test pins.
     #[test]
     fn render_subtree_markdown_walks_parent_chain_and_emits_indent() {
         let nodes = vec![
@@ -2326,10 +2301,17 @@ mod tests {
         let body = render_subtree_markdown(&nodes, "root");
         assert!(body.contains("- Root"));
         assert!(body.contains("  - Child 1"));
-        assert!(body.contains("    > a desc"));
+        // Description renders with 4-space indent (the unified format
+        // the server-side renderer has shipped); the legacy CLI `> `
+        // prefix was the outlier and went away with the lift.
+        assert!(body.contains("a desc"));
         assert!(body.contains("    - Grandchild"));
     }
 
+    /// Same lift smoke test for the OPML renderer. The unified header
+    /// includes `encoding="UTF-8"` (the server-side renderer's; the
+    /// CLI's previous header omitted it). Asserts the encoding +
+    /// XML-character escaping over the shared implementation.
     #[test]
     fn render_subtree_opml_xml_encodes_node_names() {
         let nodes = vec![
