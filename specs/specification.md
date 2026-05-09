@@ -447,7 +447,7 @@ The contract callers can rely on:
 - **`degraded` means there is unrecovered breakage right now.** It
   does not mean "we saw a failure once". After the failing tool
   returns OK, the warning clears.
-- **Deserialization errors name the offending field.**
+- **[C-server-001] Deserialization errors name the offending field.**
   `Parameters::from_context_part` runs every payload through
   `serde_path_to_error::deserialize`, so a rejected JSON value
   reaches the caller as `invalid parameters at \`.<field>\`:
@@ -455,7 +455,7 @@ The contract callers can rely on:
   client) that sends `null` for a required `NodeId` sees the field
   name and can self-correct on the next call. Pinned by
   `null_required_uuid_field_error_names_the_field`.
-- **Every error path emits the structured envelope with no exemptions
+- **[C-server-002] Every error path emits the structured envelope with no exemptions
   inside handler bodies.** Validation failures route through
   `tool_invalid_params(operation, node_id, msg)`; operational
   failures route through `tool_error(operation, node_id, err)`. Both
@@ -472,6 +472,16 @@ The contract callers can rely on:
   bare `McpError::invalid_params(...)` inside a handler body, or
   any bare `McpError::internal_error(...)`, fails the build before
   it ships.
+
+---
+
+## Architectural Pins (Server Runtime)
+
+Three runtime contracts that have caused silent regressions historically and are now enforced by named tests. CLAUDE.md describes the rationale for each in operational terms; the spec carries the contract markers so the traceability matrix has a single source.
+
+- **[C-server-003] `Parameters<T>` is the wrapper name on every tool's input.** `rmcp-macros 0.16` discovers a tool's parameter type by matching the literal identifier `Parameters` on the last path segment of the function-arg type. A wrapper renamed to anything else makes the macro fall back to a hardcoded `{"type": "object", "properties": {}}` schema for every parameter-bearing tool — silently strips arguments at the wire. Pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
+- **[C-server-004] Every walk-shaped tool's JSON output carries the four-field truncation envelope.** `truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint` — uniform on every walk response. Adding a new walk-shaped tool that emits `"truncation_limit"` without the reason + hint companions fails the build. Pinned by `every_walk_tool_emits_full_truncation_envelope_in_json` (grep-audits the source).
+- **[C-server-005] `move_node` propagation retry is inlined into `client.move_node`.** The 2026-05-04 unification removed the previous `move_node_with_propagation_retry` wrapper, so every move caller (the bare tool handler, `transaction.move`, the `wflow-do move` CLI) hits the same retry path. The failure-report 2026-05-03 traced an 11 % vs 100 % success-rate divergence between the bare tool and `transaction.move` to that wrapper-vs-bare split. Pinned by `move_node_embeds_propagation_retry_loop`.
 
 ---
 
@@ -509,29 +519,18 @@ behaviour shared between the MCP `server` and the `wflow-do` CLI. The
 
 ### Behaviours pinned by workflow tests
 
-- `create_mirror_via_convention_rejects_self_mirror_without_api_call`
-  — mirror-of-self is rejected before any API call.
-- `workflow_context_default_signals_no_cancel_and_no_deadline` and
-  `workflow_context_deadline_is_past_when_now_is_after` — context
-  helpers behave correctly with and without arguments.
-- `mutation_footprint_records_invalidations` — the declarative
-  footprint accumulates IDs and merges via `extend()`.
-- `insert_content_empty_payload_is_zero_cost_complete` — empty
-  payload short-circuits to `Complete { created_count: 0 }` without
-  touching the API.
-- `insert_content_above_cap_returns_invalid_input` — payload above
-  `MAX_INSERT_CONTENT_LINES` fails with `InvalidInput`.
-- `insert_content_pre_cancelled_returns_partial_zero` and
-  `insert_content_past_deadline_returns_partial_timeout` — partial
-  success cursor lands at zero with the right reason.
-- `bulk_op_parse_accepts_exact_wire_strings_only` — wire strings are
-  the public contract; case-sensitive.
-- `apply_bulk_op_rejects_tag_op_without_operation_tag` — required
-  arguments are checked before any API call.
-- `smart_insert_under_target_rejects_empty_content` — empty bodies
-  reject before walks.
-- `parse_indented_content_handles_indents_and_blanks` — 2-space-per-
-  level parsing, empty lines dropped, whitespace trimmed.
+- **[C-wf-001]** Mirror-of-self is rejected before any API call. Pinned by `create_mirror_via_convention_rejects_self_mirror_without_api_call`.
+- **[C-wf-002]** `WorkflowContext::default()` signals no cancel and no deadline. Pinned by `workflow_context_default_signals_no_cancel_and_no_deadline`.
+- **[C-wf-003]** A deadline is correctly classified as past when now is after it. Pinned by `workflow_context_deadline_is_past_when_now_is_after`.
+- **[C-wf-004]** The declarative `MutationFootprint` accumulates IDs and merges via `extend()`. Pinned by `mutation_footprint_records_invalidations`.
+- **[C-wf-005]** `insert_content` empty payload short-circuits to `Complete { created_count: 0 }` without touching the API. Pinned by `insert_content_empty_payload_is_zero_cost_complete`.
+- **[C-wf-006]** `insert_content` payload above `MAX_INSERT_CONTENT_LINES` fails with `InvalidInput`. Pinned by `insert_content_above_cap_returns_invalid_input`.
+- **[C-wf-007]** `insert_content` pre-cancelled returns partial-success cursor at zero. Pinned by `insert_content_pre_cancelled_returns_partial_zero`.
+- **[C-wf-008]** `insert_content` past deadline returns partial-success cursor with `Timeout` reason. Pinned by `insert_content_past_deadline_returns_partial_timeout`.
+- **[C-wf-009]** Bulk-op wire strings are the public contract; case-sensitive. Pinned by `bulk_op_parse_accepts_exact_wire_strings_only`.
+- **[C-wf-010]** `bulk_update` tag operations require `operation_tag` before any API call. Pinned by `apply_bulk_op_rejects_tag_op_without_operation_tag`.
+- **[C-wf-011]** `smart_insert` rejects empty content before walking. Pinned by `smart_insert_under_target_rejects_empty_content`.
+- **[C-wf-012]** Indented content parser handles 2-space-per-level indentation, drops empty lines, trims whitespace. Pinned by `parse_indented_content_handles_indents_and_blanks`.
 
 ### MCP-CLI parity properties
 
@@ -555,7 +554,7 @@ The repo ships templates that other users clone, populate, and run.
 Three classes of leak have happened in past sessions and are now
 explicitly forbidden by tests in `tests/template_portability.rs`:
 
-1. **No machine-specific paths in `templates/skills/wflow/SKILL.md`.**
+1. **[C-skill-001] No machine-specific paths in `templates/skills/wflow/SKILL.md`.**
    The skill must reference `$SECONDBRAIN_DIR` for every user-data
    location, never hardcode `~/code/SecondBrain`, `/Users/<name>/...`,
    or any equivalent. A new user's `$SECONDBRAIN_DIR` may point at
@@ -564,7 +563,7 @@ explicitly forbidden by tests in `tests/template_portability.rs`:
    Pinned by `template_skill_has_no_machine_specific_user_paths` and
    `template_skill_references_env_driven_secondbrain_path`.
 
-2. **No author-specific frameworks named in the skill body.** Pillar
+2. **[C-skill-002] No author-specific frameworks named in the skill body.** Pillar
    names, theme names, intellectual frameworks (e.g. IOTA, ELSA,
    Drift into Failure, How we Lead/Decide/Learn/Build) are
    user-specific data and live in
@@ -575,7 +574,7 @@ explicitly forbidden by tests in `tests/template_portability.rs`:
    file*; the skill body must stay neutral. Pinned by
    `template_skill_does_not_embed_author_specific_frameworks`.
 
-3. **Per-user memory files do not ship in the repo.** The earlier
+3. **[C-skill-003] Per-user memory files do not ship in the repo.** The earlier
    arrangement shipped `workflowy_node_links.md`,
    `distillation_taxonomy.md`, and `services.md` as standalone
    fill-in-the-blank templates under `templates/secondbrain/memory/`.
@@ -594,6 +593,10 @@ explicitly forbidden by tests in `tests/template_portability.rs`:
    `template_skill_contains_no_real_workflowy_uuids`, and
    `template_skill_inline_memory_schemas_declare_env_driven_canonical_path`.
 
+4. **[C-skill-004] No specific external services named in the skill body.** Specific service names (reMarkable, Notion, Obsidian, Linear, Readwise, etc.) are user-specific surfaces; the skill body must stay neutral and the user's actual services live in `$SECONDBRAIN_DIR/memory/services.md`. Naming a specific service in the skill forces every user to either use that service or read past instructions that don't apply. The 2026-05-03 leak: reMarkable was a first-class integration in the template (10 inline references); the cleanup moved it to `services.md` like any other optional surface. Pinned by `template_skill_does_not_embed_specific_external_services`.
+
+5. **[C-skill-005] Skill `description:` frontmatter ≤ 1024 characters.** Claude skill upload rejects over-length entries; the May-2026 incident pushed the user's canonical description to 1202 chars and broke the upload path. The repo template's description must stay under the 1024-char hard limit. Pinned by `template_skill_description_under_1024_chars`.
+
 These tests run as part of `cargo test` (integration test target
 `template_portability`). They are content-shape tests on shipped
 files, not server-runtime tests — they protect the user-facing
@@ -610,45 +613,45 @@ mode that wrote the discipline in the first place. All of them are
 pinned by `template_skill_carries_required_discipline_phrases` in
 `tests/template_portability.rs`.
 
-1. **Bootstrap probe is unconditional.** Step 0 must say "The probe
+1. **[C-disc-001] Bootstrap probe is unconditional.** Step 0 must say "The probe
    is unconditional" — Desktop, Cowork, and claude.ai all lazy-load
    MCP tools on first `tool_search`, and the gap bites when the
    agent defers the probe until a write is imminent. Pin: phrase
-   `The probe is unconditional`.
+   `The probe is unconditional`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
-2. **Working-memory rule for memory files.** Step 2 must require
+2. **[C-disc-002] Working-memory rule for memory files.** Step 2 must require
    `workflowy_node_links.md` and `distillation_taxonomy.md` to be
    read into conversation context during Bootstrap, not on demand —
    cached UUIDs only bite when in front of the agent before the
-   first tool call. Pin: phrase `WORKING-MEMORY RULE`.
+   first tool call. Pin: phrase `WORKING-MEMORY RULE`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
-3. **Bootstrap fails loud when `$SECONDBRAIN_DIR` is unreachable
+3. **[C-disc-003] Bootstrap fails loud when `$SECONDBRAIN_DIR` is unreachable
    from a subshell.** A non-interactive `bash` subshell does not
    inherit `~/.zshrc` exports — the env var must also be set in the
    MCP host's `env` block. The skill must name both places. Pin:
-   phrase `Fail loud when` `$SECONDBRAIN_DIR`.
+   phrase `Fail loud when` `$SECONDBRAIN_DIR`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
-4. **Synthesis workflows share three named patterns** — the
+4. **[C-disc-004] Synthesis workflows share three named patterns** — the
    routing-plan gate (with novelty check), the MOC-batch-mirror
    sequence, and the Journal-scan + `Journal range covered:` stamp
    convention. The skill must name and describe all three so they
    become the prescribed defaults rather than implicit suggestions.
    Pins: phrases `routing-plan gate`, `MOC-batch-mirror`,
-   `Journal range covered:`.
+   `Journal range covered:`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
-5. **Null discipline is definitive.** The skill must require an
+5. **[C-disc-005] Null discipline is definitive.** The skill must require an
    explicit UUID for every UUID-typed parameter, with no exceptions
    — even when the server's `parent_id: null = workspace root`
    affordance would accept null. The "warn but it might work
    sometimes" middle ground is the worst of both worlds. Pin:
-   phrase `Every UUID-typed parameter gets an explicit UUID`.
+   phrase `Every UUID-typed parameter gets an explicit UUID`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
-6. **Truncation distinguishes walk shapes.** The skill must call
+6. **[C-disc-006] Truncation distinguishes walk shapes.** The skill must call
    out the difference between *audit-shaped* walks (where missing
    branches matter and recovery is required) and *research-shaped*
    walks (where partial coverage is often sufficient and reflexive
    recovery wastes latency). Pin: phrases `Audit-shaped` and
-   `Research-shaped`.
+   `Research-shaped`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
 These pins are intentionally phrase-based rather than structural.
 Any rewrite that preserves the discipline is free to change the
