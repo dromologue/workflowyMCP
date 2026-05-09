@@ -20,7 +20,8 @@ Evals/
 !BOOTSTRAP.md
 !CLAUDE.md
 
-# Local cross-session todo file. Replaces the previous habit of filing
-# follow-ups as Workflowy "system tasks" — keep them in the repo, out of
-# the tracked tree. New session? Re-read this first.
-tasks/todo.local.md
+# Local working notes — cross-session todos, eval runs, reliability
+# scratchpads. Replaces the previous habit of filing follow-ups as
+# Workflowy "system tasks" — keep them on disk, out of the tracked
+# tree. New session? Re-read tasks/todo.local.md first.
+tasks/
