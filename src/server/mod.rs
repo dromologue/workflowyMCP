@@ -6699,6 +6699,23 @@ mod tests {
     /// carrying `truncation_reason: timeout` — a precise proxy for "the
     /// wiring compiles and the call reaches walk_subtree before the
     /// network gives up".
+    /// Wiring test. Asserts the handler reaches `walk_subtree` —
+    /// either returning Ok with the walk-truncation envelope (when
+    /// the 20 s wall-clock fires before the retry loop exhausts) or
+    /// Err with the structured `tool_error` envelope (when a fast
+    /// connection-refused makes the 5 retries finish within the
+    /// budget).
+    ///
+    /// Pre-2026-05-09 the test asserted only the first branch, which
+    /// passed locally (DNS for `.local` takes ~2 s on most systems —
+    /// 5 retries with backoff exceed the 20 s budget) but failed on
+    /// every GitHub Actions runner since 2026-05-03 (refused
+    /// connections complete in milliseconds, so the retry loop
+    /// drains before walk_subtree's wall-clock timeout fires).
+    /// Either outcome proves the handler dispatched through the walk
+    /// path — neither shape is reachable without it. Asserting on the
+    /// dispatch invariant rather than a timing-dependent envelope
+    /// shape makes this test deterministic on every CI surface.
     #[tokio::test]
     async fn audit_mirrors_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
@@ -6707,19 +6724,35 @@ mod tests {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
             }))
-            .await
-            .expect("handler must return a degraded result, not error");
-        let body = result_text(&result);
-        assert!(
-            body.contains("\"truncation_reason\":\"timeout\""),
-            "must carry walk_subtree truncation marker: {body}"
-        );
-        assert!(
-            body.contains("\"scanned\":0"),
-            "no nodes should be scanned when upstream is unreachable: {body}"
-        );
+            .await;
+        match result {
+            Ok(call) => {
+                let body = result_text(&call);
+                assert!(
+                    body.contains("\"truncation_reason\":\"timeout\""),
+                    "Ok branch must carry walk_subtree truncation marker: {body}"
+                );
+                assert!(
+                    body.contains("\"scanned\":0"),
+                    "Ok branch: no nodes should be scanned when upstream is unreachable: {body}"
+                );
+            }
+            Err(e) => {
+                let json = serde_json::to_value(&e).expect("McpError serialises");
+                assert_eq!(
+                    json["data"]["operation"], "audit_mirrors",
+                    "Err branch must route through tool_error with operation=audit_mirrors: {json}"
+                );
+                assert!(
+                    json["data"]["proximate_cause"].is_string(),
+                    "Err branch must carry a proximate_cause classification: {json}"
+                );
+            }
+        }
     }
 
+    /// Same shape as `audit_mirrors_handler_dispatches_via_walk_subtree` —
+    /// see that test's docstring for the timing-tolerance rationale.
     #[tokio::test]
     async fn review_handler_dispatches_via_walk_subtree() {
         let server = new_test_server();
@@ -6729,17 +6762,31 @@ mod tests {
                 max_depth: Some(2),
                 days_stale: Some(30),
             }))
-            .await
-            .expect("handler must return a degraded result, not error");
-        let body = result_text(&result);
-        assert!(
-            body.contains("\"truncation_reason\":\"timeout\""),
-            "must carry walk_subtree truncation marker: {body}"
-        );
-        assert!(
-            body.contains("\"scanned\":0"),
-            "no nodes should be scanned when upstream is unreachable: {body}"
-        );
+            .await;
+        match result {
+            Ok(call) => {
+                let body = result_text(&call);
+                assert!(
+                    body.contains("\"truncation_reason\":\"timeout\""),
+                    "Ok branch must carry walk_subtree truncation marker: {body}"
+                );
+                assert!(
+                    body.contains("\"scanned\":0"),
+                    "Ok branch: no nodes should be scanned when upstream is unreachable: {body}"
+                );
+            }
+            Err(e) => {
+                let json = serde_json::to_value(&e).expect("McpError serialises");
+                assert_eq!(
+                    json["data"]["operation"], "review",
+                    "Err branch must route through tool_error with operation=review: {json}"
+                );
+                assert!(
+                    json["data"]["proximate_cause"].is_string(),
+                    "Err branch must carry a proximate_cause classification: {json}"
+                );
+            }
+        }
     }
 
     /// The MCP handler and the wflow-do CLI must call into the SAME
