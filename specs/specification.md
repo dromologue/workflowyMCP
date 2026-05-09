@@ -653,6 +653,20 @@ pinned by `template_skill_carries_required_discipline_phrases` in
    recovery wastes latency). Pin: phrases `Audit-shaped` and
    `Research-shaped`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
+7. **[C-disc-007] Atomic notes use `batch_create_nodes`, not `insert_content`.** `insert_content` has no per-line description channel; using it for atomic notes silently drops source attribution on every child. `batch_create_nodes(operations=[{name, description, parent_id}, ...])` accepts description per operation and is the only insertion path that preserves the "source attribution in the description" rule of Atomic Note Discipline. Failure caught by Eval Test 5 (2026-05-09). Pin: phrase `batch_create_nodes` (not `insert_content`). Pinned by `template_skill_carries_required_discipline_phrases`.
+
+8. **[C-disc-008] Backlinks use the literal `<a href>` anchor form.** Workflowy renders backlinks only when written as `<a href="https://workflowy.com/#/<short-hash>">name</a>`. Raw UUIDs in prose do not render as clickable links and audit tooling can't follow them. Failure caught by Eval Test 11 (2026-05-09). Pin: phrase `<a href="https://workflowy.com/#/`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+9. **[C-disc-009] Mid-session task capture is offer-then-confirm.** When a task surfaces during an unrelated chat, the workflow MUST split into two messages: an offer ("I can capture this as ... — confirm?") and, on user yes, the write. Collapsing the two denies the user the chance to redirect / veto and lets inferred-domain mistakes compound silently. Failure caught by Eval Test 24 (2026-05-09). Pin: phrase `offer-then-confirm`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+10. **[C-disc-010] Daily prioritisation produces a priority-ordered briefing, not a per-source paste.** The output is synthesised into a single ranked list, ordered by urgency × strategic importance, headed by "the most important thing today". A flat per-system summary is data, not a briefing. Failure caught by Eval Test 1 (2026-05-09). Pin: phrase `priority-ordered briefing`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+11. **[C-disc-011] Explicit-check discipline.** Every workflow step that says "scan X" or "check Y" must explicitly state the result, including the negative. Silent omission breaks the audit trail of what was checked. Data calls must be re-issued at workflow start even when "the same data" was loaded earlier in the session. Failures caught by Eval Tests 2 + 8 (2026-05-09). Pin: phrase `Explicit-check discipline`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+12. **[C-disc-012] Cross-system retrieval requires both name AND content search per source.** Index-fast-path catches name matches in O(1); description-touching content needs a live walk. For each external service: surface search AND content/grep search, even when the surface returned empty. Failure caught by Eval Test 4 (2026-05-09). Pin: phrase `name AND content search`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+13. **[C-disc-013] Uniform per-pillar mirroring.** When a synthesis produces 3+ atomic notes and two or more of them substantively bear on the same destination pillar, *all atoms* that touch that pillar get mirrored there — not just the most obviously-anchored ones. Failure caught by Eval Test 9 (2026-05-09). Pin: phrase `Uniform per-pillar mirroring`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
 These pins are intentionally phrase-based rather than structural.
 Any rewrite that preserves the discipline is free to change the
 surrounding prose; a rewrite that drops the phrase fails the test

@@ -361,19 +361,29 @@ fn template_skill_carries_required_discipline_phrases() {
     // (phrase, contract name) — contract name appears in the failure
     // message so the author knows which discipline they just dropped.
     let required: &[(&str, &str)] = &[
-        ("The probe is unconditional", "Bootstrap probe is unconditional (Step 0)"),
-        ("WORKING-MEMORY RULE", "Working-memory rule for memory files (Step 2)"),
-        ("Fail loud when", "Bootstrap fail-loud on `$SECONDBRAIN_DIR`"),
-        ("$SECONDBRAIN_DIR", "Bootstrap fail-loud on `$SECONDBRAIN_DIR` (env var named)"),
-        ("routing-plan gate", "Synthesis pattern 1: routing-plan gate"),
-        ("MOC-batch-mirror", "Synthesis pattern 2: MOC-batch-mirror sequence"),
-        ("Journal range covered:", "Synthesis pattern 3: Journal-scan + range stamp"),
+        ("The probe is unconditional", "C-disc-001 Bootstrap probe unconditional"),
+        ("WORKING-MEMORY RULE", "C-disc-002 Working-memory rule for memory files"),
+        ("Fail loud when", "C-disc-003 Bootstrap fail-loud on `$SECONDBRAIN_DIR`"),
+        ("$SECONDBRAIN_DIR", "C-disc-003 Bootstrap fail-loud (env var named)"),
+        ("routing-plan gate", "C-disc-004 Synthesis pattern: routing-plan gate"),
+        ("MOC-batch-mirror", "C-disc-004 Synthesis pattern: MOC-batch-mirror"),
+        ("Journal range covered:", "C-disc-004 Synthesis pattern: Journal-scan + range stamp"),
         (
             "Every UUID-typed parameter gets an explicit UUID",
-            "Null discipline (definitive — no exceptions)",
+            "C-disc-005 Null discipline (definitive — no exceptions)",
         ),
-        ("Audit-shaped", "Truncation: audit-shaped walk recognition"),
-        ("Research-shaped", "Truncation: research-shaped walk recognition"),
+        ("Audit-shaped", "C-disc-006 Truncation: audit-shaped walk recognition"),
+        ("Research-shaped", "C-disc-006 Truncation: research-shaped walk recognition"),
+        ("`batch_create_nodes` (not `insert_content`)", "C-disc-007 Atomic notes use `batch_create_nodes`"),
+        (
+            "<a href=\"https://workflowy.com/#/",
+            "C-disc-008 Backlink format is the literal `<a href>` anchor",
+        ),
+        ("offer-then-confirm", "C-disc-009 Mid-session task capture is offer-then-confirm"),
+        ("priority-ordered briefing", "C-disc-010 Daily prioritisation produces a priority-ordered briefing"),
+        ("Explicit-check discipline", "C-disc-011 Explicit-check discipline (state every check, including negative)"),
+        ("name AND content search", "C-disc-012 Cross-system retrieval requires both name AND content search"),
+        ("Uniform per-pillar mirroring", "C-disc-013 Uniform per-pillar mirroring (no per-atom drift)"),
     ];
     let mut missing: Vec<String> = Vec::new();
     for (phrase, contract) in required {

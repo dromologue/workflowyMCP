@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 28 contracts, 28 unique pinning tests.
+**Coverage:** 35 contracts, 28 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -26,6 +26,13 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-disc-004` | Synthesis workflows share three named patterns | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 | `C-disc-005` | Null discipline is definitive | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 | `C-disc-006` | Truncation distinguishes walk shapes | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-007` | Atomic notes use `batch_create_nodes`, not `insert_content` | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-008` | Backlinks use the literal `<a href>` anchor form | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-009` | Mid-session task capture is offer-then-confirm | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-010` | Daily prioritisation produces a priority-ordered briefing, not a per-source paste | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-011` | Explicit-check discipline | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-012` | Cross-system retrieval requires both name AND content search per source | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
+| `C-disc-013` | Uniform per-pillar mirroring | `template_skill_carries_required_discipline_phrases` | `tests/template_portability.rs` |
 
 ## Server runtime (`C-server-*`)
 
