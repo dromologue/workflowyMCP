@@ -6,7 +6,7 @@ into a working second brain.
 
 There are two ways to use it:
 
-1. **Bare MCP server.** Wire the binary into your MCP host and call the 26
+1. **Bare MCP server.** Wire the binary into your MCP host and call the 41
    tools directly. No templates, no opinions.
 2. **Second brain.** Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The
    assistant follows the script: builds the binary, wires the host, sets up
@@ -22,12 +22,23 @@ live wherever `$SECONDBRAIN_DIR` points, never in this repo.
 
 ## Quick install
 
+You need: Rust 1.75+ (`rustup install stable`), a Workflowy account with an
+API key (Settings → API in Workflowy), and an MCP host (Claude Code,
+Claude Desktop, or claude.ai web).
+
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
 cd ~/code/workflowy-mcp-server
 cargo build --release
 echo "WORKFLOWY_API_KEY=<your-token>" > .env
 ```
+
+The binary reads `.env` from the directory it's launched from. The
+clone path above (`~/code/workflowy-mcp-server`) is the working
+directory for the host's MCP launch — the host runs the binary from
+there, so `.env` resolves correctly. **Recommended alternative:** put
+the same key in your MCP host's `env` block (see the next section), so
+the binary works regardless of where it's launched from.
 
 Wire the resulting `target/release/workflowy-mcp-server` into your MCP host:
 
@@ -37,8 +48,10 @@ Wire the resulting `target/release/workflowy-mcp-server` into your MCP host:
   or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). See
   [BOOTSTRAP.md](BOOTSTRAP.md) for the JSON shape.
 
-Verify with `workflowy_status` — the host should return
-`status: "ok"`, `api_reachable: true`.
+Verify by calling the `workflowy_status` tool — the host should return
+`status: "ok"`, `api_reachable: true`, `authenticated: true`. If
+`authenticated: false`, your API key is wrong or not reaching the
+binary; check the env-var section below.
 
 That's it for plain MCP usage.
 
@@ -182,10 +195,23 @@ description carries `mirror_of: <canonical_uuid>`. Edits to the
 canonical do **not** propagate to the mirror — the link is structural
 and human-curated, not live. Pass an optional `pillar` to write a
 `canonical_of: <pillar>` marker to the canonical when it lacks one;
-existing markers are never overwritten. The mirror's create + the
-optional canonical edit run through the shared
-[`crate::workflows::create_mirror_via_convention`](src/workflows.rs)
-function, the same code path the `wflow-do create-mirror` CLI calls.
+existing markers are never overwritten. Pass `dry_run=true` to preview
+the resolved canonical, target_parent, and mirror name (verbatim copy of
+the canonical's name) without writing — useful when batching multiple
+mirror passes across a synthesis. The mirror's create + the optional
+canonical edit (and the dry-run preview) run through the shared
+[`crate::workflows`](src/workflows.rs) module, the same code path the
+`wflow-do create-mirror [--dry-run]` CLI calls.
+
+**`scope_resolved` diagnostic field.** Every tool that accepts an
+`Option<NodeId>` for parent_id (`create_node`, `batch_create_nodes`,
+`insert_content`, `create_mirror`, `list_children`, `find_node`,
+`search_nodes`) returns a `scope_resolved` field naming what the server
+actually targeted: `workspace_root` when the resolved scope was None
+(caller passed null or omitted), or `scoped:<full-uuid>` otherwise.
+Read this field after every call where parent_id was null/omitted to
+verify the server resolved to where you intended — pre-2026-05-09
+callers had no way to audit this without inspecting the wire payload.
 
 **`insert_content` payload cap.** The hard cap is 80 lines per call,
 lowered from 200 on 2026-05-04 after the failure-report 2026-05-03
@@ -238,21 +264,27 @@ kind-appropriate wall-clock deadline:
 |-----------|--------|----------|
 | Read | 30 s | `get_node`, `list_children` |
 | Write | 15 s | `create_node`, `delete_node`, `edit_node` |
-| Bulk | 210 s | `insert_content`, `transaction`, `bulk_update`, `path_of`, `node_at_path` |
+| Bulk | 180 s | `insert_content`, `transaction`, `bulk_update`, `path_of`, `node_at_path` |
 | Walk | 20 s (internal) | `search_nodes`, `get_subtree`, `find_node` |
 
 `cancel_all` interrupts any in-flight tool within ~50 ms. On budget
 expiry, bulk operations return a structured partial-success payload
 (`status: "partial"`, `created_count`, `last_inserted_id`, etc.) so the
-caller can resume — no "no result received" without diagnostic.
+caller can resume — no "no result received" without diagnostic. The
+180 s bulk budget leaves 60 s of margin under the MCP transport's
+4-min hard timeout (Claude Desktop, claude.ai web) so the
+partial-success envelope is reachable on every surface — lowered from
+210 s on 2026-05-09 after a sub-cap `insert_content` payload was
+observed hanging the full 4 minutes with no diagnostic on claude.ai
+web.
 
 For the full list (transport-timeout retry, `authenticated`/`api_reachable`
-decoupling, `null` parameter handling, the 2026-05-04 `move_node`
-unification that collapsed the previous wrapper-vs-bare divergence,
-etc.) see [`specs/specification.md`](specs/specification.md). 314 lib +
-12 CLI tests pin the contracts, including 21 wiremock-driven
-failure-mode tests that run in under 2 seconds, plus build-time
-invariant tests:
+decoupling, `null` parameter handling and the `scope_resolved` audit
+field, the 2026-05-04 `move_node` unification that collapsed the
+previous wrapper-vs-bare divergence, etc.) see
+[`specs/specification.md`](specs/specification.md). 331 lib + 12 CLI
+tests pin the 43 contracts, including 21 wiremock-driven failure-mode
+tests that run in under 2 seconds, plus build-time invariant tests:
 
 - `parameter_bearing_tools_publish_non_empty_input_schema_properties`
   fails the build if a tool's published schema has empty `properties`
@@ -268,6 +300,16 @@ invariant tests:
   unification: the move retry now lives inside `client.move_node`
   itself, so every caller (handler, transaction, CLI) gets identical
   resilience without having to remember which wrapper to call.
+- `every_scoped_tool_emits_scope_resolved_in_response` and
+  `bulk_budget_leaves_mcp_transport_margin` (2026-05-09) pin the
+  diagnostic surface: every parent-scoped tool surfaces
+  `scope_resolved`, and the bulk budget is held below the MCP transport
+  cap so partial-success envelopes are always reachable.
+- `no_duplicated_renderer_or_scope_label_definitions_outside_canonical_modules`
+  pins the duplication-audit contract: the subtree renderers
+  (`render_subtree_markdown`, `render_subtree_opml`) and the
+  `scope_resolved_label` renderer live once each, with both surfaces
+  re-exporting from `utils::subtree::*` / `workflows::*`.
 
 ---
 
@@ -279,12 +321,17 @@ has a matching subcommand, enforced at build time. Useful as a fallback
 when the MCP transport drops or when you want a Bash-driven workflow.
 
 The CLI and the MCP server share more than the API client: workflow
-orchestration that used to be duplicated (`create_mirror` on 2026-05-04,
-with more to come) now lives in [`src/workflows.rs`](src/workflows.rs).
-Both surfaces call the same workflow function and wrap the typed result
-in their own envelope (structured `tool_error` for the MCP handler,
-stdout/JSON for the CLI). Adding a new tool means writing the
-orchestration once.
+orchestration that used to be duplicated (`create_mirror`,
+`insert_content`, `transaction`, `bulk_update`, `smart_insert`, plus
+the renderers used by `export_subtree`, plus the dry-run preview and
+`scope_resolved` label added on 2026-05-09) lives in
+[`src/workflows.rs`](src/workflows.rs) and
+[`src/utils/subtree.rs`](src/utils/subtree.rs). Both surfaces call the
+same shared function and wrap the typed result in their own envelope
+(structured `tool_error` for the MCP handler, stdout/JSON for the
+CLI). A build-time test grep-audits the source so any future
+contributor reintroducing a parallel implementation in either binary
+fails the build.
 
 ```bash
 target/release/wflow-do status                              # liveness
@@ -318,7 +365,8 @@ without calling the API.
 ```bash
 cargo build              # debug
 cargo build --release    # optimised
-cargo test --lib         # 314 unit tests
+cargo test --lib         # 331 unit tests
+cargo test               # full suite (lib + portability + traceability + eval coverage)
 cargo check              # type-check only
 ```
 
