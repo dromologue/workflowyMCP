@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
 use crate::defaults;
 use crate::error::WorkflowyError;
-use crate::types::{WorkflowyNode, NodeId};
+use crate::types::WorkflowyNode;
 use crate::utils::cache::NodeCache;
 use crate::utils::cancel::CancelRegistry;
 use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
@@ -779,6 +779,7 @@ fn truncation_envelope_from_fetch(
 ///
 /// Returns a `serde_json::Value::Object` ready to pass to
 /// `Content::text(value.to_string())`.
+#[allow(dead_code)] // pinned by `with_truncation_envelope_merges_payload_and_envelope_without_loss` — the helper exists as the canonical merge path; current handlers inline the envelope via `truncation_envelope` directly, but the merge shape is kept callable for any future handler that holds a pre-built JSON payload.
 fn with_truncation_envelope(
     mut payload: serde_json::Value,
     truncated: bool,
@@ -4882,6 +4883,7 @@ pub async fn run_server(client: Arc<WorkflowyClient>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NodeId;
     use serde_json::json;
 
     // --- Parameter deserialization tests ---

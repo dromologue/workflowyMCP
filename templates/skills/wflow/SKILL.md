@@ -128,6 +128,14 @@ Read `$SECONDBRAIN_DIR/drafts/`. Files there are pending writes from a previous 
 3. If resuming: execute the plan, then move the draft from `drafts/` to `session-logs/` with the original date prefix retained.
 4. If setting aside: leave the draft in place and proceed with the new request.
 
+**Fail loud when `$SECONDBRAIN_DIR` is unreachable from the executing subshell.** A non-interactive `bash` subshell (which is what `Read` / `Bash` tools and `ls $SECONDBRAIN_DIR/drafts/` calls run in) does NOT inherit `~/.zshrc` exports — the env var is only visible if it was also set in the MCP host's `env` block (`claude_desktop_config.json` for Desktop, the equivalent for other hosts). When the var is set in `.zshrc` but missing from the host config (or vice-versa), the subshell sees an empty string and silently reports "directory does not exist" — a phantom gap, not a real one. Before the draft check, resolve the var explicitly. If it expands to empty:
+
+1. Stop. Do not write a draft to a fallback path.
+2. Tell the user: "`$SECONDBRAIN_DIR` is unset in this subshell. Check both (a) your shell rc (`~/.zshrc` or `~/.bashrc`) and (b) the MCP host's `env` block in `claude_desktop_config.json`. Both need the same value; the subshell only sees what the host config sets, not what your shell rc sets."
+3. Wait for the user to fix the gap and re-confirm the var is visible (`echo $SECONDBRAIN_DIR` from a tool-issued shell), then resume.
+
+This rule prevents the failure mode where a half-configured environment makes the bootstrap fall through to "no canonical dir" silently — the most common cause of session drafts being staged in unexpected places.
+
 ### Step 2 — MCP health and node-ID resolution
 
 **PERFORMANCE RULE:** the bootstrap must be fast. Never use `find_node` for structural nodes during bootstrap — read them from `memory/workflowy_node_links.md`. Use `search_nodes` with `max_depth:1` only as a last resort.
@@ -234,10 +242,11 @@ The detailed implementation of each workflow lives in the user's customised copy
 - **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
 - **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
 
-#### Two patterns every synthesis workflow shares
+#### Three patterns every synthesis workflow shares
 
 1. **The routing-plan gate.** Before writing anything to Distillations, build a draft routing table — *candidate atom name; destination pillar; mirror destinations; sources integrated* — and gate on user confirmation. Pair this with a **novelty check**: for each candidate atom, run a narrowed `find_node` / `search_nodes` (with `use_index=true` against the destination pillar UUID) for the key concept; if a canonical already covers the same ground, propose a mirror or backlink rather than a new atom. Both passes are cheap and both reduce drift between the user's mental model and what lands in the graph. Worth writing into "Distil single source", "Distil reading list", and "Synthesis capture" alike.
 2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (the nested-array shape protects against the bare-string-UUID encoding bug); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) `create_node` the session log under the cached `Session logs` UUID and append the local mirror at `$SECONDBRAIN_DIR/session-logs/`; (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
+3. **The Journal-scan + range-stamp convention.** When the user keeps a journal, every synthesis or review session begins with a scan of Journal entries over the period since the last journal-bearing session log. The session log's description (or first child) MUST stamp `Journal range covered: YYYY-MM-DD → YYYY-MM-DD` — the next session reads that stamp to know where to pick up. First-run convention: if no prior journal-bearing session log exists, scan back ~30 days. Lift only principle-level insights as atomic notes; personal-context entries stay in the Journal. Skip this pattern entirely if the user doesn't keep a journal.
 
 ---
 

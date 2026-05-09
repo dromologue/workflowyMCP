@@ -600,6 +600,62 @@ files, not server-runtime tests — they protect the user-facing
 template surface, complementing the in-handler envelope pins above
 that protect the runtime surface.
 
+### Discipline contracts the skill template must carry
+
+Beyond the leak rules above, the skill template carries a number of
+positive disciplines that the wflow community has paid for in
+real-session pain. These are the contracts the skill must continue
+to ship; a refactor that quietly drops one re-introduces the failure
+mode that wrote the discipline in the first place. All of them are
+pinned by `template_skill_carries_required_discipline_phrases` in
+`tests/template_portability.rs`.
+
+1. **Bootstrap probe is unconditional.** Step 0 must say "The probe
+   is unconditional" — Desktop, Cowork, and claude.ai all lazy-load
+   MCP tools on first `tool_search`, and the gap bites when the
+   agent defers the probe until a write is imminent. Pin: phrase
+   `The probe is unconditional`.
+
+2. **Working-memory rule for memory files.** Step 2 must require
+   `workflowy_node_links.md` and `distillation_taxonomy.md` to be
+   read into conversation context during Bootstrap, not on demand —
+   cached UUIDs only bite when in front of the agent before the
+   first tool call. Pin: phrase `WORKING-MEMORY RULE`.
+
+3. **Bootstrap fails loud when `$SECONDBRAIN_DIR` is unreachable
+   from a subshell.** A non-interactive `bash` subshell does not
+   inherit `~/.zshrc` exports — the env var must also be set in the
+   MCP host's `env` block. The skill must name both places. Pin:
+   phrase `Fail loud when` `$SECONDBRAIN_DIR`.
+
+4. **Synthesis workflows share three named patterns** — the
+   routing-plan gate (with novelty check), the MOC-batch-mirror
+   sequence, and the Journal-scan + `Journal range covered:` stamp
+   convention. The skill must name and describe all three so they
+   become the prescribed defaults rather than implicit suggestions.
+   Pins: phrases `routing-plan gate`, `MOC-batch-mirror`,
+   `Journal range covered:`.
+
+5. **Null discipline is definitive.** The skill must require an
+   explicit UUID for every UUID-typed parameter, with no exceptions
+   — even when the server's `parent_id: null = workspace root`
+   affordance would accept null. The "warn but it might work
+   sometimes" middle ground is the worst of both worlds. Pin:
+   phrase `Every UUID-typed parameter gets an explicit UUID`.
+
+6. **Truncation distinguishes walk shapes.** The skill must call
+   out the difference between *audit-shaped* walks (where missing
+   branches matter and recovery is required) and *research-shaped*
+   walks (where partial coverage is often sufficient and reflexive
+   recovery wastes latency). Pin: phrases `Audit-shaped` and
+   `Research-shaped`.
+
+These pins are intentionally phrase-based rather than structural.
+Any rewrite that preserves the discipline is free to change the
+surrounding prose; a rewrite that drops the phrase fails the test
+and forces the author to either restate the discipline or
+explicitly remove it from the spec.
+
 ---
 
 ## Load Testing & Failure-Mode Coverage

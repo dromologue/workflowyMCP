@@ -345,6 +345,53 @@ fn template_skill_description_under_1024_chars() {
     );
 }
 
+/// The skill template must continue to carry the positive
+/// disciplines that the wflow community paid for in real-session
+/// pain. Each phrase below is the lexical anchor for a contract the
+/// skill ships; a rewrite that quietly drops one re-introduces the
+/// failure mode that wrote the discipline in the first place. The
+/// pins are intentionally phrase-based rather than structural — any
+/// rewrite that preserves the discipline is free to change the
+/// surrounding prose. See `specs/specification.md` "Discipline
+/// contracts the skill template must carry" for the rationale per
+/// rule.
+#[test]
+fn template_skill_carries_required_discipline_phrases() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
+    // (phrase, contract name) — contract name appears in the failure
+    // message so the author knows which discipline they just dropped.
+    let required: &[(&str, &str)] = &[
+        ("The probe is unconditional", "Bootstrap probe is unconditional (Step 0)"),
+        ("WORKING-MEMORY RULE", "Working-memory rule for memory files (Step 2)"),
+        ("Fail loud when", "Bootstrap fail-loud on `$SECONDBRAIN_DIR`"),
+        ("$SECONDBRAIN_DIR", "Bootstrap fail-loud on `$SECONDBRAIN_DIR` (env var named)"),
+        ("routing-plan gate", "Synthesis pattern 1: routing-plan gate"),
+        ("MOC-batch-mirror", "Synthesis pattern 2: MOC-batch-mirror sequence"),
+        ("Journal range covered:", "Synthesis pattern 3: Journal-scan + range stamp"),
+        (
+            "Every UUID-typed parameter gets an explicit UUID",
+            "Null discipline (definitive — no exceptions)",
+        ),
+        ("Audit-shaped", "Truncation: audit-shaped walk recognition"),
+        ("Research-shaped", "Truncation: research-shaped walk recognition"),
+    ];
+    let mut missing: Vec<String> = Vec::new();
+    for (phrase, contract) in required {
+        if !src.contains(phrase) {
+            missing.push(format!("`{}` ({})", phrase, contract));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "templates/skills/wflow/SKILL.md must carry every discipline \
+         phrase below. A missing phrase means a contract the skill \
+         used to ship has been silently dropped — restate the \
+         discipline (rewriting prose around the phrase is fine) or \
+         remove it from `specs/specification.md` first. Missing:\n  {}",
+        missing.join("\n  "),
+    );
+}
+
 /// The inline memory-file schemas in the skill template must declare
 /// their `canonical_path:` as `$SECONDBRAIN_DIR/memory/<file>.md` —
 /// never a hardcoded user path. The schemas are the source the skill
