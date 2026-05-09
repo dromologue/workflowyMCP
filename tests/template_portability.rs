@@ -144,63 +144,100 @@ fn template_skill_does_not_embed_author_specific_frameworks() {
     );
 }
 
-/// The shipped `workflowy_node_links.md` template must look like a
-/// template, not a real user's cache. Real UUIDs (32-hex-with-hyphens)
-/// in a template would silently anchor a new user to the author's
-/// Workflowy tree. Placeholders (`<UUID>`, `<paste your UUID here>`,
-/// blank cells) are required.
+/// Per-user memory files do NOT live in the repo. The wflow skill
+/// creates them on first use from the schemas embedded inline in
+/// `templates/skills/wflow/SKILL.md`. Earlier the repo shipped
+/// `workflowy_node_links.md`, `distillation_taxonomy.md`, and
+/// `services.md` as standalone fill-in-the-blank templates under
+/// `templates/secondbrain/memory/`; that arrangement was a
+/// half-measure — the files looked like data even when they were
+/// schemas, and a real-UUID regression there would have leaked the
+/// author's Workflowy tree to every clone. The current contract:
+/// `templates/secondbrain/memory/` ships empty (`.gitkeep` only); the
+/// skill carries the schemas; first-use creation has no repo
+/// dependency.
 #[test]
-fn template_workflowy_node_links_is_placeholder_shaped() {
-    let src = read_template("templates/secondbrain/memory/workflowy_node_links.md");
-    // The frontmatter `canonical_path` line uses `$SECONDBRAIN_DIR/...`
-    // — that's a literal env-var reference, not a hardcoded path.
-    // Confirm the file contains no real UUIDs. Real UUIDs match the
-    // pattern xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
-    let real_uuid_re = regex::Regex::new(
-        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-    )
-    .expect("static regex");
-    let hits: Vec<&str> = real_uuid_re
-        .find_iter(&src)
-        .map(|m| m.as_str())
+fn templates_secondbrain_memory_directory_ships_no_per_user_files() {
+    let dir = repo_root().join("templates/secondbrain/memory");
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("memory dir not readable at {}: {}", dir.display(), e))
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != ".gitkeep")
         .collect();
     assert!(
-        hits.is_empty(),
-        "templates/secondbrain/memory/workflowy_node_links.md contains \
-         what look like real Workflowy UUIDs. Templates must use \
-         placeholders (`<UUID>`, blank cells, or descriptive shapes) \
-         so a new user's clone doesn't inherit the author's tree. \
-         Hits: {:?}",
-        hits,
+        entries.is_empty(),
+        "templates/secondbrain/memory/ must ship empty (`.gitkeep` only) — \
+         per-user memory files (workflowy_node_links.md, \
+         distillation_taxonomy.md, services.md) live at \
+         `$SECONDBRAIN_DIR/memory/<file>.md`, NOT in the repo. The \
+         skill creates them on first use using the schemas inline in \
+         `templates/skills/wflow/SKILL.md`. Found unexpected files: {:?}",
+        entries,
     );
 }
 
-/// Same shape rule for the distillation taxonomy template: no real
-/// UUIDs, and at minimum one placeholder marker (`<Pillar`, `<UUID>`,
-/// or `<…>`) so the structure is obviously a fill-in-the-blank.
+/// The skill template carries the inline schemas the skill needs to
+/// create user-specific memory files on first run. Required because
+/// the repo ships no per-user memory templates (see the test above) —
+/// if the schemas weren't in the skill, the first-use creation path
+/// would have nothing to copy from. Pinning the schema headings here
+/// stops a refactor from silently moving them out of the skill.
 #[test]
-fn template_distillation_taxonomy_is_placeholder_shaped() {
-    let src = read_template("templates/secondbrain/memory/distillation_taxonomy.md");
+fn template_skill_carries_inline_memory_file_schemas() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
+    for required in [
+        "## Memory file schemas",
+        "### `workflowy_node_links.md`",
+        "### `distillation_taxonomy.md`",
+        "### `services.md`",
+    ] {
+        assert!(
+            src.contains(required),
+            "templates/skills/wflow/SKILL.md must carry the inline \
+             memory-file schemas the skill uses for first-use \
+             creation. Missing heading: `{}`. Without it, a fresh \
+             clone has no schema to populate `$SECONDBRAIN_DIR/memory/` \
+             from on first use.",
+            required,
+        );
+    }
+}
+
+/// The skill template must contain no real Workflowy UUIDs. The
+/// inline schemas use placeholders (`<TBD>`, `<UUID>`, `<Pillar 1>`,
+/// blank cells); a real UUID in the skill would silently anchor every
+/// new user to the author's tree the moment they run first-use
+/// population. This test absorbs the per-file UUID-shape checks the
+/// previous `template_workflowy_node_links_is_placeholder_shaped` and
+/// `template_distillation_taxonomy_is_placeholder_shaped` tests
+/// performed; it's now scoped to the skill where the schemas live.
+#[test]
+fn template_skill_contains_no_real_workflowy_uuids() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
     let real_uuid_re = regex::Regex::new(
         r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     )
     .expect("static regex");
+    // The placeholder example UUID in the UUID Parameter Discipline
+    // section is a deliberate documentation example, not a real
+    // Workflowy ID — recognised by its all-zeros / all-`5`s shape.
+    let example_uuids = [
+        "550e8400-e29b-41d4-a716-446655440000", // RFC 4122 example
+    ];
     let hits: Vec<&str> = real_uuid_re
         .find_iter(&src)
         .map(|m| m.as_str())
+        .filter(|u| !example_uuids.contains(u))
         .collect();
     assert!(
         hits.is_empty(),
-        "templates/secondbrain/memory/distillation_taxonomy.md contains \
-         real-looking UUIDs. Use placeholders. Hits: {:?}",
+        "templates/skills/wflow/SKILL.md contains what look like real \
+         Workflowy UUIDs. The inline memory-file schemas must use \
+         placeholders only. A real UUID in the skill would silently \
+         anchor every new user to the author's tree on first-use \
+         population. Hits: {:?}",
         hits,
-    );
-    assert!(
-        src.contains("<Pillar") || src.contains("<UUID>") || src.contains("<…>"),
-        "templates/secondbrain/memory/distillation_taxonomy.md must \
-         contain at least one placeholder marker (`<Pillar 1>`, \
-         `<UUID>`, or `<…>`) so the file is obviously a fill-in-the-\
-         blank shape, not a populated cache."
     );
 }
 
@@ -308,39 +345,50 @@ fn template_skill_description_under_1024_chars() {
     );
 }
 
-/// Both memory-file templates must declare their canonical_path as
-/// `$SECONDBRAIN_DIR/memory/<file>.md` — never a hardcoded user path.
-/// This was the May-2026 leak in the *user's bundled copies* (which
-/// the repo template was already correct on, but a regression here
-/// would propagate to new users).
+/// The inline memory-file schemas in the skill template must declare
+/// their `canonical_path:` as `$SECONDBRAIN_DIR/memory/<file>.md` —
+/// never a hardcoded user path. The schemas are the source the skill
+/// copies from on first-use creation; a leaked path here propagates
+/// to every new user's `$SECONDBRAIN_DIR/memory/` files. This test
+/// replaces the previous per-file
+/// `template_memory_files_declare_env_driven_canonical_path`, which
+/// pointed at standalone repo files that no longer ship.
 #[test]
-fn template_memory_files_declare_env_driven_canonical_path() {
-    for rel in [
-        "templates/secondbrain/memory/workflowy_node_links.md",
-        "templates/secondbrain/memory/distillation_taxonomy.md",
-        "templates/secondbrain/memory/services.md",
+fn template_skill_inline_memory_schemas_declare_env_driven_canonical_path() {
+    let src = read_template("templates/skills/wflow/SKILL.md");
+    for required_canonical in [
+        "canonical_path: $SECONDBRAIN_DIR/memory/workflowy_node_links.md",
+        "canonical_path: $SECONDBRAIN_DIR/memory/distillation_taxonomy.md",
+        "canonical_path: $SECONDBRAIN_DIR/memory/services.md",
     ] {
-        let src = read_template(rel);
-        // Find the frontmatter `canonical_path:` line.
-        let canonical_line = src
-            .lines()
-            .find(|l| l.trim_start().starts_with("canonical_path:"))
-            .unwrap_or_else(|| panic!("{}: missing `canonical_path:` frontmatter", rel));
         assert!(
-            canonical_line.contains("$SECONDBRAIN_DIR"),
-            "{}: canonical_path must reference `$SECONDBRAIN_DIR` not a \
-             hardcoded user path. Line: `{}`",
-            rel,
-            canonical_line.trim(),
+            src.contains(required_canonical),
+            "templates/skills/wflow/SKILL.md must contain the \
+             env-driven canonical_path declaration `{}` inside its \
+             inline memory-file schemas. Without it, first-use \
+             creation would copy a frontmatter that doesn't name the \
+             SECONDBRAIN_DIR env var — and a hardcoded path would \
+             route a new user's data into the author's filesystem \
+             layout.",
+            required_canonical,
         );
+    }
+    // Belt-and-braces: scan for any `canonical_path:` line that
+    // references a hardcoded user-home subdirectory rather than the
+    // env var.
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("canonical_path:") {
+            continue;
+        }
         for banned in ["~/code/", "/Users/", "/home/"] {
             assert!(
-                !canonical_line.contains(banned),
-                "{}: canonical_path leaks `{}` — replace with \
-                 `$SECONDBRAIN_DIR/...`. Line: `{}`",
-                rel,
+                !line.contains(banned),
+                "templates/skills/wflow/SKILL.md `canonical_path:` line \
+                 leaks `{}` — replace with `$SECONDBRAIN_DIR/...`. \
+                 Line: `{}`",
                 banned,
-                canonical_line.trim(),
+                line.trim(),
             );
         }
     }

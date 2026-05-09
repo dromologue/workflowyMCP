@@ -97,14 +97,13 @@ The result has this layout:
 ```
 $SECONDBRAIN_DIR/
 ├── README.md                       ← describes what each subdir is for
-├── memory/
-│   └── workflowy_node_links.md    ← cached structural node IDs (you fill this)
+├── memory/                         ← empty; populated by the skill on first use
 ├── drafts/                         ← in-flight distillations awaiting execution
 ├── session-logs/                   ← one markdown file per session that mutated Distillations
 └── briefs/                         ← documents intended for collaborators / future Claude sessions
 ```
 
-The persistent name index (`memory/name_index.json`) appears automatically the first time the MCP server checkpoints.
+The `memory/` directory starts empty. The wflow skill creates `workflowy_node_links.md` on first use using the inline schema in `templates/skills/wflow/SKILL.md`; the optional `distillation_taxonomy.md` and `services.md` files are user-authored. The persistent name index (`memory/name_index.json`) appears automatically the first time the MCP server checkpoints.
 
 **Check before continuing:** all four subdirectories exist; the README.md template was copied in.
 
@@ -123,9 +122,9 @@ Walk the user through identifying their structural nodes. The expected categorie
 - **Resources** — long-term reference material.
 - **Distillations** (optional) — the layer for atomic notes synthesised from reading and conversation. Only relevant if the user follows the second-brain discipline described in `templates/skills/wflow/SKILL.md`.
 
-For each one, use `find_node` (with `parent_id` scoped to root) or `search_nodes` to discover the full UUID, then write the row into `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. The template at `templates/secondbrain/memory/workflowy_node_links.md` is the schema; replace the `<TBD>` placeholders.
+For each one, use `find_node` (with `parent_id` scoped to root) or `search_nodes` to discover the full UUID, then write the row into `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. The schema lives inline in `templates/skills/wflow/SKILL.md` under "Memory file schemas" — copy that section's `workflowy_node_links.md` block to the user's path and replace the `<TBD>` placeholders.
 
-**Important:** every value in this file is the user's specific data. Never check it into a public repo.
+**Important:** every value in this file is the user's specific data. The repo deliberately ships no per-user memory files; the skill creates them on first use. Never check `workflowy_node_links.md`, `distillation_taxonomy.md`, or `services.md` into a public repo.
 
 **Check before continuing:** the user's `workflowy_node_links.md` has at least Tasks, Inbox, and Journal filled in. Verify each ID by calling `get_node` on it.
 

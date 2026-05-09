@@ -575,17 +575,24 @@ explicitly forbidden by tests in `tests/template_portability.rs`:
    file*; the skill body must stay neutral. Pinned by
    `template_skill_does_not_embed_author_specific_frameworks`.
 
-3. **Memory templates use placeholders, not real UUIDs.**
-   `templates/secondbrain/memory/workflowy_node_links.md` and
-   `templates/secondbrain/memory/distillation_taxonomy.md` ship as
-   fill-in-the-blank shapes (`<TBD>`, `<UUID>`, `<Pillar 1>`, blank
-   table cells). Real Workflowy UUIDs in a template would silently
-   anchor a new user to the original author's tree. Both files'
-   `canonical_path:` frontmatter must reference
-   `$SECONDBRAIN_DIR/memory/<file>.md`, never a hardcoded path.
-   Pinned by `template_workflowy_node_links_is_placeholder_shaped`,
-   `template_distillation_taxonomy_is_placeholder_shaped`, and
-   `template_memory_files_declare_env_driven_canonical_path`.
+3. **Per-user memory files do not ship in the repo.** The earlier
+   arrangement shipped `workflowy_node_links.md`,
+   `distillation_taxonomy.md`, and `services.md` as standalone
+   fill-in-the-blank templates under `templates/secondbrain/memory/`.
+   That was a half-measure: the files looked like data even when they
+   were schemas, and a real-UUID regression would have leaked the
+   author's Workflowy tree to every clone. The current contract is
+   that `templates/secondbrain/memory/` ships empty (`.gitkeep`
+   only), the wflow skill carries the three schemas inline at
+   `templates/skills/wflow/SKILL.md` under "Memory file schemas", and
+   the skill creates the user's files on first use using those
+   schemas. The schemas use placeholders only (`<TBD>`, `<UUID>`,
+   `<Pillar 1>`, blank cells) and declare `canonical_path:` as
+   `$SECONDBRAIN_DIR/memory/<file>.md`. Pinned by
+   `templates_secondbrain_memory_directory_ships_no_per_user_files`,
+   `template_skill_carries_inline_memory_file_schemas`,
+   `template_skill_contains_no_real_workflowy_uuids`, and
+   `template_skill_inline_memory_schemas_declare_env_driven_canonical_path`.
 
 These tests run as part of `cargo test` (integration test target
 `template_portability`). They are content-shape tests on shipped

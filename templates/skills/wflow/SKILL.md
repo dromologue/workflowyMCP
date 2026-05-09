@@ -44,7 +44,7 @@ Seven contracts the workflowy-mcp server ships — re-read this section if behav
 1. **`complete_node` is the native completion path; `bulk_update` accepts `complete` / `uncomplete`.** The legacy `#done` tag-as-completion-marker is deprecated for tasks (`#done` on reading-list entries to mark "I've distilled this source" remains a separate convention). Workflowy's wire field is `note` for descriptions and `completed` for the boolean.
 2. **`Parameters<T>` is the wrapper name on every tool's input.** If parameter-bearing calls suddenly silently misroute (every call acts as if you sent no arguments, only `workflowy_status` works), the server has regressed the wrapper name and the cowork client is validating against an empty schema. Recovery: route through `wflow-do` until the server is rebuilt.
 3. **`use_index=true` is the recovery for walk-budget timeouts on name queries.** `find_node` and `search_nodes` answer from the persistent name index in O(1) with no walk budget. Index is name-only — descriptions need a live walk. Populate via `build_name_index(parent_id=<scope>)` once per fresh session or whenever the index is sparse.
-4. **Every walk-shaped tool emits the same JSON-truncation envelope** (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`). Read these on every walk response — don't silently accept partial results.
+4. **Every walk-shaped tool emits the same JSON-truncation envelope** (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`). Read these on every walk response. What you do with `truncated: true` depends on the **walk shape**, not on the truncation flag itself. *Audit-shaped* walks (every-reference sweeps, mirror audits, "review every node under X") cannot tolerate missing branches and must recover (`build_name_index(parent_id=<scope>)` then re-issue with `use_index=true`). *Research-shaped* walks ("what do I have on X", "trace my thinking on Y") tolerate partial coverage well — accept the partial result, surface the truncation banner verbatim, proceed. Reflexive recovery on every truncation adds latency without synthesis benefit; reflexive acceptance on audit walks misses the thing the audit was looking for. Decide which shape the current walk is before reacting.
 5. **`parent_id: null` (or omitted) means workspace root, uniformly.** `create_node`, `batch_create_nodes`, `insert_content`, `list_children`, and every other parent-scoped tool accept null with the same semantics. Pre-2026-05-04 `insert_content` rejected null at the schema layer ("invalid type: null, expected a string"); the failure-report fix aligned its shape to the rest of the family.
 6. **`insert_content` hard cap is 80 lines per call, lowered from 200 on 2026-05-04.** Above the cap, the call returns a typed error with a chunking instruction; chunk to ≤80 lines and pass the previous batch's `last_inserted_id` as the next call's `parent_id` to keep the hierarchy stitched together. The cap tracks the empirically safe transport ceiling.
 7. **`move_node` is unified across the bare tool, `transaction.move`, and the CLI.** Until 2026-05-04 the bare handler used a propagation-retry wrapper while `transaction.move` used a plain method, producing the divergence the failure-report 2026-05-03 traced (11 % vs 100 % success rate). The retry now lives inside `client.move_node` itself, so every move caller gets identical resilience.
@@ -58,7 +58,7 @@ Most preventable write-failure mode. Before any tool call that takes a UUID para
 
 1. **Have the UUID string in front of you.** Full UUID (`550e8400-e29b-41d4-a716-446655440000`), 12-char URL-suffix short hash, or 8-char doc-prefix short hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the write call yet.
 
-2. **NEVER write the literal string `null` between parameter tags for a required UUID.** Some host surfaces (claude.ai web/mobile in particular) have a tendency to emit `null` when the UUID isn't immediately to hand. The MCP server has no fallback that resolves `null` to a previously-touched UUID — the call gets rejected, or worse, lands on the wrong node. If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
+2. **NEVER write the literal string `null`, `"null"`, or any placeholder between parameter tags. Every UUID-typed parameter gets an explicit UUID. No exceptions.** This is the definitive rule, and the skill *deliberately* does not rely on the server's `parent_id: null = workspace root` affordance documented in server contract #5. Three observed pathologies make the affordance unsafe in practice: (a) on some host surfaces (claude.ai web / mobile) the host or model emits `null` when the UUID isn't immediately to hand, treating it as a placeholder — calls land on the wrong node or are rejected with a path-aware deserialization error; (b) when the literal string `"null"` rather than JSON `null` is passed, behaviour was observed routing to the most-recently-discussed contextual destination on three consecutive calls in a single session — neither workspace-root semantics nor a clean rejection; (c) even when the server *would* accept `null`, passing the cached workspace-root UUID explicitly is preferable because it makes the destination auditable in tool-result transcripts. **If the UUID isn't on screen in your reasoning, resolve it before the write call. Do not pass `null` even when the schema accepts it.** If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
 
 3. **If the error reads `invalid parameters at \`.<field>\`: invalid type: null, expected a string`** — you typed `null` for `<field>`. Don't apologise and retry with `null`. Find the actual UUID for that field, then retry. The error names the field on purpose.
 
@@ -89,10 +89,12 @@ A three-step probe at session start. All steps must complete before any workflow
 
 Confirm the MCP tool surface this skill needs is actually loaded **before** doing anything else. claude.ai connectors can be disabled, removed, or fail to load silently; the skill must fail loud rather than silently degrade to filesystem-staging.
 
+**The probe is unconditional.** Run it on every wflow session, regardless of host. Claude Desktop, Cowork, and claude.ai all lazy-load MCP tools on first `tool_search`; "the connector was working last session" is not a substitute for probing this session. Deferring the probe until a write is imminent is how the gap bites — the agent forgets, captures degrade silently to disk, and the user finds out a session later.
+
 #### What to probe
 
-- **`workflowy:*`** — required for every workflow.
-- **`Filesystem:*`** — required to read drafts and memory files (skip in Claude Code, which uses native `Read`/`Write`/`Bash`).
+- **`workflowy:*`** — required for every workflow. Probe always.
+- **`Filesystem:*`** — required to read drafts and memory files. Probe always (skip only in Claude Code, where `Read` / `Write` / `Bash` are native).
 - **Each additional service** *(only if the user has any)*. Check whether `$SECONDBRAIN_DIR/memory/services.md` exists; if it does, read it once at session start and probe each service's `bootstrap_probe` tool. Skip a service whose `bootstrap_probe` is `none`. Skip services whose `participates_in` doesn't intersect the workflow you're about to run. **If the file doesn't exist, skip this step entirely** — many users will run with Workflowy-only and that's a fully supported configuration.
 
 #### How to probe
@@ -129,6 +131,8 @@ Read `$SECONDBRAIN_DIR/drafts/`. Files there are pending writes from a previous 
 ### Step 2 — MCP health and node-ID resolution
 
 **PERFORMANCE RULE:** the bootstrap must be fast. Never use `find_node` for structural nodes during bootstrap — read them from `memory/workflowy_node_links.md`. Use `search_nodes` with `max_depth:1` only as a last resort.
+
+**WORKING-MEMORY RULE.** `workflowy_node_links.md` and `distillation_taxonomy.md` (whichever exist) must be **read into the conversation's working context during Bootstrap**, not treated as on-demand resources to be opened later when a workflow needs an ID. Cached UUIDs only bite when they are in front of the agent before the first tool call. Sessions that defer the read routinely run live searches that the cache would have answered in O(1), inflate latency, and fall back to walks that hit the truncation cap. Read both files at the top of Step 2; carry their tables forward through the workflow. The same applies to `services.md` whenever it is present — read it at the top of Step 0 before the probe so the queued service set is known before any `tool_search` call.
 
 #### Persistent name index + path-based discovery
 
@@ -191,7 +195,7 @@ Try these paths in order; use the first one found by the `Read` tool:
 3. `$HOME/.claude/projects/*/memory/workflowy_node_links.md` (Claude Code project memory)
 4. `$HOME/.claude/memory/workflowy_node_links.md` (legacy global fallback)
 
-If all reads fail, create a new memory file at the first writable path using the schema documented in `templates/secondbrain/memory/workflowy_node_links.md`. Then run **first-use population**: ask the user (via `AskUserQuestion`) for the names of their structural nodes (Tasks, Inbox, Journal, etc.), discover their IDs via `find_node`, and populate the table.
+If all reads fail, create a new memory file at the first writable path using the inline schema in [Memory file schemas](#memory-file-schemas) below. Then run **first-use population**: ask the user (via `AskUserQuestion`) for the names of their structural nodes (Tasks, Inbox, Journal, etc.), discover their IDs via `find_node`, and populate the table. The skill ships the schemas inline; no per-user data lives in the repo.
 
 #### First-use population (only when memory file is empty)
 
@@ -230,6 +234,11 @@ The detailed implementation of each workflow lives in the user's customised copy
 - **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
 - **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
 
+#### Two patterns every synthesis workflow shares
+
+1. **The routing-plan gate.** Before writing anything to Distillations, build a draft routing table — *candidate atom name; destination pillar; mirror destinations; sources integrated* — and gate on user confirmation. Pair this with a **novelty check**: for each candidate atom, run a narrowed `find_node` / `search_nodes` (with `use_index=true` against the destination pillar UUID) for the key concept; if a canonical already covers the same ground, propose a mirror or backlink rather than a new atom. Both passes are cheap and both reduce drift between the user's mental model and what lands in the graph. Worth writing into "Distil single source", "Distil reading list", and "Synthesis capture" alike.
+2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (the nested-array shape protects against the bare-string-UUID encoding bug); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) `create_node` the session log under the cached `Session logs` UUID and append the local mirror at `$SECONDBRAIN_DIR/session-logs/`; (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
+
 ---
 
 ## End-of-session discipline
@@ -246,6 +255,164 @@ If the MCP wedges mid-session (a write returns `Tool execution failed` and `work
 1. Stop writes immediately.
 2. Save the in-flight plan as a markdown file in `$SECONDBRAIN_DIR/drafts/` with the date prefix and a clear "RESUME EXECUTION" header.
 3. Tell the user the next session will resume from the draft.
+
+---
+
+## Memory file schemas
+
+The three memory files this skill reads — `workflowy_node_links.md`, `distillation_taxonomy.md`, `services.md` — are **user-specific data** that lives at `$SECONDBRAIN_DIR/memory/<file>.md`. They are NOT shipped in the repo; the skill creates them on first use using the schemas below. Every line here is a fill-in-the-blank shape; replace `<TBD>`, `<UUID>`, `<Pillar 1>`, etc. with the user's actual values.
+
+### `workflowy_node_links.md`
+
+```markdown
+---
+name: Workflowy Node Links
+description: Cached Workflowy node IDs for structural and pillar nodes — avoids repeated find_node calls
+type: reference
+canonical_path: $SECONDBRAIN_DIR/memory/workflowy_node_links.md
+---
+
+The wflow skill reads this file on every bootstrap. Replace `<TBD>` placeholders with the actual UUIDs from your Workflowy account. Update `Last Verified` whenever you confirm an ID still resolves.
+
+## Synthesis Write Targets (Workflows 9–14) — only if you follow the second-brain discipline
+
+Every node a synthesis session might write to. **Read this section into working context during Bootstrap** for any synthesis workflow; never resolve these by live search. Re-resolve any entry whose `Last Verified` is older than 30 days.
+
+| Node Name                  | Node ID | Last Verified | Used By |
+| -------------------------- | ------- | ------------- | ------- |
+| Distillations (root)       | <TBD>   | <TBD>         | every synthesis search and write |
+| Pillar 1 — distillations   | <TBD>   | <TBD>         | pillar canonical |
+| Pillar 2 — distillations   | <TBD>   | <TBD>         | pillar canonical |
+| Cross-pillar concept maps  | <TBD>   | <TBD>         | irreducibly cross-pillar claims |
+| Session logs               | <TBD>   | <TBD>         | every synthesis session writes here |
+| Themes (parent)            | <TBD>   | <TBD>         | parent for theme mirror destinations |
+
+## Structural Nodes (rarely change)
+
+| Node Name      | Node ID | Last Verified |
+| -------------- | ------- | ------------- |
+| Tasks          | <TBD>   | <TBD>         |
+| Inbox          | <TBD>   | <TBD>         |
+| Tags           | <TBD>   | <TBD>         |
+| Resources      | <TBD>   | <TBD>         |
+| Links          | <TBD>   | <TBD>         |
+| Journal        | <TBD>   | <TBD>         |
+| Reading List   | <TBD>   | <TBD>         |
+| Distillations  | <TBD>   | <TBD>         |
+
+## Reading List sub-nodes (under Reading List)
+
+| Node Name | Node ID | Last Verified |
+| --------- | ------- | ------------- |
+|           |         |               |
+
+## Triage Sources
+
+The set of nodes that Workflow 6 (Inbox Triage) sweeps in order. Append rows to add a new triage target without changing the skill.
+
+| Order | Source Node          | Node ID | Notes |
+| ----- | -------------------- | ------- | ----- |
+| 1     | Inbox (master)       | <TBD>   | Untriaged tasks, links, ideas. |
+| 2     | Reading List         | <TBD>   | URLs you want to read but haven't decided what to do with. |
+| 3     | Reading WIP          | <TBD>   | Items being read or recently read but not yet distilled. |
+
+## Domain Nodes (under Tasks)
+
+Domains are user-specific (Office / Personal / Project / etc.). Discover them once via `list_children` against the Tasks node and write the rows here.
+
+| Node Name | Node ID | Last Verified |
+| --------- | ------- | ------------- |
+|           |         |               |
+```
+
+### `distillation_taxonomy.md`
+
+Author once before the synthesise workflows (9–14) can run. The skill reads it during Bootstrap whenever a workflow needs pillar / theme / routing data.
+
+```markdown
+---
+name: Distillation Taxonomy
+description: Pillar / theme / routing data for the wflow skill — the semantic layer of the second brain.
+type: reference
+last_reviewed: <YYYY-MM-DD>
+canonical_path: $SECONDBRAIN_DIR/memory/distillation_taxonomy.md
+---
+
+# Distillation Taxonomy
+
+## Pillars (canonical)
+
+A *pillar* is a top-level conceptual bucket. Each typically has a Link node (raw material under Resources / Links) and a Distillations node (atomic notes under Distillations). Three is a sensible minimum; five is the upper bound before pillars start overlapping.
+
+| Pillar     | Focus                                                | Link node UUID | Distillations node UUID |
+| ---------- | ---------------------------------------------------- | -------------- | ----------------------- |
+| <Pillar 1> | <one-line description of what this pillar is about>  | `<UUID>`       | `<UUID>`                |
+| <Pillar 2> | <…>                                                  | `<UUID>`       | `<UUID>`                |
+| <Pillar 3> | <…>                                                  | `<UUID>`       | `<UUID>`                |
+
+**Key thinkers per pillar (optional).**
+
+- **<Pillar 1>** — <author>, <author>
+- **<Pillar 2>** — <author>
+
+**Cross-pillar concepts (optional).** Concepts that connect multiple pillars; synthesis touching them mirrors across both and gets a node under `Cross-pillar concept maps`.
+
+- **<Concept name>** — connects <Pillar A> + <Pillar B>.
+
+## Themes (cross-cutting)
+
+A *theme* describes what a claim is about, not what it tells you to do. Themes typically mirror into one or more pillars.
+
+| Theme     | Link UUID | Distillations UUID | Default pillar mirror | Notes |
+| --------- | --------- | ------------------ | --------------------- | ----- |
+| <Theme 1> | `<UUID>`  | `<UUID>`           | <Pillar X>            | <…>   |
+
+## Inbound routing table
+
+When triage (Workflow 6) or reading-list management (Workflow 7) needs to decide where an inbound link belongs.
+
+| Topic marker                            | Destination Link folder | Default pillar for distillation |
+| --------------------------------------- | ----------------------- | ------------------------------- |
+| <e.g. "anthropic.com", "openai.com">    | <e.g. AI Link folder>   | <e.g. Build>                    |
+
+## Tag conventions (optional)
+
+- `#done` — applied to Reading List entries that have been distilled.
+- `#session_<YYYY-MM-DD>` — applied to atoms created in a single distillation session.
+- `#mirror_of:<short-hash>` — applied to a mirror node pointing at its canonical.
+```
+
+### `services.md`
+
+Optional. Skip this file entirely if Workflowy is the only surface the user has.
+
+```markdown
+---
+name: Additional Services
+description: User-configured services the wflow skill probes and routes to alongside Workflowy.
+type: reference
+canonical_path: $SECONDBRAIN_DIR/memory/services.md
+---
+
+# Additional Services
+
+The wflow skill ships service-agnostic. The `Workflowy` MCP is the one required surface; everything else — ink capture, document storage, reading queues, task systems, calendar — is optional and declared here.
+
+## Schema
+
+Each `## <Service Name>` block holds:
+
+- **mcp_namespace** — the `mcp__<name>__*` prefix the tools use, or `none` if the service is reached via shell / HTTP rather than MCP.
+- **purpose** — one-line description.
+- **participates_in** — comma-separated workflow categories: `capture`, `triage`, `retrieval`, `synthesis`, `extraction`, `prioritisation`.
+- **bootstrap_probe** — health-check tool name to call during Step 0, or `none`.
+- **runbook_on_unreachable** — exact text to surface to the user when the probe fails.
+- **notes** — optional. Anything else relevant: known fragility, OCR backend selection, rate limits, cache TTLs, etc.
+
+## Configured services
+
+(Populate with `## <Service>` blocks per service. Leave empty if Workflowy is the only surface.)
+```
 
 ---
 
