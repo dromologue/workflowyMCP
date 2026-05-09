@@ -166,7 +166,7 @@ cargo test --lib -- --nocapture            # with stdout
 
 ## Configuration
 
-Environment variables loaded from `.env` via dotenv (`src/config.rs`):
+Environment variables loaded from `.env` via dotenvy (`src/config.rs`):
 - `WORKFLOWY_API_KEY` (required)
 - `WORKFLOWY_INDEX_PATH` (optional) — disk path for the persistent name index. Unset or empty disables persistence. The repository ships no machine-specific default; each user (or MCP host config) wires the path explicitly.
 - `SECONDBRAIN_DIR` (optional) — root of the user's operational `secondBrain` directory (drafts, session logs, briefs, memory). The `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip).

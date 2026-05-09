@@ -8,7 +8,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() {
     // Load .env
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let api_key = std::env::var("WORKFLOWY_API_KEY")
         .expect("WORKFLOWY_API_KEY must be set in .env");

@@ -441,7 +441,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     if !cli.quiet {
         let _ = tracing_subscriber::fmt()

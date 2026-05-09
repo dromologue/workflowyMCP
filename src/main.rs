@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env file if present
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     // Initialize tracing — MUST write to stderr, stdout is reserved for MCP JSON-RPC
     tracing_subscriber::fmt()
