@@ -3532,6 +3532,7 @@ impl WorkflowyMcpServer {
             "name_index": {
                 "size": self.name_index.size(),
                 "populated": self.name_index.is_populated(),
+                "persistence": name_index_persistence_envelope(),
             },
             "server_uptime_ms": self.started_at.elapsed().as_millis() as u64,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
@@ -3661,6 +3662,7 @@ impl WorkflowyMcpServer {
             "name_index": {
                 "size": self.name_index.size(),
                 "populated": self.name_index.is_populated(),
+                "persistence": name_index_persistence_envelope(),
             },
             "rate_limit": {
                 "remaining": rate_limit.remaining,
@@ -4873,6 +4875,35 @@ fn resolve_index_save_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(trimmed))
 }
 
+/// Build the `name_index.persistence` envelope shared by `health_check`
+/// and `workflowy_status`. Surfaced 2026-05-09: the dual-config gap
+/// between shell-rc exports and MCP host config means
+/// `WORKFLOWY_INDEX_PATH` can be set in `.zshrc` but unseen by the
+/// MCP server process Claude Desktop launches, with no signal that
+/// persistence is disabled. The agent then pays cold-start latency on
+/// every short-hash resolve. Surfacing the configured-vs-not state
+/// here means a single status probe answers the diagnostic question
+/// without the user having to grep their shell config.
+fn name_index_persistence_envelope() -> serde_json::Value {
+    let path = resolve_index_save_path();
+    let configured = path.is_some();
+    let warning = if configured {
+        None
+    } else {
+        Some(format!(
+            "{} is not set (or empty) — the persistent name index is in-memory only and will not survive restart; short-hash resolution pays walk-budget cost on every cold start. Set the env var in the MCP host config (e.g. claude_desktop_config.json `mcpServers.workflowy.env.{}`); `.zshrc` exports do not propagate to the MCP server process.",
+            defaults::INDEX_PATH_ENV,
+            defaults::INDEX_PATH_ENV,
+        ))
+    };
+    json!({
+        "configured": configured,
+        "path": path.map(|p| p.to_string_lossy().into_owned()),
+        "env_var": defaults::INDEX_PATH_ENV,
+        "warning": warning,
+    })
+}
+
 /// Spawn a background task that flushes the dirty name index to disk
 /// every [`defaults::INDEX_SAVE_INTERVAL_SECS`] seconds. The task lives
 /// for as long as the process — there is no graceful shutdown over MCP
@@ -5639,6 +5670,58 @@ mod tests {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "");
         assert!(resolve_index_save_path().is_none(), "empty env disables persistence");
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Surfaced 2026-05-09: when `WORKFLOWY_INDEX_PATH` is unset (or set
+    /// only in `.zshrc`, which the MCP server process does not see),
+    /// the persistent name index runs in-memory-only with no signal,
+    /// and the agent pays cold-start latency on every short-hash
+    /// resolve. The persistence envelope on `name_index` surfaces the
+    /// state explicitly, with a `warning` field that names the env
+    /// var and the recommended host-config fix.
+    #[test]
+    fn name_index_persistence_envelope_warns_when_env_unset() {
+        let key = defaults::INDEX_PATH_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        let env = name_index_persistence_envelope();
+        assert_eq!(env["configured"], serde_json::Value::Bool(false));
+        assert_eq!(env["path"], serde_json::Value::Null);
+        assert_eq!(env["env_var"], serde_json::Value::String(key.to_string()));
+        let warn = env["warning"].as_str().expect("warning string when unset");
+        assert!(warn.contains(key), "warning must name the env var: {}", warn);
+        assert!(
+            warn.contains("MCP host config") || warn.contains("claude_desktop_config"),
+            "warning must point at the host-config fix path: {}",
+            warn
+        );
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Companion to the unset-warning case: when the env var is set,
+    /// the envelope reports the path and `warning` is null. Pinning so
+    /// the diagnostic remains a single source of truth — neither the
+    /// configured nor the unconfigured shape can drift silently.
+    #[test]
+    fn name_index_persistence_envelope_reports_path_when_env_set() {
+        let key = defaults::INDEX_PATH_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/wflow-persist-test/idx.json");
+        let env = name_index_persistence_envelope();
+        assert_eq!(env["configured"], serde_json::Value::Bool(true));
+        assert_eq!(
+            env["path"],
+            serde_json::Value::String("/tmp/wflow-persist-test/idx.json".to_string())
+        );
+        assert_eq!(env["warning"], serde_json::Value::Null);
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
@@ -7410,6 +7493,59 @@ mod tests {
         assert!(
             path.contains("node_id"),
             "symmetric case: error path must name node_id, got `{}`",
+            path,
+        );
+    }
+
+    /// Companion to `null_required_uuid_field_error_names_the_field`:
+    /// the literal *string* `"null"` (four chars, not JSON null) must
+    /// reject with a path-aware error, the same way JSON-null does.
+    /// Surfaced 2026-05-09 by a Claude Desktop session that observed
+    /// `parent_id="null"` (string) silently landing at contextually-
+    /// derived destinations across three consecutive `create_node` /
+    /// `create_mirror` calls — the host serialiser was emitting `"null"`
+    /// for what should have been an explicit UUID, and the server was
+    /// accepting it. The 2026-05-10 fix added a hand-written Deserialize
+    /// on `NodeId` that rejects the literal up-front. This test pins the
+    /// failure shape so the regression cannot recur silently: the field
+    /// path is observable and the message names the constraint.
+    #[test]
+    fn literal_null_string_in_required_uuid_field_error_names_the_field() {
+        // node_id = "null" (string), new_parent_id present
+        let payload = serde_json::json!({
+            "node_id": "null",
+            "new_parent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let result: std::result::Result<MoveNodeParams, _> =
+            serde_path_to_error::deserialize(&payload);
+        let err = result.expect_err(
+            "literal \"null\" on a required NodeId must reject — pinning the failure shape",
+        );
+        let path = err.path().to_string();
+        assert!(
+            path.contains("node_id"),
+            "error path must name the offending field so the host can self-correct, got `{}`",
+            path,
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a valid UUID"),
+            "error must explain the constraint, got: {}",
+            msg,
+        );
+
+        // Symmetric case: new_parent_id = "null" must name new_parent_id.
+        let payload = serde_json::json!({
+            "node_id": "550e8400-e29b-41d4-a716-446655440000",
+            "new_parent_id": "null",
+        });
+        let result: std::result::Result<MoveNodeParams, _> =
+            serde_path_to_error::deserialize(&payload);
+        let err = result.expect_err("symmetric: literal \"null\" on new_parent_id must reject");
+        let path = err.path().to_string();
+        assert!(
+            path.contains("new_parent_id"),
+            "symmetric case: error path must name new_parent_id, got `{}`",
             path,
         );
     }

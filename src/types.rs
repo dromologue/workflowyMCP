@@ -10,9 +10,57 @@ pub struct NodeData {
 
 /// Newtype wrapper for Workflowy node IDs (UUIDs).
 /// Provides type safety to prevent mixing node IDs with arbitrary strings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+///
+/// `Deserialize` is a hand-written impl rather than `#[derive]` so the
+/// host-encoded literal strings `"null"` / `"undefined"` reject up-front
+/// at the parameter boundary instead of routing as opaque IDs that the
+/// API layer fails on later. Surfaced 2026-05-09 by a Claude Desktop
+/// session that observed `parent_id="null"` (string, not JSON `null`)
+/// landing at contextually-derived destinations across three calls in a
+/// row — the symptom of a host serialiser that emits `"null"` for what
+/// should have been an explicit UUID. The wire-level fix is to refuse
+/// the literal at the deserialiser, with a path-aware message naming
+/// the field, so the model self-corrects on retry.
+///
+/// Empty string is preserved (some handlers special-case `""` as the
+/// workspace-root sentinel — see `list_children`'s `None | Some("")`
+/// pattern). Whitespace-only is rejected because no real UUID is
+/// whitespace, and silent acceptance hides quoting bugs.
+///
+/// Pinned by the regression tests `null_required_uuid_field_error_names_the_field`
+/// (JSON-null) and `literal_null_string_in_required_uuid_field_error_names_the_field`
+/// (string-"null") plus the `tests::node_id_*` family below.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, Default)]
 #[serde(transparent)]
 pub struct NodeId(pub String);
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let trimmed = s.trim();
+        // Reject host-encoded JS literals that surfaced as silently
+        // routed UUIDs in the 2026-05-09 incident. The skill's UUID
+        // Parameter Discipline tells the assistant never to emit the
+        // literal four-char string "null"; the server now enforces it.
+        if trimmed.eq_ignore_ascii_case("null") || trimmed.eq_ignore_ascii_case("undefined") {
+            return Err(serde::de::Error::custom(format!(
+                "literal \"{}\" is not a valid UUID; supply an explicit UUID or omit the field",
+                trimmed
+            )));
+        }
+        // Reject whitespace-only payloads. An empty string ("") is left
+        // alone because some handlers (e.g. list_children) treat it as
+        // the workspace-root sentinel. Whitespace, by contrast, is never
+        // a real UUID and silently accepting it hides host-side quoting
+        // bugs that should be caught at the deserialiser.
+        if !s.is_empty() && trimmed.is_empty() {
+            return Err(serde::de::Error::custom(
+                "whitespace-only string is not a valid UUID; pass an explicit UUID, an empty string for workspace root, or omit the field",
+            ));
+        }
+        Ok(NodeId(s))
+    }
+}
 
 impl NodeId {
     /// Create a NodeId from a string without validation (for internal/trusted use).
@@ -271,6 +319,66 @@ mod tests {
     fn test_node_id_default() {
         let id = NodeId::default();
         assert_eq!(id.as_str(), "");
+    }
+
+    /// Pinning the 2026-05-09 fix: literal `"null"` (JS string, not JSON null)
+    /// is rejected at the deserialiser. Surfaced when a Claude Desktop
+    /// session emitted `parent_id="null"` for `create_node` and `create_mirror`
+    /// across three calls; the server silently routed those to contextual
+    /// destinations rather than failing loudly. Refusing the literal here
+    /// means the failure is observable at the wire and the host can
+    /// self-correct on retry. Case-insensitive because hosts also emit
+    /// `"NULL"` and `"Null"`; whitespace-trimmed for the same reason.
+    #[test]
+    fn test_node_id_rejects_literal_null_string() {
+        for variant in ["null", "NULL", "Null", "  null  "] {
+            let result: serde_json::Result<NodeId> =
+                serde_json::from_value(json!(variant));
+            let err = result.expect_err(&format!(
+                "variant {:?} must reject — literal `null` is not a UUID",
+                variant
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not a valid UUID"),
+                "error must explain the constraint, got: {}",
+                msg
+            );
+        }
+    }
+
+    /// Symmetric pin: literal `"undefined"` (JS host emits this when a
+    /// reactive UUID binding is unresolved) is rejected the same way.
+    #[test]
+    fn test_node_id_rejects_literal_undefined_string() {
+        let result: serde_json::Result<NodeId> = serde_json::from_value(json!("undefined"));
+        let err = result.expect_err("literal `undefined` must reject");
+        assert!(err.to_string().contains("not a valid UUID"));
+    }
+
+    /// Empty string is preserved — handlers like `list_children` use
+    /// it as the workspace-root sentinel via `None | Some("")`. The
+    /// deserialiser must NOT reject empty; the rejection lives at the
+    /// handler when the operation requires a real ID.
+    #[test]
+    fn test_node_id_accepts_empty_string() {
+        let id: NodeId = serde_json::from_value(json!("")).expect("empty string must deserialize");
+        assert_eq!(id.as_str(), "");
+    }
+
+    /// Whitespace-only input is rejected. No real UUID is whitespace,
+    /// and silent acceptance hides host-side quoting bugs.
+    #[test]
+    fn test_node_id_rejects_whitespace_only() {
+        for variant in ["   ", "\t", "\n"] {
+            let result: serde_json::Result<NodeId> =
+                serde_json::from_value(json!(variant));
+            assert!(
+                result.is_err(),
+                "whitespace-only {:?} must reject",
+                variant
+            );
+        }
     }
 
     // --- WorkflowyNode API deserialization tests ---
