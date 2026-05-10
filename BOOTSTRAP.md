@@ -221,10 +221,25 @@ same Workflowy graph.
 
 ### claude.ai
 
-Upload `templates/skills/wflow/SKILL.md` as a Skill via Settings →
-Capabilities. Note: the persistent name index is local-only — claude.ai is
-best used as a read surface unless the MCP server is reachable as a remote
-service.
+claude.ai's Settings → Skills upload expects a zip with a top-level
+`<skill-name>/` directory wrapper, not a bare SKILL.md. Use the bundler
+shipped with this repo:
+
+```bash
+scripts/bundle-skill.sh                                 # bundles ~/.claude/skills/wflow → dist/wflow.skill.zip
+scripts/bundle-skill.sh --src templates/skills/wflow    # bundle the generic template directly (first-run, no live skill yet)
+```
+
+The bundler validates the SKILL.md frontmatter at bundle time —
+descriptions over the 1024-char cap and `<` / `>` characters anywhere
+in the YAML block are refused there rather than at upload (claude.ai's
+upload validator rejects XML-like tags with no diagnostic). Upload the
+resulting zip via Settings → Skills, then **start a fresh claude.ai
+session**: skills are mounted at session-start and an in-flight thread
+keeps its initial mount.
+
+Note: the persistent name index is local-only — claude.ai is best used
+as a read surface unless the MCP server is reachable as a remote service.
 
 **Check before continuing:** the skill is loaded on the user's primary
 surface. Future sessions will reference it on first interaction.
@@ -270,6 +285,24 @@ expected workspace size.
   automatically. If it does not, confirm `$WORKFLOWY_INDEX_PATH` points
   at a writable location and that the MCP host has the env var set.
   For huge trees, re-run Step 6 with the appropriate `--root` UUIDs.
+- **Index runs in-memory only after restart / cold-start latency on every
+  short-hash resolve.** Likely the dual-config gap — the env var is set
+  in `.zshrc` but not in the MCP host config (Claude Desktop's
+  `claude_desktop_config.json` `mcpServers.workflowy.env`, Claude Code's
+  `~/.claude.json`). The MCP server process inherits its env from the
+  host's launch, not from the user's interactive shell. Diagnose with
+  `workflowy_status` — its `name_index.persistence` block reports
+  `configured: false` and a `warning` string when the env var is unseen,
+  and `configured: true` with the resolved path when it is. Fix by
+  copying `WORKFLOWY_INDEX_PATH` from `.zshrc` into the host config's
+  `env` block, then restart the host.
+- **`invalid type: null, expected a string` or `literal "null" is not a
+  valid UUID`.** The host serialised an unresolved binding as JSON null
+  or the literal four-char string `"null"` for a UUID-typed field. The
+  error path names the offending field (e.g. `invalid parameters at
+  \`.new_parent_id\`: ...`); resolve the actual UUID first and retry.
+  Both forms are rejected at the deserialiser; the previous silent-
+  routing-to-context behaviour is gone.
 - **`insert_content` returns `status: "partial"`.** The bulk budget fired
   before the call completed. The response carries `created_count`,
   `last_inserted_id`, and `stopped_at_line`; resume by re-running with the
