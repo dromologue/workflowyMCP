@@ -18,7 +18,20 @@ scripts/bundle-skill.sh --src <dir>          # alternate skill source
 scripts/bundle-skill.sh --out <zip>          # alternate output path
 ```
 
-The bundler validates frontmatter (no `<` or `>` characters, description ≤ 1024 chars) and writes the skill source as a `<skill-name>/` directory inside the zip — the structure claude.ai's Settings → Skills upload expects. Run after editing `~/.claude/skills/wflow/SKILL.md`, then re-upload.
+The bundler validates frontmatter (no `<` or `>` characters, description ≤ 1024 chars) and writes the skill source as a `<skill-name>/` directory inside the zip — the structure claude.ai's Settings → Skills upload expects.
+
+### Auto-bundle on skill edit (mandatory)
+
+Whenever any file under `~/.claude/skills/wflow/` is edited (`SKILL.md`, `distillation_taxonomy.md`, `workflowy_node_links.md`, or any companion file), the bundle at `dist/wflow.skill.zip` MUST be rebuilt and the user alerted. The harness enforces this via a `PostToolUse` hook in `.claude/settings.json` matching `Edit|Write|MultiEdit`, which delegates to `scripts/auto-bundle-skill.sh`. The wrapper:
+
+1. Reads the tool-call payload from stdin and pulls `tool_input.file_path`.
+2. No-ops if the file isn't under `~/.claude/skills/wflow/`.
+3. Otherwise runs `scripts/bundle-skill.sh` and prints a 🛎 alert line on stderr naming the rebuilt zip path. The alert is what the user sees — do NOT also re-state the rebuild in your own response, the hook output is the single source of truth.
+4. On bundler failure (frontmatter violation, source error) prints a ⚠ STALE warning with the bundler's stderr so the user can fix the underlying issue.
+
+This means: **never run `scripts/bundle-skill.sh` by hand after editing the skill in this project** — the hook has already done it, and a manual rerun is wasted work. Only invoke the bundler explicitly when bundling from a non-default `--src` (e.g. the generic template) or to a non-default `--out`.
+
+Never ask the user to "remember to re-bundle" — the hook removes that obligation. The only outstanding step on the user's side is re-uploading the freshly-bundled zip to claude.ai → Settings → Skills and starting a fresh session, which the alert message names explicitly.
 
 ## Architecture
 
