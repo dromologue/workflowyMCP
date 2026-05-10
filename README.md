@@ -173,7 +173,7 @@ behave the same way.
 | Category | Tools |
 |----------|-------|
 | Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path` |
-| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
+| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `reorder_nodes`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
 | Mirror discipline | `create_mirror` (convention-based: duplicates the canonical's name into a new parent and writes `mirror_of:` to the new node's note), `audit_mirrors` |
 | Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
 | Project management | `get_project_summary`, `get_recent_changes` |
@@ -185,6 +185,23 @@ workaround is deprecated for tasks. `bulk_update(operation: "complete"|"uncomple
 toggles a filtered set in one call; `transaction` accepts the same ops
 with rollback. Wire payload is `POST /nodes/{id}` with
 `{"completed": true|false}`.
+
+**Reordering siblings (`reorder_nodes`).** Workflowy's `move_node`
+priority is *position-relative-to-siblings* and renormalises after every
+call, so a naive forward `priority=0,1,2,…` loop fights itself when you
+try to batch-reorder a set. `reorder_nodes(parent_id, node_ids[])`
+takes the desired head-first order and walks it in **reverse**, issuing
+`move_node` with `priority=0` per id — every move plants its node at
+position 0, the previously-planted nodes shift one step right, and after
+N moves the head of the parent's children is the requested sequence.
+Side effect: ids not currently under `parent_id` are reparented as part
+of the reorder (the primitive is built on `move_node`, not a sibling-
+only assertion). Capped at 200 ids per call. Returns `Complete` or
+`Partial { reason: cancelled | timeout }` with per-id `ok / error /
+skipped` entries; partial outcomes are safe to re-issue with the full
+list because each reverse-priority-0 move is idempotent. The
+orchestration lives once in `crate::workflows::reorder_nodes_via_priority`
+and is shared with `wflow-do reorder --parent <id> --node <id> --node <id>`.
 
 **Mirror creation (convention).** Workflowy's REST API does not expose
 native mirror creation, so `create_mirror(canonical_node_id, target_parent_id)`

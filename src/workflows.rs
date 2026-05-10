@@ -1160,6 +1160,271 @@ pub async fn smart_insert_under_target(
     insert_content_via_indented(client, Some(target_node_id), parsed, ctx).await
 }
 
+// ---------------------------------------------------------------------
+// reorder_nodes
+// ---------------------------------------------------------------------
+
+/// Why a `reorder_nodes_via_priority` call returned partial success
+/// rather than complete. Maps 1:1 to the cancel/deadline signals the
+/// workflow observes between API calls. Reuses the same vocabulary
+/// as `PartialReason` so callers can route on a uniform set of
+/// strings across the workflow surface, but kept distinct because a
+/// reorder partial does NOT carry a resume cursor: the caller can
+/// safely re-issue the full ordered list (each reverse-priority-0
+/// move is idempotent) and the workflow will re-converge.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReorderPartialReason {
+    Cancelled,
+    Timeout,
+}
+
+impl ReorderPartialReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReorderPartialReason::Cancelled => "cancelled",
+            ReorderPartialReason::Timeout => "timeout",
+        }
+    }
+}
+
+/// Per-id outcome of a reorder. The workflow walks the desired list
+/// in reverse so the first element of `node_ids` is processed last;
+/// callers reading this back per-id should remember that the order
+/// of `results` matches the input list (head-first), not the order
+/// of execution.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum ReorderEntry {
+    /// The move POST returned 2xx. The id is now under `parent_id`
+    /// at position 0 at the moment the move ran (subsequent reverse-
+    /// order moves shift it later, by design).
+    Ok { node_id: String },
+    /// The move POST failed. `error` is the upstream message; the
+    /// node may or may not be at its previous position depending on
+    /// where the failure occurred. Other ids in the list still ran.
+    Error { node_id: String, error: String },
+    /// Cancelled or past deadline before this id was reached. The
+    /// node was not touched. Reissue the full list to converge.
+    Skipped { node_id: String },
+}
+
+/// Outcome of a `reorder_nodes_via_priority` call. Two terminal shapes:
+///
+/// - [`ReorderOutcome::Complete`] — every id was attempted (success or
+///   per-id failure recorded in `results`).
+/// - [`ReorderOutcome::Partial`] — the workflow bailed mid-walk because
+///   the cancel guard flipped or the deadline passed. `results`
+///   carries entries up to the bail point (with `Skipped` placeholders
+///   for the un-reached ids); the caller can re-issue the full list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum ReorderOutcome {
+    Complete {
+        parent_id: String,
+        attempted: usize,
+        succeeded: usize,
+        failed: usize,
+        results: Vec<ReorderEntry>,
+    },
+    Partial {
+        parent_id: String,
+        reason: ReorderPartialReason,
+        attempted: usize,
+        succeeded: usize,
+        failed: usize,
+        skipped: usize,
+        results: Vec<ReorderEntry>,
+    },
+}
+
+/// Place the listed `node_ids` in the given order under `parent_id`.
+///
+/// ## Algorithm
+///
+/// Workflowy's `move_node` priority is *position-relative-to-siblings*
+/// and re-normalises after every call: a naive forward loop with
+/// `priority = i` (for i = 0..N) interacts with the renormalisation
+/// in ways that depend on which other siblings the parent carries,
+/// and on huge subtrees a batched reorder can fight itself. The
+/// robust trick is to walk the desired list in **reverse** and pass
+/// `priority = 0` on every move:
+///
+/// ```text
+/// desired order: [A, B, C, D]
+/// step 1: move D parent_id priority=0  → [D, …other siblings]
+/// step 2: move C parent_id priority=0  → [C, D, …]
+/// step 3: move B parent_id priority=0  → [B, C, D, …]
+/// step 4: move A parent_id priority=0  → [A, B, C, D, …]
+/// ```
+///
+/// Each move plants its node at position 0; the previously-planted
+/// nodes shift one step right. After N moves the head of the parent's
+/// children is the desired sequence, regardless of how many other
+/// siblings were already there or how the upstream renormalises
+/// priorities between calls. Other siblings are pushed after the
+/// reordered set, in their original relative order — a stable side
+/// effect callers should be aware of.
+///
+/// ## Side effects
+///
+/// Each move is a real `move_node` POST — nodes not currently under
+/// `parent_id` are reparented as a side effect. This makes
+/// `reorder_nodes_via_priority` simultaneously a reorder AND a
+/// "gather these nodes here in this order" operation, which matches
+/// the move-based primitive Workflowy exposes. Callers who only want
+/// to reorder strict siblings should pre-validate; the workflow
+/// itself does not refetch the parent's children to enforce that.
+///
+/// ## Validation
+///
+/// - `node_ids` must be non-empty.
+/// - `node_ids` must not contain duplicates (the order would be
+///   undefined, and re-moving the same node to priority 0 in the
+///   same call is just slow with no net effect).
+/// - `node_ids.len()` must not exceed [`defaults::MAX_REORDER_NODES`].
+/// - No node id may equal `parent_id` (would attempt to make a node
+///   its own child — the API rejects, but we do too, with a clearer
+///   message and no API touch).
+///
+/// ## Cancel / deadline
+///
+/// Checked between iterations. The workflow returns
+/// [`ReorderOutcome::Partial`] with the un-reached ids marked
+/// `Skipped` so the caller can re-issue the full list.
+pub async fn reorder_nodes_via_priority(
+    client: &WorkflowyClient,
+    parent_id: &str,
+    node_ids: &[String],
+    ctx: &WorkflowContext<'_>,
+) -> Result<(ReorderOutcome, MutationFootprint)> {
+    let mut footprint = MutationFootprint::new();
+
+    if node_ids.is_empty() {
+        return Err(WorkflowyError::InvalidInput {
+            reason: "node_ids must not be empty".to_string(),
+        });
+    }
+    if node_ids.len() > defaults::MAX_REORDER_NODES {
+        return Err(WorkflowyError::InvalidInput {
+            reason: format!(
+                "node_ids length {} exceeds the {}-id cap. Split into batches \
+                 of ≤{} ids and call reorder_nodes once per batch (each batch \
+                 lands at the head of the parent's children at call time, so \
+                 the LAST batch ends up first; order your batches accordingly).",
+                node_ids.len(),
+                defaults::MAX_REORDER_NODES,
+                defaults::MAX_REORDER_NODES,
+            ),
+        });
+    }
+    let mut seen = std::collections::HashSet::with_capacity(node_ids.len());
+    for id in node_ids {
+        if !seen.insert(id.as_str()) {
+            return Err(WorkflowyError::InvalidInput {
+                reason: format!(
+                    "node_ids contains duplicate `{}` — order is undefined for \
+                     duplicates and re-moving the same node within one call is \
+                     a no-op. Pass each id at most once.",
+                    id
+                ),
+            });
+        }
+        if id == parent_id {
+            return Err(WorkflowyError::InvalidInput {
+                reason: format!(
+                    "node_ids contains parent_id `{}` — a node cannot be its \
+                     own child.",
+                    id
+                ),
+            });
+        }
+    }
+
+    // Pre-declare the footprint: we will touch the parent (its children
+    // listing changes) and every node in the list (its parent_id may
+    // change, and its position certainly does). The wrapper applies
+    // these post-call.
+    footprint.invalidate_cache_only(parent_id);
+    for id in node_ids {
+        footprint.invalidate_node(id.clone());
+    }
+
+    // Walk in reverse so the first id ends up at position 0 last.
+    // Build the per-id results in input order so the response shape
+    // matches the request.
+    let mut results: Vec<Option<ReorderEntry>> = (0..node_ids.len()).map(|_| None).collect();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut bailed: Option<ReorderPartialReason> = None;
+
+    for (idx, id) in node_ids.iter().enumerate().rev() {
+        if ctx.is_cancelled() {
+            bailed = Some(ReorderPartialReason::Cancelled);
+            break;
+        }
+        if ctx.is_past_deadline() {
+            bailed = Some(ReorderPartialReason::Timeout);
+            break;
+        }
+        match client.move_node(id, parent_id, Some(0)).await {
+            Ok(()) => {
+                results[idx] = Some(ReorderEntry::Ok {
+                    node_id: id.clone(),
+                });
+                succeeded += 1;
+            }
+            Err(e) => {
+                error!(
+                    node_id = %id,
+                    parent_id = %parent_id,
+                    error = %e,
+                    "reorder_nodes: move failed"
+                );
+                results[idx] = Some(ReorderEntry::Error {
+                    node_id: id.clone(),
+                    error: e.to_string(),
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    // Fill in skipped placeholders for any ids that the loop never
+    // reached (only possible on a cancel / deadline bail-out).
+    let mut skipped = 0usize;
+    for (idx, id) in node_ids.iter().enumerate() {
+        if results[idx].is_none() {
+            results[idx] = Some(ReorderEntry::Skipped {
+                node_id: id.clone(),
+            });
+            skipped += 1;
+        }
+    }
+    let results: Vec<ReorderEntry> = results.into_iter().map(|r| r.expect("filled")).collect();
+
+    let attempted = succeeded + failed;
+    let outcome = match bailed {
+        None => ReorderOutcome::Complete {
+            parent_id: parent_id.to_string(),
+            attempted,
+            succeeded,
+            failed,
+            results,
+        },
+        Some(reason) => ReorderOutcome::Partial {
+            parent_id: parent_id.to_string(),
+            reason,
+            attempted,
+            succeeded,
+            failed,
+            skipped,
+            results,
+        },
+    };
+    Ok((outcome, footprint))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,5 +1764,180 @@ mod tests {
         assert_eq!(parsed[2].indent, 2);
         assert_eq!(parsed[3].text, "Second top");
         assert_eq!(parsed[3].indent, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // reorder_nodes_via_priority — validation pinned without API touch
+    // -----------------------------------------------------------------
+
+    fn test_client() -> WorkflowyClient {
+        WorkflowyClient::new(
+            "http://invalid.local".to_string(),
+            "test-key".to_string(),
+        )
+        .expect("test client builds")
+    }
+
+    /// Empty `node_ids` is rejected with `InvalidInput` before any API
+    /// touch. Pinned because both the MCP envelope and the CLI error
+    /// message rely on the workflow surfacing this as `InvalidInput`
+    /// rather than a network-shaped error.
+    #[tokio::test]
+    async fn reorder_nodes_rejects_empty_list_without_api_call() {
+        let client = test_client();
+        let ctx = WorkflowContext::default();
+        let err = reorder_nodes_via_priority(&client, "parent-uuid", &[], &ctx)
+            .await
+            .expect_err("empty node_ids must reject");
+        assert!(
+            matches!(err, WorkflowyError::InvalidInput { .. }),
+            "empty node_ids must surface as InvalidInput, got: {err:?}"
+        );
+    }
+
+    /// Duplicate ids are rejected with `InvalidInput` and a message
+    /// that names the duplicated id, before any API touch. Re-moving
+    /// the same node within one call is a no-op slow path; refusing
+    /// it up-front keeps the contract honest.
+    #[tokio::test]
+    async fn reorder_nodes_rejects_duplicates_without_api_call() {
+        let client = test_client();
+        let ctx = WorkflowContext::default();
+        let ids = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-a".to_string(),
+        ];
+        let err = reorder_nodes_via_priority(&client, "parent-uuid", &ids, &ctx)
+            .await
+            .expect_err("duplicate ids must reject");
+        let WorkflowyError::InvalidInput { reason } = err else {
+            panic!("duplicates must surface as InvalidInput");
+        };
+        assert!(
+            reason.contains("duplicate") && reason.contains("node-a"),
+            "validation message must name the duplicated id: {reason}"
+        );
+    }
+
+    /// `node_ids` containing the parent id is rejected up-front so the
+    /// caller gets a clear "node cannot be its own child" message
+    /// rather than the upstream's downstream symptom.
+    #[tokio::test]
+    async fn reorder_nodes_rejects_parent_in_list_without_api_call() {
+        let client = test_client();
+        let ctx = WorkflowContext::default();
+        let ids = vec!["node-a".to_string(), "parent-uuid".to_string()];
+        let err = reorder_nodes_via_priority(&client, "parent-uuid", &ids, &ctx)
+            .await
+            .expect_err("parent in node_ids must reject");
+        assert!(
+            matches!(err, WorkflowyError::InvalidInput { .. }),
+            "parent-as-child must surface as InvalidInput, got: {err:?}"
+        );
+    }
+
+    /// `node_ids.len() > MAX_REORDER_NODES` is rejected up-front with
+    /// a chunking instruction. Pinned so the cap is visible at the
+    /// workflow boundary, matching the way `insert_content` exposes
+    /// its own line cap.
+    #[tokio::test]
+    async fn reorder_nodes_rejects_oversized_list_without_api_call() {
+        let client = test_client();
+        let ctx = WorkflowContext::default();
+        let ids: Vec<String> = (0..(defaults::MAX_REORDER_NODES + 1))
+            .map(|i| format!("node-{i:04}"))
+            .collect();
+        let err = reorder_nodes_via_priority(&client, "parent-uuid", &ids, &ctx)
+            .await
+            .expect_err("oversized node_ids must reject");
+        let WorkflowyError::InvalidInput { reason } = err else {
+            panic!("oversize must surface as InvalidInput");
+        };
+        assert!(
+            reason.contains("exceeds")
+                && reason.contains(&defaults::MAX_REORDER_NODES.to_string()),
+            "validation message must surface the cap: {reason}"
+        );
+    }
+
+    /// A pre-cancelled context bails out before the first move, so
+    /// every id is `Skipped` and the outcome is `Partial { reason: cancelled }`.
+    /// No API call required to test this path because the cancel check
+    /// is the very first thing each iteration does. Pinned so the
+    /// partial-shape contract is callable from both surfaces with no
+    /// upstream needed.
+    #[tokio::test]
+    async fn reorder_nodes_pre_cancelled_returns_partial_all_skipped() {
+        use crate::utils::cancel::CancelRegistry;
+        let client = test_client();
+        let registry = CancelRegistry::new();
+        let guard = registry.guard();
+        registry.cancel_all();
+        let ctx = WorkflowContext::new(Some(&guard), None);
+
+        let ids = vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()];
+        let (outcome, footprint) =
+            reorder_nodes_via_priority(&client, "parent-uuid", &ids, &ctx)
+                .await
+                .expect("pre-cancel returns Ok with Partial outcome");
+
+        match outcome {
+            ReorderOutcome::Partial {
+                reason,
+                attempted,
+                succeeded,
+                failed,
+                skipped,
+                results,
+                ..
+            } => {
+                assert!(matches!(reason, ReorderPartialReason::Cancelled));
+                assert_eq!(attempted, 0);
+                assert_eq!(succeeded, 0);
+                assert_eq!(failed, 0);
+                assert_eq!(skipped, 3);
+                assert_eq!(results.len(), 3);
+                for entry in &results {
+                    assert!(matches!(entry, ReorderEntry::Skipped { .. }));
+                }
+            }
+            ReorderOutcome::Complete { .. } => {
+                panic!("pre-cancel must yield Partial, not Complete");
+            }
+        }
+        // Footprint is declared up front (parent + every id) regardless
+        // of whether the moves ran — the wrapper invalidates aggressively
+        // because a partial run may have touched some nodes already.
+        assert!(footprint.invalidated_nodes.contains(&"parent-uuid".to_string()));
+        assert!(footprint.invalidated_name_index.contains(&"node-a".to_string()));
+    }
+
+    /// A past deadline bails out the same way as a pre-cancel, but
+    /// surfaces `ReorderPartialReason::Timeout`. Pinned because the
+    /// two reasons map to different recovery hints in the response
+    /// envelope and a regression flipping the variants would mask
+    /// the wrong cause to the caller.
+    #[tokio::test]
+    async fn reorder_nodes_past_deadline_returns_partial_timeout() {
+        let client = test_client();
+        let past = Instant::now() - std::time::Duration::from_millis(1);
+        let ctx = WorkflowContext::new(None, Some(past));
+
+        let ids = vec!["node-a".to_string()];
+        let (outcome, _) =
+            reorder_nodes_via_priority(&client, "parent-uuid", &ids, &ctx)
+                .await
+                .expect("past-deadline returns Ok with Partial outcome");
+
+        match outcome {
+            ReorderOutcome::Partial { reason, skipped, .. } => {
+                assert!(matches!(reason, ReorderPartialReason::Timeout));
+                assert_eq!(skipped, 1);
+            }
+            ReorderOutcome::Complete { .. } => {
+                panic!("past-deadline must yield Partial, not Complete");
+            }
+        }
     }
 }

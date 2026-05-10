@@ -4066,6 +4066,84 @@ impl WorkflowyMcpServer {
         })
     }
 
+    #[tool(description = "Place a set of nodes in a specific order under a given parent. Pass `parent_id` plus `node_ids` in the desired head-first order — the 0th id becomes the first child of `parent_id`, the last id ends up after every other id in the list. Side effect: ids not currently under `parent_id` are reparented (the call is built on `move_node`, so this is a reorder + gather primitive). Implementation: walks the desired list in REVERSE issuing `priority=0` for each move, which avoids the self-fighting problem of the naive forward `priority=0,1,2,…` loop on Workflowy's renormalising priority semantics. Capped at 200 ids per call; chunk above that. Returns per-id status (ok/error/skipped) so partial outcomes are inspectable.")]
+    async fn reorder_nodes(
+        &self,
+        Parameters(params): Parameters<ReorderNodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_handler!(self, "reorder_nodes", ToolKind::Bulk, params, {
+            // Resolve parent + every id BEFORE any mutation so a short-hash
+            // miss surfaces as `tool_invalid_params` rather than partway
+            // through the reverse walk. Sequential because the resolver
+            // is async and may walk on cache miss; the workflow itself
+            // is the parallel-amenable phase but we keep its inputs
+            // pre-resolved to match every other write tool.
+            let resolved_parent = self.validate_and_resolve(&params.parent_id).await?;
+            let mut resolved_ids: Vec<String> = Vec::with_capacity(params.node_ids.len());
+            for id in &params.node_ids {
+                resolved_ids.push(self.validate_and_resolve(id).await?);
+            }
+            info!(
+                parent_id = %resolved_parent,
+                count = resolved_ids.len(),
+                "Reordering nodes",
+            );
+
+            let cancel_guard = self.cancel_registry.guard();
+            let ctx = crate::workflows::WorkflowContext::new(Some(&cancel_guard), None);
+            let (outcome, footprint) = crate::workflows::reorder_nodes_via_priority(
+                &self.client,
+                &resolved_parent,
+                &resolved_ids,
+                &ctx,
+            )
+            .await
+            .map_err(|e| workflow_error_to_mcp("reorder_nodes", Some(&resolved_parent), e))?;
+            self.apply_footprint(&footprint);
+
+            // Project the typed outcome into the wire envelope the rest
+            // of the bulk-style tools use: a `status` field plus the
+            // per-id `results` array. The CLI projects the same outcome
+            // into stdout — both surfaces stay aligned because they
+            // call this single workflow.
+            let payload = match &outcome {
+                crate::workflows::ReorderOutcome::Complete {
+                    parent_id,
+                    attempted,
+                    succeeded,
+                    failed,
+                    results,
+                } => json!({
+                    "status": "ok",
+                    "parent_id": parent_id,
+                    "attempted": attempted,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "results": results,
+                }),
+                crate::workflows::ReorderOutcome::Partial {
+                    parent_id,
+                    reason,
+                    attempted,
+                    succeeded,
+                    failed,
+                    skipped,
+                    results,
+                } => json!({
+                    "status": "partial",
+                    "reason": reason.as_str(),
+                    "parent_id": parent_id,
+                    "attempted": attempted,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "results": results,
+                }),
+            };
+            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
     #[tool(description = "Cheap incremental sync helper: returns whether the given node has been modified at or after the threshold timestamp (unix milliseconds). One API call. Useful for polling a small set of known-interesting nodes without re-walking the tree.")]
     async fn since(
         &self,

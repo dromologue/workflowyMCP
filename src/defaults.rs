@@ -69,6 +69,14 @@ pub const MAX_CONTENT_LENGTH: usize = 500_000;
 /// callers either succeed atomically at ≤80 or get a structured
 /// "split into ≤80-line batches" error.
 pub const MAX_INSERT_CONTENT_LINES: usize = 80;
+/// Maximum number of node IDs accepted in a single `reorder_nodes`
+/// call. Each id costs one `move_node` POST (the priority-rebalance
+/// trick is documented in `crate::workflows::reorder_nodes_via_priority`).
+/// 200 keeps the call comfortably inside the bulk-tool budget on a
+/// healthy upstream (each move ~150–300 ms) while bounding the worst
+/// case. Above the cap callers chunk the desired order — the trailing
+/// chunk lands first since the algorithm walks in reverse.
+pub const MAX_REORDER_NODES: usize = 200;
 /// Hard cap on max_results for any search/list tool
 pub const HARD_MAX_RESULTS: usize = 100;
 /// Default max_results when not specified

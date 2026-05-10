@@ -67,6 +67,20 @@ enum Cmd {
         #[arg(long)]
         priority: Option<i32>,
     },
+    /// Reorder a set of nodes under a given parent. Pass --node for each
+    /// id in the desired head-first order: the first --node ends up at
+    /// position 0, the last --node ends up after every other id in the
+    /// list. Side effect: ids not currently under `--parent` are
+    /// reparented as part of the reorder. Mirrors MCP `reorder_nodes`
+    /// — same `crate::workflows::reorder_nodes_via_priority` workflow.
+    Reorder {
+        /// Parent under which to order the listed nodes.
+        #[arg(long = "parent")]
+        parent_id: String,
+        /// Desired order, head-first. Repeat `--node` for each id.
+        #[arg(long = "node", value_name = "NODE_ID", num_args = 1..)]
+        nodes: Vec<String>,
+    },
     /// Delete a node.
     Delete { node_id: String },
     /// Edit a node's name and/or description.
@@ -490,6 +504,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Children { .. } => "children",
         Cmd::Create { .. } => "create",
         Cmd::Move { .. } => "move",
+        Cmd::Reorder { .. } => "reorder",
         Cmd::Delete { .. } => "delete",
         Cmd::Edit { .. } => "edit",
         Cmd::Complete { .. } => "complete",
@@ -544,6 +559,11 @@ fn dry_run_line(cmd: &Cmd) -> Option<String> {
         Cmd::Move { node_id, to, priority } => Some(format!(
             "DRY-RUN move node_id={} to={} priority={:?}",
             node_id, to, priority
+        )),
+        Cmd::Reorder { parent_id, nodes } => Some(format!(
+            "DRY-RUN reorder parent_id={} count={}",
+            parent_id,
+            nodes.len(),
         )),
         Cmd::Delete { node_id } => Some(format!("DRY-RUN delete node_id={}", node_id)),
         Cmd::Edit { node_id, name, description } => Some(format!(
@@ -668,6 +688,48 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 println!("{}", json!({ "ok": true, "node_id": node_id, "new_parent": to }));
             } else {
                 println!("Moved {} -> {}", node_id, to);
+            }
+        }
+        Cmd::Reorder { parent_id, nodes } => {
+            // Both this CLI surface and the MCP `reorder_nodes` tool
+            // delegate to the same workflow function. The CLI passes a
+            // default WorkflowContext (no cancel, no deadline) — single-
+            // shot processes don't need either; the MCP wraps with its
+            // tool_handler! cancel + bulk-budget deadline.
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) =
+                workflowy_mcp_server::workflows::reorder_nodes_via_priority(
+                    &client, parent_id, nodes, &ctx,
+                )
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                use workflowy_mcp_server::workflows::ReorderOutcome;
+                match &outcome {
+                    ReorderOutcome::Complete {
+                        attempted, succeeded, failed, ..
+                    } => println!(
+                        "Reordered {} node(s) under {} ({} ok, {} failed)",
+                        attempted, parent_id, succeeded, failed,
+                    ),
+                    ReorderOutcome::Partial {
+                        reason,
+                        attempted,
+                        succeeded,
+                        failed,
+                        skipped,
+                        ..
+                    } => println!(
+                        "Reorder partial ({}): attempted={} succeeded={} failed={} skipped={} parent={}",
+                        reason.as_str(),
+                        attempted,
+                        succeeded,
+                        failed,
+                        skipped,
+                        parent_id,
+                    ),
+                }
             }
         }
         Cmd::Delete { node_id } => {
@@ -2137,7 +2199,7 @@ mod tests {
         // CLI subcommand here will fail this test before it ships.
         for sub in [
             // CRUD + reads
-            "status", "get", "children", "create", "move", "delete", "edit",
+            "status", "get", "children", "create", "move", "reorder", "delete", "edit",
             "complete", "search", "tag-search", "find", "subtree",
             "backlinks", "find-by-tag-and-path", "node-at-path", "path-of",
             "resolve-link", "since",
@@ -2179,6 +2241,7 @@ mod tests {
             ("edit_node", "edit"),
             ("delete_node", "delete"),
             ("move_node", "move"),
+            ("reorder_nodes", "reorder"),
             ("complete_node", "complete"),
             ("search_nodes", "search"),
             ("tag_search", "tag-search"),
@@ -2259,6 +2322,50 @@ mod tests {
             .expect("dry-run uncomplete parses");
         let line = dry_run_line(&cli.cmd).expect("uncomplete yields a dry-run line");
         assert!(line.contains("target_state=false"), "got: {}", line);
+    }
+
+    #[test]
+    fn reorder_parses_parent_and_repeated_node_flags() {
+        let parsed = Cli::try_parse_from([
+            "wflow-do",
+            "reorder",
+            "--parent",
+            "parent-uuid",
+            "--node",
+            "id-1",
+            "--node",
+            "id-2",
+            "--node",
+            "id-3",
+        ])
+        .expect("reorder with --parent and three --node flags parses");
+        match parsed.cmd {
+            Cmd::Reorder { parent_id, nodes } => {
+                assert_eq!(parent_id, "parent-uuid");
+                assert_eq!(nodes, vec!["id-1", "id-2", "id-3"]);
+            }
+            _ => panic!("expected Reorder"),
+        }
+    }
+
+    #[test]
+    fn reorder_dry_run_emits_count() {
+        let cli = Cli::try_parse_from([
+            "wflow-do",
+            "--dry-run",
+            "reorder",
+            "--parent",
+            "parent-uuid",
+            "--node",
+            "a",
+            "--node",
+            "b",
+        ])
+        .expect("dry-run reorder parses");
+        let line = dry_run_line(&cli.cmd).expect("reorder yields a dry-run line");
+        assert!(line.starts_with("DRY-RUN reorder"), "got: {}", line);
+        assert!(line.contains("count=2"), "got: {}", line);
+        assert!(line.contains("parent_id=parent-uuid"), "got: {}", line);
     }
 
     #[test]

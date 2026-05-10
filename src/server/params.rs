@@ -483,6 +483,16 @@ pub struct BulkTagParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "Place a set of nodes in a specific order under a given parent. Each entry in `node_ids` becomes the next sibling under `parent_id`, in the order given. Nodes not currently under `parent_id` are reparented as a side effect — the call is a reorder primitive built on `move_node`, not a sibling-only assertion. The orchestration walks the desired list in reverse and issues `priority=0` for each move so the final state is the requested order at the head of the parent's children, regardless of how many other siblings the parent already has. Workflowy normalises priorities after each move; the reverse-priority-0 trick avoids the self-fighting batched-reorder problem the naive forward `priority=0,1,2,…` loop runs into.")]
+pub struct ReorderNodesParams {
+    #[schemars(description = "Parent under which the listed nodes will be ordered. Required: the call refuses to guess. Pass a UUID or 12-char short hash.")]
+    pub parent_id: NodeId,
+    #[schemars(description = "Desired order, head-first. The 0th entry will be the first child of `parent_id`; the last entry will appear after every other id in this list (other siblings of `parent_id` are pushed after the listed nodes). Must be non-empty; duplicates are rejected; capped at `defaults::MAX_REORDER_NODES` (200).")]
+    pub node_ids: Vec<NodeId>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Cheap incremental check: did this node change after the given timestamp?")]
 pub struct SinceParams {
     #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
