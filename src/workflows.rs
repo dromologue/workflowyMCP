@@ -1425,6 +1425,162 @@ pub async fn reorder_nodes_via_priority(
     Ok((outcome, footprint))
 }
 
+// ---------------------------------------------------------------------
+// audit_mirrors
+// ---------------------------------------------------------------------
+
+/// Outcome of an [`audit_mirrors_walk`] call. Carries the union of
+/// nodes visited (deduped by id), an aggregated truncation envelope
+/// (`truncated` + `truncation_reason`), and a per-chunk envelope when
+/// the walk was chunked.
+///
+/// Pre-2026-05-16 the MCP server defined an `AuditWalkOutcome` struct
+/// in `server/mod.rs` with the same fields and the CLI inlined its
+/// own version. Lifting both into this single typed shape closes the
+/// drift the architecture review surfaced: the MCP decremented
+/// `child_depth` via `saturating_sub(1)` while the CLI hardcoded
+/// `7`, and the two surfaces ordered the "include the root" step
+/// differently. Both surfaces now share this single orchestration.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditMirrorsWalkOutcome {
+    pub nodes: Vec<WorkflowyNode>,
+    pub truncated: bool,
+    /// Stable string form (`"node_limit"`/`"timeout"`/`"cancelled"`)
+    /// or `None`. The string form is what every existing JSON
+    /// payload emits — keeping the typed enum here would force a
+    /// second translation at the wire.
+    pub truncation_reason: Option<&'static str>,
+    /// Per-chunk envelope when the walk was chunked (one entry per
+    /// direct child of the root). Empty when `chunked = false`.
+    pub chunks: Vec<serde_json::Value>,
+}
+
+/// Walk a subtree for the `audit_mirrors` workflow.
+///
+/// When `chunked = true`, lists `root_id`'s direct children and
+/// walks each as its own subtree with `max_depth - 1` so each pillar
+/// fits comfortably under the [`defaults::MAX_SUBTREE_NODES`] walk
+/// cap. The root node itself is best-effort fetched and included so
+/// a `mirror_of:` marker living directly under the root is observed.
+/// Returned nodes are deduped by id (a node visited via two chunks
+/// is counted once).
+///
+/// When `chunked = false`, fetches the subtree under `root_id` as a
+/// single walk with `max_depth`.
+///
+/// Cancel/deadline are observed via `_ctx` for API uniformity; the
+/// per-walk timeout from [`defaults::SUBTREE_FETCH_TIMEOUT_MS`]
+/// already bounds each `get_subtree_with_controls` call.
+pub async fn audit_mirrors_walk(
+    client: &WorkflowyClient,
+    root_id: &str,
+    max_depth: usize,
+    chunked: bool,
+    _ctx: &WorkflowContext<'_>,
+) -> Result<AuditMirrorsWalkOutcome> {
+    let make_controls = || {
+        crate::api::FetchControls::with_timeout(std::time::Duration::from_millis(
+            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+        ))
+    };
+
+    if !chunked {
+        let fetch = client
+            .get_subtree_with_controls(
+                Some(root_id),
+                max_depth,
+                defaults::MAX_SUBTREE_NODES,
+                make_controls(),
+            )
+            .await?;
+        return Ok(AuditMirrorsWalkOutcome {
+            nodes: fetch.nodes,
+            truncated: fetch.truncated,
+            truncation_reason: fetch.truncation_reason.map(|r| r.as_str()),
+            chunks: Vec::new(),
+        });
+    }
+
+    // Chunked path. Include the root itself first (so a mirror_of
+    // marker directly under the root is observed), then walk each
+    // child. Best-effort on the root fetch — a failure there is
+    // non-fatal; the audit still runs across children.
+    let mut all_nodes: Vec<WorkflowyNode> = Vec::new();
+    if let Ok(root_node) = client.get_node(root_id).await {
+        all_nodes.push(root_node);
+    }
+    let children = client.get_children(root_id).await?;
+    let child_depth = max_depth.saturating_sub(1);
+    let mut chunks: Vec<serde_json::Value> = Vec::new();
+    let mut truncated_any = false;
+    let mut top_truncation: Option<&'static str> = None;
+    for child in &children {
+        let fetch = client
+            .get_subtree_with_controls(
+                Some(&child.id),
+                child_depth,
+                defaults::MAX_SUBTREE_NODES,
+                make_controls(),
+            )
+            .await?;
+        let truncated = fetch.truncated;
+        let scanned = fetch.nodes.len();
+        let reason = fetch.truncation_reason.map(|r| r.as_str());
+        if truncated {
+            truncated_any = true;
+            if top_truncation.is_none() {
+                top_truncation = reason;
+            }
+        }
+        chunks.push(json!({
+            "id": child.id,
+            "name": child.name,
+            "scanned": scanned,
+            "truncated": truncated,
+            "truncation_reason": reason,
+        }));
+        all_nodes.extend(fetch.nodes);
+    }
+    all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    all_nodes.dedup_by(|a, b| a.id == b.id);
+    Ok(AuditMirrorsWalkOutcome {
+        nodes: all_nodes,
+        truncated: truncated_any,
+        truncation_reason: top_truncation,
+        chunks,
+    })
+}
+
+/// Extract the set of `mirror_of:` UUIDs encountered in `nodes` that
+/// are not resolved within the walked scope. The caller resolves each
+/// returned UUID through its surface-appropriate resolver (the MCP
+/// server uses its persistent name index; the CLI issues a live
+/// `get_node` against the API) and assembles the `external_canonicals`
+/// map for [`crate::audit::audit_mirrors_with_external`].
+///
+/// "Not in scope" is end-matched in both directions so a short-hash
+/// `mirror_of:` resolves against a full-UUID node in scope and vice
+/// versa — mirrors the MCP and CLI inline checks pre-2026-05-16.
+pub fn extract_unresolved_mirror_targets(nodes: &[WorkflowyNode]) -> Vec<String> {
+    use std::collections::HashSet;
+    let in_scope: HashSet<String> = nodes.iter().map(|n| n.id.to_lowercase()).collect();
+    let mut targets: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for node in nodes {
+        let desc = node.description.as_deref().unwrap_or("");
+        if let Some(target) = extract_marker(desc, "mirror_of:") {
+            let t = target.to_lowercase();
+            if in_scope.iter().any(|s| s.ends_with(&t) || t.ends_with(s)) {
+                continue;
+            }
+            if seen.insert(t.clone()) {
+                targets.push(t);
+            }
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1939,5 +2095,78 @@ mod tests {
                 panic!("past-deadline must yield Partial, not Complete");
             }
         }
+    }
+
+    /// `extract_unresolved_mirror_targets` is pure: it walks the node
+    /// set, finds `mirror_of:` markers whose target UUID is not in
+    /// scope, and returns the unique unresolved set. The MCP server
+    /// uses its name index to resolve each one; the CLI issues a
+    /// live `get_node`. Both surfaces share this extraction so the
+    /// "not in scope" rule cannot drift.
+    #[test]
+    fn extract_unresolved_mirror_targets_finds_external_uuids_only() {
+        let mut canonical = WorkflowyNode::default();
+        canonical.id = "canonical-in-scope".to_string();
+        canonical.name = "Canonical".to_string();
+
+        let mut mirror_local = WorkflowyNode::default();
+        mirror_local.id = "mirror-local".to_string();
+        mirror_local.description = Some("mirror_of: canonical-in-scope".to_string());
+
+        let mut mirror_external_a = WorkflowyNode::default();
+        mirror_external_a.id = "mirror-ext-a".to_string();
+        mirror_external_a.description = Some("mirror_of: external-uuid-A".to_string());
+
+        let mut mirror_external_b = WorkflowyNode::default();
+        mirror_external_b.id = "mirror-ext-b".to_string();
+        mirror_external_b.description = Some("mirror_of: external-uuid-B".to_string());
+
+        // Duplicate marker for A — should dedupe in the result.
+        let mut mirror_external_a_dup = WorkflowyNode::default();
+        mirror_external_a_dup.id = "mirror-ext-a-dup".to_string();
+        mirror_external_a_dup.description = Some("mirror_of: external-uuid-A".to_string());
+
+        let nodes = vec![
+            canonical,
+            mirror_local,
+            mirror_external_a,
+            mirror_external_b,
+            mirror_external_a_dup,
+        ];
+
+        let targets = extract_unresolved_mirror_targets(&nodes);
+        assert_eq!(targets.len(), 2, "in-scope target and dupe both excluded");
+        assert!(targets.contains(&"external-uuid-a".to_string()));
+        assert!(targets.contains(&"external-uuid-b".to_string()));
+    }
+
+    /// The audit walk's chunked vs single behaviour is mostly an
+    /// orchestration over `client.get_subtree_with_controls`, so the
+    /// unit test focuses on the per-bucket extraction logic which is
+    /// the only part this layer can verify without a live API. The
+    /// end-to-end behaviour (chunked walk includes the root, dedupes
+    /// across chunks, surfaces per-chunk envelope) is exercised by
+    /// the live-integration test in `tests/live_insert.rs` when
+    /// `WORKFLOWY_API_KEY` is set.
+    #[test]
+    fn extract_unresolved_mirror_targets_end_matches_short_hashes() {
+        // Full-UUID node in scope; mirror references the trailing
+        // 12-char short hash. The end-match rule means the target
+        // should be considered in-scope and NOT returned.
+        let full = "550e8400-e29b-41d4-a716-446655440000";
+        let short = &full[full.len() - 12..]; // "446655440000"
+
+        let mut canonical = WorkflowyNode::default();
+        canonical.id = full.to_string();
+
+        let mut mirror = WorkflowyNode::default();
+        mirror.id = "mirror".to_string();
+        mirror.description = Some(format!("mirror_of: {}", short));
+
+        let targets = extract_unresolved_mirror_targets(&[canonical, mirror]);
+        assert!(
+            targets.is_empty(),
+            "short-hash mirror targeting an in-scope full UUID must be considered resolved",
+        );
     }
 }

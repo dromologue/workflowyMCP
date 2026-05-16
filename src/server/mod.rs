@@ -14,7 +14,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use regex::Regex;
 // `serde::Deserialize` moved to params.rs along with the param structs.
 use serde_json::json;
@@ -27,7 +27,7 @@ use crate::error::WorkflowyError;
 use crate::types::WorkflowyNode;
 use crate::utils::cache::NodeCache;
 use crate::utils::cancel::CancelRegistry;
-use crate::utils::date_parser::{parse_due_date_from_node, is_overdue};
+use crate::utils::date_parser::parse_due_date_from_node;
 use crate::utils::name_index::NameIndex;
 use crate::utils::node_paths::{build_node_path_with_map, build_node_map};
 use crate::utils::op_log::OpLog;
@@ -640,28 +640,12 @@ const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) onc
 /// in the workflows module per the duplication-audit rule.
 use crate::workflows::scope_resolved_label;
 
-/// Outcome of an `audit_mirrors` walk — either a single subtree fetch
-/// or a chunked walk that unioned its children. `chunks` is empty in
-/// the single-walk case; per-chunk envelope (id, name, scanned,
-/// truncated, truncation_reason) in the chunked case.
-#[derive(Debug)]
-struct AuditWalkOutcome {
-    nodes: Vec<crate::types::WorkflowyNode>,
-    truncated: bool,
-    truncation_reason: Option<TruncationReason>,
-    chunks: Vec<serde_json::Value>,
-}
-
-impl AuditWalkOutcome {
-    fn single(fetch: SubtreeFetch) -> Self {
-        Self {
-            nodes: fetch.nodes,
-            truncated: fetch.truncated,
-            truncation_reason: fetch.truncation_reason,
-            chunks: Vec::new(),
-        }
-    }
-}
+// The pre-2026-05-16 `AuditWalkOutcome` struct + `single` constructor
+// lived here as the union-of-walks shape for `audit_mirrors`. Lifted
+// into `crate::workflows::AuditMirrorsWalkOutcome` so the MCP handler
+// and the CLI share a single typed shape. The MCP-specific side
+// effect (name-index ingestion of every walked node) now happens at
+// the handler boundary after the workflow returns.
 
 /// JSON-truncation surface invariant: every walk-shaped tool that emits
 /// JSON spreads this four-field envelope into its payload:
@@ -709,9 +693,9 @@ fn truncation_envelope_from_fetch(
 /// `serde_json::Value` carrying both the tool-specific fields and the
 /// four envelope fields. The helper exists because pre-2026-05-03 the
 /// envelope was inlined at every call site and 11 of them quietly
-/// drifted off-spec; routing through one definition makes the
-/// contract enforceable by `cargo build` rather than by a source-grep
-/// audit. Inputs:
+/// drifted off-spec; the 2026-05-16 sweep then converted the
+/// remaining ~13 inline sites to route through this helper, so the
+/// envelope contract has exactly one definition. Inputs:
 ///
 /// - `payload`: the tool-specific `json!({...})` map. Anything mergeable
 ///   into a JSON object works; non-object values panic in tests via
@@ -722,7 +706,8 @@ fn truncation_envelope_from_fetch(
 ///
 /// Returns a `serde_json::Value::Object` ready to pass to
 /// `Content::text(value.to_string())`.
-#[allow(dead_code)] // pinned by `with_truncation_envelope_merges_payload_and_envelope_without_loss` — the helper exists as the canonical merge path; current handlers inline the envelope via `truncation_envelope` directly, but the merge shape is kept callable for any future handler that holds a pre-built JSON payload.
+///
+/// Pinned by `envelope_construction_routes_through_one_helper_no_inline_fields`.
 fn with_truncation_envelope(
     mut payload: serde_json::Value,
     truncated: bool,
@@ -2200,17 +2185,14 @@ impl WorkflowyMcpServer {
 
                 let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 if matches.is_empty() {
-                    let mut result = json!({
+                    let payload = json!({
                         "found": false,
                         "scope_resolved": scope_resolved,
-                        "truncated": truncated,
-                        "truncation_limit": limit,
-                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "banner": banner,
                         "message": format!("No nodes found matching '{}' (mode: {}). Try match_mode: 'contains'.", params.name, match_mode)
                     });
+                    let mut result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                     if truncated {
                         result["hint"] = json!("Results are partial — narrow parent_id or max_depth, or retry with use_index after build_name_index populates.");
                     }
@@ -2226,13 +2208,9 @@ impl WorkflowyMcpServer {
                     }
                     let node = matches[idx - 1];
                     let path = build_node_path_with_map(&node.id, &node_map);
-                    let result = json!({
+                    let payload = json!({
                         "found": true,
                         "scope_resolved": scope_resolved,
-                        "truncated": truncated,
-                        "truncation_limit": limit,
-                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "node_id": node.id,
                         "name": node.name,
@@ -2240,6 +2218,7 @@ impl WorkflowyMcpServer {
                         "note": node.description,
                         "message": format!("Found '{}'", node.name)
                     });
+                    let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                     Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                 } else {
                     let options: Vec<serde_json::Value> = matches.iter().enumerate().map(|(i, n)| {
@@ -2255,19 +2234,16 @@ impl WorkflowyMcpServer {
                             "note_preview": note_preview
                         })
                     }).collect();
-                    let result = json!({
+                    let payload = json!({
                         "found": false,
                         "scope_resolved": scope_resolved,
                         "multiple_matches": true,
-                        "truncated": truncated,
-                        "truncation_limit": limit,
-                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "truncated_at_path": truncated_at_path,
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches for '{}'. Use selection parameter to choose.", matches.len(), params.name)
                     });
+                    let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                     Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
                 }
             }
@@ -2378,16 +2354,13 @@ impl WorkflowyMcpServer {
                         let path = build_node_path_with_map(&n.id, &node_map);
                         json!({ "option": i + 1, "name": n.name, "id": n.id, "path": path })
                     }).collect();
-                    let result = json!({
+                    let payload = json!({
                         "multiple_matches": true,
-                        "truncated": truncated,
-                        "truncation_limit": limit,
-                        "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                        "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "count": matches.len(),
                         "options": options,
                         "message": format!("Found {} matches. Use selection parameter to choose.", matches.len())
                     });
+                    let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                     return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
                 }
 
@@ -2430,17 +2403,14 @@ impl WorkflowyMcpServer {
                     crate::workflows::InsertContentOutcome::Partial { created_count, .. } => *created_count,
                 };
 
-                let result = json!({
+                let payload = json!({
                     "success": true,
-                    "truncated": truncated,
-                    "truncation_limit": limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "created_count": created_count,
                     "outcome": serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null),
                     "target": { "id": target_id, "name": target_name },
                     "message": format!("Inserted {} node(s) under '{}'", created_count, target_name)
                 });
+                let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("smart_insert", None, e)),
@@ -2463,101 +2433,34 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit, truncation_reason, .. }) => {
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
+                // Aggregation routed through the shared helper so the
+                // MCP handler and the `wflow-do daily-review` CLI
+                // cannot drift in semantics — pre-2026-05-16 the CLI
+                // hardcoded a 7-day horizon and emitted `days_until`
+                // while this handler parameterised `upcoming_days`
+                // and emitted `days_until_due`. The four buckets
+                // (overdue / due_soon / recent_changes / top_pending)
+                // route through the per-bucket helpers, so any tweak
+                // to a bucket's shape lands across both surfaces
+                // automatically.
                 let today = Utc::now().date_naive();
-                let upcoming_days = params.upcoming_days.unwrap_or(7) as i64;
-                let recent_days = params.recent_days.unwrap_or(1) as i64;
-                let overdue_limit = params.overdue_limit.unwrap_or(10);
-                let pending_limit = params.pending_limit.unwrap_or(20);
                 let now_ms = Utc::now().timestamp_millis();
-                let recent_cutoff = now_ms - (recent_days * 86_400_000);
-                let node_map = build_node_map(&all_nodes);
-
-                let mut overdue_items = Vec::new();
-                let mut due_soon_items = Vec::new();
-                let mut recent_items = Vec::new();
-                let mut pending_items = Vec::new();
-                let mut total = 0;
-                let mut pending_count = 0;
-                let mut due_today_count = 0;
-                let mut modified_today = 0;
-
-                for node in &candidates {
-                    total += 1;
-                    let completed = is_completed(node);
-                    let todo = is_todo(node);
-
-                    if todo && !completed {
-                        pending_count += 1;
-                        if pending_items.len() < pending_limit {
-                            let path = build_node_path_with_map(&node.id, &node_map);
-                            pending_items.push(json!({ "id": node.id, "name": node.name, "path": path }));
-                        }
-                    }
-
-                    if !completed {
-                        if let Some(due) = parse_due_date_from_node(node) {
-                            let days_until = (due - today).num_days();
-                            if days_until < 0 {
-                                overdue_items.push((node, due, -days_until));
-                            } else if days_until == 0 {
-                                due_today_count += 1;
-                                due_soon_items.push((node, due, days_until));
-                            } else if days_until <= upcoming_days {
-                                due_soon_items.push((node, due, days_until));
-                            }
-                        }
-                    }
-
-                    if let Some(mod_ts) = node.last_modified {
-                        if mod_ts > recent_cutoff {
-                            modified_today += 1;
-                            recent_items.push((node, mod_ts));
-                        }
-                    }
+                let review = crate::utils::aggregation::compute_daily_review(
+                    &all_nodes,
+                    today,
+                    now_ms,
+                    params.upcoming_days.unwrap_or(7) as i64,
+                    params.recent_days.unwrap_or(1) as i64,
+                    params.overdue_limit.unwrap_or(10),
+                    20, // due_soon_limit — historical handler cap
+                    20, // recent_limit — historical handler cap
+                    params.pending_limit.unwrap_or(20),
+                );
+                let mut result = serde_json::to_value(&review)
+                    .expect("DailyReview serialises to a JSON object");
+                if let Some(obj) = result.as_object_mut() {
+                    obj.extend(truncation_envelope(truncated, limit, truncation_reason));
                 }
-
-                overdue_items.sort_by(|a, b| b.2.cmp(&a.2));
-                overdue_items.truncate(overdue_limit);
-                due_soon_items.sort_by(|a, b| a.1.cmp(&b.1));
-                due_soon_items.truncate(20);
-                recent_items.sort_by(|a, b| b.1.cmp(&a.1));
-                recent_items.truncate(20);
-
-                let overdue_json: Vec<serde_json::Value> = overdue_items.iter().map(|(n, due, days)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "path": path, "due_date": due.to_string(), "days_overdue": days })
-                }).collect();
-
-                let due_soon_json: Vec<serde_json::Value> = due_soon_items.iter().map(|(n, due, days)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "path": path, "due_date": due.to_string(), "days_until_due": days })
-                }).collect();
-
-                let recent_json: Vec<serde_json::Value> = recent_items.iter().map(|(n, ts)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "path": path, "modifiedAt": ts, "completed": is_completed(n) })
-                }).collect();
-
-                let result = json!({
-                    "as_of": today.to_string(),
-                    "truncated": truncated,
-                    "truncation_limit": limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
-                    "summary": {
-                        "total_nodes": total,
-                        "pending_todos": pending_count,
-                        "overdue_count": overdue_items.len(),
-                        "due_today": due_today_count,
-                        "modified_today": modified_today
-                    },
-                    "overdue": overdue_json,
-                    "due_soon": due_soon_json,
-                    "recent_changes": recent_json,
-                    "top_pending": pending_items
-                });
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("daily_review", resolved_root.as_deref(), e)),
@@ -2583,41 +2486,25 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
+                // Aggregation routed through the shared helper so the
+                // CLI's `wflow-do recent-changes` and this handler
+                // cannot drift — see
+                // `src/utils/aggregation.rs::compute_recent_changes`.
                 let now_ms = Utc::now().timestamp_millis();
-                let cutoff = now_ms - (days * 86_400_000);
-                let node_map = build_node_map(&all_nodes);
-
-                let mut changes: Vec<(&WorkflowyNode, i64)> = candidates.iter()
-                    .filter_map(|n| {
-                        let mod_ts = n.last_modified?;
-                        if mod_ts <= cutoff { return None; }
-                        if !include_completed && is_completed(n) { return None; }
-                        Some((*n, mod_ts))
-                    })
-                    .collect();
-
-                changes.sort_by(|a, b| b.1.cmp(&a.1));
-                changes.truncate(limit);
-
                 let today = Utc::now().date_naive();
                 let since = today - chrono::Duration::days(days);
-
-                let items: Vec<serde_json::Value> = changes.iter().map(|(n, ts)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "path": path, "modifiedAt": ts, "completed": is_completed(n) })
-                }).collect();
-
-                let result = json!({
+                let mut items = crate::utils::aggregation::compute_recent_changes(
+                    &all_nodes, now_ms, days * 24, limit,
+                );
+                if !include_completed {
+                    items.retain(|entry| !entry["completed"].as_bool().unwrap_or(false));
+                }
+                let payload = json!({
                     "since": since.to_string(),
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "changes": items
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("get_recent_changes", resolved_root.as_deref(), e)),
@@ -2648,15 +2535,12 @@ impl WorkflowyMcpServer {
                 let today = Utc::now().date_naive();
                 let mut items = crate::utils::aggregation::compute_overdue(&all_nodes, today, include_completed);
                 items.truncate(limit);
-                let result = json!({
+                let payload = json!({
                     "as_of": today.to_string(),
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "overdue": items
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_overdue", resolved_root.as_deref(), e)),
@@ -2682,42 +2566,37 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
+                // Aggregation routed through the shared helper so the
+                // CLI's `wflow-do upcoming` and this handler cannot
+                // drift — see
+                // `src/utils/aggregation.rs::compute_upcoming`. The
+                // `include_no_due_date` flag is the handler-specific
+                // extra: when set, no-due-date todos are appended
+                // post-helper with `due_date: null`.
                 let today = Utc::now().date_naive();
-                let cutoff = today + chrono::Duration::days(days);
-                let node_map = build_node_map(&all_nodes);
-
-                let mut upcoming: Vec<(&WorkflowyNode, NaiveDate, i64)> = Vec::new();
-                let mut no_date: Vec<&WorkflowyNode> = Vec::new();
-
-                for n in &candidates {
-                    if is_completed(n) { continue; }
-                    match parse_due_date_from_node(n) {
-                        Some(due) if due <= cutoff => {
-                            let days_until = (due - today).num_days();
-                            upcoming.push((n, due, days_until));
-                        }
-                        None if include_no_due_date && is_todo(n) => {
-                            no_date.push(n);
-                        }
-                        _ => {}
+                let mut items =
+                    crate::utils::aggregation::compute_upcoming(&all_nodes, today, days, false);
+                // Helper omits `overdue` — the handler's historical
+                // wire shape carries it. Re-attach per-entry so the
+                // surface stays stable.
+                for entry in items.iter_mut() {
+                    if let Some(obj) = entry.as_object_mut() {
+                        let days_until = obj
+                            .get("days_until_due")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        obj.insert("overdue".into(), json!(days_until < 0));
                     }
                 }
-
-                upcoming.sort_by(|a, b| a.1.cmp(&b.1));
-
-                let mut items: Vec<serde_json::Value> = upcoming.iter().map(|(n, due, days_until)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({
-                        "id": n.id, "name": n.name, "path": path,
-                        "due_date": due.to_string(), "days_until_due": days_until,
-                        "overdue": *days_until < 0
-                    })
-                }).collect();
-
                 if include_no_due_date {
-                    for n in &no_date {
+                    let node_map = build_node_map(&all_nodes);
+                    for n in &all_nodes {
+                        if is_completed(n) || !is_todo(n) {
+                            continue;
+                        }
+                        if parse_due_date_from_node(n).is_some() {
+                            continue;
+                        }
                         let path = build_node_path_with_map(&n.id, &node_map);
                         items.push(json!({
                             "id": n.id, "name": n.name, "path": path,
@@ -2725,18 +2604,13 @@ impl WorkflowyMcpServer {
                         }));
                     }
                 }
-
                 items.truncate(limit);
-
-                let result = json!({
+                let payload = json!({
                     "as_of": today.to_string(),
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": items.len(),
                     "upcoming": items
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_upcoming", resolved_root.as_deref(), e)),
@@ -2757,101 +2631,26 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(Some(&resolved), 10).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
-                let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-                if subtree.is_empty() {
+                // Aggregation routed through the shared helper so the
+                // MCP handler and the `wflow-do project-summary` CLI
+                // cannot drift in semantics — see
+                // `src/utils/aggregation.rs::compute_project_summary`.
+                let today = Utc::now().date_naive();
+                let now_ms = Utc::now().timestamp_millis();
+                let Some(summary) = crate::utils::aggregation::compute_project_summary(
+                    &all_nodes, &resolved, today, now_ms, include_tags, recent_days,
+                ) else {
                     return Err(tool_invalid_params(
                         "get_project_summary",
                         Some(params.node_id.as_str()),
                         format!("Node '{}' not found or has no subtree", params.node_id),
                     ));
+                };
+                let mut result = serde_json::to_value(&summary)
+                    .expect("ProjectSummary serialises to a JSON object");
+                if let Some(obj) = result.as_object_mut() {
+                    obj.extend(truncation_envelope(truncated, node_limit, truncation_reason));
                 }
-
-                let today = Utc::now().date_naive();
-                let now_ms = Utc::now().timestamp_millis();
-                let recent_cutoff = now_ms - (recent_days * 86_400_000);
-                let node_map = build_node_map(&all_nodes);
-
-                let root = subtree.iter().find(|n| n.id == resolved).unwrap();
-                let root_path = build_node_path_with_map(&root.id, &node_map);
-
-                let mut total = 0usize;
-                let mut todo_total = 0usize;
-                let mut todo_completed = 0usize;
-                let mut overdue_count = 0usize;
-                let mut has_due_dates = false;
-                let mut tag_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                let mut assignee_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                let mut recent_modified: Vec<(&WorkflowyNode, i64)> = Vec::new();
-
-                for node in &subtree {
-                    total += 1;
-                    let todo = is_todo(node);
-                    let completed = is_completed(node);
-
-                    if todo {
-                        todo_total += 1;
-                        if completed { todo_completed += 1; }
-                    }
-
-                    if parse_due_date_from_node(node).is_some() {
-                        has_due_dates = true;
-                    }
-                    if is_overdue(node, today) {
-                        overdue_count += 1;
-                    }
-
-                    if include_tags {
-                        let parsed = parse_node_tags(node);
-                        for t in &parsed.tags {
-                            *tag_counts.entry(format!("#{}", t)).or_default() += 1;
-                        }
-                        for a in &parsed.assignees {
-                            *assignee_counts.entry(format!("@{}", a)).or_default() += 1;
-                        }
-                    }
-
-                    if let Some(mod_ts) = node.last_modified {
-                        if mod_ts > recent_cutoff {
-                            recent_modified.push((node, mod_ts));
-                        }
-                    }
-                }
-
-                recent_modified.sort_by(|a, b| b.1.cmp(&a.1));
-                recent_modified.truncate(20);
-
-                let completion_pct = if todo_total > 0 {
-                    ((todo_completed as f64 / todo_total as f64) * 100.0).round() as usize
-                } else { 0 };
-
-                let recent_json: Vec<serde_json::Value> = recent_modified.iter().map(|(n, ts)| {
-                    let path = build_node_path_with_map(&n.id, &node_map);
-                    json!({ "id": n.id, "name": n.name, "modifiedAt": ts, "path": path })
-                }).collect();
-
-                let mut result = json!({
-                    "root": { "id": root.id, "name": root.name, "path": root_path },
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
-                    "stats": {
-                        "total_nodes": total,
-                        "todo_total": todo_total,
-                        "todo_pending": todo_total - todo_completed,
-                        "todo_completed": todo_completed,
-                        "completion_percent": completion_pct,
-                        "has_due_dates": has_due_dates,
-                        "overdue_count": overdue_count
-                    },
-                    "recently_modified": recent_json
-                });
-
-                if include_tags {
-                    result["tags"] = json!(tag_counts);
-                    result["assignees"] = json!(assignee_counts);
-                }
-
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("get_project_summary", Some(&resolved), e)),
@@ -2905,15 +2704,12 @@ impl WorkflowyMcpServer {
                     }
                 }
 
-                let result = json!({
+                let payload = json!({
                     "target": { "id": resolved, "name": target_name },
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "count": backlinks.len(),
                     "backlinks": backlinks
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("find_backlinks", Some(&resolved), e)),
@@ -2938,45 +2734,23 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
-                let node_map = build_node_map(&all_nodes);
-                let query_lower = params.query.as_ref().map(|q| q.to_lowercase());
-
-                let mut todos: Vec<serde_json::Value> = Vec::new();
-                for node in &candidates {
-                    if !is_todo(node) { continue; }
-                    let completed = is_completed(node);
-
-                    match status {
-                        "pending" if completed => continue,
-                        "completed" if !completed => continue,
-                        _ => {}
-                    }
-
-                    if let Some(q) = &query_lower {
-                        let in_name = node.name.to_lowercase().contains(q);
-                        let in_desc = node.description.as_ref().map(|d| d.to_lowercase().contains(q)).unwrap_or(false);
-                        if !in_name && !in_desc { continue; }
-                    }
-
-                    let path = build_node_path_with_map(&node.id, &node_map);
-                    todos.push(json!({
-                        "id": node.id, "name": node.name, "path": path,
-                        "note": node.description, "completed": completed,
-                        "completed_at": node.completed_at
-                    }));
-                    if todos.len() >= limit { break; }
-                }
-
-                let result = json!({
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
+                // Aggregation routed through the shared helper so the
+                // CLI's `wflow-do list-todos` (where present) and this
+                // handler cannot drift — see
+                // `src/utils/aggregation.rs::filter_todos`. The helper
+                // already emits the full per-entry shape including
+                // `note` (the node description).
+                let todos = crate::utils::aggregation::filter_todos(
+                    &all_nodes,
+                    status,
+                    params.query.as_deref(),
+                    limit,
+                );
+                let payload = json!({
                     "count": todos.len(),
                     "todos": todos,
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_todos", resolved_parent.as_deref(), e)),
@@ -3305,16 +3079,13 @@ impl WorkflowyMcpServer {
                         let path = build_node_path_with_map(&n.id, &node_map);
                         json!({ "id": n.id, "name": n.name, "path": path })
                     }).collect();
-                    let result = json!({
+                    let payload = json!({
                         "dry_run": true,
-                        "truncated": truncated,
-                        "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                         "matched_count": items.len(),
                         "operation": params.operation,
                         "nodes_matched": items
                     });
+                    let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                     return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
                 }
 
@@ -3348,17 +3119,14 @@ impl WorkflowyMcpServer {
                     })
                     .collect();
 
-                let result = json!({
+                let payload = json!({
                     "dry_run": false,
-                    "truncated": truncated,
-                    "truncation_limit": node_limit,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "matched_count": apply_result.matched_count,
                     "affected_count": apply_result.affected_count,
                     "operation": bulk_op.as_str(),
                     "nodes_affected": affected_nodes
                 });
+                let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("bulk_update", resolved_root.as_deref(), e)),
@@ -3745,16 +3513,13 @@ impl WorkflowyMcpServer {
 
         match self.walk_subtree(resolved_root.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes, truncated, limit, truncation_reason, elapsed_ms, .. }) => {
-                let result = json!({
+                let payload = json!({
                     "status": if truncated { "partial" } else { "ok" },
                     "nodes_indexed": nodes.len(),
                     "index_size_after": self.name_index.size(),
-                    "truncated": truncated,
-                    "truncation_reason": truncation_reason.map(|r| r.as_str()),
-                    "truncation_limit": limit,
-                    "truncation_recovery_hint": if truncated { TRUNCATION_RECOVERY_HINT } else { "" },
                     "elapsed_ms": elapsed_ms,
                 });
+                let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                 Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("build_name_index", resolved_root.as_deref(), e)),
@@ -4285,21 +4050,30 @@ impl WorkflowyMcpServer {
             "audit_mirrors"
         );
 
-        // Helper: walk either a single subtree or a set of child
-        // chunks under `root`, returning the union of nodes plus an
-        // aggregated truncation envelope.
-        let outcome = if chunked {
-            match self.audit_mirrors_walk_chunked(&root, max_depth).await {
-                Ok(o) => o,
-                Err(e) => return Err(tool_error("audit_mirrors", Some(&root), e)),
-            }
-        } else {
-            match self.walk_subtree(Some(&root), max_depth).await {
-                Ok(fetch) => AuditWalkOutcome::single(fetch),
-                Err(e) => return Err(tool_error("audit_mirrors", Some(&root), e)),
-            }
+        // Walk orchestration routed through the shared workflow so
+        // the MCP handler and the `wflow-do audit-mirrors` CLI cannot
+        // drift in walk semantics. Pre-2026-05-16 the MCP decremented
+        // child depth via `saturating_sub(1)` while the CLI hardcoded
+        // `7`, and the two surfaces ordered the "include the root"
+        // step differently — both behaviours converged at the lift.
+        let ctx = crate::workflows::WorkflowContext::default();
+        let outcome = match crate::workflows::audit_mirrors_walk(
+            &self.client, &root, max_depth, chunked, &ctx,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return Err(workflow_error_to_mcp("audit_mirrors", Some(&root), e)),
         };
+        // Side effect: ingest every walked node into the persistent
+        // name index. The workflow returns the union of nodes; the
+        // server applies its surface-specific side effect here.
+        self.name_index.ingest(&outcome.nodes);
 
+        // External canonical resolution stays per-surface because
+        // the MCP uses its O(1) name index while the CLI issues live
+        // `get_node` calls — same in/out shape via
+        // `crate::audit::ExternalCanonical`, different data source.
         let external = if cross_scope_resolve {
             self.audit_mirrors_external_canonicals(&outcome.nodes)
         } else {
@@ -4311,10 +4085,7 @@ impl WorkflowyMcpServer {
         payload.insert("scope".into(), json!(root));
         payload.insert("scanned".into(), json!(outcome.nodes.len()));
         payload.insert("truncated".into(), json!(outcome.truncated));
-        payload.insert(
-            "truncation_reason".into(),
-            json!(outcome.truncation_reason.as_ref().map(|r| r.as_str())),
-        );
+        payload.insert("truncation_reason".into(), json!(outcome.truncation_reason));
         payload.insert("chunked".into(), json!(chunked));
         payload.insert("cross_scope_resolve".into(), json!(cross_scope_resolve));
         payload.insert(
@@ -4330,73 +4101,12 @@ impl WorkflowyMcpServer {
         })
     }
 
-    /// Chunked walk for `audit_mirrors`. Lists the root's direct
-    /// children and walks each as its own subtree (with the depth
-    /// budget decremented by one for the implied root level), then
-    /// returns the union with a per-chunk envelope and aggregated
-    /// truncation reason. Pre-2026-05-16 the default Distillations
-    /// scope timed out before reaching any leaf because the
-    /// subtree exceeded the 10 000-node walk cap; chunking sidesteps
-    /// the cap because each pillar fits well under it.
-    async fn audit_mirrors_walk_chunked(
-        &self,
-        root_id: &str,
-        max_depth: usize,
-    ) -> crate::error::Result<AuditWalkOutcome> {
-        let children = self.client.get_children(root_id).await?;
-        let mut all_nodes: Vec<crate::types::WorkflowyNode> = Vec::new();
-        let mut chunks = Vec::new();
-        let mut truncated_any = false;
-        // First non-null truncation reason wins for the top-level
-        // banner; callers can inspect `chunks` for the per-chunk
-        // breakdown.
-        let mut top_truncation: Option<crate::api::client::TruncationReason> = None;
-
-        // Include the root itself in the audit scope so a mirror
-        // marker living directly under the root is observed. Best
-        // effort — failure to fetch the root is fatal to the audit
-        // anyway, so propagate.
-        if let Ok(root_node) = self.client.get_node(root_id).await {
-            all_nodes.push(root_node);
-        }
-
-        let child_depth = max_depth.saturating_sub(1);
-        for child in &children {
-            let fetch = self.walk_subtree(Some(&child.id), child_depth).await?;
-            let truncated = fetch.truncated;
-            let scanned = fetch.nodes.len();
-            let reason = fetch.truncation_reason;
-            if truncated {
-                truncated_any = true;
-                if top_truncation.is_none() {
-                    top_truncation = reason;
-                }
-            }
-            chunks.push(json!({
-                "id": child.id,
-                "name": child.name,
-                "scanned": scanned,
-                "truncated": truncated,
-                "truncation_reason": reason.map(|r| r.as_str()),
-            }));
-            all_nodes.extend(fetch.nodes);
-        }
-        // Dedupe by ID (a node visited via two chunks shouldn't double-count).
-        all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        all_nodes.dedup_by(|a, b| a.id == b.id);
-        Ok(AuditWalkOutcome {
-            nodes: all_nodes,
-            truncated: truncated_any,
-            truncation_reason: top_truncation,
-            chunks,
-        })
-    }
-
-    /// Build the external-canonicals map for `audit_mirrors`. For
-    /// every `mirror_of:` UUID encountered in scope that the walk
-    /// itself didn't resolve, consult the persistent name index.
-    /// Lookups are O(1) and bounded by index size — the user's
-    /// production index carries ~55 000 entries.
+    /// Build the external-canonicals map for `audit_mirrors` using
+    /// the persistent name index. Pure consumer of
+    /// [`crate::workflows::extract_unresolved_mirror_targets`] — the
+    /// "which mirrors are unresolved" extraction is shared with the
+    /// CLI; the resolution data source (name index vs live `get_node`)
+    /// is the per-surface differentiator.
     ///
     /// Marker presence is left `None` because the index doesn't
     /// store descriptions; the audit treats `None` as "unknown,
@@ -4408,42 +4118,29 @@ impl WorkflowyMcpServer {
         &self,
         nodes: &[crate::types::WorkflowyNode],
     ) -> std::collections::HashMap<String, crate::audit::ExternalCanonical> {
-        use std::collections::{HashMap, HashSet};
-        let in_scope: HashSet<String> =
-            nodes.iter().map(|n| n.id.to_lowercase()).collect();
-        let mut external: HashMap<String, crate::audit::ExternalCanonical> = HashMap::new();
-        for node in nodes {
-            let desc = node.description.as_deref().unwrap_or("");
-            if let Some(target) = crate::audit::extract_marker(desc, "mirror_of:") {
-                let target_lc = target.to_lowercase();
-                // Already in scope (end-match either direction, to
-                // cover short-hash forms): skip.
-                if in_scope.iter().any(|s| s.ends_with(&target_lc) || target_lc.ends_with(s)) {
-                    continue;
-                }
-                if external.contains_key(&target_lc) {
-                    continue;
-                }
-                // Try direct-by-id lookup; fall back to short-hash
-                // resolution then by-id on the resolved full UUID.
-                let resolved = self
-                    .name_index
-                    .lookup_entry_by_id(&target_lc)
-                    .or_else(|| {
-                        self.name_index
-                            .resolve_short_hash(&target_lc)
-                            .and_then(|full| self.name_index.lookup_entry_by_id(&full))
-                    });
-                if let Some(entry) = resolved {
-                    external.insert(
-                        target_lc,
-                        crate::audit::ExternalCanonical {
-                            id: entry.node_id,
-                            name: entry.name,
-                            has_canonical_marker: None,
-                        },
-                    );
-                }
+        let targets = crate::workflows::extract_unresolved_mirror_targets(nodes);
+        let mut external: std::collections::HashMap<String, crate::audit::ExternalCanonical> =
+            std::collections::HashMap::new();
+        for target_lc in targets {
+            // Try direct-by-id lookup; fall back to short-hash
+            // resolution then by-id on the resolved full UUID.
+            let resolved = self
+                .name_index
+                .lookup_entry_by_id(&target_lc)
+                .or_else(|| {
+                    self.name_index
+                        .resolve_short_hash(&target_lc)
+                        .and_then(|full| self.name_index.lookup_entry_by_id(&full))
+                });
+            if let Some(entry) = resolved {
+                external.insert(
+                    target_lc,
+                    crate::audit::ExternalCanonical {
+                        id: entry.node_id,
+                        name: entry.name,
+                        has_canonical_marker: None,
+                    },
+                );
             }
         }
         external
@@ -7714,6 +7411,146 @@ mod tests {
         );
     }
 
+    /// Workflow-error translation invariant. Every site that
+    /// translates a `WorkflowyError` returned from a
+    /// `crate::workflows::*` function into an `McpError` must route
+    /// through `workflow_error_to_mcp(operation, node_id, err)` —
+    /// the single canonical translator that maps `InvalidInput` to
+    /// `tool_invalid_params` and every other variant to `tool_error`.
+    /// Pre-2026-05-04 every handler that delegated to a workflow
+    /// hand-wrote the match arms and got the operation name slightly
+    /// wrong each time ("create_mirror" vs "insert_content"); the
+    /// helper closes the divergence. This test grep-audits the
+    /// source so a future contributor adding a new
+    /// `crate::workflows::` call site that hand-writes the match
+    /// fails the build instead of silently introducing the drift.
+    ///
+    /// The audit looks for `WorkflowyError::InvalidInput` outside
+    /// the helper definition itself — the helper is the only place
+    /// that should match on that variant explicitly. Test bodies
+    /// constructing `WorkflowyError` values for assertions are
+    /// allow-listed by skipping the test module.
+    #[test]
+    fn workflow_error_translation_routes_through_workflow_error_to_mcp() {
+        let src = include_str!("mod.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let test_module_start = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.trim() == "mod tests {")
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+        // Locate the helper definition body so its own `InvalidInput`
+        // match arm is excluded from the audit.
+        let helper_start = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains("fn workflow_error_to_mcp("))
+            .map(|(i, _)| i);
+        let helper_end = helper_start.map(|start| {
+            let mut depth = 0i32;
+            let mut end = start;
+            for (offset, line) in lines[start..].iter().enumerate() {
+                for ch in line.chars() {
+                    if ch == '{' {
+                        depth += 1;
+                    } else if ch == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + offset;
+                            return end;
+                        }
+                    }
+                }
+            }
+            end
+        });
+
+        let mut violations: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i >= test_module_start {
+                continue;
+            }
+            if let (Some(s), Some(e)) = (helper_start, helper_end) {
+                if i >= s && i <= e {
+                    continue;
+                }
+            }
+            if !line.contains("WorkflowyError::InvalidInput") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            violations.push(format!("line {}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            violations.is_empty(),
+            "Workflow-error translation must route through `workflow_error_to_mcp(operation, \
+             node_id, err)` — the single canonical translator. Matching on \
+             `WorkflowyError::InvalidInput` inside a handler body re-implements the helper and \
+             always drifts on the operation name. New violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Truncation envelope adoption invariant: the 2026-05-16 sweep
+    /// converted every inline `"truncation_limit":` emit site to
+    /// route through one of the two canonical helpers
+    /// (`with_truncation_envelope` for fresh-payload merge, or
+    /// `truncation_envelope` for fold-into-existing-Map use). This
+    /// test grep-audits the source so a future contributor adding a
+    /// new walk-shaped tool that hand-rolls the four-field envelope
+    /// fails the build instead of silently introducing the drift
+    /// the earlier sweep closed.
+    ///
+    /// Allow-listed sites:
+    /// - The helper definitions and their doc comments themselves.
+    /// - Test bodies (this test runs against `mod.rs` source which
+    ///   includes the test module; per-test json! payloads that
+    ///   construct sample envelopes for assertion are fine).
+    #[test]
+    fn envelope_construction_routes_through_one_helper_no_inline_fields() {
+        let src = include_str!("mod.rs");
+        // Approximation: any `"truncation_limit":` outside of (a)
+        // a doc-comment line, (b) the test module, or (c) the helper
+        // definitions, is a violation. The current source has zero
+        // such sites — proven by the existing
+        // `every_walk_tool_emits_full_truncation_envelope_in_json`
+        // test which finds no matches at all after the sweep.
+        let lines: Vec<&str> = src.lines().collect();
+        let test_module_start = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.trim() == "mod tests {")
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+        let mut violations: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i >= test_module_start {
+                continue;
+            }
+            if !line.contains("\"truncation_limit\":") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            violations.push(format!("line {}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            violations.is_empty(),
+            "Envelope construction must route through `with_truncation_envelope(payload, ...)` \
+             or `obj.extend(truncation_envelope(...))` — the two canonical helpers. The 2026-05-16 \
+             sweep removed every inline `\"truncation_limit\":` emit site for exactly this \
+             reason: the contract is then enforceable by `cargo build` rather than by a source-grep \
+             audit. New violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
     /// Parameter-deserialization error regression: when a required
     /// `NodeId` field is sent as `null`, the error message must name
     /// the field so the host (an LLM, an MCP client) can self-correct.
@@ -7911,6 +7748,81 @@ mod tests {
              error}}` envelope as every other runtime failure. Bare `McpError::internal_error` \
              produces messages that some clients truncate to 'Tool execution failed' with no \
              proximate cause. New violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Aggregation-helper adoption invariant. Every list-shaped
+    /// walk handler (`list_overdue`, `list_upcoming`,
+    /// `get_recent_changes`, `list_todos`, plus `daily_review` and
+    /// `get_project_summary`) MUST route through the shared
+    /// helpers in `src/utils/aggregation.rs`. Pre-2026-05-16 the
+    /// MCP handler bodies reimplemented the date-window + status-
+    /// filter loops inline; the architecture review surfaced this
+    /// as the single biggest CLI/MCP parity risk because the same
+    /// helpers were called from the CLI side, so the inline MCP
+    /// bodies could drift from the CLI bodies silently. The
+    /// 2026-05-16 refactor adopted the helpers in every list-shaped
+    /// handler; this test grep-audits the source so a future
+    /// contributor adding a new list-shaped handler that hand-rolls
+    /// the loop fails the build instead of silently introducing the
+    /// inconsistency.
+    ///
+    /// Audit shape: for every handler in the list below, the function
+    /// body must contain a call to the matching aggregation helper.
+    #[test]
+    fn list_shaped_handlers_route_through_aggregation_helpers() {
+        let src = include_str!("mod.rs");
+        // (handler-name, required helper-call substring).
+        // The handler-name match relies on the `tool_handler!(self,
+        // "<name>", ...)` line being unique per handler — it is by
+        // construction since the macro picks the per-call op-log
+        // attribution from this string.
+        let required: &[(&str, &str)] = &[
+            ("\"list_overdue\"", "compute_overdue("),
+            ("\"list_upcoming\"", "compute_upcoming("),
+            ("\"get_recent_changes\"", "compute_recent_changes("),
+            ("\"list_todos\"", "filter_todos("),
+            ("\"daily_review\"", "compute_daily_review("),
+            ("\"get_project_summary\"", "compute_project_summary("),
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        for (handler, helper) in required {
+            // Find the line containing the handler name's op-log
+            // attribution, then look in the next 40 lines for the
+            // required helper call. 40 lines comfortably contains
+            // the handler body for all six tools.
+            let lines: Vec<&str> = src.lines().collect();
+            let anchor = lines
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.contains(handler) && l.contains("tool_handler!"));
+            match anchor {
+                None => violations.push(format!(
+                    "handler with op-log attribution {} not found — has it been renamed?",
+                    handler
+                )),
+                Some((idx, _)) => {
+                    let hi = (idx + 60).min(lines.len());
+                    let window: String = lines[idx..hi].join("\n");
+                    if !window.contains(helper) {
+                        violations.push(format!(
+                            "handler {} (line {}) does not call shared helper `{}` within the next 60 lines — adopt the helper or extend this test if a new helper has supplanted it",
+                            handler,
+                            idx + 1,
+                            helper,
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Aggregation-helper adoption invariant — every list-shaped MCP handler MUST route \
+             through the shared helpers in `src/utils/aggregation.rs` so the MCP and CLI \
+             surfaces cannot drift. Pre-2026-05-16 the MCP handlers reimplemented the \
+             date-window/status-filter loops inline; the helpers exist precisely to prevent \
+             that drift. Violations:\n  {}",
             violations.join("\n  "),
         );
     }

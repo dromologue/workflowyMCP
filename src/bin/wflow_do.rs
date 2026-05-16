@@ -1133,72 +1133,39 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::DailyReview { root, depth } => {
-            use workflowy_mcp_server::utils::date_parser::parse_due_date_from_node;
-            use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::subtree::{is_completed, is_todo};
+            // Aggregation routed through the shared helper so the CLI
+            // and the MCP `daily_review` tool cannot drift —
+            // see `src/utils/aggregation.rs::compute_daily_review`.
             let today = chrono::Utc::now().date_naive();
-            let horizon = today + chrono::Duration::days(7);
-            let recent_cutoff_ms = (chrono::Utc::now() - chrono::Duration::hours(24)).timestamp_millis();
+            let now_ms = chrono::Utc::now().timestamp_millis();
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
             let fetch = client
                 .get_subtree_with_controls(root.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let map = build_node_map(&fetch.nodes);
-            let mut overdue: Vec<serde_json::Value> = Vec::new();
-            let mut upcoming: Vec<serde_json::Value> = Vec::new();
-            let mut recent: Vec<serde_json::Value> = Vec::new();
-            let mut pending: Vec<serde_json::Value> = Vec::new();
-            for n in &fetch.nodes {
-                let path = build_node_path_with_map(&n.id, &map);
-                let entry = json!({ "id": n.id, "name": n.name, "path": path });
-                if let Some(due) = parse_due_date_from_node(n) {
-                    if !is_completed(n) {
-                        if due < today {
-                            overdue.push(json!({
-                                "id": n.id, "name": n.name,
-                                "due_date": due.to_string(),
-                                "days_overdue": (today - due).num_days(),
-                                "path": entry["path"].clone(),
-                            }));
-                        } else if due <= horizon {
-                            upcoming.push(json!({
-                                "id": n.id, "name": n.name,
-                                "due_date": due.to_string(),
-                                "days_until": (due - today).num_days(),
-                                "path": entry["path"].clone(),
-                            }));
-                        }
-                    }
-                }
-                if let Some(ts) = n.last_modified {
-                    if ts >= recent_cutoff_ms {
-                        recent.push(json!({
-                            "id": n.id, "name": n.name,
-                            "modifiedAt": ts,
-                            "completed": is_completed(n),
-                            "path": entry["path"].clone(),
-                        }));
-                    }
-                }
-                if is_todo(n) && !is_completed(n) {
-                    pending.push(entry);
-                }
-            }
-            overdue.sort_by(|a, b| b["days_overdue"].as_i64().cmp(&a["days_overdue"].as_i64()));
-            upcoming.sort_by(|a, b| a["days_until"].as_i64().cmp(&b["days_until"].as_i64()));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "scope": root,
-                    "today": today.to_string(),
-                    "overdue": overdue,
-                    "upcoming": upcoming,
-                    "recent_changes": recent,
-                    "pending_todos": pending,
-                }))?
+            let review = workflowy_mcp_server::utils::aggregation::compute_daily_review(
+                &fetch.nodes,
+                today,
+                now_ms,
+                7,  // upcoming_days — historical CLI default
+                1,  // recent_days — historical CLI default (24-hour window)
+                10, // overdue_limit
+                20, // due_soon_limit
+                20, // recent_limit
+                20, // pending_limit
             );
+            let mut value = serde_json::to_value(&review)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("scope".into(), json!(root));
+                obj.insert("truncated".into(), json!(fetch.truncated));
+                obj.insert("truncation_limit".into(), json!(fetch.limit));
+                obj.insert(
+                    "truncation_reason".into(),
+                    json!(fetch.truncation_reason.map(|r| r.as_str())),
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         Cmd::RecentChanges { root, hours, depth, limit } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1222,41 +1189,36 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::ProjectSummary { node_id } => {
-            use std::collections::HashMap;
-            use workflowy_mcp_server::utils::subtree::{is_completed, is_todo};
-            use workflowy_mcp_server::utils::tag_parser::parse_node_tags;
+            // Aggregation routed through the shared helper so the CLI
+            // and the MCP `get_project_summary` tool cannot drift —
+            // see `src/utils/aggregation.rs::compute_project_summary`.
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
             let fetch = client
                 .get_subtree_with_controls(Some(node_id), 10, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
-            let mut total = 0usize;
-            let mut todo_total = 0usize;
-            let mut todo_completed = 0usize;
-            let mut tag_counts: HashMap<String, usize> = HashMap::new();
-            let mut assignee_counts: HashMap<String, usize> = HashMap::new();
-            for n in &fetch.nodes {
-                total += 1;
-                if is_todo(n) {
-                    todo_total += 1;
-                    if is_completed(n) { todo_completed += 1; }
-                }
-                let parsed = parse_node_tags(n);
-                for t in parsed.tags { *tag_counts.entry(t).or_insert(0) += 1; }
-                for a in parsed.assignees { *assignee_counts.entry(a).or_insert(0) += 1; }
+            let today = chrono::Utc::now().date_naive();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let summary = workflowy_mcp_server::utils::aggregation::compute_project_summary(
+                &fetch.nodes, node_id, today, now_ms, true, 7,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "project-summary: node {:?} not found in the {}-node walk; pass a UUID/short-hash that resolves under the workspace root",
+                    node_id, fetch.nodes.len(),
+                )
+            })?;
+            let mut value = serde_json::to_value(&summary)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("truncated".into(), json!(fetch.truncated));
+                obj.insert("truncation_limit".into(), json!(fetch.limit));
+                obj.insert(
+                    "truncation_reason".into(),
+                    json!(fetch.truncation_reason.map(|r| r.as_str())),
+                );
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "node_id": node_id,
-                    "total_nodes": total,
-                    "todos": { "total": todo_total, "completed": todo_completed },
-                    "tag_counts": tag_counts,
-                    "assignee_counts": assignee_counts,
-                    "truncated": fetch.truncated,
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         Cmd::Insert { parent_id, content } => {
             let body = match content {
@@ -1721,99 +1683,38 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             );
         }
         Cmd::AuditMirrors { root, chunked, cross_scope_resolve } => {
+            // Walk orchestration routed through the shared workflow
+            // so the CLI and the MCP `audit_mirrors` tool cannot
+            // drift — see `crate::workflows::audit_mirrors_walk`.
             let scope = root.as_deref().unwrap_or(DEFAULT_REVIEW_ROOT);
-            // Default chunked when scope is the default Distillations
-            // root, since that is the only scope known to exceed the
-            // 10 000-node walk cap. Explicit --root opts into single
-            // walk by default.
             let do_chunked = chunked.unwrap_or(root.is_none());
             let do_cross_resolve = cross_scope_resolve.unwrap_or(true);
-            let make_controls = || {
-                FetchControls::with_timeout(std::time::Duration::from_millis(
-                    defaults::SUBTREE_FETCH_TIMEOUT_MS,
-                ))
-            };
-            let mut all_nodes: Vec<workflowy_mcp_server::types::WorkflowyNode> = Vec::new();
-            let mut chunks_json: Vec<serde_json::Value> = Vec::new();
-            let mut truncated_any = false;
-            let mut top_truncation: Option<&'static str> = None;
-            if do_chunked {
-                // Best-effort include the root node itself; failure to
-                // fetch is non-fatal — the audit still runs across
-                // children.
-                if let Ok(root_node) = client.get_node(scope).await {
-                    all_nodes.push(root_node);
-                }
-                let children = client.get_children(scope).await?;
-                for child in &children {
-                    let fetch = client
-                        .get_subtree_with_controls(
-                            Some(&child.id),
-                            7,
-                            defaults::MAX_SUBTREE_NODES,
-                            make_controls(),
-                        )
-                        .await?;
-                    let truncated = fetch.truncated;
-                    let scanned = fetch.nodes.len();
-                    let reason = fetch.truncation_reason.map(|r| r.as_str());
-                    if truncated {
-                        truncated_any = true;
-                        if top_truncation.is_none() {
-                            top_truncation = reason;
-                        }
-                    }
-                    chunks_json.push(json!({
-                        "id": child.id,
-                        "name": child.name,
-                        "scanned": scanned,
-                        "truncated": truncated,
-                        "truncation_reason": reason,
-                    }));
-                    all_nodes.extend(fetch.nodes);
-                }
-                all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
-                all_nodes.dedup_by(|a, b| a.id == b.id);
-            } else {
-                let fetch = client
-                    .get_subtree_with_controls(
-                        Some(scope),
-                        8,
-                        defaults::MAX_SUBTREE_NODES,
-                        make_controls(),
-                    )
-                    .await?;
-                truncated_any = fetch.truncated;
-                top_truncation = fetch.truncation_reason.map(|r| r.as_str());
-                all_nodes = fetch.nodes;
-            }
+            // Use the same depth budget the MCP handler defaults to
+            // (8). Pre-2026-05-16 the CLI hardcoded 7 for child
+            // walks; both surfaces now flow through the workflow's
+            // `saturating_sub(1)` decrement so child_depth is 7 by
+            // construction when max_depth = 8 — same result, single
+            // definition.
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let outcome = workflowy_mcp_server::workflows::audit_mirrors_walk(
+                &client, scope, 8, do_chunked, &ctx,
+            )
+            .await?;
+            let all_nodes = outcome.nodes;
+            let chunks_json = outcome.chunks;
+            let truncated_any = outcome.truncated;
+            let top_truncation = outcome.truncation_reason;
 
-            // Build the external-canonicals map by issuing `get_node`
-            // for every `mirror_of:` UUID not already in scope. The
-            // CLI is single-shot so no persistent index is available;
-            // we lean on the API directly. Rate limiter inside the
-            // client serialises requests.
+            // External-canonical resolution stays per-surface: the
+            // CLI is single-shot and has no persistent index, so it
+            // issues live `get_node` calls (rate limiter inside the
+            // client serialises). Both surfaces share the unresolved-
+            // target extraction.
             let mut external: std::collections::HashMap<String, workflowy_mcp_server::audit::ExternalCanonical> =
                 std::collections::HashMap::new();
             if do_cross_resolve {
-                use std::collections::HashSet;
-                let in_scope: HashSet<String> =
-                    all_nodes.iter().map(|n| n.id.to_lowercase()).collect();
-                let mut targets: Vec<String> = Vec::new();
-                for node in &all_nodes {
-                    let desc = node.description.as_deref().unwrap_or("");
-                    if let Some(target) =
-                        workflowy_mcp_server::audit::extract_marker(desc, "mirror_of:")
-                    {
-                        let t = target.to_lowercase();
-                        if in_scope.iter().any(|s| s.ends_with(&t) || t.ends_with(s)) {
-                            continue;
-                        }
-                        if !targets.contains(&t) {
-                            targets.push(t);
-                        }
-                    }
-                }
+                let targets =
+                    workflowy_mcp_server::workflows::extract_unresolved_mirror_targets(&all_nodes);
                 for t in targets {
                     if let Ok(canon) = client.get_node(&t).await {
                         let canon_desc = canon.description.as_deref().unwrap_or("");

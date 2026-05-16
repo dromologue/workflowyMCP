@@ -222,15 +222,60 @@ The following Rust patterns are actively enforced in this codebase:
 ### One source of truth for cross-surface aggregation
 - Aggregation logic shared between MCP handlers and the `wflow-do` CLI
   lives in `src/utils/aggregation.rs` as pure functions taking
-  `&[WorkflowyNode]` and producing `Vec<serde_json::Value>`. Today:
-  `compute_overdue`, `compute_upcoming`, `compute_recent_changes`,
-  `filter_todos`. Pre-2026-05-03 each surface implemented these
-  independently; the CLI parity build-time test catches surface drift
-  but not semantic divergence between two parallel implementations.
-  Routing both surfaces through one helper makes them converge by
-  construction; the helpers take their `today` / `now_ms` as
-  parameters rather than reading the system clock so they stay pure
-  and tests can pin behaviour against arbitrary timestamps.
+  `&[WorkflowyNode]` and producing either `Vec<serde_json::Value>`
+  (list shapes) or typed `Serialize` structs (single-object shapes).
+  Today: `compute_overdue`, `compute_upcoming`,
+  `compute_recent_changes`, `filter_todos`, `compute_project_summary`
+  (→ `ProjectSummary` / `ProjectSummaryStats` / `ProjectSummaryRoot`),
+  `compute_daily_review` (→ `DailyReview` / `DailyReviewSummary`).
+  Pre-2026-05-03 each surface implemented these independently; the
+  CLI parity build-time test catches surface drift but not semantic
+  divergence between two parallel implementations. Routing both
+  surfaces through one helper makes them converge by construction;
+  the helpers take their `today` / `now_ms` as parameters rather
+  than reading the system clock so they stay pure and tests can pin
+  behaviour against arbitrary timestamps.
+
+  **Adoption invariant** (2026-05-16). Every list-shaped MCP handler
+  MUST route through the matching aggregation helper. Pinned by
+  `list_shaped_handlers_route_through_aggregation_helpers` which
+  grep-audits the source so a future handler that reimplements the
+  date-window / status-filter loop inline fails the build. The
+  six handlers covered are `list_overdue` → `compute_overdue`,
+  `list_upcoming` → `compute_upcoming`, `get_recent_changes` →
+  `compute_recent_changes`, `list_todos` → `filter_todos`,
+  `daily_review` → `compute_daily_review`,
+  `get_project_summary` → `compute_project_summary`.
+
+### One source of truth for cross-surface JSON envelopes
+
+- The four-field truncation envelope (`truncated`, `truncation_limit`,
+  `truncation_reason`, `truncation_recovery_hint`) is constructed
+  through one of two canonical helpers in `src/server/mod.rs`:
+  `with_truncation_envelope(payload, truncated, limit, reason)` for
+  fresh-payload merge, or `obj.extend(truncation_envelope(...))`
+  for fold-into-existing-Map use after `serde_json::to_value(&typed)`.
+  Pre-2026-05-16 the codebase carried ~13 inline emit sites that
+  re-wrote the four-field block; a 2026-05-16 sweep collapsed them.
+  **Construction invariant**: pinned by
+  `envelope_construction_routes_through_one_helper_no_inline_fields`
+  which forbids any inline `"truncation_limit":` JSON key outside
+  the helpers' own definitions and the test module. The contract
+  is enforceable by `cargo build` rather than by a source-grep audit.
+
+### One canonical translator for workflow errors
+
+- Every `WorkflowyError` returned from a `crate::workflows::*` call
+  is translated to `McpError` via `workflow_error_to_mcp(operation,
+  node_id, err)` — the helper maps `InvalidInput` →
+  `tool_invalid_params`, every other variant → `tool_error`. Pre-
+  2026-05-04 each handler that delegated to a workflow hand-wrote
+  the `match err { InvalidInput => …, _ => … }` arms and got the
+  operation name slightly wrong each time. **Translation invariant**:
+  pinned by `workflow_error_translation_routes_through_workflow_error_to_mcp`
+  which forbids `WorkflowyError::InvalidInput` matching anywhere
+  in `server/mod.rs` except inside the helper's own body and the
+  test module.
 
 ### Workflow orchestration shared between MCP and CLI (`src/workflows.rs`)
 

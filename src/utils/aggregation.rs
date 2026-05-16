@@ -19,12 +19,16 @@
 //! `server/`) lets the CLI use them without dragging in any of the
 //! server's MCP machinery.
 
+use std::collections::BTreeMap;
+
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::types::WorkflowyNode;
-use crate::utils::date_parser::parse_due_date_from_node;
+use crate::utils::date_parser::{is_overdue, parse_due_date_from_node};
 use crate::utils::node_paths::{build_node_map, build_node_path_with_map};
 use crate::utils::subtree::{is_completed, is_todo};
+use crate::utils::tag_parser::parse_node_tags;
 
 /// Build the per-node JSON entry that overdue / upcoming / todos-list
 /// responses embed. Centralised so the entry shape (id / name / path /
@@ -86,6 +90,12 @@ pub fn compute_overdue(
 
 /// Upcoming todos within `[today, today + horizon_days]`, sorted by
 /// nearest deadline first. Same purity contract as `compute_overdue`.
+///
+/// Per-entry field `days_until_due` matches the name the MCP
+/// `list_upcoming` and `daily_review` handlers have always emitted —
+/// the helper field used to be `days_until`, but the 2026-05-16
+/// refactor renamed it so adopting the helper inside the MCP handler
+/// is shape-preserving rather than a wire-break.
 pub fn compute_upcoming(
     nodes: &[WorkflowyNode],
     today: chrono::NaiveDate,
@@ -109,13 +119,13 @@ pub fn compute_upcoming(
                 &map,
                 &[
                     ("due_date", json!(due.to_string())),
-                    ("days_until", json!((due - today).num_days())),
+                    ("days_until_due", json!((due - today).num_days())),
                     ("completed", json!(is_completed(n))),
                 ],
             ))
         })
         .collect();
-    hits.sort_by(|a, b| a["days_until"].as_i64().cmp(&b["days_until"].as_i64()));
+    hits.sort_by(|a, b| a["days_until_due"].as_i64().cmp(&b["days_until_due"].as_i64()));
     hits
 }
 
@@ -156,9 +166,13 @@ pub fn compute_recent_changes(
 /// Filter nodes to todos matching the given status (`all` /
 /// `pending` / `completed`) and optional substring query (case-
 /// insensitive, matched against name + description). Result capped
-/// at `limit`. JSON shape includes `completed` and `completed_at`
-/// alongside the standard entry fields so callers can render the
-/// completion state.
+/// at `limit`. JSON shape includes `completed`, `completed_at`, and
+/// `note` (the node's description) alongside the standard entry
+/// fields so callers can render the completion state and any
+/// attached note. The `note` field was added 2026-05-16 to make
+/// helper adoption shape-preserving for the MCP `list_todos`
+/// handler — pre-refactor that handler emitted `note` inline; the
+/// helper now emits it uniformly so both surfaces stay aligned.
 pub fn filter_todos(
     nodes: &[WorkflowyNode],
     status: &str,
@@ -198,12 +212,294 @@ pub fn filter_todos(
                 n,
                 &map,
                 &[
+                    ("note", json!(n.description)),
                     ("completed", json!(is_completed(n))),
                     ("completed_at", json!(n.completed_at)),
                 ],
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------
+// project_summary
+// ---------------------------------------------------------------------
+
+/// Aggregated summary for `get_project_summary`. Single shape both
+/// the MCP handler and the `wflow-do project-summary` CLI emit, so
+/// the surfaces cannot drift — pre-2026-05-16 the MCP emitted a
+/// nested `stats` object with a conditional `tags`/`assignees` pair
+/// while the CLI flat-printed counts and stripped tag prefixes, the
+/// drift the architecture review on 2026-05-16 surfaced as the
+/// most-divergent of the three orchestrations not yet lifted.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummary {
+    pub root: ProjectSummaryRoot,
+    pub stats: ProjectSummaryStats,
+    /// 20-most-recent-first nodes whose `last_modified` is newer than
+    /// `now_ms - recent_days * 86_400_000`. Capped at 20 because the
+    /// MCP wire surface has carried that cap since the original
+    /// handler and consumers depend on a bounded list.
+    pub recently_modified: Vec<Value>,
+    /// Tag counts as `#tag → count`. `None` when the caller passed
+    /// `include_tags = false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, usize>>,
+    /// Assignee counts as `@person → count`. `None` when
+    /// `include_tags = false` (the flag governs both — they are the
+    /// same parse pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignees: Option<BTreeMap<String, usize>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummaryRoot {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummaryStats {
+    pub total_nodes: usize,
+    pub todo_total: usize,
+    pub todo_pending: usize,
+    pub todo_completed: usize,
+    pub completion_percent: usize,
+    pub has_due_dates: bool,
+    pub overdue_count: usize,
+}
+
+/// Compute the project summary over a walked subtree.
+///
+/// Returns `None` when `root_id` is not present in `nodes` — the
+/// caller surfaces this as a `not found` validation failure rather
+/// than an empty summary. `today` and `now_ms` are taken as
+/// parameters (no system-clock reads) so the function is pure and
+/// tests can pass deterministic values.
+///
+/// `recent_days` is the recently-modified window in days; the
+/// resulting list is sorted newest-first and capped at 20.
+/// `include_tags` controls whether `tags` / `assignees` are
+/// populated — passing `false` skips the per-node tag parse, which
+/// matters on big trees.
+pub fn compute_project_summary(
+    nodes: &[WorkflowyNode],
+    root_id: &str,
+    today: chrono::NaiveDate,
+    now_ms: i64,
+    include_tags: bool,
+    recent_days: i64,
+) -> Option<ProjectSummary> {
+    let map = build_node_map(nodes);
+    let root = nodes.iter().find(|n| n.id == root_id)?;
+    let root_path = build_node_path_with_map(&root.id, &map);
+
+    let recent_cutoff = now_ms - recent_days * 86_400_000;
+
+    let mut total = 0usize;
+    let mut todo_total = 0usize;
+    let mut todo_completed = 0usize;
+    let mut overdue_count = 0usize;
+    let mut has_due_dates = false;
+    let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut assignee_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut recent_modified: Vec<(&WorkflowyNode, i64)> = Vec::new();
+
+    for node in nodes {
+        total += 1;
+        let todo = is_todo(node);
+        let completed = is_completed(node);
+
+        if todo {
+            todo_total += 1;
+            if completed {
+                todo_completed += 1;
+            }
+        }
+
+        if parse_due_date_from_node(node).is_some() {
+            has_due_dates = true;
+        }
+        if is_overdue(node, today) {
+            overdue_count += 1;
+        }
+
+        if include_tags {
+            let parsed = parse_node_tags(node);
+            for t in &parsed.tags {
+                *tag_counts.entry(format!("#{}", t)).or_default() += 1;
+            }
+            for a in &parsed.assignees {
+                *assignee_counts.entry(format!("@{}", a)).or_default() += 1;
+            }
+        }
+
+        if let Some(mod_ts) = node.last_modified {
+            if mod_ts > recent_cutoff {
+                recent_modified.push((node, mod_ts));
+            }
+        }
+    }
+
+    recent_modified.sort_by(|a, b| b.1.cmp(&a.1));
+    recent_modified.truncate(20);
+
+    let completion_percent = if todo_total > 0 {
+        ((todo_completed as f64 / todo_total as f64) * 100.0).round() as usize
+    } else {
+        0
+    };
+
+    let recently_modified: Vec<Value> = recent_modified
+        .iter()
+        .map(|(n, ts)| {
+            json!({
+                "id": n.id,
+                "name": n.name,
+                "modifiedAt": ts,
+                "path": build_node_path_with_map(&n.id, &map),
+            })
+        })
+        .collect();
+
+    Some(ProjectSummary {
+        root: ProjectSummaryRoot {
+            id: root.id.clone(),
+            name: root.name.clone(),
+            path: root_path,
+        },
+        stats: ProjectSummaryStats {
+            total_nodes: total,
+            todo_total,
+            todo_pending: todo_total - todo_completed,
+            todo_completed,
+            completion_percent,
+            has_due_dates,
+            overdue_count,
+        },
+        recently_modified,
+        tags: if include_tags { Some(tag_counts) } else { None },
+        assignees: if include_tags {
+            Some(assignee_counts)
+        } else {
+            None
+        },
+    })
+}
+
+// ---------------------------------------------------------------------
+// daily_review
+// ---------------------------------------------------------------------
+
+/// Aggregated four-bucket daily review over a walked subtree. Both
+/// the MCP `daily_review` handler and the `wflow-do daily-review`
+/// CLI emit this shape, so semantic drift between the surfaces is
+/// impossible — pre-2026-05-16 the CLI hardcoded a 7-day horizon
+/// and emitted `days_until` while the MCP parameterised
+/// `upcoming_days` and emitted `days_until_due`.
+///
+/// The four buckets reuse the per-bucket aggregation helpers
+/// (`compute_overdue`, `compute_upcoming`, `compute_recent_changes`,
+/// `filter_todos`) so any future tweak to a bucket's shape lands
+/// across all five entry points uniformly.
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyReview {
+    pub as_of: String,
+    pub summary: DailyReviewSummary,
+    pub overdue: Vec<Value>,
+    pub due_soon: Vec<Value>,
+    pub recent_changes: Vec<Value>,
+    pub top_pending: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyReviewSummary {
+    pub total_nodes: usize,
+    pub pending_todos: usize,
+    pub overdue_count: usize,
+    pub due_today: usize,
+    pub modified_today: usize,
+}
+
+/// Compute the daily review over a walked subtree.
+///
+/// Bucket parameters:
+/// - `upcoming_days`: forward window (days) for `due_soon`.
+/// - `recent_days`: backward window (days) for `recent_changes` —
+///   converted internally to `recent_days * 24` hours so the
+///   helper signature matches `compute_recent_changes`.
+/// - `*_limit`: per-bucket caps applied AFTER sorting.
+///
+/// `today` and `now_ms` are taken as parameters so the function is
+/// pure and tests can supply deterministic values.
+pub fn compute_daily_review(
+    nodes: &[WorkflowyNode],
+    today: chrono::NaiveDate,
+    now_ms: i64,
+    upcoming_days: i64,
+    recent_days: i64,
+    overdue_limit: usize,
+    due_soon_limit: usize,
+    recent_limit: usize,
+    pending_limit: usize,
+) -> DailyReview {
+    let mut overdue = compute_overdue(nodes, today, false);
+    overdue.truncate(overdue_limit);
+
+    let mut due_soon = compute_upcoming(nodes, today, upcoming_days, false);
+    due_soon.truncate(due_soon_limit);
+
+    let mut recent_changes =
+        compute_recent_changes(nodes, now_ms, recent_days * 24, recent_limit);
+    recent_changes.truncate(recent_limit);
+
+    let top_pending = filter_todos(nodes, "pending", None, pending_limit);
+
+    // Summary stats are computed in one pass over the full node set
+    // — the per-bucket helpers already filter+sort+limit, but the
+    // summary counts (total nodes, pending count, due-today count,
+    // modified-today count) must reflect the whole walk.
+    let mut total_nodes = 0usize;
+    let mut pending_todos = 0usize;
+    let mut due_today = 0usize;
+    let mut modified_today = 0usize;
+    let recent_cutoff = now_ms - recent_days * 86_400_000;
+
+    for node in nodes {
+        total_nodes += 1;
+        let completed = is_completed(node);
+        if is_todo(node) && !completed {
+            pending_todos += 1;
+        }
+        if !completed {
+            if let Some(due) = parse_due_date_from_node(node) {
+                if due == today {
+                    due_today += 1;
+                }
+            }
+        }
+        if let Some(ts) = node.last_modified {
+            if ts > recent_cutoff {
+                modified_today += 1;
+            }
+        }
+    }
+
+    DailyReview {
+        as_of: today.to_string(),
+        summary: DailyReviewSummary {
+            total_nodes,
+            pending_todos,
+            overdue_count: overdue.len(),
+            due_today,
+            modified_today,
+        },
+        overdue,
+        due_soon,
+        recent_changes,
+        top_pending,
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +566,11 @@ mod tests {
         let hits = compute_upcoming(&[a, b, c], today, 7, false);
         assert_eq!(hits.len(), 2, "out-of-window item dropped");
         assert_eq!(hits[0]["id"].as_str(), Some("b"), "nearest-first");
+        assert_eq!(
+            hits[0]["days_until_due"].as_i64(),
+            Some(2),
+            "field name `days_until_due` is the wire contract — renamed from `days_until` on 2026-05-16 so the MCP handler can adopt the helper without breaking its existing JSON shape",
+        );
     }
 
     #[test]
@@ -313,5 +614,136 @@ mod tests {
 
         let limited = filter_todos(&[t1.clone(), t2.clone()], "all", None, 1);
         assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn filter_todos_entry_carries_note_field() {
+        // The MCP `list_todos` handler used to emit a `note` field
+        // alongside id/name/path/completed/completed_at — pinned
+        // here as part of the helper's contract so adoption inside
+        // the handler is shape-preserving (no wire break).
+        let mut t = node("t", "[ ] do thing");
+        t.layout_mode = Some("todo".into());
+        t.description = Some("some note body".into());
+
+        let hits = filter_todos(std::slice::from_ref(&t), "all", None, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0]["note"].as_str(),
+            Some("some note body"),
+            "filter_todos entries must include the description as `note`",
+        );
+    }
+
+    #[test]
+    fn compute_project_summary_counts_todos_overdue_and_tags() {
+        let mut t1 = node("t1", "[ ] pending #a @bob");
+        t1.layout_mode = Some("todo".into());
+        let mut t2 = node("t2", "[x] done #a #b");
+        t2.layout_mode = Some("todo".into());
+        t2.completed_at = Some(1700000000000);
+        let mut overdue_node = node("o1", "[ ] overdue");
+        overdue_node.layout_mode = Some("todo".into());
+        overdue_node.description = Some("due:2026-04-25".into());
+        let mut recent_node = node("r1", "modified recently");
+        recent_node.last_modified = Some(1_700_000_500_000);
+
+        let root = node("root", "Root");
+        let nodes = vec![
+            root.clone(),
+            t1,
+            t2,
+            overdue_node,
+            recent_node,
+        ];
+        let today = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
+        let now_ms = 1_700_001_000_000i64;
+
+        let summary = compute_project_summary(&nodes, "root", today, now_ms, true, 7)
+            .expect("root present");
+
+        assert_eq!(summary.stats.total_nodes, 5);
+        assert_eq!(summary.stats.todo_total, 3); // t1, t2, overdue_node
+        assert_eq!(summary.stats.todo_completed, 1); // t2
+        assert_eq!(summary.stats.todo_pending, 2);
+        assert_eq!(summary.stats.completion_percent, 33);
+        assert!(summary.stats.has_due_dates);
+        assert_eq!(summary.stats.overdue_count, 1);
+        assert_eq!(summary.root.id, "root");
+
+        let tags = summary.tags.as_ref().expect("include_tags=true");
+        assert_eq!(tags.get("#a").copied(), Some(2));
+        assert_eq!(tags.get("#b").copied(), Some(1));
+
+        let assignees = summary.assignees.as_ref().expect("include_tags=true");
+        assert_eq!(assignees.get("@bob").copied(), Some(1));
+    }
+
+    #[test]
+    fn compute_project_summary_returns_none_when_root_absent() {
+        let other = node("other", "Other");
+        let today = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
+        let summary =
+            compute_project_summary(std::slice::from_ref(&other), "missing", today, 0, false, 7);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn compute_project_summary_skips_tag_parse_when_include_tags_false() {
+        let mut t = node("t", "[ ] thing #foo");
+        t.layout_mode = Some("todo".into());
+        let today = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
+        let summary = compute_project_summary(
+            std::slice::from_ref(&t),
+            "t",
+            today,
+            0,
+            false,
+            7,
+        )
+        .expect("root present");
+        assert!(summary.tags.is_none());
+        assert!(summary.assignees.is_none());
+    }
+
+    #[test]
+    fn compute_daily_review_routes_buckets_through_per_bucket_helpers() {
+        let mut overdue_n = node("o1", "[ ] overdue");
+        overdue_n.layout_mode = Some("todo".into());
+        overdue_n.description = Some("due:2026-04-25".into());
+        let mut soon_n = node("s1", "[ ] due soon");
+        soon_n.layout_mode = Some("todo".into());
+        soon_n.description = Some("due:2026-05-17".into());
+        let mut pending_n = node("p1", "[ ] just a pending todo");
+        pending_n.layout_mode = Some("todo".into());
+        let mut recent_n = node("r1", "modified recently");
+        recent_n.last_modified = Some(1_700_000_500_000);
+
+        let today = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
+        let now_ms = 1_700_001_000_000i64;
+        let review = compute_daily_review(
+            &[overdue_n, soon_n, pending_n, recent_n],
+            today,
+            now_ms,
+            7,    // upcoming_days
+            1,    // recent_days
+            10,   // overdue_limit
+            20,   // due_soon_limit
+            20,   // recent_limit
+            20,   // pending_limit
+        );
+
+        assert_eq!(review.as_of, "2026-05-16");
+        assert_eq!(review.overdue.len(), 1);
+        assert_eq!(review.overdue[0]["id"].as_str(), Some("o1"));
+        assert_eq!(review.due_soon.len(), 1);
+        assert_eq!(review.due_soon[0]["id"].as_str(), Some("s1"));
+        assert_eq!(review.recent_changes.len(), 1);
+        assert_eq!(review.recent_changes[0]["id"].as_str(), Some("r1"));
+        // top_pending includes every pending todo: overdue, due-soon, p1.
+        assert_eq!(review.top_pending.len(), 3);
+        assert_eq!(review.summary.overdue_count, 1);
+        assert_eq!(review.summary.pending_todos, 3);
+        assert_eq!(review.summary.modified_today, 1);
     }
 }
