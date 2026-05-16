@@ -29,12 +29,10 @@ Agents may retry or parallelize requests. Design for this.
 - Use pagination tokens and cursors for list operations
 - Keep responses small and predictable
 
-**Status**: ⚠️ Partial. Read tools are idempotent. Writes are mutations against Workflowy — idempotency depends on upstream API. **Gaps**: No pagination for search_nodes or tag_search. No result size caps documented.
+**Status**: ⚠️ Partial. Read tools are idempotent. Writes are mutations against Workflowy — idempotency depends on upstream API. Hard caps now enforced (`MAX_SUBTREE_NODES=10_000`, `MAX_INSERT_CONTENT_LINES=80`, `MAX_REORDER_NODES=200`, `SUBTREE_FETCH_TIMEOUT_MS=20_000`) and surfaced in `truncated` flag + `truncation_reason` envelope on every walk-shaped tool. **Remaining gap**: no `offset`/`cursor` pagination for search_nodes / tag_search; callers narrow via `parent_id` + `max_depth` instead.
 
 **Action items**:
-- Add `offset`/`cursor` pagination to search_nodes, tag_search, get_children
-- Document max response sizes per tool
-- Add `max_results` enforcement with hard cap
+- Add `offset`/`cursor` pagination to search_nodes, tag_search, get_children for callers that need cursor-style iteration rather than scope narrowing.
 
 ---
 
@@ -46,11 +44,15 @@ Support stdio for maximum compatibility. Add Streamable HTTP for networked deplo
 - **Streamable HTTP**: Future, for remote/multi-tenant deployments (SSE deprecated)
 - Implement request cancellation and timeouts to prevent resource stranding
 
-**Status**: ⚠️ stdio implemented. **Gaps**: No cancellation handling. No per-tool timeouts. No Streamable HTTP transport.
+**Status**: ✅ stdio implemented; cancellation + per-tool timeouts fully wired. **Remaining gap**: no Streamable HTTP transport.
+
+**Implemented**:
+- `CancelRegistry` (generation counter) shared across the server. `cancel_all` bumps the generation; every outstanding tree walk returns partial results on its next checkpoint with `truncation_reason: "cancelled"` within ~50 ms.
+- `tool_handler!(name, kind, params, body)` macro wraps every non-diagnostic handler. The `ToolKind` taxonomy (`Read` / `Write` / `Bulk` / `Walk`) selects the wall-clock budget from `defaults::*_TIMEOUT_MS`; the wrapper races the handler future against the cancel guard and the deadline.
+- `WorkflowContext { cancel, deadline }` plumbs both signals through `workflows::*` functions so partial-success outcomes (e.g. `InsertContentOutcome::Partial`) are observable from both surfaces.
 
 **Action items**:
-- Add tokio timeout wrappers for each tool handler (configurable default)
-- Plan Streamable HTTP transport as future milestone (not blocking v2.0)
+- Plan Streamable HTTP transport as future milestone (not blocking v2.x).
 
 ---
 
@@ -62,12 +64,13 @@ Use elicitation to fill missing parameters or confirm risky actions. Gate with c
 - Never use elicitation to harvest sensitive data
 - Fall back gracefully if host doesn't support elicitation
 
-**Status**: ❌ Not implemented. rmcp may not support elicitation yet (June 2025 MCP spec feature).
+**Status**: ⚠️ Partial. Elicitation primitive not yet implemented (rmcp 0.16 doesn't expose it). `dry_run` adopted on the highest-impact mutation tools:
+- `create_mirror` honours `dry_run=true` via the shared `create_mirror_dry_run` workflow — returns the would-be canonical / target / pillar resolution without writing.
+- `bulk_update` honours `dry_run=true` — returns the matched node set without applying the operation.
 
 **Action items**:
-- For now: add `dry_run: Option<bool>` parameter to delete_node, move_node
-- When dry_run=true, return a preview of what would happen without executing
-- Implement elicitation when rmcp adds support + capability check
+- Add `dry_run: Option<bool>` to `delete_node`, `move_node`, `insert_content` for the same preview shape.
+- Implement elicitation when rmcp adds support + capability check.
 
 ---
 
@@ -97,12 +100,16 @@ Responses must be LLM-parsable AND human-readable.
 - Keep error messages actionable with machine-readable codes
 - Use `outputSchema` / `structuredContent` (June 2025 spec) when supported
 
-**Status**: ⚠️ Responses are markdown-formatted (human-readable). **Gaps**: No structured/typed output. No machine-readable error codes.
+**Status**: ✅ Structured error envelope + typed JSON responses; machine-readable error codes via `ProximateCause` enum. **Remaining gap**: no `outputSchema` / `structuredContent` adoption (waiting on rmcp support).
+
+**Implemented**:
+- `ProximateCause` enum (`Timeout` / `LockContention` / `CacheMiss` / `UpstreamError` / `Cancelled` / `NotFound` / `AuthFailure` / `InvalidParams` / `Unknown`) ships in the `data.proximate_cause` field of every error response. Callers route on the discrete value, not a parsed hint string.
+- Every error response carries the same `{operation, node_id, hint, proximate_cause, error}` envelope — `tool_error` for operational failures, `tool_invalid_params` for validation failures, `workflow_error_to_mcp` for workflow returns. Pinned by `handler_body_validation_uses_structured_envelope_not_bare_invalid_params` + `operational_failures_route_through_tool_error_not_bare_internal_error` + `workflow_error_translation_routes_through_workflow_error_to_mcp`.
+- Walk-shaped tool responses are typed JSON with the four-field truncation envelope (`truncated`, `truncation_limit`, `truncation_reason`, `truncation_recovery_hint`) routed through one canonical helper. Pinned by `envelope_construction_routes_through_one_helper_no_inline_fields`.
+- Aggregation responses (`compute_project_summary`, `compute_daily_review`) return typed `#[derive(Serialize)]` structs (`ProjectSummary`, `DailyReview`) — the JSON shape is the contract, derived not hand-written.
 
 **Action items**:
-- Define error code enum (e.g. `NODE_NOT_FOUND`, `RATE_LIMITED`, `VALIDATION_FAILED`)
-- Include error code in all error responses
-- Plan structuredContent adoption when rmcp supports outputSchema
+- Plan `structuredContent` adoption when rmcp supports `outputSchema`.
 
 ---
 
@@ -189,13 +196,16 @@ Validate against multiple MCP clients. Inject faults.
 - Test with MCP Inspector tool
 - Inject: slow API responses, partial failures, malformed inputs, rate limiting
 
-**Status**: ❌ No tests for Rust version yet.
+**Status**: ✅ 364 unit tests + integration suite + pin-tested invariants. **Remaining gap**: no fault-injection harness for upstream API errors; relies on the `tests/live_insert.rs` integration test (gated by `WORKFLOWY_API_KEY`) for end-to-end coverage.
+
+**Implemented**:
+- `cargo test --lib` runs 364 unit tests in ~40 s covering every tool handler, workflow, aggregation helper, parameter validation, and pin-tested invariant. Tests are per-module `#[cfg(test)]` blocks alongside source.
+- Pin tests grep the source at build time to enforce consistency rules (envelope adoption, error helper routing, CLI/MCP parity, aggregation helper adoption). See the constitution's Helper-First Construction table for the full list.
+- Live-integration test in `tests/live_insert.rs` exercises real Workflowy API paths when `WORKFLOWY_API_KEY` is set.
+- Daily Claude Desktop usage is the de-facto primary-host smoke test; failure modes get filed as `principles-architecture.md` incident comments and pinned by tests.
 
 **Action items**:
-- Unit tests for each tool handler (mock WorkflowyClient)
-- Integration test with MCP Inspector
-- Fault injection tests (timeout, 429, 500, malformed JSON)
-- Test with Claude Desktop as primary host
+- Add fault-injection harness for upstream 429 / 500 / malformed JSON — currently only the live test exercises real failure shapes.
 
 ---
 
@@ -236,12 +246,16 @@ Behind the MCP layer, keep the domain API clean.
 - Idempotent mutations where possible
 - Validate all inputs at system boundary
 
-**Status**: ⚠️ Tools are focused. **Gaps**: Node ID validation is missing. No input sanitization beyond schema.
+**Status**: ✅ Tools are focused; input validation is enforced at the boundary via the `NodeId` newtype and `#[serde(deny_unknown_fields)]` on every parameter struct.
+
+**Implemented**:
+- `NodeId` newtype hand-written `Deserialize` rejects the literal strings `"null"` / `"undefined"` and whitespace-only at the parameter boundary, before the handler body runs. Empty string is preserved as the workspace-root sentinel for handlers that special-case it (`list_children`, `insert_content` etc.).
+- Every parameter struct in `src/server/params.rs` carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded `invalid_parameters at \`.field_name\`: unknown field` error rather than silently defaulting.
+- `Parameters<T>` wrapper routes deserialisation failures through `serde_path_to_error` so the error path names the offending field — pinned by `null_required_uuid_field_error_names_the_field` and the `literal_null_string_*` companions.
+- `insert_content` enforces the `MAX_INSERT_CONTENT_LINES` cap at the workflow level; oversized payloads return a typed `InvalidInput` with a chunking instruction.
 
 **Action items**:
-- Validate node_id format (UUID) before API calls
-- Validate text inputs: max length, no null bytes, no control characters
-- Sanitize content input for insert_content
+- Add max-length / control-character validation for free-text inputs (`name`, `description`, `content`) — currently bounded by Workflowy API limits, not validated client-side.
 
 ---
 
@@ -253,13 +267,12 @@ Require confirmation for state changes. Provide dry-run mode.
 - Return a diff/preview of intended changes before execution
 - Use structured content for machine-readable change summaries
 
-**Status**: ❌ All mutations execute immediately with no preview.
+**Status**: ⚠️ Partial. `dry_run` adopted on `create_mirror` (returns the would-be canonical / target / pillar resolution) and `bulk_update` (returns the matched node set without applying). Walk-shaped tools naturally surface a preview shape via the `truncated` + `truncation_reason` envelope. **Remaining gap**: `delete_node`, `move_node`, `insert_content` execute immediately.
 
 **Action items**:
-- Add `dry_run: Option<bool>` to delete_node, move_node, insert_content
-- dry_run returns what would happen without executing
-- Include "this action is irreversible" warning in delete tool description
-- Consider requiring confirmation string for delete (e.g. "confirm_delete: true")
+- Add `dry_run: Option<bool>` to `delete_node`, `move_node`, `insert_content` for symmetric preview surface.
+- Include "this action is irreversible" warning in the `delete_node` tool description string.
+- Consider requiring a confirmation-string parameter on `delete_node` (e.g. `confirm_delete: true`) for the highest-impact mutation.
 
 ---
 

@@ -2,12 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Read This First — Project Constitution
+
+**Before starting any non-trivial task in this repository, consult [`specs/constitution.md`](specs/constitution.md).** It is the canonical reference for every contributor — human or AI agent — and establishes:
+
+- The eight Core Principles that govern every design decision (correctness first, typed contracts, resilience, helper-first construction, single source of truth across MCP + CLI, pin-tested invariants, paranoid security, public utility).
+- The **Definition of Done** checklist — every commit must satisfy each item before it ships.
+- The **Conflict-Resolution Hierarchy** for when principles compete (correctness > security > simplicity > cross-surface consistency > maintainability > performance > extensibility).
+- Pointers into the four detail files: `specs/principles-architecture.md`, `specs/principles-development.md`, `specs/principles-mcp.md`, `specs/principles-security.md`.
+
+When this file (CLAUDE.md) and the constitution disagree, the constitution wins — this file is the operational guide (commands, project structure, known limitations); the constitution is the law.
+
 ## Commands
 
 ```bash
 cargo build                  # compile (debug)
 cargo build --release        # compile (optimized, LTO)
-cargo test --lib             # run all unit tests (~283)
+cargo test --lib             # run all unit tests (364)
 cargo test                   # run all tests (unit + integration)
 cargo run --bin workflowy-mcp-server  # start MCP server
 cargo check                  # type-check without building
