@@ -640,6 +640,29 @@ const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) onc
 /// in the workflows module per the duplication-audit rule.
 use crate::workflows::scope_resolved_label;
 
+/// Outcome of an `audit_mirrors` walk — either a single subtree fetch
+/// or a chunked walk that unioned its children. `chunks` is empty in
+/// the single-walk case; per-chunk envelope (id, name, scanned,
+/// truncated, truncation_reason) in the chunked case.
+#[derive(Debug)]
+struct AuditWalkOutcome {
+    nodes: Vec<crate::types::WorkflowyNode>,
+    truncated: bool,
+    truncation_reason: Option<TruncationReason>,
+    chunks: Vec<serde_json::Value>,
+}
+
+impl AuditWalkOutcome {
+    fn single(fetch: SubtreeFetch) -> Self {
+        Self {
+            nodes: fetch.nodes,
+            truncated: fetch.truncated,
+            truncation_reason: fetch.truncation_reason,
+            chunks: Vec::new(),
+        }
+    }
+}
+
 /// JSON-truncation surface invariant: every walk-shaped tool that emits
 /// JSON spreads this four-field envelope into its payload:
 ///
@@ -4236,7 +4259,7 @@ impl WorkflowyMcpServer {
     #[doc(hidden)]
     const DEFAULT_REVIEW_ROOT: &'static str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
 
-    #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171; pass root_id to scope elsewhere. Returns a JSON object with scope, scanned count, truncated flag, and findings array.")]
+    #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope OR in the persistent name index), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171, walked in chunks (one per direct child of the root) to avoid the 10 000-node walk cap on large pillars. Canonical resolution widens to the name index by default so cross-pillar mirrors don't false-positive as BROKEN (Fix A for the 2026-05-16 weekly-synthesis report). Pass chunked=false to force a single walk; pass cross_scope_resolve=false to restore the legacy in-scope-only classifier. Returns a JSON object with scope, scanned count, truncated flag, per-chunk envelope (when chunked), and findings array.")]
     async fn audit_mirrors(
         &self,
         Parameters(params): Parameters<AuditMirrorsParams>,
@@ -4247,23 +4270,183 @@ impl WorkflowyMcpServer {
             None => Self::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
-        info!(root = %root, max_depth, "audit_mirrors");
+        // Default behaviour: chunked when the scope is the default
+        // root (the only place known to exceed the 10 000-node walk
+        // cap today). Explicit `root_id` opts into single-walk by
+        // default — callers who pick a narrower scope rarely need
+        // chunking.
+        let chunked = params.chunked.unwrap_or(params.root_id.is_none());
+        let cross_scope_resolve = params.cross_scope_resolve.unwrap_or(true);
+        info!(
+            root = %root,
+            max_depth,
+            chunked,
+            cross_scope_resolve,
+            "audit_mirrors"
+        );
 
-        match self.walk_subtree(Some(&root), max_depth).await {
-            Ok(fetch) => {
-                let findings = crate::audit::audit_mirrors(&fetch.nodes);
-                let payload = json!({
-                    "scope": root,
-                    "scanned": fetch.nodes.len(),
-                    "truncated": fetch.truncated,
-                    "truncation_reason": fetch.truncation_reason.map(|r| r.as_str()),
-                    "findings": findings,
-                });
-                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        // Helper: walk either a single subtree or a set of child
+        // chunks under `root`, returning the union of nodes plus an
+        // aggregated truncation envelope.
+        let outcome = if chunked {
+            match self.audit_mirrors_walk_chunked(&root, max_depth).await {
+                Ok(o) => o,
+                Err(e) => return Err(tool_error("audit_mirrors", Some(&root), e)),
             }
-            Err(e) => Err(tool_error("audit_mirrors", Some(&root), e)),
+        } else {
+            match self.walk_subtree(Some(&root), max_depth).await {
+                Ok(fetch) => AuditWalkOutcome::single(fetch),
+                Err(e) => return Err(tool_error("audit_mirrors", Some(&root), e)),
+            }
+        };
+
+        let external = if cross_scope_resolve {
+            self.audit_mirrors_external_canonicals(&outcome.nodes)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let findings = crate::audit::audit_mirrors_with_external(&outcome.nodes, &external);
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("scope".into(), json!(root));
+        payload.insert("scanned".into(), json!(outcome.nodes.len()));
+        payload.insert("truncated".into(), json!(outcome.truncated));
+        payload.insert(
+            "truncation_reason".into(),
+            json!(outcome.truncation_reason.as_ref().map(|r| r.as_str())),
+        );
+        payload.insert("chunked".into(), json!(chunked));
+        payload.insert("cross_scope_resolve".into(), json!(cross_scope_resolve));
+        payload.insert(
+            "external_canonicals_resolved".into(),
+            json!(external.len()),
+        );
+        if chunked {
+            payload.insert("chunks".into(), json!(outcome.chunks));
         }
+        payload.insert("findings".into(), serde_json::to_value(&findings).unwrap());
+        let json_str = serde_json::Value::Object(payload).to_string();
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
         })
+    }
+
+    /// Chunked walk for `audit_mirrors`. Lists the root's direct
+    /// children and walks each as its own subtree (with the depth
+    /// budget decremented by one for the implied root level), then
+    /// returns the union with a per-chunk envelope and aggregated
+    /// truncation reason. Pre-2026-05-16 the default Distillations
+    /// scope timed out before reaching any leaf because the
+    /// subtree exceeded the 10 000-node walk cap; chunking sidesteps
+    /// the cap because each pillar fits well under it.
+    async fn audit_mirrors_walk_chunked(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+    ) -> crate::error::Result<AuditWalkOutcome> {
+        let children = self.client.get_children(root_id).await?;
+        let mut all_nodes: Vec<crate::types::WorkflowyNode> = Vec::new();
+        let mut chunks = Vec::new();
+        let mut truncated_any = false;
+        // First non-null truncation reason wins for the top-level
+        // banner; callers can inspect `chunks` for the per-chunk
+        // breakdown.
+        let mut top_truncation: Option<crate::api::client::TruncationReason> = None;
+
+        // Include the root itself in the audit scope so a mirror
+        // marker living directly under the root is observed. Best
+        // effort — failure to fetch the root is fatal to the audit
+        // anyway, so propagate.
+        if let Ok(root_node) = self.client.get_node(root_id).await {
+            all_nodes.push(root_node);
+        }
+
+        let child_depth = max_depth.saturating_sub(1);
+        for child in &children {
+            let fetch = self.walk_subtree(Some(&child.id), child_depth).await?;
+            let truncated = fetch.truncated;
+            let scanned = fetch.nodes.len();
+            let reason = fetch.truncation_reason;
+            if truncated {
+                truncated_any = true;
+                if top_truncation.is_none() {
+                    top_truncation = reason;
+                }
+            }
+            chunks.push(json!({
+                "id": child.id,
+                "name": child.name,
+                "scanned": scanned,
+                "truncated": truncated,
+                "truncation_reason": reason.map(|r| r.as_str()),
+            }));
+            all_nodes.extend(fetch.nodes);
+        }
+        // Dedupe by ID (a node visited via two chunks shouldn't double-count).
+        all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        all_nodes.dedup_by(|a, b| a.id == b.id);
+        Ok(AuditWalkOutcome {
+            nodes: all_nodes,
+            truncated: truncated_any,
+            truncation_reason: top_truncation,
+            chunks,
+        })
+    }
+
+    /// Build the external-canonicals map for `audit_mirrors`. For
+    /// every `mirror_of:` UUID encountered in scope that the walk
+    /// itself didn't resolve, consult the persistent name index.
+    /// Lookups are O(1) and bounded by index size — the user's
+    /// production index carries ~55 000 entries.
+    ///
+    /// Marker presence is left `None` because the index doesn't
+    /// store descriptions; the audit treats `None` as "unknown,
+    /// don't classify ORPHAN," which is the correct default for
+    /// cross-scope canonicals (a positive marker check would
+    /// require a live `get_node` fetch the handler deliberately
+    /// avoids).
+    fn audit_mirrors_external_canonicals(
+        &self,
+        nodes: &[crate::types::WorkflowyNode],
+    ) -> std::collections::HashMap<String, crate::audit::ExternalCanonical> {
+        use std::collections::{HashMap, HashSet};
+        let in_scope: HashSet<String> =
+            nodes.iter().map(|n| n.id.to_lowercase()).collect();
+        let mut external: HashMap<String, crate::audit::ExternalCanonical> = HashMap::new();
+        for node in nodes {
+            let desc = node.description.as_deref().unwrap_or("");
+            if let Some(target) = crate::audit::extract_marker(desc, "mirror_of:") {
+                let target_lc = target.to_lowercase();
+                // Already in scope (end-match either direction, to
+                // cover short-hash forms): skip.
+                if in_scope.iter().any(|s| s.ends_with(&target_lc) || target_lc.ends_with(s)) {
+                    continue;
+                }
+                if external.contains_key(&target_lc) {
+                    continue;
+                }
+                // Try direct-by-id lookup; fall back to short-hash
+                // resolution then by-id on the resolved full UUID.
+                let resolved = self
+                    .name_index
+                    .lookup_entry_by_id(&target_lc)
+                    .or_else(|| {
+                        self.name_index
+                            .resolve_short_hash(&target_lc)
+                            .and_then(|full| self.name_index.lookup_entry_by_id(&full))
+                    });
+                if let Some(entry) = resolved {
+                    external.insert(
+                        target_lc,
+                        crate::audit::ExternalCanonical {
+                            id: entry.node_id,
+                            name: entry.name,
+                            has_canonical_marker: None,
+                        },
+                    );
+                }
+            }
+        }
+        external
     }
 
     #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under `$SECONDBRAIN_DIR/session-logs/` in the last 7 days (skipped if the env var is unset). Default scope: Distillations.")]
@@ -6884,6 +7067,8 @@ mod tests {
             .audit_mirrors(Parameters(AuditMirrorsParams {
                 root_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
                 max_depth: Some(2),
+                chunked: Some(false),
+                cross_scope_resolve: Some(false),
             }))
             .await;
         match result {
@@ -6951,15 +7136,18 @@ mod tests {
     }
 
     /// The MCP handler and the wflow-do CLI must call into the SAME
-    /// `audit::audit_mirrors` and `audit::build_review` functions, so
-    /// findings are guaranteed identical between transports. Anchored
-    /// here as a source-pattern test — accidental re-implementation in
-    /// either surface fails before deploy.
+    /// `audit::audit_mirrors_with_external` and `audit::build_review`
+    /// functions, so findings are guaranteed identical between
+    /// transports. Anchored here as a source-pattern test —
+    /// accidental re-implementation in either surface fails before
+    /// deploy. (`audit_mirrors` itself remains as a back-compat shim
+    /// but every production caller goes through the
+    /// external-canonicals path now, post-2026-05-16 Fix A.)
     #[test]
     fn audit_review_handlers_route_through_lib_module() {
         let server_src = include_str!("mod.rs");
         for needle in &[
-            "crate::audit::audit_mirrors(",
+            "crate::audit::audit_mirrors_with_external(",
             "crate::audit::build_review(",
         ] {
             assert!(
@@ -6969,7 +7157,7 @@ mod tests {
         }
         let cli_src = include_str!("../bin/wflow_do.rs");
         for needle in &[
-            "audit_mirrors(",
+            "audit_mirrors_with_external(",
             "build_review(",
         ] {
             assert!(
@@ -6982,6 +7170,85 @@ mod tests {
         assert!(
             cli_src.contains("workflowy_mcp_server::audit::"),
             "wflow_do.rs must import from the lib module, not redefine"
+        );
+    }
+
+    /// Cross-pillar mirror resolution: a mirror under scope X whose
+    /// `mirror_of:` points at a canonical in the persistent name
+    /// index but outside the walked scope must classify OK, not
+    /// BROKEN. Pre-2026-05-16 the audit conflated walk-scope with
+    /// resolution-scope and returned five false-positive BROKEN
+    /// findings on the weekly synthesis run — the symptom the
+    /// 2026-05-16 report names.
+    #[test]
+    fn audit_external_resolution_finds_canonical_in_name_index() {
+        let server = new_test_server();
+        // Pre-populate the name index with a canonical that lives
+        // outside the walked subtree.
+        let canonical_uuid = "cf07501e-4e1a-4914-b3a3-0157006680ad";
+        server.name_index.ingest(&[crate::types::WorkflowyNode {
+            id: canonical_uuid.to_string(),
+            name: "Specification without accountability".to_string(),
+            parent_id: Some("4ef32619-aaaa-bbbb-cccc-ddddeeeeffff".to_string()),
+            ..Default::default()
+        }]);
+        // Simulate a walked node set that contains only the mirror.
+        let walked = vec![crate::types::WorkflowyNode {
+            id: "e696eddf-8f32-46d5-8ecd-ff0df2dc1c5e".to_string(),
+            name: "Specification without accountability".to_string(),
+            description: Some(format!("mirror_of: {}", canonical_uuid)),
+            parent_id: Some("7f6d357c-77c6-4654-9c7e-8ec4be8b16e0".to_string()),
+            ..Default::default()
+        }];
+        let external = server.audit_mirrors_external_canonicals(&walked);
+        assert_eq!(
+            external.len(),
+            1,
+            "name-index lookup must surface the cross-scope canonical: {:?}",
+            external
+        );
+        let findings = crate::audit::audit_mirrors_with_external(&walked, &external);
+        assert!(
+            findings.is_empty(),
+            "cross-pillar mirror must classify OK, got: {:?}",
+            findings
+        );
+    }
+
+    /// Without `cross_scope_resolve`, the same mirror falls back to
+    /// BROKEN — pinning the legacy behaviour for callers that opt
+    /// out (`cross_scope_resolve=false`).
+    #[test]
+    fn audit_legacy_path_still_flags_broken_when_cross_scope_resolve_disabled() {
+        let walked = vec![crate::types::WorkflowyNode {
+            id: "e696eddf-8f32-46d5-8ecd-ff0df2dc1c5e".to_string(),
+            name: "Specification without accountability".to_string(),
+            description: Some("mirror_of: cf07501e-4e1a-4914-b3a3-0157006680ad".to_string()),
+            parent_id: Some("7f6d357c-77c6-4654-9c7e-8ec4be8b16e0".to_string()),
+            ..Default::default()
+        }];
+        let empty_external = std::collections::HashMap::new();
+        let findings = crate::audit::audit_mirrors_with_external(&walked, &empty_external);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].status, "BROKEN");
+    }
+
+    /// Source-pattern pin: when the default scope is used,
+    /// `audit_mirrors` must dispatch through the chunked walker
+    /// (`audit_mirrors_walk_chunked`), not a bare `walk_subtree` —
+    /// otherwise the 10 000-node walk cap re-strands the default
+    /// audit (Fix B for the 2026-05-16 report).
+    #[test]
+    fn audit_default_scope_dispatches_via_chunked_walk() {
+        let server_src = include_str!("mod.rs");
+        assert!(
+            server_src.contains("audit_mirrors_walk_chunked"),
+            "audit_mirrors handler must dispatch through audit_mirrors_walk_chunked when chunked=true"
+        );
+        // And `chunked` defaults to true when root_id is omitted.
+        assert!(
+            server_src.contains("params.chunked.unwrap_or(params.root_id.is_none())"),
+            "chunked must default to true for the default (root_id=None) scope"
         );
     }
 

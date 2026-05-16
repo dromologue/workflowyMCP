@@ -21,12 +21,12 @@
 //!   description. The mirror's name should be a verbatim copy of the
 //!   canonical's name at creation time.
 //!
-//! `audit_mirrors` walks the supplied node set and emits findings of
-//! four kinds:
+//! `audit_mirrors_with_external` walks the supplied node set and emits
+//! findings of four kinds:
 //!
-//! - **BROKEN** — `mirror_of:<uuid>` does not resolve to any node in
-//!   scope (UUID typo, target deleted, target outside the audited
-//!   subtree).
+//! - **BROKEN** — `mirror_of:<uuid>` does not resolve in the walked
+//!   scope **and** is not present in the supplied `external_canonicals`
+//!   map (UUID typo, target deleted from the entire graph).
 //! - **DRIFTED** — mirror name has diverged from the canonical's name
 //!   (substring-match in either direction; the canonical's name has
 //!   probably been edited and the mirror was missed).
@@ -36,6 +36,27 @@
 //! - **LONELY** — a canonical with `canonical_of:` set but no mirrors
 //!   pointing at it. May be intentional (some canonicals genuinely
 //!   live in one place); reported so the user can confirm.
+//!
+//! ### Walk scope vs canonical-resolution scope
+//!
+//! The classifier separates the *walk scope* (which subtree was
+//! traversed to find mirrors) from the *canonical-resolution scope*
+//! (where the canonical UUIDs are looked up). Cross-pillar mirroring —
+//! a mirror under pillar A pointing at a canonical under pillar B — is
+//! the standard pattern under Mirror Discipline, so resolving the
+//! canonical must reach outside the walk. The caller supplies an
+//! `external_canonicals` map (typically built from the persistent name
+//! index + a few live `get_node` calls); the classifier consults it
+//! before declaring BROKEN. The ORPHAN check is skipped for external
+//! canonicals because the resolver path doesn't carry the canonical's
+//! description — absence of evidence is not evidence of absence.
+//!
+//! Surfaced 2026-05-16 by the weekly synthesis report:
+//! cross-pillar audits returned five false-positive BROKEN findings
+//! because the original implementation conflated the two scopes. The
+//! `audit_mirrors(nodes)` shim preserves the old single-scope
+//! behaviour for callers (and tests) that only care about a closed
+//! subtree.
 //!
 //! ## Review surface (build_review)
 //!
@@ -112,9 +133,48 @@ pub fn extract_marker(text: &str, prefix: &str) -> Option<String> {
     re.captures(text).map(|c| c[1].to_lowercase())
 }
 
-/// Audit a node set against the canonical/mirror convention. See
-/// module-level docs for the four finding kinds.
+/// A canonical resolved from outside the walked scope. The handler
+/// builds this map by consulting the persistent name index (and, for
+/// the MCP path, an optional live `get_node` fallback) for every
+/// `mirror_of:` UUID encountered in scope that the walk itself didn't
+/// resolve.
+///
+/// `has_canonical_marker` is `None` when the resolution path only
+/// recovered the name (the common case — the name index does not
+/// store descriptions). When `Some(true)`, the canonical is known to
+/// acknowledge its role; when `Some(false)`, it does not. Only
+/// `Some(false)` triggers an ORPHAN finding for an external mirror —
+/// `None` is treated as "unknown, do not classify."
+#[derive(Debug, Clone)]
+pub struct ExternalCanonical {
+    pub id: String,
+    pub name: String,
+    pub has_canonical_marker: Option<bool>,
+}
+
+/// Backward-compatible shim: audit a node set treating the slice as
+/// both the walk scope **and** the resolution scope. Equivalent to
+/// `audit_mirrors_with_external(nodes, &HashMap::new())`. Cross-scope
+/// mirrors will all classify as BROKEN — use
+/// [`audit_mirrors_with_external`] when the walk doesn't cover the
+/// graph the mirrors point into.
 pub fn audit_mirrors(nodes: &[WorkflowyNode]) -> Vec<MirrorFinding> {
+    audit_mirrors_with_external(nodes, &HashMap::new())
+}
+
+/// Audit a node set against the canonical/mirror convention with
+/// canonical resolution widened beyond the walk scope. See
+/// module-level docs for the four finding kinds and the walk-vs-
+/// resolution split.
+///
+/// Keys of `external_canonicals` are lowercased UUIDs (or short hashes
+/// — the resolver uses the same `id_match` rule the in-scope lookup
+/// uses, so end-matching on either side works). Values carry the
+/// canonical's name and optionally a `canonical_of:` marker flag.
+pub fn audit_mirrors_with_external(
+    nodes: &[WorkflowyNode],
+    external_canonicals: &HashMap<String, ExternalCanonical>,
+) -> Vec<MirrorFinding> {
     let id_match = |a: &str, b: &str| -> bool {
         let (a, b) = (a.to_lowercase(), b.to_lowercase());
         a == b || a.ends_with(&b) || b.ends_with(&a)
@@ -141,11 +201,6 @@ pub fn audit_mirrors(nodes: &[WorkflowyNode]) -> Vec<MirrorFinding> {
                 .push(n.id.clone());
             let canon = by_id.values().find(|c| id_match(&c.id, &target));
             match canon {
-                None => findings.push(mk(
-                    "BROKEN",
-                    n,
-                    format!("mirror_of:{} not found in scope", target),
-                )),
                 Some(canon) => {
                     let (mn, cn) = (n.name.to_lowercase(), canon.name.to_lowercase());
                     if !mn.contains(&cn) && !cn.contains(&mn) {
@@ -162,6 +217,52 @@ pub fn audit_mirrors(nodes: &[WorkflowyNode]) -> Vec<MirrorFinding> {
                             n,
                             format!("canonical {} has no canonical_of: marker", canon.id),
                         ));
+                    }
+                }
+                None => {
+                    // Not in walk scope — consult the external
+                    // resolver (typically the persistent name index)
+                    // before declaring BROKEN. Mirror Discipline is
+                    // designed around cross-pillar references, so the
+                    // common case is a canonical living elsewhere in
+                    // the graph.
+                    let external = external_canonicals
+                        .values()
+                        .find(|c| id_match(&c.id, &target));
+                    match external {
+                        None => findings.push(mk(
+                            "BROKEN",
+                            n,
+                            format!(
+                                "mirror_of:{} not found in scope or in name index",
+                                target
+                            ),
+                        )),
+                        Some(ec) => {
+                            let (mn, cn) = (n.name.to_lowercase(), ec.name.to_lowercase());
+                            if !mn.contains(&cn) && !cn.contains(&mn) {
+                                findings.push(mk(
+                                    "DRIFTED",
+                                    n,
+                                    format!(
+                                        "name diverges from canonical \"{}\" (resolved outside scope)",
+                                        ec.name
+                                    ),
+                                ));
+                            }
+                            // Only emit ORPHAN for an external
+                            // canonical when the resolver positively
+                            // knows the marker is absent. `None`
+                            // means "the resolver didn't fetch the
+                            // description" and must not classify.
+                            if ec.has_canonical_marker == Some(false) {
+                                findings.push(mk(
+                                    "ORPHAN",
+                                    n,
+                                    format!("canonical {} has no canonical_of: marker", ec.id),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -356,6 +457,99 @@ mod tests {
         let findings = audit_mirrors(&nodes);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, "LONELY");
+    }
+
+    #[test]
+    fn cross_pillar_mirror_classifies_ok_when_canonical_present_in_external_map() {
+        // The scope only contains the mirror; the canonical lives in
+        // some other pillar and is supplied through the external map.
+        // Pre-2026-05-16 this was a false-positive BROKEN. After Fix
+        // A it must be silent.
+        let nodes = vec![node("bbb", "Distillation Title", Some("mirror_of:aaa"))];
+        let mut external = HashMap::new();
+        external.insert(
+            "aaa".to_string(),
+            ExternalCanonical {
+                id: "aaa".to_string(),
+                name: "Distillation Title".to_string(),
+                has_canonical_marker: Some(true),
+            },
+        );
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert!(
+            findings.is_empty(),
+            "cross-pillar mirror with resolvable canonical must not classify BROKEN: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn cross_pillar_mirror_drifts_when_name_diverges_from_external() {
+        let nodes = vec![node(
+            "bbb",
+            "Completely Different Name",
+            Some("mirror_of:aaa"),
+        )];
+        let mut external = HashMap::new();
+        external.insert(
+            "aaa".to_string(),
+            ExternalCanonical {
+                id: "aaa".to_string(),
+                name: "Original Title".to_string(),
+                has_canonical_marker: Some(true),
+            },
+        );
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].status, "DRIFTED");
+        assert!(findings[0].issue.contains("resolved outside scope"));
+    }
+
+    #[test]
+    fn cross_pillar_mirror_orphan_only_when_marker_known_absent() {
+        // marker_known_absent → ORPHAN
+        let nodes = vec![node("bbb", "Title", Some("mirror_of:aaa"))];
+        let mut external = HashMap::new();
+        external.insert(
+            "aaa".to_string(),
+            ExternalCanonical {
+                id: "aaa".to_string(),
+                name: "Title".to_string(),
+                has_canonical_marker: Some(false),
+            },
+        );
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert!(
+            findings.iter().any(|f| f.status == "ORPHAN" && f.node_id == "bbb"),
+            "expected ORPHAN, got: {:?}", findings
+        );
+
+        // marker unknown (None) → no classification
+        external.get_mut("aaa").unwrap().has_canonical_marker = None;
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert!(
+            findings.is_empty(),
+            "unknown marker state must not classify: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn unresolvable_mirror_still_classifies_broken_with_external_map() {
+        let nodes = vec![node("bbb", "Title", Some("mirror_of:dad"))];
+        let mut external = HashMap::new();
+        external.insert(
+            "cab".to_string(),
+            ExternalCanonical {
+                id: "cab".to_string(),
+                name: "Other".to_string(),
+                has_canonical_marker: Some(true),
+            },
+        );
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].status, "BROKEN");
+        assert!(findings[0].issue.contains("not found in scope or in name index"));
     }
 
     #[test]

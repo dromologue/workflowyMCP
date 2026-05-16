@@ -211,6 +211,18 @@ impl NameIndex {
         out
     }
 
+    /// Look up the entry for a specific node by its full UUID. Used by
+    /// the `audit_mirrors` resolver path to widen canonical resolution
+    /// beyond the walked subtree (Fix A for the 2026-05-16
+    /// cross-pillar false-positive report). Returns `None` if the
+    /// node has never been ingested.
+    pub fn lookup_entry_by_id(&self, node_id: &str) -> Option<NameIndexEntry> {
+        let lc_name = self.by_id.read().get(node_id).cloned()?;
+        let by_name = self.by_name.read();
+        let value = by_name.get(&lc_name)?;
+        value.entries.iter().find(|e| e.node_id == node_id).cloned()
+    }
+
     /// Resolve a short-hash form to its full UUID.
     ///
     /// Accepts both the 12-char URL-suffix form and the 8-char prefix
@@ -596,6 +608,37 @@ mod tests {
         assert_eq!(short_hash_of("not-a-uuid"), None);
         assert_eq!(short_hash_of(""), None);
         assert_eq!(short_hash_of("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn lookup_entry_by_id_returns_ingested_entry() {
+        let idx = NameIndex::new();
+        let id = "cf07501e-4e1a-4914-b3a3-0157006680ad";
+        idx.ingest(&[node(id, "How we Lead — Specification without accountability", None)]);
+        let hit = idx.lookup_entry_by_id(id).expect("ingested id must resolve");
+        assert_eq!(hit.node_id, id);
+        assert_eq!(
+            hit.name,
+            "How we Lead — Specification without accountability"
+        );
+    }
+
+    #[test]
+    fn lookup_entry_by_id_returns_none_for_unknown_id() {
+        let idx = NameIndex::new();
+        idx.ingest(&[node("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "X", None)]);
+        assert!(idx
+            .lookup_entry_by_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            .is_none());
+    }
+
+    #[test]
+    fn lookup_entry_by_id_returns_none_after_invalidate() {
+        let idx = NameIndex::new();
+        let id = "cf07501e-4e1a-4914-b3a3-0157006680ad";
+        idx.ingest(&[node(id, "Name", None)]);
+        idx.invalidate_node(id);
+        assert!(idx.lookup_entry_by_id(id).is_none());
     }
 
     #[test]

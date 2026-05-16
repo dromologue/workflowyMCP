@@ -373,9 +373,25 @@ enum Cmd {
         limit: usize,
     },
     /// Audit `canonical_of:` / `mirror_of:` markers under a subtree.
+    /// Mirrors the MCP `audit_mirrors` tool: default scope is the
+    /// Distillations root, walked in chunks (one per direct child) to
+    /// avoid the 10 000-node walk cap. Canonical resolution widens to
+    /// `get_node` calls for `mirror_of:` UUIDs the walk didn't catch
+    /// so cross-pillar mirrors don't false-positive as BROKEN.
     AuditMirrors {
         #[arg(long)]
         root: Option<String>,
+        /// Force-chunked walk (default: true when --root is omitted,
+        /// false when --root is supplied). Pass false to opt out.
+        #[arg(long)]
+        chunked: Option<bool>,
+        /// Widen canonical resolution beyond the walked scope by
+        /// issuing `get_node` for `mirror_of:` UUIDs not covered by
+        /// the walk. Defaults to true. Set false to restore the
+        /// legacy in-scope-only classifier (any cross-scope mirror
+        /// will then classify as BROKEN).
+        #[arg(long)]
+        cross_scope_resolve: Option<bool>,
     },
     /// Create a convention-based mirror of a canonical node under a
     /// new parent. Mirrors MCP `create_mirror`. The mirror's name is
@@ -1704,29 +1720,162 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }))?
             );
         }
-        Cmd::AuditMirrors { root } => {
+        Cmd::AuditMirrors { root, chunked, cross_scope_resolve } => {
             let scope = root.as_deref().unwrap_or(DEFAULT_REVIEW_ROOT);
-            let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-                defaults::SUBTREE_FETCH_TIMEOUT_MS,
-            ));
-            let fetch = client
-                .get_subtree_with_controls(Some(scope), 8, defaults::MAX_SUBTREE_NODES, controls)
-                .await?;
-            let findings = audit_mirrors(&fetch.nodes);
+            // Default chunked when scope is the default Distillations
+            // root, since that is the only scope known to exceed the
+            // 10 000-node walk cap. Explicit --root opts into single
+            // walk by default.
+            let do_chunked = chunked.unwrap_or(root.is_none());
+            let do_cross_resolve = cross_scope_resolve.unwrap_or(true);
+            let make_controls = || {
+                FetchControls::with_timeout(std::time::Duration::from_millis(
+                    defaults::SUBTREE_FETCH_TIMEOUT_MS,
+                ))
+            };
+            let mut all_nodes: Vec<workflowy_mcp_server::types::WorkflowyNode> = Vec::new();
+            let mut chunks_json: Vec<serde_json::Value> = Vec::new();
+            let mut truncated_any = false;
+            let mut top_truncation: Option<&'static str> = None;
+            if do_chunked {
+                // Best-effort include the root node itself; failure to
+                // fetch is non-fatal — the audit still runs across
+                // children.
+                if let Ok(root_node) = client.get_node(scope).await {
+                    all_nodes.push(root_node);
+                }
+                let children = client.get_children(scope).await?;
+                for child in &children {
+                    let fetch = client
+                        .get_subtree_with_controls(
+                            Some(&child.id),
+                            7,
+                            defaults::MAX_SUBTREE_NODES,
+                            make_controls(),
+                        )
+                        .await?;
+                    let truncated = fetch.truncated;
+                    let scanned = fetch.nodes.len();
+                    let reason = fetch.truncation_reason.map(|r| r.as_str());
+                    if truncated {
+                        truncated_any = true;
+                        if top_truncation.is_none() {
+                            top_truncation = reason;
+                        }
+                    }
+                    chunks_json.push(json!({
+                        "id": child.id,
+                        "name": child.name,
+                        "scanned": scanned,
+                        "truncated": truncated,
+                        "truncation_reason": reason,
+                    }));
+                    all_nodes.extend(fetch.nodes);
+                }
+                all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+                all_nodes.dedup_by(|a, b| a.id == b.id);
+            } else {
+                let fetch = client
+                    .get_subtree_with_controls(
+                        Some(scope),
+                        8,
+                        defaults::MAX_SUBTREE_NODES,
+                        make_controls(),
+                    )
+                    .await?;
+                truncated_any = fetch.truncated;
+                top_truncation = fetch.truncation_reason.map(|r| r.as_str());
+                all_nodes = fetch.nodes;
+            }
+
+            // Build the external-canonicals map by issuing `get_node`
+            // for every `mirror_of:` UUID not already in scope. The
+            // CLI is single-shot so no persistent index is available;
+            // we lean on the API directly. Rate limiter inside the
+            // client serialises requests.
+            let mut external: std::collections::HashMap<String, workflowy_mcp_server::audit::ExternalCanonical> =
+                std::collections::HashMap::new();
+            if do_cross_resolve {
+                use std::collections::HashSet;
+                let in_scope: HashSet<String> =
+                    all_nodes.iter().map(|n| n.id.to_lowercase()).collect();
+                let mut targets: Vec<String> = Vec::new();
+                for node in &all_nodes {
+                    let desc = node.description.as_deref().unwrap_or("");
+                    if let Some(target) =
+                        workflowy_mcp_server::audit::extract_marker(desc, "mirror_of:")
+                    {
+                        let t = target.to_lowercase();
+                        if in_scope.iter().any(|s| s.ends_with(&t) || t.ends_with(s)) {
+                            continue;
+                        }
+                        if !targets.contains(&t) {
+                            targets.push(t);
+                        }
+                    }
+                }
+                for t in targets {
+                    if let Ok(canon) = client.get_node(&t).await {
+                        let canon_desc = canon.description.as_deref().unwrap_or("");
+                        let has_marker = workflowy_mcp_server::audit::extract_marker(
+                            canon_desc,
+                            "canonical_of:",
+                        )
+                        .is_some();
+                        external.insert(
+                            t,
+                            workflowy_mcp_server::audit::ExternalCanonical {
+                                id: canon.id,
+                                name: canon.name,
+                                has_canonical_marker: Some(has_marker),
+                            },
+                        );
+                    }
+                }
+            }
+
+            let findings = workflowy_mcp_server::audit::audit_mirrors_with_external(
+                &all_nodes, &external,
+            );
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&json!({
-                    "scope": scope,
-                    "scanned": fetch.nodes.len(),
-                    "truncated": fetch.truncated,
-                    "findings": findings,
-                }))?);
+                let mut payload = serde_json::Map::new();
+                payload.insert("scope".into(), json!(scope));
+                payload.insert("scanned".into(), json!(all_nodes.len()));
+                payload.insert("truncated".into(), json!(truncated_any));
+                payload.insert("truncation_reason".into(), json!(top_truncation));
+                payload.insert("chunked".into(), json!(do_chunked));
+                payload.insert("cross_scope_resolve".into(), json!(do_cross_resolve));
+                payload.insert(
+                    "external_canonicals_resolved".into(),
+                    json!(external.len()),
+                );
+                if do_chunked {
+                    payload.insert("chunks".into(), json!(chunks_json));
+                }
+                payload.insert(
+                    "findings".into(),
+                    serde_json::to_value(&findings).unwrap(),
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(payload))?
+                );
             } else if findings.is_empty() {
-                println!("audit-mirrors: scanned {} nodes, no findings", fetch.nodes.len());
+                println!(
+                    "audit-mirrors: scanned {} nodes ({} external canonicals resolved), no findings",
+                    all_nodes.len(),
+                    external.len()
+                );
             } else {
                 for f in &findings {
                     println!("{} {} \"{}\" -> {}", f.status, f.node_id, f.name, f.issue);
                 }
-                println!("---\n{} findings across {} nodes", findings.len(), fetch.nodes.len());
+                println!(
+                    "---\n{} findings across {} nodes ({} external canonicals resolved)",
+                    findings.len(),
+                    all_nodes.len(),
+                    external.len()
+                );
             }
         }
         Cmd::CreateMirror { canonical_node_id, target_parent_id, priority, pillar, dry_run } => {
@@ -1985,7 +2134,9 @@ async fn cmd_reindex(
 // adapter: it loads the recent session-log blob from disk (the lib is
 // pure-data and never touches the filesystem) and passes it through.
 
-use workflowy_mcp_server::audit::{audit_mirrors, build_review, ReviewReport};
+use workflowy_mcp_server::audit::{build_review, ReviewReport};
+#[cfg(test)]
+use workflowy_mcp_server::audit::audit_mirrors;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 

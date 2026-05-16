@@ -585,6 +585,10 @@ pub struct AuditMirrorsParams {
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 8)")]
     pub max_depth: Option<usize>,
+    #[schemars(description = "Chunked walk: list root's direct children and walk each separately, then aggregate. Avoids the 10 000-node walk cap on large subtrees. Defaults to true when root_id is omitted (default Distillations scope), false when an explicit root is supplied. Pass true to force chunking for any scope; pass false to opt out.")]
+    pub chunked: Option<bool>,
+    #[schemars(description = "Widen canonical resolution beyond the walked scope by consulting the persistent name index. Mirror Discipline is built around cross-pillar references, so a canonical living outside the walk is the normal case rather than a fault. Defaults to true. Set false to restore the legacy in-scope-only classifier (any cross-scope mirror will then classify as BROKEN).")]
+    pub cross_scope_resolve: Option<bool>,
 }
 
 /// Parameters for `review`. Same scoping shape as `audit_mirrors`.
