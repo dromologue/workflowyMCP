@@ -7654,6 +7654,86 @@ mod tests {
         );
     }
 
+    /// Wrapper-level acceptance for the null-UUID hardening task.
+    /// Pins that `Parameters::from_context_part`'s exact transformation
+    /// — `serde_path_to_error::deserialize` → message format with field
+    /// path → route through `tool_invalid_params` — produces the
+    /// canonical structured envelope `{operation, node_id, hint,
+    /// proximate_cause, error}` BEFORE any API touch, and that the
+    /// `error` field carries the offending field's name so the host
+    /// self-corrects on retry. The two earlier tests pin only the
+    /// deserializer in isolation; this one pins the full wrapper
+    /// pipeline end-to-end. Surfaced 2026-05-10 resumption-2: a session
+    /// that ran at 20 % `move_node` success because the agent emitted
+    /// JSON `null` for `new_parent_id` repeatedly. The string-`"null"`
+    /// defence does not catch JSON-null; the wrapper-level rejection
+    /// already does, but was unpinned at the envelope layer.
+    #[test]
+    fn wrapper_rejects_json_null_uuid_with_structured_envelope_before_api_touch() {
+        // Mirror the wrapper transformation exactly. JSON null on
+        // `new_parent_id` must fail at the deserializer with a
+        // path-aware error, then route through `tool_invalid_params`
+        // to produce the canonical envelope.
+        let payload = serde_json::json!({
+            "node_id": "550e8400-e29b-41d4-a716-446655440000",
+            "new_parent_id": null,
+        });
+        let result: std::result::Result<MoveNodeParams, _> =
+            serde_path_to_error::deserialize(&payload);
+        let err = result.expect_err(
+            "JSON null on required NodeId must reject at the wrapper before any API touch",
+        );
+        let path = err.path().to_string();
+        let inner = err.into_inner();
+        let msg = if path.is_empty() || path == "." {
+            format!("invalid parameters: {}", inner)
+        } else {
+            format!("invalid parameters at `{}`: {}", path, inner)
+        };
+        let mcp_err = tool_invalid_params("move_node", None, msg);
+
+        // Pin envelope shape exactly. Any drift in `tool_invalid_params`
+        // that drops one of these fields will break the host's
+        // self-correction loop.
+        assert_eq!(
+            mcp_err.code,
+            ErrorCode::INVALID_PARAMS,
+            "wrapper rejection must use INVALID_PARAMS code"
+        );
+        let data = mcp_err
+            .data
+            .as_ref()
+            .expect("wrapper rejection must carry structured envelope data");
+        assert_eq!(
+            data["operation"], "move_node",
+            "envelope must name the operation so the host can attribute the failure"
+        );
+        assert_eq!(
+            data["proximate_cause"], "invalid_params",
+            "envelope must classify cause as invalid_params for validation failures"
+        );
+        assert!(
+            data["hint"].is_string(),
+            "envelope must carry a hint string"
+        );
+        let error_field = data["error"]
+            .as_str()
+            .expect("envelope must carry the error message in the `error` field");
+        assert!(
+            error_field.contains("new_parent_id"),
+            "error must name the offending field so the host self-corrects on retry, got: {}",
+            error_field
+        );
+
+        // The message field always names the operation so even clients
+        // that only render `message` can attribute the failure.
+        assert!(
+            mcp_err.message.starts_with("move_node:"),
+            "message must start with the operation name, got: {}",
+            mcp_err.message
+        );
+    }
+
     /// Error-envelope consistency invariant: handler-body validation
     /// failures route through `tool_invalid_params` (which emits the
     /// `{operation, node_id, hint, proximate_cause, error}` envelope),
