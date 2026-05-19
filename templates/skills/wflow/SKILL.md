@@ -2,7 +2,7 @@
 name: wflow
 description: Integrated second-brain skill built on Workflowy plus any additional services the user has configured (declared in $SECONDBRAIN_DIR/memory/services.md). Capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__reorder_nodes, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__bulk_update, mcp__workflowy__find_backlinks
-# Additional service tool namespaces (e.g. mcp__<service>__*) are listed in $SECONDBRAIN_DIR/memory/services.md and must be added to allowed-tools when configured.
+# Additional service tool namespaces (e.g. mcp__SERVICENAME__*) are listed in $SECONDBRAIN_DIR/memory/services.md and must be added to allowed-tools when configured.
 ---
 
 # wflow — second-brain skill (template)
@@ -67,6 +67,28 @@ Most preventable write-failure mode. Before any tool call that takes a UUID para
 4. **Path-less version of the error** (`invalid type: null, expected a string` with no `at \`.<field>\``) means the running MCP binary is pre-2026-05-03. Restart Claude Desktop / re-launch the host process to pick up the path-aware deserializer.
 
 5. **Workaround for surfaces that persistently strip bare-string UUIDs to `null`:** route writes through a tool whose parameters are an `operations` array — `transaction(operations=[{op: "move", node_id: "<uuid>", new_parent_id: "<uuid>"}, ...])` for multi-write batches, `batch_create_nodes(operations=[...])` for multi-creates. The UUIDs sit inside nested array items, dodging the bare-top-level-string encoding bug. Trade-off: one rollback unit per transaction. Last resort: `wflow-do` CLI, which bypasses host-side encoding entirely.
+
+---
+
+## Multi-write batch discipline (transaction-over-move)
+
+Rule 5 of UUID Parameter Discipline names `transaction` as the *workaround* for surfaces that strip bare-string UUIDs to null. This section promotes that to a *default*: when a workflow will perform 2+ writes that share a logical batch — moves with a common destination, edits across a set of related nodes, deletes within one subtree — route through `transaction(operations=[…])` from the start, not after a failure proves the host is dropping UUIDs.
+
+**Why default to transaction (belt-and-braces with rule 5):**
+
+1. **Single rollback unit.** A failure mid-batch rolls back what already landed; sequential per-op calls leave partial state stranded for manual cleanup.
+2. **Dodges the null-UUID encoding bug at the host boundary.** UUIDs nested inside `operations[]` array items aren't subject to the host-side bare-top-level-string stripping that has surfaced repeatedly on web / mobile surfaces. The workaround is reliable; using `transaction` by default neutralises the failure mode before it can land.
+3. **Auditable plan.** A single `transaction` call presents the full operation list before execution. Sequential calls require the agent to reason about partial state across many tool turns — the cognitive load is where drift creeps in.
+
+**When NOT to use transaction:**
+
+- **Single-shot writes.** One `create_node`, one `move_node`, one `edit_node`. The transaction wrapper adds no rollback value when there's nothing to roll back.
+- **Interactive per-item triage.** Workflows that ask the user about each item (inbox triage, reading-list management) should land each move on confirmation — bundling them defeats the per-item gate.
+- **Operations that are not transaction-supported ops.** `create_mirror`, `bulk_update`, `reorder_nodes`, `bulk_tag`, and `complete_node` are their own tools. Don't wrap them. (The `transaction` schema does accept `complete` / `uncomplete` if completion needs to be part of a rollback unit.)
+
+**Sizing.** The transaction tool runs operations sequentially server-side (best-effort atomicity wrapper, not true upstream atomicity). For batches > ~80 ops, chunk into multiple transactions to keep individual call latencies reasonable; rollback granularity per chunk is the trade-off.
+
+**Op ordering inside a transaction.** Cascading deletes (deleting a parent cascades children) must come *last* in the operations array — earlier ops on the same subtree get 404'd if the parent is deleted first.
 
 ---
 
@@ -256,7 +278,7 @@ These shorten the gap between "the skill said X" and "the agent actually did X" 
 
 - **Atomic notes use `batch_create_nodes` (not `insert_content`).** `insert_content` parses an indented text block into a hierarchy of names — it has no per-line description channel, so source attribution silently drops on every child node it creates. `batch_create_nodes(operations=[{name, description, parent_id}, ...])` accepts a description per operation and is the only insertion path that preserves the "source attribution in the description" rule of Atomic Note Discipline. (Eval Test 5: descriptions on 4 atomic notes were not set per-note in the `insert_content` call.)
 
-- **Backlinks are `<a href="https://workflowy.com/#/<short-hash>">name</a>`, not raw UUIDs in prose.** The literal HTML anchor is the form the Workflowy UI renders as a clickable link. Writing "see canonical 4ef32619-..." as plain text means the link is invisible at the UI layer and audit tooling can't follow the reference. Always use the anchor form in descriptions. (Eval Test 11: description named the canonical UUID in plain text but did not write a Workflowy `<a href>` backlink.)
+- **Backlinks are `<a href="https://workflowy.com/#/<short-hash>">name</a>`, not raw UUIDs in prose.** The literal HTML anchor is the form the Workflowy UI renders as a clickable link. Writing "see canonical 550e8400-..." as plain text means the link is invisible at the UI layer and audit tooling can't follow the reference. Always use the anchor form in descriptions. (Eval Test 11: description named the canonical UUID in plain text but did not write a Workflowy `<a href>` backlink.)
 
 - **Mid-session task capture is offer-then-confirm.** When a task surfaces during an unrelated chat (i.e. capture is incidental, not the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under \<inferred-domain\> — confirm?" (2) on user yes, the actual `create_node` / `smart_insert` write. Collapsing both into a single move denies the user the chance to redirect or veto, and inferred-domain mistakes compound silently. When the user's primary intent IS task capture (they opened with "capture: X"), the offer collapses to inferred-domain confirmation in the first response and the create lands on yes — fine. The two-message rule applies only when capture is incidental. (Eval Test 24: captured directly without an explicit confirmation step.)
 
@@ -278,8 +300,38 @@ Every session that mutated the second-brain should:
 
 1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `$SECONDBRAIN_DIR/session-logs/YYYY-MM-DD-<brief-name>.md`.
 2. Move any pending drafts from `drafts/` to `session-logs/` once their writes have landed.
-3. Update `memory/workflowy_node_links.md` if the user moved or renamed a structural node during the session.
+3. **Update the canonicals when the session made a structural change to Workflowy** — see the next subsection. This is the discipline that prevents `memory/workflowy_node_links.md` and `memory/distillation_taxonomy.md` from drifting silently out of sync with the live tree.
 4. **If this session resumes a previously-partial one, create a new sibling session-log node — don't edit the original.** Name the new node `[YYYY-MM-DD] — [original brief title] (resumption: complete)`. The original log captures the failure mode and routing decisions; the resumption log captures the resolution and final tally. Both stay readable, the audit trail is two-stage, and any later session reading the subtree sees the full arc instead of a description that's been overwritten. Same rule applies to the local `$SECONDBRAIN_DIR/session-logs/` mirror — write a new dated file with a `-resumption` or `-completion` suffix; don't overwrite the partial log.
+
+### Structural-change discipline (update the canonicals)
+
+Two filesystem artefacts hold the cached Workflowy structure the skill depends on:
+
+- **`$SECONDBRAIN_DIR/memory/workflowy_node_links.md`** — structural-node and priority-node UUID cache.
+- **`$SECONDBRAIN_DIR/memory/distillation_taxonomy.md`** — pillars, themes, register classifications, routing rules (only required if the user follows the synthesise workflows; if there are no Distillations, skip this file entirely).
+
+Both files are **canonical at the `$SECONDBRAIN_DIR/memory/` path**. They are not shipped in the public skill bundle (it would be impossible to ship a generic one — every user's pillars, structural nodes, and routing rules differ). The skill's bootstrap creates them on first use from the schemas in the Memory file schemas section below.
+
+**Update obligation.** After any session that makes a **structural change** to Workflowy, before closing the session, update the relevant canonical(s). Structural changes are:
+
+1. **New pillar / pillar rename / pillar UUID change** → `workflowy_node_links.md` synthesis-write-targets table + `distillation_taxonomy.md` Pillars table.
+2. **New theme / theme rename** → `distillation_taxonomy.md` Themes table.
+3. **New structural node under a pillar or theme** (e.g. a new sub-grouping under a pillar's Distillations node, a new theme distillation root) → corresponding section in `workflowy_node_links.md`.
+4. **New Reading-List sub-node** (e.g. a new current-reading thread, a new bulk-import source) → "Reading List sub-nodes" table in `workflowy_node_links.md`.
+5. **New atomic note that earns a long-lived cross-reference** (typically a synthesis or meta-synthesis node that other notes will backlink to) → the relevant atomic-notes table in `workflowy_node_links.md`. Ephemeral draft notes do NOT belong here.
+6. **A previously-cached node was deleted, moved out of scope, or its parent changed materially** → update or remove the entry; add a one-line change-log entry naming the move so a future reader can correlate the cache delta with the Workflowy delta.
+7. **Routing-rule change** (a new convergence concept reclassified between cross-pillar and pillar-native; a register reclassification of a thinker; a new pillar with its own register) → `distillation_taxonomy.md` routing-nuance section.
+
+**What is NOT a structural change.** Adding a regular atomic note that nothing else will backlink to; renaming an atomic note; capturing a journal entry; completing a task; routine inbox-triage moves; reading-list imports of individual articles. The canonicals cache *structure*, not *content*.
+
+**How to apply.** When the session arc closes and any of points 1-7 above applies:
+
+1. State explicitly which point applies — surfaces the change so the user can sanity-check it.
+2. Edit the relevant canonical at its `$SECONDBRAIN_DIR/memory/` path.
+3. Append a change-log entry to `workflowy_node_links.md` under a "Change log" section dated today, naming the change in one or two sentences. The change log is what lets a future session diff "what changed in Workflowy structure since I last looked" without walking the tree.
+4. If the user uploads the skill bundle to claude.ai web for that surface, remind them that the bundle ships generic — their personal data files live only at `$SECONDBRAIN_DIR/memory/` and are read at session start; uploading the skill bundle alone does not push the canonicals.
+
+**Why this is the discipline, not a soft suggestion.** When the canonicals drift, the agent reads structurally-outdated UUIDs at Bootstrap and routes content to nodes that no longer exist (or that have moved). The update discipline is what prevents that.
 
 If the MCP wedges mid-session (a write returns `Tool execution failed` and `workflowy_status` shows degraded health):
 

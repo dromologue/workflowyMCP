@@ -18,10 +18,18 @@
 # disk anywhere; bundling was being done ad-hoc by hand each time.
 #
 # Usage:
-#   scripts/bundle-skill.sh                        # defaults: ~/.claude/skills/wflow → dist/wflow.skill.zip
+#   scripts/bundle-skill.sh                        # defaults: <repo>/templates/skills/wflow → dist/wflow.skill.zip
 #   scripts/bundle-skill.sh --src <dir>            # override skill source
 #   scripts/bundle-skill.sh --out <zip>            # override output path
 #   scripts/bundle-skill.sh --src <dir> --out <z>  # both
+#
+# Default source is the GENERIC template skill in this repo. The bundle
+# at dist/wflow.skill.zip is meant to be public-distributable — it carries
+# no user-specific node IDs, no personalised pillars, no cached
+# Workflowy data. Personal customisations (Justin's live skill at
+# `~/.claude/skills/wflow/`) are intentionally NOT bundled here; for a
+# personal upload to claude.ai, bundle that source explicitly with
+# `--src ~/.claude/skills/wflow --out <somewhere personal>`.
 #
 # Exit codes:
 #   0  — bundle written, frontmatter clean
@@ -32,8 +40,8 @@
 set -euo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-DEFAULT_SRC="$HOME/.claude/skills/wflow"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_SRC="$REPO_ROOT/templates/skills/wflow"
 DEFAULT_OUT="$REPO_ROOT/dist/wflow.skill.zip"
 
 SRC_DIR="$DEFAULT_SRC"

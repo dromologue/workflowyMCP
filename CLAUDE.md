@@ -40,25 +40,48 @@ cargo run --bin workflowy-mcp-server  # start MCP server
 cargo check                  # type-check without building
 
 # Skill bundling (claude.ai upload)
-scripts/bundle-skill.sh                      # bundle ~/.claude/skills/wflow → dist/wflow.skill.zip
-scripts/bundle-skill.sh --src <dir>          # alternate skill source
+scripts/bundle-skill.sh                      # bundle templates/skills/wflow → dist/wflow.skill.zip (PUBLIC, generic)
+scripts/bundle-skill.sh --src <dir>          # alternate skill source (e.g. ~/.claude/skills/wflow for personal)
 scripts/bundle-skill.sh --out <zip>          # alternate output path
 ```
 
 The bundler validates frontmatter (no `<` or `>` characters, description ≤ 1024 chars) and writes the skill source as a `<skill-name>/` directory inside the zip — the structure claude.ai's Settings → Skills upload expects.
 
-### Auto-bundle on skill edit (mandatory)
+### Public vs personal bundle split
 
-Whenever any file under `~/.claude/skills/wflow/` is edited (`SKILL.md`, `distillation_taxonomy.md`, `workflowy_node_links.md`, or any companion file), the bundle at `dist/wflow.skill.zip` MUST be rebuilt and the user alerted. The harness enforces this via a `PostToolUse` hook in `.claude/settings.json` matching `Edit|Write|MultiEdit`, which delegates to `scripts/auto-bundle-skill.sh`. The wrapper:
+The repository ships a **public, generic** skill bundle at `dist/wflow.skill.zip` (sourced from `templates/skills/wflow/`). It carries no user-specific node IDs, no personalised pillars, no cached Workflowy data — anyone can download or fork the repo and upload this bundle to their own claude.ai account, then run the in-skill Bootstrap to point it at their own `$SECONDBRAIN_DIR/memory/` and Workflowy account. This is the only artefact the repo ships.
+
+**Personal bundles** (Justin's live skill at `~/.claude/skills/wflow/`, which contains his customised workflows, framework references, etc.) are intentionally NOT auto-built by this repo. Justin uses that source directly for local Claude Code (filesystem reads `~/.claude/skills/wflow/SKILL.md` + the symlinked canonicals at `$SECONDBRAIN_DIR/memory/`). To produce a personal upload for claude.ai web, bundle explicitly:
+
+```bash
+scripts/bundle-skill.sh --src ~/.claude/skills/wflow --out ~/some-personal-path/wflow-personal.skill.zip
+```
+
+The `dist/wflow.skill.zip` path is reserved for the public bundle. Switching the default away from the personal source on 2026-05-19 was the user's explicit ask: the public-distribution bundle must contain no personal data; the personal data lives in `$SECONDBRAIN_DIR` and is consumed at session start by the in-skill Bootstrap procedure.
+
+### Auto-bundle on skill edit (two pipelines)
+
+A single `PostToolUse` hook (`scripts/auto-bundle-skill.sh`, wired in `.claude/settings.json` matching `Edit|Write|MultiEdit`) classifies every edit and rebuilds whichever bundle(s) the edit feeds:
+
+| Pipeline | Source | Output | Trigger |
+|----------|--------|--------|---------|
+| **Public** | `templates/skills/wflow/` | `<repo>/dist/wflow.skill.zip` | edits under `templates/skills/wflow/` |
+| **Personal** | `~/.claude/skills/wflow/` | `$SECONDBRAIN_DIR/dist/wflow-personal.skill.zip` | edits under `~/.claude/skills/wflow/` OR edits whose realpath matches a file in that directory (covers the symlinked canonicals at `$SECONDBRAIN_DIR/memory/{taxonomy,node_links}.md`) |
+
+Both pipelines run independently. A template edit fires only the public bundle; a personal-skill or canonical edit fires only the personal bundle. The hook:
 
 1. Reads the tool-call payload from stdin and pulls `tool_input.file_path`.
-2. No-ops if the file isn't under `~/.claude/skills/wflow/`.
-3. Otherwise runs `scripts/bundle-skill.sh` and prints a 🛎 alert line on stderr naming the rebuilt zip path. The alert is what the user sees — do NOT also re-state the rebuild in your own response, the hook output is the single source of truth.
-4. On bundler failure (frontmatter violation, source error) prints a ⚠ STALE warning with the bundler's stderr so the user can fix the underlying issue.
+2. Classifies the path against both pipelines (string-prefix for the literal paths; `realpath` equality to catch symlink-traversed edits to the canonicals).
+3. For each matching pipeline, calls `scripts/bundle-skill.sh --src <src> --out <out>` and prints a 🛎 alert line on stderr naming the rebuilt zip path. The alert is what the user sees — do NOT also re-state the rebuild in your own response, the hook output is the single source of truth.
+4. On bundler failure (frontmatter violation, source error) prints a ⚠ STALE warning with the bundler's stderr.
 
-This means: **never run `scripts/bundle-skill.sh` by hand after editing the skill in this project** — the hook has already done it, and a manual rerun is wasted work. Only invoke the bundler explicitly when bundling from a non-default `--src` (e.g. the generic template) or to a non-default `--out`.
+**Why two pipelines:** the user explicitly asked on 2026-05-19 that (a) `dist/wflow.skill.zip` ship only the generic template (no personal data) AND (b) personal-skill edits always publish to Drive so the personal upload artefact stays current. The split prevents personal data from leaking into the public repo while keeping the personal claude.ai upload one click from the Drive web UI.
 
-Never ask the user to "remember to re-bundle" — the hook removes that obligation. The only outstanding step on the user's side is re-uploading the freshly-bundled zip to claude.ai → Settings → Skills and starting a fresh session, which the alert message names explicitly.
+**Personal bundle requires `$SECONDBRAIN_DIR`** — the hook fails loudly when that env var is unset in the subshell, surfacing the same dual-config gap (`.zshrc` vs MCP host config) that `wflow:health_check` warns about.
+
+**Never run `scripts/bundle-skill.sh` by hand after editing either skill source** — the hook has already done it. Manual invocations are only required for one-off bundles to non-default paths.
+
+Never ask the user to "remember to re-bundle" — the hook removes that obligation entirely. The only outstanding step on the user's side is re-uploading the freshly-bundled zip(s) to claude.ai → Settings → Skills and starting a fresh session, which the alert message names explicitly. Local Claude Code sees personal-skill changes immediately (reads `~/.claude/skills/wflow/` from disk); the upload is only needed for the web/mobile surfaces.
 
 ## Architecture
 
