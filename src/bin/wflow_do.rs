@@ -1007,16 +1007,19 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::ResolveLink { link, segments } => {
-            // Extract a 12-char short hash from the URL or assume the input
-            // is already an ID. Then look up via subtree-walk under the
-            // given segment path (or workspace).
-            let candidate: String = link
-                .split(['/', '#'])
-                .last()
-                .unwrap_or(link)
-                .chars()
-                .filter(|c| c.is_ascii_hexdigit())
-                .collect();
+            // Single canonical extractor — see src/utils/link_parser.rs.
+            // Both this CLI arm and the MCP `resolve_link` handler share
+            // the same parser so URL forms cannot drift across surfaces.
+            let candidate = match workflowy_mcp_server::utils::link_parser::extract_workflowy_short_hash(link) {
+                Some(h) => h,
+                None => {
+                    return Err(format!(
+                        "could not extract a Workflowy short hash from {:?}. Expected a workflowy.com URL (fragment, /s/<slug>/<hash>, or ?focusedItem=<hash> form) or a bare 8/12/32-char hex hash.",
+                        link
+                    )
+                    .into())
+                }
+            };
             let scope = if segments.is_empty() {
                 None
             } else {

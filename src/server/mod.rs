@@ -4294,16 +4294,27 @@ impl WorkflowyMcpServer {
         Parameters(params): Parameters<ResolveLinkParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "resolve_link", ToolKind::Walk, params, {
-        let trimmed = params.link.trim();
-        // Extract the trailing hex segment from URL-form input.
-        let last_seg = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        let last_seg = last_seg.trim_start_matches('#');
-        let normalised: String = last_seg.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
-        let unhyphen: String = normalised.chars().filter(|c| *c != '-').collect();
+        // Route every URL/hash form through the single canonical
+        // extractor in `utils::link_parser`. Pre-2026-05-19 this
+        // handler had its own inline parser that hex-filtered the
+        // whole URL and so corrupted on `?focusedItem=…` forms — the
+        // bug the user-report named.
+        let extracted = crate::utils::link_parser::extract_workflowy_short_hash(&params.link);
+        let Some(canonical) = extracted else {
+            return Err(tool_invalid_params(
+                "resolve_link",
+                None,
+                format!(
+                    "could not extract a Workflowy short hash from '{}'. Expected one of: (a) a full URL of the form 'https://workflowy.com/#/<hash>', 'https://workflowy.com/s/<slug>/<hash>', or any URL carrying '?focusedItem=<hash>'; (b) a bare 12-char URL-suffix hash, 8-char doc-form prefix, or 32-char UUID (with or without hyphens).",
+                    params.link
+                ),
+            ));
+        };
 
-        // Direct full-UUID input: just look up.
-        if unhyphen.len() == 32 && unhyphen.chars().all(|c| c.is_ascii_hexdigit()) {
-            return match self.client.get_node(&unhyphen).await {
+        // Direct full-UUID input: skip the index, look up the node
+        // straight away and return.
+        if canonical.len() == 32 {
+            return match self.client.get_node(&canonical).await {
                 Ok(node) => {
                     self.name_index.ingest(std::slice::from_ref(&node));
                     let payload = serde_json::json!({
@@ -4315,22 +4326,11 @@ impl WorkflowyMcpServer {
                     });
                     Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
                 }
-                Err(e) => Err(tool_error("resolve_link", Some(&unhyphen), e)),
+                Err(e) => Err(tool_error("resolve_link", Some(&canonical), e)),
             };
         }
 
-        if !(unhyphen.len() == 12 || unhyphen.len() == 8) || !unhyphen.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(tool_invalid_params(
-                "resolve_link",
-                None,
-                format!(
-                    "could not extract a Workflowy short hash from '{}'. Expected a 12-char URL-suffix hash, 8-char prefix, or full UUID.",
-                    params.link
-                ),
-            ));
-        }
-
-        let short = unhyphen.to_lowercase();
+        let short = canonical;
 
         // Cache hit: return immediately.
         if let Some(full) = self.name_index.resolve_short_hash(&short) {
@@ -7903,6 +7903,66 @@ mod tests {
              surfaces cannot drift. Pre-2026-05-16 the MCP handlers reimplemented the \
              date-window/status-filter loops inline; the helpers exist precisely to prevent \
              that drift. Violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Link-parsing adoption invariant: any URL/short-hash extraction
+    /// MUST route through `utils::link_parser::extract_workflowy_short_hash`.
+    /// Pre-2026-05-19 both surfaces (`server::resolve_link` and the
+    /// CLI's `Cmd::ResolveLink`) inlined a `.chars().filter(|c|
+    /// c.is_ascii_hexdigit())` pass over the whole URL string, which
+    /// silently corrupted on URLs carrying `?focusedItem=…` query
+    /// parameters (every hex character anywhere in the URL got
+    /// concatenated into the candidate hash). The user-report named
+    /// this as "the link resolver having trouble" — the symptom of a
+    /// parser that produced confidently-wrong hashes.
+    ///
+    /// This test scans both `server/mod.rs` and `bin/wflow_do.rs` for
+    /// the bug-pattern `chars().filter(|c| c.is_ascii_hexdigit())` and
+    /// fails the build if it reappears. The single helper definition
+    /// in `link_parser.rs` is exempt; this test runs against the two
+    /// consumer files only.
+    #[test]
+    fn link_parsing_routes_through_extract_workflowy_short_hash() {
+        let consumers: &[(&str, &str)] = &[
+            ("server/mod.rs", include_str!("mod.rs")),
+            ("bin/wflow_do.rs", include_str!("../bin/wflow_do.rs")),
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        for (label, src) in consumers {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("is_ascii_hexdigit") {
+                    continue;
+                }
+                if !line.contains(".filter") {
+                    // `.all(|c| c.is_ascii_hexdigit())` is a legitimate
+                    // validator (used by `is_short_hash` and the
+                    // `link_parser` helper itself); the bug-pattern is
+                    // specifically `.filter(...)` which silently
+                    // collapses non-hex characters and so loses the
+                    // structural separators (`?`, `&`, `/`, `=`) that
+                    // make a URL parseable.
+                    continue;
+                }
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                violations.push(format!("{}: line {}: {}", label, i + 1, line.trim()));
+            }
+        }
+        // NOTE: the bug-pattern's literal substring is deliberately
+        // NOT inlined in this message — this test runs against its own
+        // source file, so reproducing the regex would trip the scan.
+        assert!(
+            violations.is_empty(),
+            "Link parsing must route through `utils::link_parser::extract_workflowy_short_hash` \
+             — the single canonical extractor that handles every Workflowy URL form (fragment, \
+             ?focusedItem=, /s/<slug>/<hash>, bare hash/UUID). The forbidden pattern is a \
+             char-level hex filter applied to URL input; it drops the URL's structural \
+             separators and produces confidently-wrong hashes on URLs carrying ?focusedItem= or \
+             other ancillary hex (the 2026-05-19 user-report bug). Violations:\n  {}",
             violations.join("\n  "),
         );
     }

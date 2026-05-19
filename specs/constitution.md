@@ -72,6 +72,7 @@ Every cross-cutting concern with more than one possible call site has exactly on
 | Translate `WorkflowyError` from a workflow | `workflow_error_to_mcp()` | `workflow_error_translation_routes_through_workflow_error_to_mcp` |
 | Build the JSON truncation envelope | `with_truncation_envelope()` / `truncation_envelope()` | `envelope_construction_routes_through_one_helper_no_inline_fields` |
 | List-shaped aggregation | `compute_*` / `filter_*` in `aggregation.rs` | `list_shaped_handlers_route_through_aggregation_helpers` |
+| Workflowy link → short-hash extraction | `utils::link_parser::extract_workflowy_short_hash()` | `link_parsing_routes_through_extract_workflowy_short_hash` |
 | Render diagnostic `scope_resolved` | `scope_resolved_label()` | |
 | MCP↔CLI surface parity | (the `wflow-do` subcommand for each tool) | `cli_covers_every_non_diagnostic_mcp_tool` |
 

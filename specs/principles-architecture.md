@@ -277,6 +277,47 @@ The following Rust patterns are actively enforced in this codebase:
   in `server/mod.rs` except inside the helper's own body and the
   test module.
 
+### Workflowy link → short-hash extraction (`src/utils/link_parser.rs`)
+
+Every URL/short-hash extraction routes through one helper:
+`extract_workflowy_short_hash(input: &str) -> Option<String>` in
+`src/utils/link_parser.rs`. Both consumers — the MCP `resolve_link`
+handler and the `wflow-do resolve-link` CLI subcommand — call the
+helper directly; neither hand-rolls the parse. Pre-2026-05-19 the
+two surfaces each had their own inline parser, both of which used the
+same anti-pattern: `last_segment.chars().filter(|c|
+c.is_ascii_hexdigit()).collect()` over the entire URL string. The
+filter drops every non-hex character, including the URL's structural
+separators (`?`, `&`, `=`, `/`), and so concatenates every hex
+character anywhere in the URL into one "candidate hash" — which
+silently corrupts on URLs carrying `?focusedItem=<hash>` query
+parameters (Workflowy's "copy link to this bullet, focused under
+that parent" form, where the inner-most target lives in the query
+string and not the fragment). The user-report on 2026-05-19 named
+this as the assistant "having trouble resolving internal links";
+the symptom is a confidently-wrong hash rather than a typed error.
+
+The helper handles every observed URL form in priority order:
+
+1. `?focusedItem=<hash>` query parameter (wins over the path
+   fragment — it identifies the inner-most target).
+2. `/#/<hash>` URL fragment (address-bar form).
+3. `/s/<slug>/<hash>` shared-URL trailing segment.
+4. Bare 32-char UUID (hyphenated or not).
+5. Bare 12-char URL-suffix short hash.
+6. Bare 8-char doc-form prefix short hash.
+
+Anything else returns `None` so the caller raises a typed
+invalid-params error rather than invent a hash. **Routing
+invariant**: pinned by
+`link_parsing_routes_through_extract_workflowy_short_hash` in
+`server/mod.rs::tests`, which grep-audits both `server/mod.rs` and
+`bin/wflow_do.rs` for the forbidden char-level hex-filter pattern
+applied to URL input. The single helper definition (and a
+legitimate `.all(|c| c.is_ascii_hexdigit())` validator inside
+`is_short_hash`) are exempt; everywhere else the pattern fails
+the build.
+
 ### Workflow orchestration shared between MCP and CLI (`src/workflows.rs`)
 
 Workflows that need an API client AND are surfaced by both binaries

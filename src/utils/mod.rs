@@ -4,6 +4,7 @@ pub mod cache;
 pub mod cancel;
 pub mod date_parser;
 pub mod job_queue;
+pub mod link_parser;
 pub mod name_index;
 pub mod node_paths;
 pub mod op_log;
