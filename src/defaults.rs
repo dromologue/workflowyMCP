@@ -195,8 +195,13 @@ pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 /// short-hash miss in `resolve_node_ref`. Bigger than the regular
 /// subtree budget because the user is *waiting* for this specific
 /// resolution and we want to give it a real chance to succeed before
-/// surfacing the cache-miss error.
-pub const RESOLVE_WALK_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+/// surfacing the cache-miss error. Capped at 180 s (3 min) so it sits
+/// 60 s below the MCP transport hard timeout — pre-2026-05-19 this
+/// was 5 min, which sat *above* the 4-min transport cap; the client
+/// ripped the connection while the server-side walk continued
+/// burning rate-limit tokens on a request the caller had already
+/// abandoned. Pinned by `resolve_walk_budget_leaves_mcp_transport_margin`.
+pub const RESOLVE_WALK_TIMEOUT_MS: u64 = 180_000;
 /// Node cap for the resolution walk. Set generously so a moderately
 /// large tree can be exhaustively walked while still bounding worst
 /// case memory use.
@@ -281,6 +286,30 @@ mod tests {
              MCP_TRANSPORT_HARD_TIMEOUT_MS = {} ms so partial-success envelopes are \
              reachable before the client times out",
             INSERT_CONTENT_TIMEOUT_MS,
+            MIN_MARGIN_MS,
+            MCP_TRANSPORT_HARD_TIMEOUT_MS,
+        );
+    }
+
+    /// The resolve-walk budget must leave the same 60-second margin
+    /// under the MCP transport hard timeout. Pre-2026-05-19 this was
+    /// 5 minutes, which sat *above* the 4-minute transport cap — the
+    /// client ripped the connection while the server-side walk
+    /// continued running, burning rate-limit tokens on a call the
+    /// caller had already abandoned. Subsequent calls then queued
+    /// behind the orphan walk's tokens, producing the resolve_link
+    /// cascade the user reported: API flapping between healthy and
+    /// degraded under a cold 56k-node workspace cache. Pinned so a
+    /// future contributor cannot regress the bound silently.
+    #[test]
+    fn resolve_walk_budget_leaves_mcp_transport_margin() {
+        const MIN_MARGIN_MS: u64 = 60_000;
+        assert!(
+            RESOLVE_WALK_TIMEOUT_MS + MIN_MARGIN_MS <= MCP_TRANSPORT_HARD_TIMEOUT_MS,
+            "RESOLVE_WALK_TIMEOUT_MS = {} ms must leave at least {} ms margin under \
+             MCP_TRANSPORT_HARD_TIMEOUT_MS = {} ms so the resolve-walk completion or \
+             truncation envelope is reachable before the client times out",
+            RESOLVE_WALK_TIMEOUT_MS,
             MIN_MARGIN_MS,
             MCP_TRANSPORT_HARD_TIMEOUT_MS,
         );

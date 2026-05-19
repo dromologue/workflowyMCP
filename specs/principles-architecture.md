@@ -318,6 +318,126 @@ legitimate `.all(|c| c.is_ascii_hexdigit())` validator inside
 `is_short_hash`) are exempt; everywhere else the pattern fails
 the build.
 
+### Resolve-walk single-flight per scope (`src/server/mod.rs`)
+
+Every on-demand short-hash resolution walk routes through one helper:
+`walk_for_short_hash_inner(short_hash, parent_id)` in `src/server/mod.rs`.
+Both wrappers — `walk_for_short_hash` (workspace root) and
+`walk_for_short_hash_scoped` (caller-supplied parent) — are thin
+delegates to the unified helper, so the single-flight invariant
+applies to every call site. The helper maintains an
+`inflight_resolve_walk_scopes: Arc<parking_lot::Mutex<HashSet<Option<String>>>>`
+keyed by scope (None = workspace root, Some(uuid) = parent UUID). A
+second caller for an in-flight scope attaches as a *secondary*: it
+polls the name index every 100 ms for its target until either the
+index resolves the hash (primary's ingestion succeeded) or the
+primary releases the scope marker (primary completed or its task
+was dropped).
+
+**Why single-flight.** Pre-2026-05-19 each `resolve_link` call on a
+cold cache fired its own workspace walk. On the user's 56k-node
+tree at 10 req/s through the shared rate limiter, two concurrent
+calls each consumed the same rate-limit tokens, doubling the time
+the limiter stayed saturated and starving every other tool. The
+100 ms watcher already short-circuited duplicate walks on a hit,
+but it didn't recognise that another walk against the same scope
+was already running. Single-flight per scope collapses N concurrent
+resolves to one walk-worth of load on the rate limiter; secondaries
+pay only the index-poll cost (negligible).
+
+**Drop safety.** The primary installs an `InflightResolveGuard`
+(an RAII wrapper) before running the walk; if the primary's future
+is dropped (cancel, panic, `tool_handler!` timeout), the guard's
+`Drop` impl removes the scope marker. Secondaries notice the marker
+disappearing on their next 100 ms poll and exit with a final index
+check — they never wait forever on a dead primary.
+
+**Routing invariant**: pinned by
+`concurrent_resolve_walks_share_one_walk_per_scope` in
+`server::load_tests`, which fires two concurrent walks for the
+same scope and asserts (via wiremock's `.expect(1)`) that only one
+underlying HTTP call hit the upstream. A refactor that drops the
+single-flight registry — or routes a new resolve site around
+`walk_for_short_hash_inner` — fails the test before it ships.
+
+### Resolve-walk envelope symmetry (`resolve_link`)
+
+`resolve_link` returns `Ok` with a structured payload on every
+non-validation outcome: on hit `{id, name, description, parent_id,
+resolved_via}`; on miss `{resolved: null, short_hash, scope,
+nodes_walked, elapsed_ms, hint}` merged with the four-field
+truncation envelope via `with_truncation_envelope`. Pre-2026-05-19
+the miss branch returned `Err(tool_invalid_params)` which:
+
+- recorded the call as an `Err` in the op log,
+- flipped the `degraded` gate via
+  `OpLog::last_unrecovered_failure`, which then gated every
+  subsequent `create_node` behind a "server in degraded state"
+  warning,
+- gave the caller no structured detail about the partial walk
+  (`nodes_walked`, `truncation_reason`) to decide a recovery
+  path.
+
+Returning `Ok` with `resolved: null` is symmetric with every other
+walk-shaped tool (`search_nodes`, `find_node`, `tag_search` all
+return Ok with empty matches arrays on no-hit). The caller branches
+on `resolved == null` rather than parsing error strings. Pinned by
+`resolve_link_returns_ok_with_null_resolved_on_walk_miss` which
+verifies the envelope shape AND asserts the op log records the
+call as Ok (so the degraded gate cannot regress).
+
+### Diagnostic-probe rate-limiter bypass (`probe_top_level`)
+
+`health_check` and `workflowy_status` issue their probe via
+`WorkflowyClient::probe_top_level(deadline)`, which calls
+`try_request_cancellable` directly — bypassing both the rate-limit
+acquire and the retry loop. The 2026-05-19 user-report observed
+both probe attempts timing out inside the rate-limit queue while
+an in-flight resolve walk drained the bucket; the 5-second probe
+budget elapsed in the queue without ever issuing a network
+round-trip, producing the misleading `"two attempts failed:
+Timeout | Timeout"` outcome.
+
+The bypass is single-shot per probe (~one request per
+diagnostic call) so the upstream impact is negligible. Retries are
+also skipped because the caller (`probe_upstream_with_retry`) owns
+its own two-attempt budget; nesting the client-level retry inside
+that halves each attempt's effective budget and produces the
+"Timeout | Timeout" failure mode without ever issuing a network
+call.
+
+**Routing invariant**: pinned by
+`probe_upstream_with_retry_uses_probe_top_level_not_throttled_path`,
+which grep-audits `server/mod.rs` to confirm the probe path uses
+`probe_top_level` and never the throttled
+`get_top_level_nodes_cancellable`. A regression — re-routing
+the probe through the queued path — fails the test before
+production.
+
+### `degraded_kind` classification (`workflowy_status`, `health_check`)
+
+When `api_reachable: false` the diagnostic responses carry a
+`degraded_kind` string distinguishing the remediation path:
+
+- `"auth"` — recent 401/403 observed; the API key is wrong.
+- `"cancelled"` — probe cancelled mid-flight, likely
+  `cancel_all` in progress.
+- `"local_queue_wedged"` — probe timed out AND `in_flight_walks > 0`;
+  the local rate limiter is the bottleneck, not the upstream. Wait
+  or `cancel_all`.
+- `"upstream_unreachable"` — probe timed out with no in-flight
+  work; the upstream is genuinely down. Wait and retry.
+- `"upstream_error"` — any other non-success probe outcome.
+
+When `api_reachable: true` the field is `null`. The classification
+sits in one helper, `classify_degraded_kind(api_reachable,
+probe_error, in_flight_walks)`, so both `health_check` and
+`workflowy_status` produce the same value for the same inputs.
+Pinned by `workflowy_status_emits_degraded_kind_field` (verifies
+the field is present in the response shape) and
+`classify_degraded_kind_distinguishes_local_queue_from_upstream`
+(unit-tests every classification branch).
+
 ### Workflow orchestration shared between MCP and CLI (`src/workflows.rs`)
 
 Workflows that need an API client AND are surfaced by both binaries

@@ -18,7 +18,7 @@ use chrono::Utc;
 use regex::Regex;
 // `serde::Deserialize` moved to params.rs along with the param structs.
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
@@ -184,6 +184,50 @@ enum ToolKind {
     /// so the outer wrapper observes `cancel_all` only — no second
     /// deadline.
     Walk,
+}
+
+/// Classify the cause of a `degraded` reading so callers know whether
+/// the remediation is "wait and retry" (upstream down) vs "the local
+/// server is busy with in-flight work" (the cascade the 2026-05-19
+/// user-report named). Returns `None` when the server is `ok` so the
+/// JSON response can serialise the field as `null`.
+///
+/// Heuristics — error-message-driven so the classifier matches the
+/// `ProximateCause` taxonomy without storing extra state:
+///
+/// - `auth` — recent 401/403 surfaced in the probe error
+/// - `cancelled` — probe was cancelled (likely `cancel_all` in flight)
+/// - `local_queue_wedged` — probe timed out AND walks are in flight,
+///   so the local rate limiter is the bottleneck (probe should rarely
+///   hit this after the 2026-05-19 probe-rate-limiter bypass, but it
+///   remains a coherent classification for the rare case where the
+///   bypass HTTP request itself slow-rolled past the budget)
+/// - `upstream_unreachable` — probe timed out with no in-flight work,
+///   so the upstream is genuinely slow or down
+/// - `upstream_error` — any other non-success probe outcome
+fn classify_degraded_kind(
+    api_reachable: bool,
+    probe_error: Option<&str>,
+    in_flight_walks: usize,
+) -> Option<&'static str> {
+    if api_reachable {
+        return None;
+    }
+    let err = probe_error.unwrap_or("");
+    let lower = err.to_lowercase();
+    if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
+        return Some("auth");
+    }
+    if lower.contains("cancelled") {
+        return Some("cancelled");
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        if in_flight_walks > 0 {
+            return Some("local_queue_wedged");
+        }
+        return Some("upstream_unreachable");
+    }
+    Some("upstream_error")
 }
 
 /// Derive `api_reachable` for the diagnostic tools. The probe is one
@@ -511,6 +555,22 @@ impl Drop for WalkGuard {
     }
 }
 
+/// RAII guard that releases the scope marker held by the primary in
+/// [`WorkflowyMcpServer::walk_for_short_hash_inner`]. Drops the marker
+/// on every exit path (normal return, error, panic, task drop) so a
+/// dropped primary can never strand a secondary waiting forever on a
+/// dead in-flight walk.
+struct InflightResolveGuard {
+    set: Arc<parking_lot::Mutex<HashSet<Option<String>>>>,
+    scope: Option<String>,
+}
+
+impl Drop for InflightResolveGuard {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.scope);
+    }
+}
+
 /// Outcome of [`WorkflowyMcpServer::probe_upstream_with_retry`]. Holds
 /// just enough for the two probe handlers to render their JSON
 /// response without each having to reimplement classification.
@@ -750,6 +810,23 @@ pub struct WorkflowyMcpServer {
     /// completes with a non-truncated count, surfaced by
     /// `workflowy_status`. A `0` means "no full walk has happened yet".
     tree_size_estimate: Arc<std::sync::atomic::AtomicUsize>,
+    /// Scopes (workspace root = None, or a specific parent UUID) that
+    /// currently have a resolve walk in flight. A second caller hitting
+    /// `walk_for_short_hash_inner` for a scope already in this set
+    /// attaches as a *secondary*: it polls the name index for its
+    /// target every 100 ms until either the index resolves the hash
+    /// (primary's ingestion succeeded) or the scope marker disappears
+    /// (primary completed or its task was dropped). The 2026-05-19
+    /// user-report named the cascade: two concurrent `resolve_link`
+    /// calls on a cold 56k-node workspace each fired their own
+    /// workspace walk, both queued behind the shared 10 req/s rate
+    /// limiter, both contended for the same rate-limit tokens. The
+    /// rate limiter became the choke point, every tool sharing it
+    /// degraded, and the timed-out resolves poisoned the
+    /// `degraded` flag via `last_unrecovered_failure`. Single-flight
+    /// per scope collapses N concurrent resolves to 1 walk-worth of
+    /// load.
+    inflight_resolve_walk_scopes: Arc<parking_lot::Mutex<HashSet<Option<String>>>>,
     /// Per-call ring-buffer log: every tool invocation records start/end
     /// timestamps, params hash, and outcome. The assistant queries this
     /// via `get_recent_tool_calls` to self-diagnose hangs and
@@ -874,6 +951,7 @@ impl WorkflowyMcpServer {
             started_at: Instant::now(),
             in_flight_walks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tree_size_estimate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            inflight_resolve_walk_scopes: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             op_log: OpLog::new(),
             read_budget_ms: defaults::READ_NODE_TIMEOUT_MS,
             bulk_budget_ms: defaults::INSERT_CONTENT_TIMEOUT_MS,
@@ -1213,10 +1291,136 @@ impl WorkflowyMcpServer {
     /// failure modes look identical from the index alone but are very
     /// different signals to the user.
     ///
-    /// Spawns a watcher task that polls the index every 100 ms and
-    /// cancels the walk as soon as the target short-hash appears, so a
-    /// successful early resolution doesn't pay the full timeout.
+    /// Thin wrapper over [`Self::walk_for_short_hash_inner`] for
+    /// workspace-root scope; see that helper for the single-flight
+    /// contract.
     async fn walk_for_short_hash(&self, short_hash: &str) -> crate::error::Result<ResolveWalkSummary> {
+        self.walk_for_short_hash_inner(short_hash, None).await
+    }
+
+    /// Single source of truth for the on-demand short-hash resolution
+    /// walk. Used by `resolve_node_ref` (workspace-root scope) and
+    /// `resolve_link` (caller-supplied parent scope). Carries the
+    /// single-flight invariant: at most one resolve walk per scope
+    /// runs at a time. A second caller hitting the same scope while
+    /// the primary is in flight attaches as a *secondary* and polls
+    /// the index for its target until either the index resolves the
+    /// hash or the primary releases the scope marker.
+    ///
+    /// **Why single-flight.** Pre-2026-05-19 each `resolve_link` call
+    /// on a cold cache fired its own workspace walk. On the user's
+    /// 56k-node tree at 10 req/s, two concurrent calls each consumed
+    /// the same rate-limit tokens, doubling the time the rate
+    /// limiter stayed saturated and starving every other tool. The
+    /// 100 ms watcher already short-circuited duplicate walks on a
+    /// hit, but it didn't recognise that *another walk against the
+    /// same scope was already running*. Single-flight per scope
+    /// collapses N concurrent resolves to one walk-worth of load on
+    /// the rate limiter. Secondaries pay only the index-poll cost
+    /// (negligible).
+    ///
+    /// **Drop safety.** The primary installs a `InflightResolveGuard`
+    /// before running the walk; if the primary's future is dropped
+    /// (cancel, panic, tool-handler timeout), the guard's Drop impl
+    /// removes the scope marker. Secondaries notice the marker
+    /// disappearing on their next 100 ms poll and exit with a final
+    /// index check — they never wait forever on a dead primary.
+    async fn walk_for_short_hash_inner(
+        &self,
+        short_hash: &str,
+        parent_id: Option<&str>,
+    ) -> crate::error::Result<ResolveWalkSummary> {
+        let scope_key: Option<String> = parent_id.map(|s| s.to_string());
+
+        // Try to claim primary status atomically.
+        let is_primary = {
+            let mut set = self.inflight_resolve_walk_scopes.lock();
+            if set.contains(&scope_key) {
+                false
+            } else {
+                set.insert(scope_key.clone());
+                true
+            }
+        };
+
+        if !is_primary {
+            return self
+                .wait_for_inflight_resolve(short_hash, &scope_key)
+                .await;
+        }
+
+        // Primary: drop-guard releases the scope marker on every exit
+        // path (success, error, panic, cancel).
+        let _guard = InflightResolveGuard {
+            set: self.inflight_resolve_walk_scopes.clone(),
+            scope: scope_key,
+        };
+        self.run_resolve_walk(short_hash, parent_id).await
+    }
+
+    /// Secondary path of [`Self::walk_for_short_hash_inner`]: another
+    /// resolve walk for the same scope is in flight. Poll the index
+    /// every 100 ms; return immediately on a hit, return a typed
+    /// truncated-summary when the primary releases the scope marker
+    /// without populating the target, fall back to a timeout if the
+    /// primary's wall-clock budget elapses (defensive: in normal
+    /// operation the primary's drop-guard releases the marker first).
+    async fn wait_for_inflight_resolve(
+        &self,
+        short_hash: &str,
+        scope_key: &Option<String>,
+    ) -> crate::error::Result<ResolveWalkSummary> {
+        let started = Instant::now();
+        let deadline =
+            started + Duration::from_millis(defaults::RESOLVE_WALK_TIMEOUT_MS);
+        loop {
+            if self.name_index.resolve_short_hash(short_hash).is_some() {
+                return Ok(ResolveWalkSummary {
+                    nodes_walked: 0,
+                    truncated: false,
+                    truncation_reason: None,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            let still_in_flight = self
+                .inflight_resolve_walk_scopes
+                .lock()
+                .contains(scope_key);
+            if !still_in_flight {
+                // Primary released the marker. One final index check;
+                // either the primary ingested our target between our
+                // last index check and the marker-clear, or it didn't
+                // and we report truncated (we don't know the primary's
+                // walk stats from here, so the summary is minimal).
+                let resolved = self.name_index.resolve_short_hash(short_hash).is_some();
+                return Ok(ResolveWalkSummary {
+                    nodes_walked: 0,
+                    truncated: !resolved,
+                    truncation_reason: None,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Ok(ResolveWalkSummary {
+                    nodes_walked: 0,
+                    truncated: true,
+                    truncation_reason: Some(crate::api::TruncationReason::Timeout),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Run the actual resolve walk under the primary's claim. Spawns a
+    /// watcher task that polls the index every 100 ms and cancels the
+    /// walk as soon as the target short-hash appears, so a successful
+    /// early resolution doesn't pay the full timeout.
+    async fn run_resolve_walk(
+        &self,
+        short_hash: &str,
+        parent_id: Option<&str>,
+    ) -> crate::error::Result<ResolveWalkSummary> {
         use crate::api::client::FetchControls;
         // Each resolver walk gets its own CancelRegistry so the watcher
         // can cancel **only this walk**, not the server-wide background
@@ -1224,7 +1428,7 @@ impl WorkflowyMcpServer {
         // shared registry meant a successful early-resolution would
         // tear down a concurrent background indexing pass — the
         // opposite of what we want on huge trees that need many walks
-        // to converge. The 5-minute walk timeout still bounds this
+        // to converge. The wall-clock walk timeout still bounds this
         // walk regardless of cancellation.
         let local_registry = crate::utils::CancelRegistry::new();
         let cancel_guard = local_registry.guard();
@@ -1233,11 +1437,6 @@ impl WorkflowyMcpServer {
         let watcher_registry = local_registry.clone();
         let target = short_hash.to_string();
 
-        // Watcher: every 100 ms, ask the index whether the target has
-        // shown up. If yes, bump only the local registry to break this
-        // walk out of its remaining levels. If the walk completes
-        // naturally, the watcher_done channel signals the watcher to
-        // exit.
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
         let watcher = tokio::spawn(async move {
             loop {
@@ -1264,14 +1463,13 @@ impl WorkflowyMcpServer {
         let result = self
             .client
             .get_subtree_with_controls(
-                None,
+                parent_id,
                 defaults::MAX_TREE_DEPTH,
                 defaults::RESOLVE_WALK_NODE_CAP,
                 controls,
             )
             .await;
 
-        // Stop the watcher whether the walk succeeded or failed.
         let _ = done_tx.send(());
         let _ = watcher.await;
 
@@ -1353,9 +1551,15 @@ impl WorkflowyMcpServer {
         let half_deadline = started + budget / 2;
         let full_deadline = started + budget;
 
+        // Use the rate-limiter-bypass probe path so a saturated limiter
+        // (e.g. behind an in-flight resolve walk) cannot wedge the probe
+        // inside the queue. The 2026-05-19 user-report showed both
+        // probe attempts elapsing in the rate-limit queue without ever
+        // issuing a network round-trip — the bypass makes the probe a
+        // single one-shot request bounded only by `half_deadline`.
         let first = self
             .client
-            .get_top_level_nodes_cancellable(None, Some(half_deadline))
+            .probe_top_level(Some(half_deadline))
             .await;
         if let Ok(nodes) = first {
             return ProbeOutcome {
@@ -1390,10 +1594,11 @@ impl WorkflowyMcpServer {
             };
         }
 
-        // One more shot inside the remaining budget.
+        // One more shot inside the remaining budget. Same bypass —
+        // we never want the probe queued behind walk fetches.
         let second = self
             .client
-            .get_top_level_nodes_cancellable(None, Some(full_deadline))
+            .probe_top_level(Some(full_deadline))
             .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match second {
@@ -3305,8 +3510,12 @@ impl WorkflowyMcpServer {
         // heavy write burst that itself proved the API is up.
         let last_success_ms_ago = self.client.last_success_ms_ago();
         let api_reachable = derive_api_reachable(outcome.api_reachable, last_success_ms_ago);
+        let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
+        let degraded_kind = classify_degraded_kind(api_reachable, outcome.error.as_deref(), in_flight);
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
+            "degraded_kind": degraded_kind,
+            "in_flight_walks": in_flight,
             "api_reachable": api_reachable,
             "api_reachable_via_recent_success": !outcome.api_reachable && api_reachable,
             "authenticated": authenticated,
@@ -3433,8 +3642,10 @@ impl WorkflowyMcpServer {
             "rate_limit_remaining": rate_limit.remaining,
             "rate_limit_limit": rate_limit.limit,
         });
+        let degraded_kind = classify_degraded_kind(api_reachable, error.as_deref(), in_flight);
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
+            "degraded_kind": degraded_kind,
             "api_reachable": api_reachable,
             "authenticated": authenticated,
             "latency_ms": elapsed_ms,
@@ -4288,7 +4499,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Resolve a Workflowy internal link or short hash to full node info. Optimised for the 'paste this URL, find this node' workflow. When you can name the parent path (e.g. ['Areas', 'Personal']), pass it via search_parent_path — the walk then runs only inside that subtree, taking seconds instead of minutes on huge trees. Bypasses the full-tree walk that ordinary tools fall back to on a short-hash cache miss.")]
+    #[tool(description = "Resolve a Workflowy internal link or short hash to full node info. Optimised for the 'paste this URL, find this node' workflow. When you can name the parent path (e.g. ['Areas', 'Personal']), pass it via search_parent_path — the walk then runs only inside that subtree, taking seconds instead of minutes on huge trees. Bypasses the full-tree walk that ordinary tools fall back to on a short-hash cache miss. Always returns Ok with a structured payload: on hit `{id, name, description, parent_id, resolved_via}`; on miss `{resolved: null, short_hash, scope, nodes_walked, elapsed_ms, hint, truncated, truncation_reason, truncation_recovery_hint}` so the caller can branch on `resolved` without parsing error strings. Concurrent calls for the same scope are single-flighted: a second resolve_link against an already-running scope attaches as a secondary and waits for the primary's index ingestion instead of firing its own walk.")]
     async fn resolve_link(
         &self,
         Parameters(params): Parameters<ResolveLinkParams>,
@@ -4406,20 +4617,37 @@ impl WorkflowyMcpServer {
             (None, Some(_)) => "the supplied parent UUID".to_string(),
             (None, None) => "the workspace root".to_string(),
         };
-        let reason_str = match summary.truncation_reason {
-            Some(crate::api::TruncationReason::Timeout) => "timeout",
-            Some(crate::api::TruncationReason::NodeLimit) => "node_limit",
-            Some(crate::api::TruncationReason::Cancelled) => "cancelled",
-            None => "none",
-        };
-        Err(tool_invalid_params(
-            "resolve_link",
-            None,
-            format!(
-                "Short-hash '{}' not found under {} after walking {} nodes in {} ms (truncation: {}). Try: (a) supplying a more specific search_parent_path that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling node_at_path with the full hierarchical path if you know it.",
-                short, scope_str, summary.nodes_walked, summary.elapsed_ms, reason_str,
-            ),
-        ))
+        let hint = format!(
+            "Short-hash '{}' not found under {} after walking {} nodes in {} ms. Try: (a) supplying a more specific search_parent_path that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling node_at_path with the full hierarchical path if you know it.",
+            short, scope_str, summary.nodes_walked, summary.elapsed_ms,
+        );
+        // Symmetric with every other walk-shaped tool: partial-walk
+        // miss returns Ok with the four-field truncation envelope and
+        // a `resolved: null` sentinel. Pre-2026-05-19 this branch
+        // returned Err(tool_invalid_params), which (a) recorded the
+        // call as a failure in the op log, flipping `degraded` via
+        // `last_unrecovered_failure` even though the upstream API was
+        // fine — only our walk budget had elapsed — and (b) gave the
+        // caller no structured detail about the partial walk. The Ok
+        // shape lets the caller branch on `resolved == null` and read
+        // `nodes_walked` / `truncation_reason` to decide whether to
+        // narrow the search and retry, escalate to `node_at_path`, or
+        // give up.
+        let payload = json!({
+            "resolved": serde_json::Value::Null,
+            "short_hash": short,
+            "scope": scope_str,
+            "nodes_walked": summary.nodes_walked,
+            "elapsed_ms": summary.elapsed_ms,
+            "hint": hint,
+        });
+        let result = with_truncation_envelope(
+            payload,
+            summary.truncated,
+            defaults::RESOLVE_WALK_NODE_CAP,
+            summary.truncation_reason,
+        );
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
         })
     }
 
@@ -4449,69 +4677,16 @@ impl WorkflowyMcpServer {
 
     /// Variant of [`Self::walk_for_short_hash`] that scopes the walk to
     /// a given parent (or root if `None`). Used by `resolve_link` so
-    /// the caller's parent hint cuts the search space.
+    /// the caller's parent hint cuts the search space. Routes through
+    /// [`Self::walk_for_short_hash_inner`] so the single-flight
+    /// invariant applies to scoped walks too — two `resolve_link`
+    /// calls naming the same parent path get one walk, not two.
     async fn walk_for_short_hash_scoped(
         &self,
         short_hash: &str,
         parent_id: Option<&str>,
     ) -> crate::error::Result<ResolveWalkSummary> {
-        use crate::api::client::FetchControls;
-        let local_registry = crate::utils::CancelRegistry::new();
-        let cancel_guard = local_registry.guard();
-        let watcher_guard = cancel_guard.clone();
-        let watcher_index = self.name_index.clone();
-        let watcher_registry = local_registry.clone();
-        let target = short_hash.to_string();
-
-        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
-        let watcher = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if watcher_guard.is_cancelled() {
-                            return;
-                        }
-                        if watcher_index.resolve_short_hash(&target).is_some() {
-                            watcher_registry.cancel_all();
-                            return;
-                        }
-                    }
-                    _ = &mut done_rx => return,
-                }
-            }
-        });
-
-        let controls = FetchControls::with_timeout(Duration::from_millis(
-            defaults::RESOLVE_WALK_TIMEOUT_MS,
-        ))
-        .and_cancel(cancel_guard);
-
-        let result = self
-            .client
-            .get_subtree_with_controls(
-                parent_id,
-                defaults::MAX_TREE_DEPTH,
-                defaults::RESOLVE_WALK_NODE_CAP,
-                controls,
-            )
-            .await;
-
-        let _ = done_tx.send(());
-        let _ = watcher.await;
-
-        match result {
-            Ok(fetch) => {
-                let nodes_walked = fetch.nodes.len();
-                self.name_index.ingest(&fetch.nodes);
-                Ok(ResolveWalkSummary {
-                    nodes_walked,
-                    truncated: fetch.truncated,
-                    truncation_reason: fetch.truncation_reason,
-                    elapsed_ms: fetch.elapsed_ms,
-                })
-            }
-            Err(e) => Err(e),
-        }
+        self.walk_for_short_hash_inner(short_hash, parent_id).await
     }
 
     #[tool(description = "Export a subtree in OPML (for Workflowy/outliner compatibility), Markdown (nested bullets), or JSON (raw node array). For backup, hand-off to other tools, or external processing. Subject to the standard 10 000-node and 20-second walk budgets — large subtrees may return partial output with a truncation marker.")]
@@ -9603,6 +9778,237 @@ mod load_tests {
         assert!(created < 5, "must not have inserted all five: {body}");
         assert_eq!(v["total_count"], 5, "body: {body}");
         assert!(v["last_inserted_id"].is_string(), "last_inserted_id must be set: {body}");
+    }
+
+    // --- 2026-05-19 cascade fixes ---
+
+    /// Two concurrent resolve walks for the same scope must share a
+    /// single underlying API call (single-flight per scope). The
+    /// 2026-05-19 user-report named the cascade: a cold-cache
+    /// `resolve_link` against a 56k-node workspace fired its own
+    /// workspace walk; a retry while the first was in flight fired a
+    /// second walk; both queued behind the same 10 rps rate limiter and
+    /// starved every other tool. Pinned so a refactor that drops the
+    /// single-flight registry surfaces here before it hits production.
+    #[tokio::test]
+    async fn concurrent_resolve_walks_share_one_walk_per_scope() {
+        let mock = MockServer::start().await;
+        // Level 0 GET /nodes (no query params) — return empty after a
+        // 250 ms delay long enough for the second caller to definitely
+        // observe the first's scope marker. `.expect(1)` is the
+        // load-bearing assertion: it panics on MockServer drop if more
+        // than one request hit this matcher.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"nodes": []}))
+                    .set_delay(Duration::from_millis(250)),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+        let s1 = Arc::clone(&server);
+        let s2 = Arc::clone(&server);
+        let h1 = tokio::spawn(async move {
+            s1.walk_for_short_hash("aaaaaaaaaaaa").await
+        });
+        // Stagger so h2 definitely enters the inflight-check after h1
+        // has claimed primary status.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let h2 = tokio::spawn(async move {
+            s2.walk_for_short_hash("aaaaaaaaaaaa").await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.expect("h1 task ok").expect("h1 walk ok");
+        r2.expect("h2 task ok").expect("h2 walk ok");
+
+        // wiremock's `.expect(1)` is verified when MockServer drops at
+        // end of test. If the single-flight invariant regresses, the
+        // matcher sees 2 hits and the drop panics with a clear message
+        // naming the over-count.
+    }
+
+    /// `resolve_link` returns Ok with `resolved: null` plus the full
+    /// four-field truncation envelope when a walk completes without
+    /// finding the target. Pre-2026-05-19 this branch returned
+    /// `Err(tool_invalid_params)` which recorded the call as a failure
+    /// in the op log and flipped `degraded` via
+    /// `last_unrecovered_failure` even though the upstream API was
+    /// fine — only our walk budget had elapsed. The Ok shape lets
+    /// the caller branch on `resolved == null` and inspect
+    /// `nodes_walked` / `truncation_reason` to decide a recovery path.
+    #[tokio::test]
+    async fn resolve_link_returns_ok_with_null_resolved_on_walk_miss() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let params: ResolveLinkParams = serde_json::from_value(json!({
+            "link": "https://workflowy.com/#/abcdef012345"
+        }))
+        .expect("ResolveLinkParams must deserialise");
+        let result = server
+            .resolve_link(Parameters(params))
+            .await
+            .expect("resolve_link returns Ok on miss, never Err — symmetric with every other walk-shaped tool");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .expect("resolve_link miss body must be valid JSON");
+        assert!(v["resolved"].is_null(), "resolved must be null on miss: {body}");
+        assert_eq!(v["short_hash"], "abcdef012345", "short_hash echoed: {body}");
+        assert!(v["truncated"].is_boolean(), "truncated field present: {body}");
+        assert!(
+            v.get("truncation_recovery_hint").is_some(),
+            "truncation envelope must be merged in: {body}",
+        );
+        assert!(
+            v["hint"].as_str().unwrap().contains("search_parent_path"),
+            "hint must guide caller to a tighter scope: {body}",
+        );
+        // Op log must record this as Ok, not Err. The 2026-05-19
+        // cascade traced directly to resolve_link miss → op log Err
+        // → `last_unrecovered_failure` → `degraded` warning gating
+        // every subsequent `create_node`.
+        let last_failure = server.op_log().last_unrecovered_failure();
+        assert!(
+            last_failure.is_none(),
+            "resolve_link miss must NOT register as an unrecovered failure: {:?}",
+            last_failure,
+        );
+    }
+
+    /// `probe_upstream_with_retry` must route through
+    /// `WorkflowyClient::probe_top_level` (the rate-limiter-bypass
+    /// path) and never through `get_top_level_nodes_cancellable`
+    /// (which queues behind the rate limiter). The 2026-05-19
+    /// user-report observed both probe attempts timing out inside
+    /// the rate-limit queue while an in-flight resolve walk drained
+    /// the bucket. Pre-fix the probe sat in the queue without ever
+    /// hitting the network; post-fix the probe is a single one-shot
+    /// request bounded only by its wall-clock deadline. Grep-pinned
+    /// so a refactor that re-routes the probe through the throttled
+    /// path surfaces here before reaching production.
+    #[test]
+    fn probe_upstream_with_retry_uses_probe_top_level_not_throttled_path() {
+        let src = include_str!("mod.rs");
+        // Find the `probe_upstream_with_retry` body (the only one in
+        // the file) and assert the two call sites use the bypass
+        // method, not the throttled one.
+        let needle = "fn probe_upstream_with_retry";
+        let start = src
+            .find(needle)
+            .expect("probe_upstream_with_retry must be defined in mod.rs");
+        // Slice a generous window covering both call sites.
+        let body = &src[start..start.saturating_add(3_000)];
+        assert!(
+            body.contains(".probe_top_level("),
+            "probe_upstream_with_retry must call client.probe_top_level (rate-limiter bypass); regressing to the throttled path re-introduces the 2026-05-19 wedged-queue cascade",
+        );
+        assert!(
+            !body.contains(".get_top_level_nodes_cancellable("),
+            "probe_upstream_with_retry must NOT call get_top_level_nodes_cancellable (which goes through the rate limiter); use probe_top_level so a saturated limiter cannot wedge the probe",
+        );
+    }
+
+    /// `workflowy_status.degraded_kind` distinguishes "upstream
+    /// unreachable" from "local queue wedged behind in-flight walks"
+    /// per the 2026-05-19 user-report recommendation. The status
+    /// payload pre-fix surfaced only `status: "degraded"` with no
+    /// indication of which remediation the caller should pick (wait
+    /// vs restart). Pinned so the field cannot silently drop.
+    #[tokio::test]
+    async fn workflowy_status_emits_degraded_kind_field() {
+        let mock = MockServer::start().await;
+        // Probe times out. Mock never responds.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"nodes": []}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams {}))
+            .await
+            .expect("workflowy_status returns Ok even on probe timeout");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .expect("body must be JSON");
+        // Either `ok` (recent-success carry-over) or `degraded` —
+        // both are valid. What we pin is the presence of the
+        // classification field.
+        assert!(
+            v.get("degraded_kind").is_some(),
+            "degraded_kind field must be present in workflowy_status: {body}",
+        );
+        // When degraded, the kind must classify rather than being null.
+        if v["status"] == "degraded" {
+            let kind = v["degraded_kind"].as_str();
+            assert!(
+                matches!(
+                    kind,
+                    Some("upstream_unreachable" | "local_queue_wedged" | "upstream_error" | "auth" | "cancelled")
+                ),
+                "degraded_kind must classify the cause: {body}",
+            );
+        }
+    }
+
+    /// `classify_degraded_kind` distinguishes upstream-down from
+    /// local-queue-wedged using the `in_flight_walks` signal. Pure
+    /// unit test on the classifier so the heuristic is exercised
+    /// without spinning a server.
+    #[test]
+    fn classify_degraded_kind_distinguishes_local_queue_from_upstream() {
+        // No degraded → no classification.
+        assert_eq!(classify_degraded_kind(true, Some("anything"), 0), None);
+        assert_eq!(classify_degraded_kind(true, None, 5), None);
+
+        // Timeout with in-flight walks → local queue.
+        assert_eq!(
+            classify_degraded_kind(false, Some("two attempts failed: Timeout | Timeout"), 3),
+            Some("local_queue_wedged"),
+        );
+
+        // Timeout without in-flight walks → upstream unreachable.
+        assert_eq!(
+            classify_degraded_kind(false, Some("Timeout"), 0),
+            Some("upstream_unreachable"),
+        );
+
+        // Auth markers route through auth even with in-flight walks.
+        assert_eq!(
+            classify_degraded_kind(false, Some("ApiError 401 Unauthorized"), 2),
+            Some("auth"),
+        );
+        assert_eq!(
+            classify_degraded_kind(false, Some("403 forbidden"), 0),
+            Some("auth"),
+        );
+
+        // Cancelled → distinct from upstream.
+        assert_eq!(
+            classify_degraded_kind(false, Some("Cancelled"), 0),
+            Some("cancelled"),
+        );
+
+        // Unclassified non-success → generic upstream_error.
+        assert_eq!(
+            classify_degraded_kind(false, Some("malformed response"), 0),
+            Some("upstream_error"),
+        );
     }
 
 }

@@ -419,6 +419,40 @@ impl WorkflowyClient {
         Ok(nodes)
     }
 
+    /// Diagnostic probe variant: bypasses the rate limiter and the retry
+    /// loop entirely. Used by `probe_upstream_with_retry` so a saturated
+    /// rate limiter (e.g. behind an in-flight resolve walk) cannot wedge
+    /// the health-check path. The 2026-05-19 user-report named the
+    /// cascade explicitly: a resolve_link walk consuming sustained
+    /// 10 rps left every queued probe blocked behind dozens of walk
+    /// fetches; the 5 s probe budget elapsed in the rate-limit queue
+    /// without ever hitting the network. With the bypass, the probe is
+    /// a single one-shot request observable only to the upstream and to
+    /// the wall-clock deadline. The volume impact on Workflowy is
+    /// negligible — at most one request per probe session, and probes
+    /// happen at most once per `health_check` / `workflowy_status` call.
+    ///
+    /// Retries are also skipped because the caller (`probe_upstream_with_retry`)
+    /// owns its own two-attempt budget; nesting our retry loop inside
+    /// the caller's halves the per-attempt budget and produces the
+    /// "two attempts failed: Timeout | Timeout" outcome with no
+    /// network round-trip ever issued.
+    pub async fn probe_top_level(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<WorkflowyNode>> {
+        let response: serde_json::Value = self
+            .try_request_cancellable("GET", "/nodes", &None, None, deadline)
+            .await?;
+        let nodes: Vec<WorkflowyNode> = serde_json::from_value(
+            response.get("nodes").cloned().unwrap_or(json!([])),
+        )
+        .map_err(|e| WorkflowyError::ParseError {
+            reason: format!("Failed to parse nodes: {}", e),
+        })?;
+        Ok(nodes)
+    }
+
     /// Get a single node by ID
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
         self.get_node_cancellable(node_id, None, None).await
