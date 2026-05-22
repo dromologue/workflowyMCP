@@ -1007,9 +1007,19 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::ResolveLink { link, segments } => {
-            // Single canonical extractor — see src/utils/link_parser.rs.
-            // Both this CLI arm and the MCP `resolve_link` handler share
-            // the same parser so URL forms cannot drift across surfaces.
+            // Facade over the lifted `crate::workflows::resolve_link_*`
+            // helpers — see the doc comment block at the top of the
+            // resolve_link section in src/workflows.rs for the design.
+            // The CLI omits server-only concerns (preflight name-index
+            // lookup, single-flight scope marker, name-index ingestion)
+            // because it has no persistent name index and no concurrent
+            // caller; everything else — URL parsing, walk-and-scan,
+            // hit/miss payload construction — routes through the same
+            // workflow functions the MCP handler calls.
+            use workflowy_mcp_server::workflows::{
+                build_resolve_link_hit_payload, build_resolve_link_miss_payload,
+                resolve_link_via_walk_and_scan,
+            };
             let candidate = match workflowy_mcp_server::utils::link_parser::extract_workflowy_short_hash(link) {
                 Some(h) => h,
                 None => {
@@ -1020,10 +1030,24 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     .into())
                 }
             };
-            let scope = if segments.is_empty() {
+
+            // Direct full-UUID input: skip the walk entirely. Matches
+            // the MCP handler's `full_uuid_passthrough` shortcut.
+            if candidate.len() == 32 {
+                match client.get_node(&candidate).await {
+                    Ok(node) => {
+                        let payload = build_resolve_link_hit_payload(&node, "full_uuid_passthrough");
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        return Ok(());
+                    }
+                    Err(e) => return Err(format!("get_node({}) failed: {}", candidate, e).into()),
+                }
+            }
+
+            // Walk the scope (parent path → UUID, or workspace root).
+            let scope_uuid = if segments.is_empty() {
                 None
             } else {
-                // Walk segments to a parent UUID first.
                 let mut current: Option<String> = None;
                 for seg in segments {
                     let children = match current.as_deref() {
@@ -1038,24 +1062,75 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }
                 current
             };
+            let scope_str = if segments.is_empty() {
+                "the workspace root".to_string()
+            } else {
+                format!("path {:?}", segments)
+            };
+
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-                defaults::SUBTREE_FETCH_TIMEOUT_MS,
+                defaults::RESOLVE_WALK_TIMEOUT_MS,
             ));
-            let fetch = client
-                .get_subtree_with_controls(scope.as_deref(), 8, defaults::MAX_SUBTREE_NODES, controls)
-                .await?;
-            let target = fetch.nodes.iter().find(|n| {
-                n.id == candidate || n.id.ends_with(&candidate)
-            });
-            match target {
-                Some(n) => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "link": link,
-                        "node": n,
-                    }))?,
-                ),
-                None => return Err(format!("link {:?} did not resolve to any node", link).into()),
+            let walk = match resolve_link_via_walk_and_scan(
+                &client,
+                &candidate,
+                scope_uuid.as_deref(),
+                controls,
+            )
+            .await
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    // Walk-error miss envelope — symmetric with the MCP
+                    // handler's `walk_error` branch. The CLI has no
+                    // persistent name index, so `name_index_size: None`.
+                    let payload = build_resolve_link_miss_payload(
+                        &candidate,
+                        &scope_str,
+                        0,
+                        0,
+                        true,
+                        None,
+                        "walk_error",
+                        None,
+                    );
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                    return Err(format!("resolve_link walk failed: {}", e).into());
+                }
+            };
+
+            match walk.found {
+                Some(node) => {
+                    // The CLI is always the primary on its own walk
+                    // (no concurrent caller, no single-flight marker),
+                    // so the only walk-derived hit value is `scoped_walk`.
+                    let payload = build_resolve_link_hit_payload(&node, "scoped_walk");
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                }
+                None => {
+                    // Miss envelope — same builder the MCP handler
+                    // calls. `name_index_size: None` because the CLI
+                    // has no persistent index; the lifted hint
+                    // adjusts to omit the "persistent index has N
+                    // entries" sentence accordingly.
+                    let payload = build_resolve_link_miss_payload(
+                        &candidate,
+                        &scope_str,
+                        walk.nodes_walked,
+                        walk.elapsed_ms,
+                        walk.truncated,
+                        walk.truncation_reason,
+                        "primary_walk",
+                        None,
+                    );
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                    // Surface the miss to the caller via a non-zero
+                    // exit code so shell pipelines can branch on it.
+                    // The MCP handler always returns Ok; the CLI
+                    // returns Err so an unattended script doesn't
+                    // silently continue with a `resolved: null`.
+                    return Err(format!("link {:?} did not resolve to any node", link).into());
+                }
             }
         }
         Cmd::Since { node_id, threshold_unix_ms } => {

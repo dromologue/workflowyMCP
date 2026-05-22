@@ -60,12 +60,13 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::api::WorkflowyClient;
+use crate::api::{TruncationReason, WorkflowyClient};
 use crate::audit::extract_marker;
 use crate::defaults;
 use crate::error::{Result, WorkflowyError};
 use crate::types::WorkflowyNode;
 use crate::utils::cancel::CancelGuard;
+use crate::utils::truncation_envelope::with_truncation_envelope_and_hint;
 
 /// Context passed into every workflow function: optional cancel guard
 /// + optional wall-clock deadline.
@@ -1581,6 +1582,253 @@ pub fn extract_unresolved_mirror_targets(nodes: &[WorkflowyNode]) -> Vec<String>
     targets
 }
 
+// ---------------------------------------------------------------------
+// resolve_link (lifted 2026-05-22)
+// ---------------------------------------------------------------------
+//
+// The MCP `resolve_link` handler and the `wflow-do resolve-link` CLI
+// subcommand share three lifted pieces:
+//
+// 1. `find_node_by_short_hash` — pure scan over walked nodes for a
+//    matching UUID (full-form or 12-char trailing form).
+// 2. `resolve_link_via_walk_and_scan` — async function that walks a
+//    scope with the supplied `FetchControls`, then runs (1) over the
+//    returned nodes. Returns `ResolveLinkWalkResult { found, nodes_walked,
+//    truncated, truncation_reason, elapsed_ms }`.
+// 3. `build_resolve_link_hit_payload` / `build_resolve_link_miss_payload`
+//    — JSON envelope constructors that both surfaces use so the wire
+//    shape is byte-identical.
+//
+// The MCP handler layers server-only concerns ON TOP of these (preflight
+// name-index lookup, single-flight scope marker via
+// `inflight_resolve_walk_scopes`, name-index ingestion of walked nodes).
+// The CLI omits those because it has no persistent name index and no
+// concurrent caller. Both surfaces share the envelope shape through the
+// `build_resolve_link_*_payload` builders.
+//
+// Pre-2026-05-22 the two surfaces diverged: the CLI emitted a thin
+// `{link, node}` payload on hit and an Err on miss; the MCP emitted the
+// full four-field truncation envelope with `resolved_via` /
+// `name_index_size` / tool-specific `hint`. The lift makes the CLI a
+// facade over the lifted helpers; both surfaces now emit the same
+// envelope on miss and a hit shape that differs only in
+// `resolved_via` values reachable from each transport (the MCP can
+// hit the persistent name index for `cache_hit`; the CLI cannot, and
+// reports `primary_walk` after walking).
+
+/// Pure scan: find a node by its short-hash form in a list of walked
+/// nodes. Matches when the candidate is the full UUID OR the trailing
+/// 12-char short-hash form. The match is case-insensitive on hex.
+///
+/// Used by both the MCP server's `resolve_link` (post-walk scan when
+/// the name-index didn't already resolve the hash) and the CLI
+/// `resolve-link` subcommand (no name-index — the walk is the only
+/// data source). Pre-2026-05-22 each surface inlined this scan and
+/// they diverged on case sensitivity (CLI was case-sensitive; MCP
+/// went through the lowercase `name_index.resolve_short_hash`).
+pub fn find_node_by_short_hash<'a>(
+    nodes: &'a [WorkflowyNode],
+    candidate: &str,
+) -> Option<&'a WorkflowyNode> {
+    let cand_lc = candidate.to_lowercase();
+    nodes.iter().find(|n| {
+        let nid = n.id.to_lowercase();
+        nid == cand_lc || nid.ends_with(&cand_lc)
+    })
+}
+
+/// Result of the walk-and-scan step shared between MCP and CLI. The
+/// caller (MCP handler or CLI subcommand) projects this into the
+/// `resolve_link` JSON envelope via the `build_resolve_link_*_payload`
+/// helpers.
+#[derive(Debug, Clone)]
+pub struct ResolveLinkWalkResult {
+    /// The matching node, when the walk reached it.
+    pub found: Option<WorkflowyNode>,
+    /// Number of nodes the walk actually returned. On a primary walk
+    /// this is the true count; the secondary-attach path in the MCP
+    /// handler doesn't go through this function (the secondary polls
+    /// the name index instead of walking).
+    pub nodes_walked: usize,
+    /// Whether the walk truncated under the FetchControls budget.
+    pub truncated: bool,
+    /// Why the walk truncated, when it did.
+    pub truncation_reason: Option<TruncationReason>,
+    pub elapsed_ms: u64,
+    /// The full list of walked nodes — exposed so the MCP handler can
+    /// ingest them into the persistent name index AFTER this function
+    /// returns. The CLI ignores this field. (Returning the nodes here
+    /// rather than re-walking from the handler keeps the API surface
+    /// to one call.)
+    pub nodes: Vec<WorkflowyNode>,
+}
+
+/// Walk a scope with the supplied `FetchControls`, then scan the
+/// returned nodes for a short-hash match. Used by both the MCP server
+/// and the CLI as the canonical resolve-link walk step.
+///
+/// The function is intentionally narrow: walk + scan + return. The
+/// caller decides what to do with truncation, what to do on a miss,
+/// and (for the MCP server) whether to ingest the walked nodes into
+/// the persistent name index. This keeps the workflow framework-agnostic.
+pub async fn resolve_link_via_walk_and_scan(
+    client: &WorkflowyClient,
+    short_hash: &str,
+    parent_id: Option<&str>,
+    controls: crate::api::client::FetchControls,
+) -> Result<ResolveLinkWalkResult> {
+    let fetch = client
+        .get_subtree_with_controls(
+            parent_id,
+            defaults::MAX_TREE_DEPTH,
+            defaults::RESOLVE_WALK_NODE_CAP,
+            controls,
+        )
+        .await?;
+    let found = find_node_by_short_hash(&fetch.nodes, short_hash).cloned();
+    Ok(ResolveLinkWalkResult {
+        found,
+        nodes_walked: fetch.nodes.len(),
+        truncated: fetch.truncated,
+        truncation_reason: fetch.truncation_reason,
+        elapsed_ms: fetch.elapsed_ms,
+        nodes: fetch.nodes,
+    })
+}
+
+/// Recovery-hint string for the truncation envelope on a `resolve_link`
+/// miss. Tool-specific — the generic `TRUNCATION_RECOVERY_HINT` points
+/// at `find_node`/`search_nodes` with `use_index=true`, which is the
+/// wrong tool for a short-hash resolution failure (those search by
+/// *name*, not by hash). Both the MCP handler and the CLI subcommand
+/// thread this constant through `with_truncation_envelope_and_hint`.
+pub const RESOLVE_LINK_RECOVERY_HINT: &str = "Supply `search_parent_path` to scope the walk to a smaller subtree (seconds rather than the full workspace budget). If the short hash isn't in the persistent name index, the node may have been deleted — open the link in Workflowy to verify it still exists.";
+
+/// Strip a small set of HTML tags Workflowy emits in node names so the
+/// `resolve_link` payload returns a plain-text `name`. Mirrors the
+/// `strip_html` helper in `server/mod.rs`; lifted here so the workflow
+/// can be called by surfaces that don't import server internals.
+fn strip_html_for_resolve_link(s: &str) -> String {
+    // Tiny, conservative stripper: drop `<...>` runs without parsing
+    // entities. The pre-existing `strip_html` in server/mod.rs uses
+    // the same approach; this duplicates it intentionally to avoid
+    // routing the CLI through a server-internal helper.
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Build the JSON payload a `resolve_link` HIT returns on either
+/// surface. Both transports emit the same five fields so a caller
+/// migrating between MCP and CLI sees the same shape.
+///
+/// `resolved_via` is the discriminator naming the resolution path: the
+/// MCP handler emits `cache_hit` / `scoped_walk` /
+/// `secondary_attached_index_hit` / `full_uuid_passthrough`; the CLI
+/// emits `scoped_walk` (its only walk path) or `full_uuid_passthrough`.
+pub fn build_resolve_link_hit_payload(
+    node: &WorkflowyNode,
+    resolved_via: &str,
+) -> serde_json::Value {
+    json!({
+        "resolved_via": resolved_via,
+        "id": node.id,
+        "name": strip_html_for_resolve_link(&node.name),
+        "description": node.description,
+        "parent_id": node.parent_id,
+    })
+}
+
+/// Build the human-readable `hint` string for a `resolve_link` miss,
+/// matched to the `resolved_via` value. The MCP and CLI both call this
+/// so the diagnostic text cannot drift across surfaces. `name_index_size`
+/// is `None` for the CLI (which has no persistent name index) and
+/// `Some(size)` for the MCP handler — when `None`, the hint omits the
+/// "persistent index has N entries" sentence.
+pub fn build_resolve_link_miss_hint(
+    short_hash: &str,
+    scope_str: &str,
+    nodes_walked: usize,
+    elapsed_ms: u64,
+    resolved_via: &str,
+    name_index_size: Option<usize>,
+) -> String {
+    let index_clause = match name_index_size {
+        Some(n) => format!(" The persistent name index has {} entries; if it covers the whole workspace, the hash likely refers to a deleted node or a link from a different account.", n),
+        None => String::new(),
+    };
+    match resolved_via {
+        "secondary_attached" => format!(
+            "Short-hash '{}' not found in the persistent name index{} after attaching to a concurrent walk for {} that finished in {} ms without resolving. Try: (a) opening the link in Workflowy to verify the node still exists — the URL may refer to a deleted node or be from a different account; (b) supplying `search_parent_path` if you know roughly where the node lives so a scoped walk can find it; (c) waiting ~30 min for the background index refresher to widen coverage, then retrying.",
+            short_hash,
+            name_index_size.map(|n| format!(" ({} entries)", n)).unwrap_or_default(),
+            scope_str,
+            elapsed_ms,
+        ),
+        "walk_error" => format!(
+            "Short-hash '{}' could not be resolved under {} because the resolution walk errored before completion.{} Try: (a) calling `health_check` to see whether the server is currently degraded; (b) supplying `search_parent_path` for a smaller scope that won't stress the rate limiter; (c) retrying in a few seconds.",
+            short_hash, scope_str, index_clause,
+        ),
+        _ /* "primary_walk" or CLI's equivalent */ => format!(
+            "Short-hash '{}' not found under {} after walking {} nodes in {} ms.{} Try: (a) supplying a more specific `search_parent_path` that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling `node_at_path` with the full hierarchical path if you know it.",
+            short_hash, scope_str, nodes_walked, elapsed_ms, index_clause,
+        ),
+    }
+}
+
+/// Build the JSON payload a `resolve_link` MISS returns on either
+/// surface — including the four-field truncation envelope. Both the
+/// MCP handler and the CLI route through this function so they cannot
+/// drift on envelope shape, hint contents, or `resolved_via` values.
+///
+/// `name_index_size` is `Some(size)` for the MCP handler (which has a
+/// persistent name index) and `None` for the CLI; the miss hint
+/// adjusts accordingly.
+pub fn build_resolve_link_miss_payload(
+    short_hash: &str,
+    scope_str: &str,
+    nodes_walked: usize,
+    elapsed_ms: u64,
+    truncated: bool,
+    truncation_reason: Option<TruncationReason>,
+    resolved_via: &str,
+    name_index_size: Option<usize>,
+) -> serde_json::Value {
+    let hint = build_resolve_link_miss_hint(
+        short_hash,
+        scope_str,
+        nodes_walked,
+        elapsed_ms,
+        resolved_via,
+        name_index_size,
+    );
+    let payload = json!({
+        "resolved": serde_json::Value::Null,
+        "short_hash": short_hash,
+        "scope": scope_str,
+        "nodes_walked": nodes_walked,
+        "elapsed_ms": elapsed_ms,
+        "resolved_via": resolved_via,
+        "name_index_size": name_index_size,
+        "hint": hint,
+    });
+    with_truncation_envelope_and_hint(
+        payload,
+        truncated,
+        defaults::RESOLVE_WALK_NODE_CAP,
+        truncation_reason,
+        RESOLVE_LINK_RECOVERY_HINT,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2167,6 +2415,136 @@ mod tests {
         assert!(
             targets.is_empty(),
             "short-hash mirror targeting an in-scope full UUID must be considered resolved",
+        );
+    }
+
+    // --- resolve_link lift (2026-05-22) ---
+
+    #[test]
+    fn find_node_by_short_hash_matches_full_uuid_and_trailing_form() {
+        let mut n = WorkflowyNode::default();
+        n.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let nodes = vec![n];
+        assert!(
+            find_node_by_short_hash(&nodes, "550e8400-e29b-41d4-a716-446655440000").is_some(),
+            "full-UUID candidate must match",
+        );
+        assert!(
+            find_node_by_short_hash(&nodes, "446655440000").is_some(),
+            "12-char trailing short-hash candidate must match by `ends_with`",
+        );
+        assert!(
+            find_node_by_short_hash(&nodes, "deadbeefcafe").is_none(),
+            "non-matching short-hash candidate returns None",
+        );
+    }
+
+    #[test]
+    fn find_node_by_short_hash_is_case_insensitive() {
+        let mut n = WorkflowyNode::default();
+        n.id = "550E8400-E29B-41D4-A716-446655440000".to_string();
+        let nodes = vec![n];
+        assert!(
+            find_node_by_short_hash(&nodes, "446655440000").is_some(),
+            "lowercase candidate must match an uppercase-ID node — match is case-insensitive",
+        );
+    }
+
+    /// Both surfaces share the hit payload shape. Pre-2026-05-22 the
+    /// CLI's hit payload was `{link, node}` while the MCP's was
+    /// `{id, name, description, parent_id, resolved_via}`. After the
+    /// CLI-as-facade refactor both call this builder; the shape is
+    /// now a single source of truth pinned by this test.
+    #[test]
+    fn build_resolve_link_hit_payload_emits_the_canonical_five_fields() {
+        let mut n = WorkflowyNode::default();
+        n.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        n.name = "Hello <b>World</b>".to_string();
+        n.description = Some("notes".to_string());
+        n.parent_id = Some("parent-uuid".to_string());
+
+        let payload = build_resolve_link_hit_payload(&n, "scoped_walk");
+        let obj = payload.as_object().expect("hit payload is an object");
+        assert_eq!(obj["resolved_via"], "scoped_walk");
+        assert_eq!(obj["id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(obj["name"], "Hello World", "HTML must be stripped from name");
+        assert_eq!(obj["description"], "notes");
+        assert_eq!(obj["parent_id"], "parent-uuid");
+    }
+
+    /// The miss payload's envelope shape (and the truncation envelope
+    /// it embeds) must match across surfaces. This test exercises the
+    /// builder directly so any drift on field names, hint text, or
+    /// envelope merging surfaces in CI before the CLI and MCP diverge.
+    #[test]
+    fn build_resolve_link_miss_payload_emits_the_canonical_envelope_shape() {
+        let payload = build_resolve_link_miss_payload(
+            "abcdef012345",
+            "the workspace root",
+            123,
+            456,
+            true,
+            Some(TruncationReason::Timeout),
+            "primary_walk",
+            Some(50_000),
+        );
+        let obj = payload.as_object().expect("miss payload is an object");
+
+        // Core miss fields.
+        assert!(obj["resolved"].is_null(), "miss must carry resolved: null");
+        assert_eq!(obj["short_hash"], "abcdef012345");
+        assert_eq!(obj["scope"], "the workspace root");
+        assert_eq!(obj["nodes_walked"], 123);
+        assert_eq!(obj["elapsed_ms"], 456);
+        assert_eq!(
+            obj["resolved_via"], "primary_walk",
+            "discriminator naming the walk path must be present",
+        );
+        assert_eq!(obj["name_index_size"], 50_000);
+        assert!(
+            obj["hint"].as_str().unwrap().contains("search_parent_path"),
+            "human hint must steer caller to a tighter scope",
+        );
+        assert!(
+            obj["hint"].as_str().unwrap().contains("50000 entries"),
+            "when name_index_size is Some, hint mentions the index size so caller can judge dead-link probability: {:?}",
+            obj["hint"],
+        );
+
+        // Four-field truncation envelope.
+        assert_eq!(obj["truncated"], true);
+        assert_eq!(obj["truncation_limit"], defaults::RESOLVE_WALK_NODE_CAP as u64);
+        assert_eq!(obj["truncation_reason"], "timeout");
+        assert!(
+            obj["truncation_recovery_hint"]
+                .as_str()
+                .unwrap()
+                .contains("search_parent_path"),
+            "tool-specific recovery hint must point at search_parent_path, NOT the generic name-index hint that's misleading for short-hash failures",
+        );
+    }
+
+    /// When the CLI builds a miss payload it passes `name_index_size:
+    /// None` (the CLI has no persistent index). The hint must adjust:
+    /// the "persistent index has N entries" sentence must NOT appear,
+    /// so the CLI's output doesn't claim a feature it doesn't have.
+    #[test]
+    fn build_resolve_link_miss_hint_omits_index_clause_when_size_is_none() {
+        let hint = build_resolve_link_miss_hint(
+            "abcdef012345",
+            "the workspace root",
+            123,
+            456,
+            "primary_walk",
+            None,
+        );
+        assert!(
+            !hint.contains("persistent name index"),
+            "CLI's miss hint (name_index_size=None) must not reference the persistent name index it doesn't have: {hint}",
+        );
+        assert!(
+            hint.contains("search_parent_path"),
+            "miss hint must still steer caller to a tighter scope: {hint}",
         );
     }
 }

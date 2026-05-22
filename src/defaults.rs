@@ -192,16 +192,29 @@ pub const INDEX_SAVE_INTERVAL_SECS: u64 = 30;
 /// requests while still building up coverage within a working day.
 pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 /// Wall-clock budget for an on-demand resolution walk triggered by a
-/// short-hash miss in `resolve_node_ref`. Bigger than the regular
-/// subtree budget because the user is *waiting* for this specific
-/// resolution and we want to give it a real chance to succeed before
-/// surfacing the cache-miss error. Capped at 180 s (3 min) so it sits
-/// 60 s below the MCP transport hard timeout — pre-2026-05-19 this
-/// was 5 min, which sat *above* the 4-min transport cap; the client
-/// ripped the connection while the server-side walk continued
-/// burning rate-limit tokens on a request the caller had already
-/// abandoned. Pinned by `resolve_walk_budget_leaves_mcp_transport_margin`.
-pub const RESOLVE_WALK_TIMEOUT_MS: u64 = 180_000;
+/// short-hash miss in `resolve_link` / `resolve_node_ref`. Aligned with
+/// `SUBTREE_FETCH_TIMEOUT_MS` so the worst-case wait a caller pays for
+/// a cold-cache resolve matches every other walk-shaped tool. Pre-2026-05-22
+/// this was 180 s (3 min) on the theory that the user was *waiting*
+/// for the resolution and we should give the walk every chance to find
+/// the target — but on the user-report workspaces (56k+ nodes) that
+/// budget is hopeless anyway (level-by-level child fetches at the
+/// rate-limit ceiling cannot drain that tree in under three minutes)
+/// AND it left the caller hanging for the full budget on a guaranteed
+/// miss. The 20 s budget converts the failure mode from "three minutes,
+/// then null" to "twenty seconds, then null" so callers can branch on
+/// the miss envelope and try a scoped retry instead of losing minutes
+/// per attempt. Pinned by `resolve_walk_budget_leaves_mcp_transport_margin`.
+pub const RESOLVE_WALK_TIMEOUT_MS: u64 = SUBTREE_FETCH_TIMEOUT_MS;
+/// Wall-clock budget for the **background** name-index refresher (every
+/// `INDEX_REFRESH_INTERVAL_SECS`). Distinct from `RESOLVE_WALK_TIMEOUT_MS`
+/// because the background walk is unattended — no caller is waiting on
+/// it — so a longer budget is the right trade-off (more nodes ingested
+/// per cycle, faster index convergence on large trees). Capped at 180 s
+/// so it still sits 60 s below the MCP transport hard timeout; the
+/// background walk doesn't have a transport caller, but the same margin
+/// rule keeps the budget visibly bounded.
+pub const BACKGROUND_INDEX_WALK_BUDGET_MS: u64 = 180_000;
 /// Node cap for the resolution walk. Set generously so a moderately
 /// large tree can be exhaustively walked while still bounding worst
 /// case memory use.

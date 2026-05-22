@@ -446,9 +446,45 @@ live in `src/workflows.rs`. The 2026-05-04 lift extracted
 `run_transaction`, `apply_bulk_op`, and `smart_insert_under_target`
 into this module after the failure-report 2026-05-03 follow-up flagged
 the duplication ("why do we have two code bases for the CLI and the
-Server"). `audit::*` and `utils::aggregation::*` cover the pure-
-function half of the same idea; `workflows::*` covers the half that
-takes a client.
+Server"). The 2026-05-22 lift added `resolve_link_via_walk_and_scan`,
+`find_node_by_short_hash`, `build_resolve_link_hit_payload`, and
+`build_resolve_link_miss_payload` after a user-report showed the CLI
+and MCP `resolve_link` envelopes had drifted to incompatible shapes
+(CLI: `{link, node}` on hit, Err on miss; MCP: full four-field
+truncation envelope with `resolved_via` discriminator). `audit::*`
+and `utils::aggregation::*` cover the pure-function half of the same
+idea; `workflows::*` covers the half that takes a client.
+
+**Resolve-link lift specifics (2026-05-22).** The full orchestration
+doesn't lift cleanly because the MCP handler has server-only concerns
+the CLI cannot share: a persistent name index (preflight `O(1)`
+lookup, post-walk ingestion), a single-flight scope marker
+(`inflight_resolve_walk_scopes`) that collapses N concurrent
+resolves to one walk-worth of load on the rate limiter, and an
+in-process op-log + degraded-state tracking. The lift extracts the
+two pieces that genuinely can be shared: (a) the walk-and-scan step
+(`resolve_link_via_walk_and_scan` + the pure `find_node_by_short_hash`
+helper); (b) the JSON envelope construction
+(`build_resolve_link_hit_payload`, `build_resolve_link_miss_payload`,
+and the `RESOLVE_LINK_RECOVERY_HINT` constant). The MCP handler
+layers its preflight, single-flight, and ingest on top; the CLI calls
+the lifted helpers directly. Both surfaces emit the same wire shape
+on hit and on miss. Pinned by
+`cli_resolve_link_routes_through_lifted_payload_builders` (grep
+audit on `src/bin/wflow_do.rs`) and by the workflow-level shape
+tests in `src/workflows.rs::tests`.
+
+Truncation envelope helpers (`truncation_envelope`,
+`truncation_envelope_with_hint`, `with_truncation_envelope`,
+`with_truncation_envelope_and_hint`, `TRUNCATION_RECOVERY_HINT`) live
+in `src/utils/truncation_envelope.rs` so both the server handlers and
+the lifted workflows can call them without a module cycle. Pre-2026-05-22
+they lived in `src/server/mod.rs`; the extraction was driven by the
+resolve_link lift and preserves the existing pin tests
+(`every_walk_tool_emits_full_truncation_envelope_in_json` and
+`envelope_construction_routes_through_one_helper_no_inline_fields`)
+since they audit only `mod.rs` source and the helper bodies were
+moved out, not duplicated.
 
 Every workflow function obeys the same contract:
 

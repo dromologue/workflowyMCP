@@ -604,12 +604,24 @@ fn strip_html(s: &str) -> String {
 /// hash genuinely doesn't exist" from "ran out of budget before
 /// reaching the target," which are different recovery scenarios for
 /// the caller.
+///
+/// `attached_as_secondary` distinguishes the two paths through
+/// `walk_for_short_hash_inner`: the *primary* runs the actual walk and
+/// reports its own `nodes_walked`; a *secondary* attaches to an
+/// in-flight walk for the same scope, polls the name index for its
+/// target, and reports `nodes_walked = 0` because it didn't walk at
+/// all (the primary did the work). Pre-2026-05-22 the two paths shared
+/// an envelope shape so callers couldn't tell which they got — a
+/// secondary's "nodes_walked: 0" looked identical to a primary that
+/// walked nothing, which the 2026-05-19 user-report flagged as the
+/// most confusing instrumentation in the response.
 #[derive(Debug, Clone)]
 struct ResolveWalkSummary {
     nodes_walked: usize,
     truncated: bool,
     truncation_reason: Option<crate::api::TruncationReason>,
     elapsed_ms: u64,
+    attached_as_secondary: bool,
 }
 
 /// Test-only shorthand: build a banner without a path. Production callers go
@@ -686,10 +698,13 @@ fn truncation_banner_from_fetch(fetch: &SubtreeFetch) -> String {
     )
 }
 
-/// Recovery hint surfaced on every truncated response (markdown banner
-/// AND JSON envelope). `use_index` is the bypass; this string names it
-/// so callers don't have to read the docs to find the recovery.
-const TRUNCATION_RECOVERY_HINT: &str = "Call build_name_index(parent_id=...) once to populate the persistent name index, then re-issue with use_index=true (search_nodes / find_node) to bypass the walk budget — name-only match, no walk timeout.";
+// Truncation-envelope helpers (and the generic recovery hint) live in
+// `crate::utils::truncation_envelope` so the lifted resolve_link
+// workflow can call the same constructors as the MCP handler. Pre-2026-05-22
+// these were defined inline here; the extract was driven by the CLI-as-
+// facade refactor — the shared workflow needed to build envelopes
+// without depending on server/mod.rs (which would create a module cycle).
+use crate::utils::truncation_envelope::{truncation_envelope, with_truncation_envelope};
 
 /// Diagnostic-surface invariant: every tool that resolves a parent_id /
 /// node_id against the workspace returns a `scope_resolved` field naming
@@ -707,84 +722,16 @@ use crate::workflows::scope_resolved_label;
 // effect (name-index ingestion of every walked node) now happens at
 // the handler boundary after the workflow returns.
 
-/// JSON-truncation surface invariant: every walk-shaped tool that emits
-/// JSON spreads this four-field envelope into its payload:
-///
-/// - `truncated: bool`
-/// - `truncation_limit: usize` — the node cap that fired
-/// - `truncation_reason: "timeout" | "node_limit" | "cancelled" | null`
-/// - `truncation_recovery_hint: string` — empty when not truncated, otherwise [`TRUNCATION_RECOVERY_HINT`]
-///
-/// Pre-2026-05-03 most JSON tools emitted `truncation_limit` only — no
-/// reason, no hint — so a JSON caller hitting the 20 s walk budget on a
-/// big subtree had no actionable information. After the architecture
-/// review on 2026-05-03 the four fields are produced by this single
-/// helper and spread into every JSON payload via the
-/// `with_truncation_envelope!` macro, so the truncation contract has
-/// exactly one definition. Pinned by
-/// `every_walk_tool_emits_full_truncation_envelope_in_json`.
-fn truncation_envelope(
-    truncated: bool,
-    limit: usize,
-    reason: Option<TruncationReason>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
-    m.insert("truncated".into(), json!(truncated));
-    m.insert("truncation_limit".into(), json!(limit));
-    m.insert("truncation_reason".into(), json!(reason.map(|r| r.as_str())));
-    m.insert(
-        "truncation_recovery_hint".into(),
-        json!(if truncated { TRUNCATION_RECOVERY_HINT } else { "" }),
-    );
-    m
-}
-
 /// Variant that takes a `SubtreeFetch` reference for handlers that hold
-/// the whole struct rather than destructuring it.
+/// the whole struct rather than destructuring it. Kept here (not in the
+/// shared envelope module) because the `SubtreeFetch` dependency is
+/// server-internal — workflow callers destructure the fetch
+/// themselves before calling the shared helpers.
 #[allow(dead_code)] // not all handlers hold the fetch; both shapes valid.
 fn truncation_envelope_from_fetch(
     fetch: &SubtreeFetch,
 ) -> serde_json::Map<String, serde_json::Value> {
     truncation_envelope(fetch.truncated, fetch.limit, fetch.truncation_reason)
-}
-
-/// Combine a caller-built JSON payload with the truncation envelope.
-/// Every walk-shaped tool's success path uses this to return a single
-/// `serde_json::Value` carrying both the tool-specific fields and the
-/// four envelope fields. The helper exists because pre-2026-05-03 the
-/// envelope was inlined at every call site and 11 of them quietly
-/// drifted off-spec; the 2026-05-16 sweep then converted the
-/// remaining ~13 inline sites to route through this helper, so the
-/// envelope contract has exactly one definition. Inputs:
-///
-/// - `payload`: the tool-specific `json!({...})` map. Anything mergeable
-///   into a JSON object works; non-object values panic in tests via
-///   the usage convention.
-/// - `truncated`, `limit`, `reason`: the three fields a `SubtreeFetch`
-///   destructure pulls out — the helper converts `reason` to its
-///   stable string form and constructs the recovery hint.
-///
-/// Returns a `serde_json::Value::Object` ready to pass to
-/// `Content::text(value.to_string())`.
-///
-/// Pinned by `envelope_construction_routes_through_one_helper_no_inline_fields`.
-fn with_truncation_envelope(
-    mut payload: serde_json::Value,
-    truncated: bool,
-    limit: usize,
-    reason: Option<TruncationReason>,
-) -> serde_json::Value {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.extend(truncation_envelope(truncated, limit, reason));
-    } else {
-        // Defensive: non-object payloads are a caller bug. Wrap so the
-        // envelope is still attached, surfacing the misuse.
-        let mut wrapped = serde_json::Map::new();
-        wrapped.insert("payload".into(), payload);
-        wrapped.extend(truncation_envelope(truncated, limit, reason));
-        return serde_json::Value::Object(wrapped);
-    }
-    payload
 }
 
 /// The main MCP server struct
@@ -1217,6 +1164,7 @@ impl WorkflowyMcpServer {
                     truncated: true,
                     truncation_reason: None,
                     elapsed_ms: 0,
+                    attached_as_secondary: false,
                 }
             }
         };
@@ -1266,8 +1214,12 @@ impl WorkflowyMcpServer {
     /// one specific node.
     pub async fn refresh_name_index(&self) -> crate::error::Result<(usize, bool)> {
         use crate::api::client::FetchControls;
+        // The background refresher is unattended, so it uses the longer
+        // `BACKGROUND_INDEX_WALK_BUDGET_MS` rather than the 20 s on-demand
+        // `RESOLVE_WALK_TIMEOUT_MS` — more nodes ingested per cycle means
+        // the index converges in fewer 30-min iterations on large trees.
         let controls = FetchControls::with_timeout(Duration::from_millis(
-            defaults::RESOLVE_WALK_TIMEOUT_MS,
+            defaults::BACKGROUND_INDEX_WALK_BUDGET_MS,
         ))
         .and_cancel(self.cancel_registry.guard());
         let fetch = self
@@ -1361,10 +1313,29 @@ impl WorkflowyMcpServer {
     /// Secondary path of [`Self::walk_for_short_hash_inner`]: another
     /// resolve walk for the same scope is in flight. Poll the index
     /// every 100 ms; return immediately on a hit, return a typed
-    /// truncated-summary when the primary releases the scope marker
-    /// without populating the target, fall back to a timeout if the
-    /// primary's wall-clock budget elapses (defensive: in normal
-    /// operation the primary's drop-guard releases the marker first).
+    /// summary when the primary releases the scope marker without
+    /// populating the target, fall back to a timeout if the
+    /// secondary's wall-clock budget elapses before the primary
+    /// releases.
+    ///
+    /// **Why `truncation_reason` is `None` on the marker-released
+    /// branch (2026-05-22).** A secondary attached to an in-flight
+    /// primary did not truncate anything — it didn't walk. The
+    /// primary may or may not have truncated; the secondary cannot
+    /// know from here. Pre-2026-05-22 this branch reported
+    /// `truncated: true, truncation_reason: None`, which violated the
+    /// four-field-envelope contract (Principle 3: every truncated
+    /// response carries a reason) AND misled the caller into thinking
+    /// the *secondary* hit a limit. The fix: when the secondary's
+    /// primary finishes without resolving, return
+    /// `truncated: false, truncation_reason: None`; the handler's
+    /// `attached_as_secondary` discriminator + tailored hint do the
+    /// real work of telling the caller "we waited for someone else's
+    /// walk; the target isn't in the index". When the secondary's
+    /// own wait budget elapses (defensive — only fires if the primary
+    /// is genuinely wedged past its drop-guard), we emit
+    /// `truncated: true, reason: Timeout` because *this* call truly
+    /// did hit a bound.
     async fn wait_for_inflight_resolve(
         &self,
         short_hash: &str,
@@ -1380,6 +1351,7 @@ impl WorkflowyMcpServer {
                     truncated: false,
                     truncation_reason: None,
                     elapsed_ms: started.elapsed().as_millis() as u64,
+                    attached_as_secondary: true,
                 });
             }
             let still_in_flight = self
@@ -1389,15 +1361,17 @@ impl WorkflowyMcpServer {
             if !still_in_flight {
                 // Primary released the marker. One final index check;
                 // either the primary ingested our target between our
-                // last index check and the marker-clear, or it didn't
-                // and we report truncated (we don't know the primary's
-                // walk stats from here, so the summary is minimal).
-                let resolved = self.name_index.resolve_short_hash(short_hash).is_some();
+                // last index check and the marker-clear, or it didn't.
+                // Either way, the SECONDARY did not truncate anything,
+                // so we report truncated=false. The handler distinguishes
+                // hit vs miss via `attached_as_secondary` + the index
+                // post-check it runs after this call returns.
                 return Ok(ResolveWalkSummary {
                     nodes_walked: 0,
-                    truncated: !resolved,
+                    truncated: false,
                     truncation_reason: None,
                     elapsed_ms: started.elapsed().as_millis() as u64,
+                    attached_as_secondary: true,
                 });
             }
             if Instant::now() >= deadline {
@@ -1406,6 +1380,7 @@ impl WorkflowyMcpServer {
                     truncated: true,
                     truncation_reason: Some(crate::api::TruncationReason::Timeout),
                     elapsed_ms: started.elapsed().as_millis() as u64,
+                    attached_as_secondary: true,
                 });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1482,6 +1457,7 @@ impl WorkflowyMcpServer {
                     truncated: fetch.truncated,
                     truncation_reason: fetch.truncation_reason,
                     elapsed_ms: fetch.elapsed_ms,
+                    attached_as_secondary: false,
                 })
             }
             Err(e) => Err(e),
@@ -4523,18 +4499,16 @@ impl WorkflowyMcpServer {
         };
 
         // Direct full-UUID input: skip the index, look up the node
-        // straight away and return.
+        // straight away and return. Payload routed through the lifted
+        // builder so MCP and CLI emit identical hit shapes.
         if canonical.len() == 32 {
             return match self.client.get_node(&canonical).await {
                 Ok(node) => {
                     self.name_index.ingest(std::slice::from_ref(&node));
-                    let payload = serde_json::json!({
-                        "id": node.id,
-                        "name": strip_html(&node.name),
-                        "description": node.description,
-                        "parent_id": node.parent_id,
-                        "resolved_via": "full_uuid_passthrough",
-                    });
+                    let payload = crate::workflows::build_resolve_link_hit_payload(
+                        &node,
+                        "full_uuid_passthrough",
+                    );
                     Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
                 }
                 Err(e) => Err(tool_error("resolve_link", Some(&canonical), e)),
@@ -4590,6 +4564,7 @@ impl WorkflowyMcpServer {
 
         // Walk the (parent or root) subtree to populate the index, with
         // the resolution budget. Re-check the index after.
+        let mut walk_errored = false;
         let summary = match self
             .walk_for_short_hash_scoped(&short, parent_uuid.as_deref())
             .await
@@ -4597,19 +4572,24 @@ impl WorkflowyMcpServer {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "resolve_link walk failed");
+                walk_errored = true;
                 ResolveWalkSummary {
                     nodes_walked: 0,
                     truncated: true,
                     truncation_reason: None,
                     elapsed_ms: 0,
+                    attached_as_secondary: false,
                 }
             }
         };
 
         if let Some(full) = self.name_index.resolve_short_hash(&short) {
-            return self
-                .return_resolved_node(&full, "scoped_walk")
-                .await;
+            let via = if summary.attached_as_secondary {
+                "secondary_attached_index_hit"
+            } else {
+                "scoped_walk"
+            };
+            return self.return_resolved_node(&full, via).await;
         }
 
         let scope_str = match (&params.search_parent_path, &params.search_parent_id) {
@@ -4617,35 +4597,28 @@ impl WorkflowyMcpServer {
             (None, Some(_)) => "the supplied parent UUID".to_string(),
             (None, None) => "the workspace root".to_string(),
         };
-        let hint = format!(
-            "Short-hash '{}' not found under {} after walking {} nodes in {} ms. Try: (a) supplying a more specific search_parent_path that contains the target; (b) opening the node in Workflowy and copying the URL bar to get a full URL the server can resolve directly; (c) calling node_at_path with the full hierarchical path if you know it.",
-            short, scope_str, summary.nodes_walked, summary.elapsed_ms,
-        );
-        // Symmetric with every other walk-shaped tool: partial-walk
-        // miss returns Ok with the four-field truncation envelope and
-        // a `resolved: null` sentinel. Pre-2026-05-19 this branch
-        // returned Err(tool_invalid_params), which (a) recorded the
-        // call as a failure in the op log, flipping `degraded` via
-        // `last_unrecovered_failure` even though the upstream API was
-        // fine — only our walk budget had elapsed — and (b) gave the
-        // caller no structured detail about the partial walk. The Ok
-        // shape lets the caller branch on `resolved == null` and read
-        // `nodes_walked` / `truncation_reason` to decide whether to
-        // narrow the search and retry, escalate to `node_at_path`, or
-        // give up.
-        let payload = json!({
-            "resolved": serde_json::Value::Null,
-            "short_hash": short,
-            "scope": scope_str,
-            "nodes_walked": summary.nodes_walked,
-            "elapsed_ms": summary.elapsed_ms,
-            "hint": hint,
-        });
-        let result = with_truncation_envelope(
-            payload,
+        let resolved_via = if walk_errored {
+            "walk_error"
+        } else if summary.attached_as_secondary {
+            "secondary_attached"
+        } else {
+            "primary_walk"
+        };
+        // Miss payload routed through the lifted builder. Both the MCP
+        // handler and the `wflow-do resolve-link` CLI subcommand call
+        // the same function so the four-field truncation envelope, the
+        // `resolved_via` discriminator, the tool-specific `hint`, and
+        // the `name_index_size` field all stay in lockstep across
+        // surfaces — `crate::workflows::build_resolve_link_miss_payload`.
+        let result = crate::workflows::build_resolve_link_miss_payload(
+            &short,
+            &scope_str,
+            summary.nodes_walked,
+            summary.elapsed_ms,
             summary.truncated,
-            defaults::RESOLVE_WALK_NODE_CAP,
             summary.truncation_reason,
+            resolved_via,
+            Some(self.name_index.size()),
         );
         Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
         })
@@ -4653,7 +4626,10 @@ impl WorkflowyMcpServer {
 
     /// Helper: fetch the node at `full_uuid` and emit a `resolve_link`
     /// success payload, recording the resolution path so the caller can
-    /// see whether it came from cache or required a walk.
+    /// see whether it came from cache or required a walk. Routes
+    /// payload construction through the lifted
+    /// [`crate::workflows::build_resolve_link_hit_payload`] so the MCP
+    /// handler and the CLI subcommand cannot drift on the hit-shape.
     async fn return_resolved_node(
         &self,
         full_uuid: &str,
@@ -4662,13 +4638,10 @@ impl WorkflowyMcpServer {
         match self.client.get_node(full_uuid).await {
             Ok(node) => {
                 self.name_index.ingest(std::slice::from_ref(&node));
-                let payload = serde_json::json!({
-                    "id": node.id,
-                    "name": strip_html(&node.name),
-                    "description": node.description,
-                    "parent_id": node.parent_id,
-                    "resolved_via": resolved_via,
-                });
+                let payload = crate::workflows::build_resolve_link_hit_payload(
+                    &node,
+                    resolved_via,
+                );
                 Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
             }
             Err(e) => Err(tool_error("resolve_link", Some(full_uuid), e)),
@@ -9873,6 +9846,18 @@ mod load_tests {
             v["hint"].as_str().unwrap().contains("search_parent_path"),
             "hint must guide caller to a tighter scope: {body}",
         );
+        // 2026-05-22: miss payload carries `resolved_via` (which path
+        // through `walk_for_short_hash_inner` we took) and
+        // `name_index_size` (so the caller can judge whether the
+        // index is current enough that a miss implies a dead link).
+        assert!(
+            v.get("resolved_via").and_then(|v| v.as_str()).is_some(),
+            "miss payload must carry `resolved_via` to distinguish primary_walk / secondary_attached / walk_error: {body}",
+        );
+        assert!(
+            v.get("name_index_size").and_then(|v| v.as_u64()).is_some(),
+            "miss payload must carry `name_index_size` so the caller can judge whether the persistent index already covers the workspace (and therefore a miss likely implies a dead link): {body}",
+        );
         // Op log must record this as Ok, not Err. The 2026-05-19
         // cascade traced directly to resolve_link miss → op log Err
         // → `last_unrecovered_failure` → `degraded` warning gating
@@ -9882,6 +9867,176 @@ mod load_tests {
             last_failure.is_none(),
             "resolve_link miss must NOT register as an unrecovered failure: {:?}",
             last_failure,
+        );
+    }
+
+    // --- 2026-05-22 follow-up: resolve_link envelope-correctness fixes ---
+
+    /// A `resolve_link` call that runs as the primary (no in-flight
+    /// walk for its scope) emits `resolved_via: "primary_walk"`. This
+    /// is the discriminator that lets the caller distinguish a true
+    /// primary walk from a secondary that attached to someone else's
+    /// walk — the 2026-05-19 user-report observed `nodes_walked: 0`
+    /// with `elapsed_ms: 173361` on what looked like a primary call,
+    /// because the secondary path emitted an identical envelope shape
+    /// to a primary that walked nothing. The discriminator closes
+    /// that ambiguity.
+    #[tokio::test]
+    async fn resolve_link_miss_payload_carries_primary_walk_resolved_via() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+        let server = server_against(&mock).await;
+        let params: ResolveLinkParams = serde_json::from_value(json!({
+            "link": "https://workflowy.com/#/abcdef012345"
+        }))
+        .expect("ResolveLinkParams must deserialise");
+        let result = server
+            .resolve_link(Parameters(params))
+            .await
+            .expect("resolve_link returns Ok on miss");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["resolved_via"], "primary_walk",
+            "no concurrent walk → resolve_link runs as primary; miss must report `resolved_via=primary_walk` so the caller can distinguish from a `secondary_attached` envelope with the same `nodes_walked: 0` shape: {body}",
+        );
+        assert!(
+            v["hint"].as_str().unwrap().contains("name index"),
+            "primary-walk miss hint must reference the persistent name index so the caller can judge whether the index is current enough to imply a dead link: {body}",
+        );
+    }
+
+    /// The secondary path in `wait_for_inflight_resolve` returns
+    /// `truncated: false, truncation_reason: None` when the primary
+    /// releases the marker without resolving — because the secondary
+    /// did not truncate anything; it didn't walk. Pre-2026-05-22 this
+    /// branch returned `truncated: true, truncation_reason: None`,
+    /// which violated the four-field-envelope contract (Principle 3:
+    /// every truncated response carries a reason) AND misled callers
+    /// into thinking *their* call hit a limit. Pinned so a refactor
+    /// that resurrects the lie surfaces here before production.
+    #[tokio::test]
+    async fn secondary_marker_released_returns_truncated_false_no_reason() {
+        let mock = MockServer::start().await;
+        // 250 ms primary walk so the secondary definitely observes the
+        // scope marker and waits behind it.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"nodes": []}))
+                    .set_delay(Duration::from_millis(250)),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+        let s1 = Arc::clone(&server);
+        let h1 = tokio::spawn(async move {
+            // Primary: claims the workspace-root scope marker for ~250 ms.
+            s1.walk_for_short_hash("aaaaaaaaaaaa").await
+        });
+        // Stagger so the secondary definitely sees the primary's marker.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let s2 = Arc::clone(&server);
+        let summary = s2
+            .walk_for_short_hash("aaaaaaaaaaaa")
+            .await
+            .expect("secondary returns Ok");
+        h1.await.expect("primary task").expect("primary walk");
+
+        assert!(
+            summary.attached_as_secondary,
+            "second call against the same in-flight scope must report attached_as_secondary=true",
+        );
+        // The load-bearing assertion the 2026-05-22 fix introduces:
+        // the secondary's marker-released branch no longer lies that
+        // it truncated. It didn't walk — it waited.
+        assert!(
+            !summary.truncated,
+            "secondary's marker-released branch must report truncated=false: it observed the primary release the scope marker, but the secondary itself did not truncate anything (the four-field envelope contract — every truncated response carries a reason — was being violated when this returned truncated=true with reason=None)",
+        );
+        assert!(
+            summary.truncation_reason.is_none(),
+            "marker-released branch must carry truncation_reason=None (the secondary did not hit any of NodeLimit/Timeout/Cancelled)",
+        );
+        assert_eq!(
+            summary.nodes_walked, 0,
+            "secondary did not walk; it polled the index — nodes_walked must be 0 (the `attached_as_secondary` flag is the discriminator, NOT a count of zero)",
+        );
+    }
+
+    /// The `wflow-do resolve-link` CLI subcommand is a facade over the
+    /// lifted resolve_link workflow — it MUST route hit/miss payload
+    /// construction through `crate::workflows::build_resolve_link_*_payload`
+    /// rather than hand-rolling its own JSON. Pre-2026-05-22 the CLI
+    /// emitted a thin `{link, node}` payload on hit and an Err on
+    /// miss, diverging from the MCP envelope on every field. After
+    /// the CLI-as-facade refactor both surfaces emit the same shape.
+    /// Grep-pinned so a refactor that hand-rolls JSON in the CLI again
+    /// surfaces here before reaching production.
+    #[test]
+    fn cli_resolve_link_routes_through_lifted_payload_builders() {
+        let src = include_str!("../bin/wflow_do.rs");
+        // Locate the `Cmd::ResolveLink { ... } =>` arm.
+        let start = src
+            .find("Cmd::ResolveLink { link, segments }")
+            .expect("Cmd::ResolveLink arm must exist in wflow_do.rs");
+        // Slice a generous window covering the arm body.
+        let end = src[start..]
+            .find("Cmd::Since {")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("build_resolve_link_hit_payload"),
+            "CLI resolve-link arm must call `crate::workflows::build_resolve_link_hit_payload` on a hit so the MCP and CLI hit shapes cannot drift; pre-2026-05-22 the CLI hand-rolled a thin `{{link, node}}` payload",
+        );
+        assert!(
+            body.contains("build_resolve_link_miss_payload"),
+            "CLI resolve-link arm must call `crate::workflows::build_resolve_link_miss_payload` on a miss so both surfaces emit the same four-field truncation envelope + resolved_via discriminator; pre-2026-05-22 the CLI returned an Err string with no envelope",
+        );
+        assert!(
+            body.contains("resolve_link_via_walk_and_scan"),
+            "CLI resolve-link arm must call `crate::workflows::resolve_link_via_walk_and_scan` so the walk-and-scan step is the same code path the MCP handler's primary path uses",
+        );
+        // Conversely: forbid the pre-refactor inline shape so a future
+        // edit that "simplifies" the CLI back to ad-hoc JSON fails CI.
+        assert!(
+            !body.contains("\"link\": link,\n                        \"node\""),
+            "CLI must NOT emit the pre-2026-05-22 `{{link, node}}` hit shape — that's the drift the lift closed",
+        );
+    }
+
+    /// The on-demand resolve walk budget (`RESOLVE_WALK_TIMEOUT_MS`)
+    /// equals the standard subtree walk budget (`SUBTREE_FETCH_TIMEOUT_MS`).
+    /// Pre-2026-05-22 the resolve budget was 180 s, on the theory that
+    /// the user was waiting for the resolution and we should give the
+    /// walk every chance to succeed — but the 2026-05-19 user-report
+    /// surfaced that on 56k-node workspaces this budget left the
+    /// caller hanging for nearly three minutes per cold-cache miss
+    /// (level-by-level child fetches at the rate-limit ceiling cannot
+    /// drain that tree in three minutes anyway). The 20 s budget
+    /// converts the failure mode from "three minutes, then null" to
+    /// "twenty seconds, then null" so callers can branch on the miss
+    /// envelope and try a scoped retry instead of losing minutes per
+    /// attempt. The background refresher uses
+    /// `BACKGROUND_INDEX_WALK_BUDGET_MS` (still 180 s) so the on-demand
+    /// drop doesn't slow index convergence.
+    #[test]
+    fn resolve_walk_budget_aligns_with_subtree_fetch_budget() {
+        assert_eq!(
+            defaults::RESOLVE_WALK_TIMEOUT_MS,
+            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+            "on-demand resolve walks must share the standard 20 s subtree budget so a cold-cache `resolve_link` miss fails fast; if you need a longer walk, use the background refresher (`BACKGROUND_INDEX_WALK_BUDGET_MS`) which is unattended",
+        );
+        assert!(
+            defaults::BACKGROUND_INDEX_WALK_BUDGET_MS > defaults::RESOLVE_WALK_TIMEOUT_MS,
+            "background refresher must have a longer budget than the on-demand resolve walk so the persistent name index keeps converging on large trees even while on-demand calls fail fast",
         );
     }
 
