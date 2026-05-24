@@ -737,6 +737,10 @@ fn truncation_envelope_from_fetch(
 /// The main MCP server struct
 #[derive(Clone)]
 pub struct WorkflowyMcpServer {
+    // rmcp 1.x macro expansion accesses this through trait methods the
+    // dead_code lint can't see; suppress the warning rather than chasing
+    // it through the macro layer.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     client: Arc<WorkflowyClient>,
     cache: Arc<NodeCache>,
@@ -4825,18 +4829,18 @@ impl WorkflowyMcpServer {
 #[tool_handler]
 impl ServerHandler for WorkflowyMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
-            server_info: Implementation {
-                name: "workflowy-mcp-server".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            instructions: Some(
-                "I manage Workflowy content. Node IDs accept either full UUIDs or 12-char short hashes (the trailing 12 hex of a UUID, as used in Workflowy URLs).
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_03_26)
+        .with_server_info(Implementation::new(
+            "workflowy-mcp-server",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "I manage Workflowy content. Node IDs accept either full UUIDs or 12-char short hashes (the trailing 12 hex of a UUID, as used in Workflowy URLs).
 
 Search & Navigation:
 - search_nodes: Search by text query (use parent_id + max_depth to scope on large trees)
@@ -4881,10 +4885,8 @@ Diagnostics & ops:
 - health_check: Sub-second API + cache + index diagnostic
 - cancel_all: Cancel in-flight tree walks; preempts the rate-limiter and HTTP send within ~50ms
 - build_name_index: Populate the opportunistic name index for fast find_node lookups
-- get_recent_tool_calls: Per-call ring-buffer log (tool, params hash, duration, ok/err) for self-diagnosis"
-                    .to_string(),
-            ),
-        }
+- get_recent_tool_calls: Per-call ring-buffer log (tool, params hash, duration, ok/err) for self-diagnosis",
+        )
     }
 }
 

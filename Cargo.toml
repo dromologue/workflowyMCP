@@ -18,17 +18,18 @@ name = "wflow-do"
 path = "src/bin/wflow_do.rs"
 
 [dependencies]
-# Floor versions match the latest stable releases as of 2026-05-09.
-# Top-level deps not bumped to a new major: rmcp (0.16 → 1.x is a
-# breaking upgrade and our `Parameters` wrapper-name contract
-# [C-server-003] is pinned against rmcp-macros 0.16; a 1.x upgrade
-# needs deliberate review of the macro's discovery mechanism),
-# reqwest (0.12 → 0.13 is breaking with no observed benefit), rand
-# (0.8 → 0.10 breaks getrandom-shaped APIs we don't need), sha2
-# (0.10 → 0.11 breaks Digest API in places; the params hash works
-# fine on 0.10).
+# Floor versions match the latest stable releases as of 2026-05-24.
+# `rmcp 1.x` confirmed compatible with our `Parameters` wrapper-name
+# contract [C-server-003] — rmcp-macros 1.7 still identifier-matches
+# the literal name `Parameters` on the function-arg type. The
+# `ServerInfo`/`Implementation` structs are now `#[non_exhaustive]`, so
+# construction routes through their builders (`ServerInfo::new` +
+# `with_*`, `Implementation::new`) rather than struct literals.
+# `reqwest 0.13` ships rustls + aws-lc-rs as the default TLS backend
+# (down from native-tls in 0.12); the API surface we touch (Client,
+# Client::builder, header::HeaderMap, Error) is unchanged.
 tokio = { version = "1.52", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1"
@@ -47,10 +48,10 @@ parking_lot = "0.12"
 clap = { version = "4.6", features = ["derive"] }
 futures = "0.3"
 lazy_static = "1.5"
-rand = "0.8"
-rmcp = { version = "0.16", features = ["server", "transport-io"] }
+rand = "0.10"
+rmcp = { version = "1.7", features = ["server", "transport-io"] }
 schemars = "1.2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
