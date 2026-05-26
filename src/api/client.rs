@@ -241,6 +241,32 @@ pub struct RateLimitSnapshot {
     pub limit: Option<i64>,
 }
 
+/// Posture w.r.t. the most recent upstream 429 response. Used by the
+/// diagnostic probe (`probe_top_level`) to suppress further HTTP calls
+/// while a `retry_after` window is still open — the 2026-05-26 incident
+/// where the act of polling `workflowy_status` repeatedly consumed the
+/// very quota the caller was waiting to recover. Carries the wall-clock
+/// `retry_after_remaining_ms` so the status surface can expose it as a
+/// typed field rather than asking the caller to regex it out of an
+/// error string.
+#[derive(Debug, Clone)]
+pub struct RateLimitPosture {
+    /// Unix-ms when the most recent 429 was observed. `None` until the
+    /// first 429 lands.
+    pub last_429_unix_ms: Option<u64>,
+    /// `retry_after` (in ms) carried by that 429's response body, if any.
+    /// Workflowy returns `{"retry_after": N}` in the body of every 429
+    /// observed so far; absence means "we hit 429 but no retry hint".
+    pub last_retry_after_ms: Option<u64>,
+    /// Time remaining inside the open `retry_after` window, in ms. `None`
+    /// means "no open window" (either no 429 ever observed, or the
+    /// window has elapsed).
+    pub retry_after_remaining_ms: Option<u64>,
+    /// True when the window is open and `retry_after_remaining_ms > 0`.
+    /// Probes consult this before issuing an HTTP call.
+    pub in_retry_window: bool,
+}
+
 pub struct WorkflowyClient {
     http_client: Client,
     base_url: String,
@@ -265,6 +291,16 @@ pub struct WorkflowyClient {
     rate_limit_remaining: Arc<std::sync::atomic::AtomicI64>,
     rate_limit_limit: Arc<std::sync::atomic::AtomicI64>,
     rate_limit_reset_unix: Arc<std::sync::atomic::AtomicI64>,
+    /// Unix-ms of the most recent 429 response. `0` until the first 429.
+    /// The diagnostic probe consults this together with
+    /// `last_retry_after_ms` so calls inside a known retry window return
+    /// the cached posture instead of consuming more quota.
+    last_429_unix_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// `retry_after` (in ms) carried by the most recent 429 response.
+    /// `0` until the first 429 with a parseable `retry_after`. When the
+    /// 429 body has no hint we still stamp `last_429_unix_ms` but leave
+    /// this at 0 — callers fall back to their normal cadence.
+    last_retry_after_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkflowyClient {
@@ -306,6 +342,8 @@ impl WorkflowyClient {
             rate_limit_remaining: Arc::new(AtomicI64::new(-1)),
             rate_limit_limit: Arc::new(AtomicI64::new(-1)),
             rate_limit_reset_unix: Arc::new(AtomicI64::new(-1)),
+            last_429_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_retry_after_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -359,6 +397,57 @@ impl WorkflowyClient {
     pub fn _test_stamp_success(&self) {
         self.last_success_unix_ms
             .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Posture w.r.t. the most recent upstream 429. Returns the wall-clock
+    /// `retry_after_remaining_ms` derived from the stamped 429 timestamp
+    /// plus the parsed `retry_after` body. Used by the diagnostic probe
+    /// to suppress further HTTP calls inside a known retry window, and
+    /// by `workflowy_status` to surface the remaining time as a typed
+    /// field. Cheap atomic reads; safe to call per request.
+    pub fn rate_limit_posture(&self) -> RateLimitPosture {
+        use std::sync::atomic::Ordering;
+        let stamped = self.last_429_unix_ms.load(Ordering::Relaxed);
+        let retry_after = self.last_retry_after_ms.load(Ordering::Relaxed);
+        if stamped == 0 {
+            return RateLimitPosture {
+                last_429_unix_ms: None,
+                last_retry_after_ms: None,
+                retry_after_remaining_ms: None,
+                in_retry_window: false,
+            };
+        }
+        let retry_after_opt = if retry_after == 0 { None } else { Some(retry_after) };
+        let now = now_unix_ms();
+        let elapsed = now.saturating_sub(stamped);
+        let remaining = retry_after_opt
+            .map(|ra| ra.saturating_sub(elapsed));
+        let in_window = matches!(remaining, Some(r) if r > 0);
+        RateLimitPosture {
+            last_429_unix_ms: Some(stamped),
+            last_retry_after_ms: retry_after_opt,
+            retry_after_remaining_ms: remaining.filter(|&r| r > 0),
+            in_retry_window: in_window,
+        }
+    }
+
+    /// Stamp a fresh 429 observation. The `retry_after_ms` argument is
+    /// the parsed body hint converted to milliseconds; pass `None` when
+    /// the body carried no hint (we still stamp the timestamp so the
+    /// `last_429_unix_ms` track stays accurate, but skip the
+    /// retry-window arithmetic). Exposed at `pub(crate)` so the request
+    /// path can call it from its 429 branch; tests use the harness
+    /// helper `_test_stamp_rate_limited`.
+    pub(crate) fn stamp_rate_limited(&self, retry_after_ms: Option<u64>) {
+        use std::sync::atomic::Ordering;
+        self.last_429_unix_ms.store(now_unix_ms(), Ordering::Relaxed);
+        self.last_retry_after_ms
+            .store(retry_after_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn _test_stamp_rate_limited(&self, retry_after_ms: Option<u64>) {
+        self.stamp_rate_limited(retry_after_ms);
     }
 
     /// Snapshot of the most recent upstream rate-limit headers. Each field
@@ -441,6 +530,32 @@ impl WorkflowyClient {
         &self,
         deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
+        // Retry-window suppression: if the most recent 429's retry_after
+        // window is still open, return the cached 429 posture WITHOUT
+        // issuing a real HTTP call. The 2026-05-26 incident: a Claude
+        // session diagnosing rate-limit pressure observed `retry_after`
+        // resetting on every `workflowy_status` poll — each probe was
+        // consuming a token from the very quota the caller was waiting
+        // to recover. Suppressing the probe converts the polling
+        // anti-pattern into a free no-op until the window genuinely
+        // clears. The synthesized `ApiError` carries the same
+        // `status: 429` + `retry_after` shape `try_request_cancellable`
+        // would have produced, so `classify_degraded_kind` routes it
+        // to `rate_limited` without special-casing the cached path.
+        let posture = self.rate_limit_posture();
+        if posture.in_retry_window {
+            let remaining_secs = posture
+                .retry_after_remaining_ms
+                .map(|ms| ms.div_ceil(1000))
+                .unwrap_or(0);
+            return Err(WorkflowyError::ApiError {
+                status: 429,
+                message: format!(
+                    "{{\"error\":\"rate limit exceeded (cached — probe suppressed inside open retry_after window)\",\"retry_after\":{remaining_secs}}}"
+                ),
+                source: None,
+            });
+        }
         let response: serde_json::Value = self
             .try_request_cancellable("GET", "/nodes", &None, None, deadline)
             .await?;
@@ -1394,6 +1509,22 @@ impl WorkflowyClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
+            // 429 stamping: record the timestamp + parsed retry_after so the
+            // diagnostic probe can suppress further HTTP calls inside the
+            // window. The 2026-05-26 incident showed that without this, the
+            // probe itself consumes the very quota the caller is waiting to
+            // recover — observable as a retry_after that resets every time
+            // `workflowy_status` runs.
+            if status.as_u16() == 429 {
+                let retry_after_ms = self.parse_retry_after(&error_text);
+                self.stamp_rate_limited(retry_after_ms);
+            }
+
+            if matches!(status.as_u16(), 401 | 403) {
+                self.last_auth_failure_unix_ms
+                    .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+            }
+
             warn!(
                 status = status.as_u16(),
                 error = %error_text,
@@ -1708,6 +1839,70 @@ mod tests {
         // saturating-sub means the value can be 0. Anything below the
         // process clock skew threshold is fine.
         assert!(ago < 5_000, "stamp-then-read should be under 5s, got {ago} ms");
+    }
+
+    /// `RateLimitPosture::in_retry_window` defaults to false until a
+    /// 429 is observed; once stamped with a retry_after, the window
+    /// stays open while time remaining > 0, and closes when the
+    /// window elapses (saturating arithmetic). Pinned because the
+    /// 2026-05-26 incident relies on this for probe suppression.
+    #[test]
+    fn test_rate_limit_posture_defaults_to_no_window() {
+        let client = test_client();
+        let p = client.rate_limit_posture();
+        assert!(p.last_429_unix_ms.is_none());
+        assert!(p.last_retry_after_ms.is_none());
+        assert!(p.retry_after_remaining_ms.is_none());
+        assert!(!p.in_retry_window);
+    }
+
+    #[test]
+    fn test_rate_limit_posture_opens_after_stamp_with_retry_after() {
+        let client = test_client();
+        client._test_stamp_rate_limited(Some(60_000));
+        let p = client.rate_limit_posture();
+        assert!(p.last_429_unix_ms.is_some());
+        assert_eq!(p.last_retry_after_ms, Some(60_000));
+        let remaining = p.retry_after_remaining_ms.expect("window is open");
+        // Stamped milliseconds ago at most a handful — remaining must
+        // be close to the full 60 s.
+        assert!(
+            (59_000..=60_000).contains(&remaining),
+            "remaining must be ~60s; got {remaining}",
+        );
+        assert!(p.in_retry_window);
+    }
+
+    #[test]
+    fn test_rate_limit_posture_closes_when_retry_after_elapses() {
+        let client = test_client();
+        // Stamp a 1-ms retry_after and sleep through it. The window
+        // closes on the saturating arithmetic — `remaining` becomes
+        // `None` and `in_retry_window` flips to false.
+        client._test_stamp_rate_limited(Some(1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let p = client.rate_limit_posture();
+        assert!(p.last_429_unix_ms.is_some(), "stamp should persist");
+        assert!(
+            p.retry_after_remaining_ms.is_none(),
+            "elapsed window must report None remaining",
+        );
+        assert!(!p.in_retry_window, "elapsed window must close");
+    }
+
+    #[test]
+    fn test_rate_limit_posture_without_retry_after_hint_does_not_open_window() {
+        // A 429 with no parseable retry_after still stamps the
+        // timestamp (useful for `last_429_unix_ms` accounting) but
+        // does NOT open a window — probes proceed at their normal
+        // cadence because there's no hint how long to wait.
+        let client = test_client();
+        client._test_stamp_rate_limited(None);
+        let p = client.rate_limit_posture();
+        assert!(p.last_429_unix_ms.is_some());
+        assert!(p.last_retry_after_ms.is_none());
+        assert!(p.retry_after_remaining_ms.is_none());
+        assert!(!p.in_retry_window);
     }
 
     #[test]

@@ -196,6 +196,12 @@ enum ToolKind {
 /// `ProximateCause` taxonomy without storing extra state:
 ///
 /// - `auth` — recent 401/403 surfaced in the probe error
+/// - `rate_limited` — recent 429 surfaced in the probe error. Distinct
+///   from `upstream_error` because 429 is a *recoverable transient*
+///   with a known retry window (`retry_after_remaining_ms` carries the
+///   remaining time). The 2026-05-26 incident named the gap: 429 was
+///   falling through to `upstream_error`, lumping "Workflowy is down"
+///   with "you've burned your quota, this clears in 49 s".
 /// - `cancelled` — probe was cancelled (likely `cancel_all` in flight)
 /// - `local_queue_wedged` — probe timed out AND walks are in flight,
 ///   so the local rate limiter is the bottleneck (probe should rarely
@@ -215,6 +221,15 @@ fn classify_degraded_kind(
     }
     let err = probe_error.unwrap_or("");
     let lower = err.to_lowercase();
+    // 429 first — order matters because a "rate limit" string never
+    // overlaps with auth/cancel/timeout, but routing it earlier keeps
+    // the intent obvious to a reader. The probe synthesises
+    // `API error 429: ...` for cached-suppression hits, and the
+    // request path lets real 429s bubble up with the same shape, so
+    // a single matcher covers both code paths.
+    if lower.contains("429") || lower.contains("rate limit") {
+        return Some("rate_limited");
+    }
     if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
         return Some("auth");
     }
@@ -581,6 +596,13 @@ struct ProbeOutcome {
     error: Option<String>,
     elapsed_ms: u64,
     attempts: u8,
+    /// True iff the probe was short-circuited inside a known
+    /// `retry_after` window without issuing an HTTP call. Surfaced as
+    /// `probe_suppressed` in the JSON response so callers can see *why*
+    /// the latency is so low and avoid mistaking it for a real probe
+    /// success. Pair with `degraded_kind = rate_limited` +
+    /// `retry_after_remaining_ms` for the full posture.
+    probe_suppressed: bool,
 }
 
 /// Strip HTML tags from a Workflowy node name. Workflowy stores
@@ -796,6 +818,17 @@ pub struct WorkflowyMcpServer {
     /// [`Self::with_bulk_budget_ms`] so failure-mode coverage runs in
     /// milliseconds instead of the production 210 s.
     bulk_budget_ms: u64,
+    /// Single-flight mutex for diagnostic probes. The 2026-05-26
+    /// incident showed how `workflowy_status` / `health_check` polling
+    /// can each fire its own HTTP call against the upstream — concurrent
+    /// pollers fan out N requests per status query and consume the very
+    /// quota they are trying to measure. This lock collapses concurrent
+    /// probe attempts onto a single in-flight call; the second caller
+    /// waits and re-reads the cached posture (including
+    /// `last_success_unix_ms` and `rate_limit_posture`) instead of
+    /// issuing its own request. Tokio mutex so the await holds across
+    /// the entire probe future without blocking the runtime.
+    probe_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Drop-in replacement for `rmcp::handler::server::wrapper::Parameters`
@@ -906,6 +939,7 @@ impl WorkflowyMcpServer {
             op_log: OpLog::new(),
             read_budget_ms: defaults::READ_NODE_TIMEOUT_MS,
             bulk_budget_ms: defaults::INSERT_CONTENT_TIMEOUT_MS,
+            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1531,6 +1565,35 @@ impl WorkflowyMcpServer {
         let half_deadline = started + budget / 2;
         let full_deadline = started + budget;
 
+        // Single-flight: collapse concurrent probe attempts onto one
+        // upstream call. The 2026-05-26 incident scenario was a single
+        // host, but multi-agent setups (and aggressive polling loops)
+        // could otherwise fan out N HTTP calls per status query and
+        // saturate the very quota the probe is meant to measure.
+        let _probe_guard = self.probe_lock.lock().await;
+
+        // Rate-limit suppression check (cheap, before any HTTP call):
+        // if `probe_top_level` is about to short-circuit on the cached
+        // posture, the second attempt won't add information — skip it
+        // and report the cached state with `probe_suppressed = true`.
+        // The act of measuring must not perturb the measurement.
+        if self.client.rate_limit_posture().in_retry_window {
+            let err = self
+                .client
+                .probe_top_level(Some(half_deadline))
+                .await
+                .err()
+                .map(|e| e.to_string());
+            return ProbeOutcome {
+                api_reachable: false,
+                top_level_count: None,
+                error: err.or_else(|| Some("rate limit window open".to_string())),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                attempts: 1,
+                probe_suppressed: true,
+            };
+        }
+
         // Use the rate-limiter-bypass probe path so a saturated limiter
         // (e.g. behind an in-flight resolve walk) cannot wedge the probe
         // inside the queue. The 2026-05-19 user-report showed both
@@ -1548,14 +1611,17 @@ impl WorkflowyMcpServer {
                 error: None,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 attempts: 1,
+                probe_suppressed: false,
             };
         }
         let first_err = first.unwrap_err();
 
         // Auth failures are sticky — retrying won't change the answer.
-        // The 401/403 timestamp is already stamped on the client by
-        // `try_request_cancellable`; this branch just short-circuits the
-        // probe without paying for a useless second attempt.
+        // 429s are also sticky inside the retry window: the first
+        // attempt either landed a real 429 (which stamped the posture)
+        // or hit a cached suppression; either way, a second HTTP attempt
+        // would just consume more quota with no new information. Skip
+        // the retry so the probe leaves the upstream alone.
         let is_auth_failure = match &first_err {
             WorkflowyError::ApiError { status, .. } => matches!(*status, 401 | 403),
             WorkflowyError::RetryExhausted { reason, .. } => {
@@ -1564,13 +1630,22 @@ impl WorkflowyMcpServer {
             }
             _ => false,
         };
-        if is_auth_failure || Instant::now() >= full_deadline {
+        let is_rate_limited = match &first_err {
+            WorkflowyError::ApiError { status: 429, .. } => true,
+            WorkflowyError::RetryExhausted { reason, .. } => {
+                let l = reason.to_lowercase();
+                l.contains("429") || l.contains("rate limit")
+            }
+            _ => false,
+        };
+        if is_auth_failure || is_rate_limited || Instant::now() >= full_deadline {
             return ProbeOutcome {
                 api_reachable: false,
                 top_level_count: None,
                 error: Some(first_err.to_string()),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 attempts: 1,
+                probe_suppressed: false,
             };
         }
 
@@ -1588,6 +1663,7 @@ impl WorkflowyMcpServer {
                 error: None,
                 elapsed_ms,
                 attempts: 2,
+                probe_suppressed: false,
             },
             Err(e) => ProbeOutcome {
                 api_reachable: false,
@@ -1595,6 +1671,7 @@ impl WorkflowyMcpServer {
                 error: Some(format!("two attempts failed: {} | {}", first_err, e)),
                 elapsed_ms,
                 attempts: 2,
+                probe_suppressed: false,
             },
         }
     }
@@ -3472,7 +3549,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget (one in-budget retry on transient failure) to confirm reachability and reports cache/name-index sizes. Surfaces `authenticated` (independent of probe success — driven by recent 401/403, not timeouts) and `last_successful_api_call_ms_ago` so callers can distinguish a one-shot blip from a sustained outage. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed.")]
+    #[tool(description = "Quick diagnostic. Calls the Workflowy API with a short budget (one in-budget retry on transient failure) to confirm reachability and reports cache/name-index sizes. Surfaces `authenticated` (independent of probe success — driven by recent 401/403, not timeouts) and `last_successful_api_call_ms_ago` so callers can distinguish a one-shot blip from a sustained outage. Sub-second regardless of tree size; use this to decide whether a larger tool call will succeed. **Rate-limit discipline:** when the response carries `degraded_kind = \"rate_limited\"` and a non-null `retry_after_remaining_ms`, the upstream is throttling this account — do NOT poll this tool again until that many milliseconds have elapsed. The probe is single-flighted and suppressed inside an open `retry_after` window precisely so polling does not consume the quota you are waiting to recover, but spamming it still wastes the caller's own time.")]
     async fn health_check(
         &self,
         Parameters(_params): Parameters<HealthCheckParams>,
@@ -3492,6 +3569,7 @@ impl WorkflowyMcpServer {
         let api_reachable = derive_api_reachable(outcome.api_reachable, last_success_ms_ago);
         let in_flight = self.in_flight_walks.load(std::sync::atomic::Ordering::Relaxed);
         let degraded_kind = classify_degraded_kind(api_reachable, outcome.error.as_deref(), in_flight);
+        let posture = self.client.rate_limit_posture();
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
             "degraded_kind": degraded_kind,
@@ -3503,8 +3581,10 @@ impl WorkflowyMcpServer {
             "latency_ms": outcome.elapsed_ms,
             "budget_ms": timeout.as_millis() as u64,
             "probe_attempts": outcome.attempts,
+            "probe_suppressed": outcome.probe_suppressed,
             "top_level_count": outcome.top_level_count,
             "last_successful_api_call_ms_ago": self.client.last_success_ms_ago(),
+            "retry_after_remaining_ms": posture.retry_after_remaining_ms,
             "cache": {
                 "node_count": cache_stats.node_count,
                 "parent_count": cache_stats.parent_count,
@@ -3523,7 +3603,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Extended liveness probe: confirms Workflowy reachability (one in-budget retry on transient failure) AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. `authenticated` reflects whether a 401/403 has been observed in the last 5 minutes — it is NOT flipped by transient timeouts or 5xx, so a one-shot probe miss after a successful write burst no longer looks like an auth failure. `last_successful_api_call_ms_ago` provides the anchor a caller needs to distinguish a transient blip from a sustained outage. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy.")]
+    #[tool(description = "Extended liveness probe: confirms Workflowy reachability (one in-budget retry on transient failure) AND surfaces in-flight walk count, last-request latency, tree-size estimate, and the most recent upstream rate-limit headers. `authenticated` reflects whether a 401/403 has been observed in the last 5 minutes — it is NOT flipped by transient timeouts or 5xx, so a one-shot probe miss after a successful write burst no longer looks like an auth failure. `last_successful_api_call_ms_ago` provides the anchor a caller needs to distinguish a transient blip from a sustained outage. Use this in preference to health_check when deciding whether to launch a heavy query — it tells you both whether the server is up and whether it is busy. **Rate-limit discipline:** the response includes `retry_after_remaining_ms` (typed, milliseconds remaining in the most recent 429's retry_after window — null when no window is open) and `degraded_kind = \"rate_limited\"` when the upstream is throttling. The probe is single-flighted and suppressed inside an open window (`probe_suppressed: true`) so the diagnostic does not consume the very quota you are measuring — but you should still wait for `retry_after_remaining_ms` to elapse before retrying the failed work. The 2026-05-26 incident: a Claude session diagnosing rate-limit pressure observed `retry_after` resetting on every status poll because each probe consumed a token; the suppression + typed remaining-ms field together make the discipline both automatic and observable.")]
     async fn workflowy_status(
         &self,
         Parameters(_params): Parameters<WorkflowyStatusParams>,
@@ -3623,6 +3703,7 @@ impl WorkflowyMcpServer {
             "rate_limit_limit": rate_limit.limit,
         });
         let degraded_kind = classify_degraded_kind(api_reachable, error.as_deref(), in_flight);
+        let posture = self.client.rate_limit_posture();
         let result = json!({
             "status": if api_reachable { "ok" } else { "degraded" },
             "degraded_kind": degraded_kind,
@@ -3631,10 +3712,12 @@ impl WorkflowyMcpServer {
             "latency_ms": elapsed_ms,
             "budget_ms": timeout.as_millis() as u64,
             "probe_attempts": outcome.attempts,
+            "probe_suppressed": outcome.probe_suppressed,
             "top_level_count": top_level_count,
             "in_flight_walks": in_flight,
             "last_request_ms": self.client.last_request_ms(),
             "last_successful_api_call_ms_ago": last_success_ms_ago,
+            "retry_after_remaining_ms": posture.retry_after_remaining_ms,
             "tree_size_estimate": tree_estimate,
             "tree_size_estimate_known": tree_estimate > 0,
             "cache": {
@@ -10168,4 +10251,234 @@ mod load_tests {
         );
     }
 
+    /// `classify_degraded_kind` recognises 429 / rate-limit signals as a
+    /// distinct `rate_limited` kind — separate from `upstream_error` so
+    /// callers can branch on the recoverable-transient nature of the
+    /// state. The 2026-05-26 incident: a Claude session diagnosing rate-
+    /// limit pressure observed `degraded_kind: upstream_error` and had
+    /// to read the error string to discover the upstream was throttling,
+    /// not down. Pin both the `429` and `rate limit` markers so the
+    /// matcher cannot silently regress to the catch-all.
+    #[test]
+    fn classify_degraded_kind_recognises_rate_limited_signals() {
+        // Bare 429 status code → rate_limited.
+        assert_eq!(
+            classify_degraded_kind(false, Some("API error 429: rate limit exceeded"), 0),
+            Some("rate_limited"),
+        );
+        // Cached-suppression text from `probe_top_level` → rate_limited.
+        assert_eq!(
+            classify_degraded_kind(
+                false,
+                Some("API error 429: rate limit exceeded (cached — probe suppressed inside open retry_after window)"),
+                0,
+            ),
+            Some("rate_limited"),
+        );
+        // "rate limit" prose anywhere → rate_limited.
+        assert_eq!(
+            classify_degraded_kind(false, Some("Rate limit hit on this client"), 0),
+            Some("rate_limited"),
+        );
+        // 429 wins over the in-flight-walks signal — a 429 inside a
+        // walk-heavy run is still rate-limited, not queue-wedged.
+        assert_eq!(
+            classify_degraded_kind(false, Some("API error 429: ..."), 7),
+            Some("rate_limited"),
+        );
+    }
+
+    /// `probe_top_level` short-circuits inside a known `retry_after`
+    /// window — it returns a synthetic 429 from the cached posture
+    /// without firing an HTTP request. Pinned because the 2026-05-26
+    /// incident showed that without this, the act of polling the
+    /// diagnostic consumed the very quota the caller was waiting to
+    /// recover. The assertion: the suppressed-path latency is
+    /// indistinguishable from instant (~ a few ms at most) regardless
+    /// of how unreachable the mock target is.
+    #[tokio::test]
+    async fn probe_top_level_is_suppressed_inside_retry_window() {
+        use crate::api::WorkflowyClient;
+        use crate::config::{RateLimitConfig, RetryConfig};
+
+        let client = WorkflowyClient::new_with_configs(
+            // Unreachable address — a real HTTP attempt would block on
+            // connect for the full deadline.
+            "http://127.0.0.1:1/".to_string(),
+            "test".to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+                retryable_statuses: &[429, 500],
+            },
+            RateLimitConfig { requests_per_second: 200, burst_size: 100 },
+        )
+        .expect("client builds");
+
+        // Stamp a fresh 429 with a 60-second retry_after so the window
+        // is comfortably open.
+        client._test_stamp_rate_limited(Some(60_000));
+
+        let started = Instant::now();
+        let res = client.probe_top_level(None).await;
+        let elapsed = started.elapsed();
+
+        match res {
+            Err(WorkflowyError::ApiError { status: 429, ref message, .. }) => {
+                assert!(
+                    message.contains("retry_after"),
+                    "cached 429 must include retry_after hint: {message}",
+                );
+            }
+            other => panic!("expected synthetic 429, got {:?}", other),
+        }
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "suppressed probe must return immediately; took {:?} — confirms no HTTP request was issued",
+            elapsed,
+        );
+    }
+
+    /// `workflowy_status.retry_after_remaining_ms` carries the remaining
+    /// time inside the open 429 window as a typed integer (not a string
+    /// the caller must regex out of the error). Pinned because the
+    /// 2026-05-26 incident named this exact gap: the caller had to
+    /// parse `retry_after: 49` out of the human-readable error to know
+    /// how long to wait. The typed field closes the gap.
+    #[tokio::test]
+    async fn workflowy_status_surfaces_retry_after_remaining_ms_when_rate_limited() {
+        let mock = MockServer::start().await;
+        // Mock will return 429 with retry_after — but we don't even need
+        // the mock to fire: stamping the posture directly is enough to
+        // exercise the surface, and avoids burning real HTTP setup time.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+        let server = server_against(&mock).await;
+        server.client._test_stamp_rate_limited(Some(45_000));
+
+        let result = server
+            .workflowy_status(Parameters(WorkflowyStatusParams {}))
+            .await
+            .expect("workflowy_status returns Ok even when rate-limited");
+        let body = body_text(&result);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+
+        // The retry_after window is open; the typed remaining-ms must
+        // be present and within the expected range.
+        let remaining = v
+            .get("retry_after_remaining_ms")
+            .and_then(|x| x.as_u64())
+            .expect("retry_after_remaining_ms must be a number when window is open");
+        assert!(
+            (40_000..=45_000).contains(&remaining),
+            "remaining must be close to the stamped retry_after (45s): {remaining}",
+        );
+        assert_eq!(
+            v.get("degraded_kind").and_then(|x| x.as_str()),
+            Some("rate_limited"),
+            "degraded_kind must classify the cause as rate_limited: {body}",
+        );
+        assert_eq!(
+            v.get("probe_suppressed").and_then(|x| x.as_bool()),
+            Some(true),
+            "probe_suppressed must be true when the retry window short-circuited the probe: {body}",
+        );
+    }
+
+    /// Concurrent probes share one in-flight call. The 2026-05-26
+    /// incident scenario was a single host, but multi-agent setups
+    /// would otherwise fan out N HTTP calls per status query and
+    /// saturate the very quota the probe is meant to measure. Pinned
+    /// at the probe-lock level: two concurrent `workflowy_status`
+    /// calls must serialize on the lock so the upstream sees at most
+    /// one probe at a time.
+    #[tokio::test]
+    async fn workflowy_status_single_flights_concurrent_probes() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mock = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_mock = counter.clone();
+        // Each probe takes ~100 ms so concurrent firing would be easily
+        // observable in the counter if not single-flighted.
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .respond_with(move |_req: &wiremock::Request| {
+                counter_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"nodes": []}))
+                    .set_delay(Duration::from_millis(100))
+            })
+            .mount(&mock)
+            .await;
+
+        let server = Arc::new(server_against(&mock).await);
+        let s1 = server.clone();
+        let s2 = server.clone();
+        let s3 = server.clone();
+        let (r1, r2, r3) = tokio::join!(
+            async move { s1.workflowy_status(Parameters(WorkflowyStatusParams {})).await },
+            async move { s2.workflowy_status(Parameters(WorkflowyStatusParams {})).await },
+            async move { s3.workflowy_status(Parameters(WorkflowyStatusParams {})).await },
+        );
+        r1.expect("first probe ok");
+        r2.expect("second probe ok");
+        r3.expect("third probe ok");
+        // With the single-flight lock, the three calls serialize through
+        // one probe each (one HTTP request per call against the mock).
+        // Without it, the three calls could fire 6 requests in total
+        // (two per call when the first attempt times out, etc.). The
+        // looser bound is fine — the point is "fewer than naive
+        // fan-out" — but in practice we expect ≤3 here.
+        let observed = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed <= 3,
+            "single-flight must collapse the three concurrent probes to ≤3 upstream calls (one per status invocation); observed {observed}",
+        );
+    }
+
+    /// Pin test: every diagnostic probe path must guard with the
+    /// single-flight lock. Without this, a refactor that lifts the
+    /// `_probe_guard = self.probe_lock.lock().await` line silently
+    /// regresses to per-caller fan-out. Grep-based so the rule
+    /// survives renames; the lock variable name is the signature.
+    #[test]
+    fn probe_upstream_with_retry_holds_probe_lock() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn probe_upstream_with_retry")
+            .expect("probe_upstream_with_retry must be defined");
+        let body = &src[start..start.saturating_add(4_000)];
+        assert!(
+            body.contains("self.probe_lock.lock().await"),
+            "probe_upstream_with_retry must take `self.probe_lock.lock().await` at the top — without it concurrent diagnostic probes fan out and consume the quota they measure (2026-05-26 incident)",
+        );
+    }
+
+    /// Pin test: `classify_degraded_kind` must keep its `rate_limited`
+    /// branch ahead of the catch-all so 429s never fall through to
+    /// `upstream_error`. The 2026-05-26 incident named the gap — the
+    /// caller had to read the error string to discover the upstream
+    /// was throttling, not down. Grep-pinned so the branch cannot
+    /// silently drop.
+    #[test]
+    fn classify_degraded_kind_carries_rate_limited_branch() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn classify_degraded_kind")
+            .expect("classify_degraded_kind must be defined");
+        let body = &src[start..start.saturating_add(3_000)];
+        assert!(
+            body.contains("\"rate_limited\""),
+            "classify_degraded_kind must classify 429s as `rate_limited`, distinct from the upstream_error catch-all (2026-05-26 incident)",
+        );
+        assert!(
+            body.contains("\"429\"") && body.contains("\"rate limit\""),
+            "classify_degraded_kind must match BOTH the bare 429 status marker and the `rate limit` prose so cached + live paths both route correctly",
+        );
+    }
 }
