@@ -60,6 +60,8 @@ The most preventable failure mode on this skill, and the single load-bearing dis
 
 **The hazard.** Some host surfaces (claude.ai web / mobile in particular) strip bare top-level string parameters. When the model emits a UUID and the host serialiser turns it into `null` — or emits the literal string `"null"`, or the model itself emits `null` when the UUID isn't to hand — the call either rejects with a path-aware deserialization error, lands at the workspace root, or silently misroutes to the most-recently-discussed contextual destination. The fault is symmetric: writes (`move_node`, `edit_node`, `create_node`, `parent_id`, `new_parent_id`) and reads (`get_node`, `list_children`, `get_subtree`, `node_id`) both suffer it.
 
+**The wire-level guard is not a backstop you can rely on.** The server's `NodeId` deserializer rejects literal `"null"` strings and JSON `null` for required fields, but the 2026-05-27 observation on claude.ai web confirms that hosts can coerce `null` to a contextual UUID _before_ the server sees it — every `null` passed for parent / canonical IDs during that session resolved silently to the intended node, masking the misroute by luck. Until the host-side coercion is closed (server-side hardening tracked in `tasks/todo.local.md`), **this discipline is the only line of defence**. Treat the rules below as enforced by your own attention, not by the schema.
+
 **The rules, every UUID parameter, every time:**
 
 1. **Have the UUID on screen.** Full UUID, 12-char URL-suffix hash, or 8-char doc-prefix hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the call yet.
