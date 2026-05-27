@@ -3913,6 +3913,150 @@ impl WorkflowyMcpServer {
         })
     }
 
+    #[tool(description = "Run many reads in one call (get_node / list_children / get_subtree). Operations dispatch sequentially in input order and results carry per-operation status. Use this when one or more sweep-shaped reads need to land reliably under hosts that strip bare-string node_id parameters: the operations-array wrapper inherits the same host-encoding resilience that batch_create_nodes already gives writes. The 2026-05-25 \"sweeping a freshly-created node\" failure surfaced this gap — list_children / get_subtree with bare-string IDs were silently misrouted to workspace root on roughly every second call, leaving the sweep with no clean read path.")]
+    async fn read_batch(
+        &self,
+        Parameters(params): Parameters<ReadBatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_handler!(self, "read_batch", ToolKind::Walk, params, {
+            if params.operations.is_empty() {
+                return Err(tool_invalid_params(
+                    "read_batch",
+                    None,
+                    "operations must not be empty",
+                ));
+            }
+
+            // Eager op-kind + required-id validation so a known-bad batch
+            // fails at the wire boundary before any API touch.
+            const VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
+            for (i, op) in params.operations.iter().enumerate() {
+                if !VALID_OPS.contains(&op.op.as_str()) {
+                    return Err(tool_invalid_params(
+                        "read_batch",
+                        None,
+                        format!(
+                            "operations[{}].op = {:?}; expected one of {:?}",
+                            i, op.op, VALID_OPS
+                        ),
+                    ));
+                }
+                if matches!(op.op.as_str(), "get_node" | "get_subtree")
+                    && op.node_id.is_none()
+                {
+                    return Err(tool_invalid_params(
+                        "read_batch",
+                        None,
+                        format!("operations[{}].node_id is required for op={}", i, op.op),
+                    ));
+                }
+            }
+
+            // Resolve short-hash IDs up front so a miss surfaces as a
+            // structured validation error before any read budget is burned.
+            let mut resolved_ops: Vec<(String, Option<String>, Option<usize>)> =
+                Vec::with_capacity(params.operations.len());
+            for op in &params.operations {
+                let resolved_id = match &op.node_id {
+                    Some(raw) => Some(self.validate_and_resolve(raw).await?),
+                    None => None,
+                };
+                resolved_ops.push((op.op.clone(), resolved_id, op.max_depth));
+            }
+
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+            let mut entries: Vec<serde_json::Value> = Vec::with_capacity(resolved_ops.len());
+            for (idx, (op_kind, id, max_depth)) in resolved_ops.into_iter().enumerate() {
+                let result: std::result::Result<serde_json::Value, String> = match op_kind.as_str() {
+                    "get_node" => {
+                        let id_ref = id.as_deref().expect("validated above");
+                        let node_fut = self.client.get_node_with_propagation_retry(id_ref);
+                        let children_fut = self.client.get_children_with_propagation_retry(id_ref);
+                        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
+                        match node_res {
+                            Ok(n) => {
+                                let children: Vec<WorkflowyNode> = children_res.unwrap_or_default();
+                                if !children.is_empty() {
+                                    self.name_index.ingest(&children);
+                                }
+                                self.name_index.ingest(std::slice::from_ref(&n));
+                                Ok(json!({"node": n, "children": children}))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "list_children" => {
+                        let res = match id.as_deref() {
+                            Some(i) => self.client.get_children_with_propagation_retry(i).await,
+                            None => self.client.get_top_level_nodes().await,
+                        };
+                        match res {
+                            Ok(children) => {
+                                if !children.is_empty() {
+                                    self.name_index.ingest(&children);
+                                }
+                                Ok(json!({
+                                    "scope_resolved": scope_resolved_label(id.as_deref()),
+                                    "children": children,
+                                }))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "get_subtree" => {
+                        let id_ref = id.as_deref().expect("validated above");
+                        let depth = max_depth.unwrap_or(5);
+                        match self.walk_subtree(Some(id_ref), depth).await {
+                            Ok(fetch) => {
+                                let payload = json!({"nodes": fetch.nodes});
+                                Ok(with_truncation_envelope(
+                                    payload,
+                                    fetch.truncated,
+                                    fetch.limit,
+                                    fetch.truncation_reason,
+                                ))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    _ => unreachable!("validated above"),
+                };
+                let entry = match result {
+                    Ok(data) => {
+                        succeeded += 1;
+                        json!({
+                            "index": idx,
+                            "op": op_kind,
+                            "node_id": id,
+                            "ok": true,
+                            "data": data,
+                        })
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        json!({
+                            "index": idx,
+                            "op": op_kind,
+                            "node_id": id,
+                            "ok": false,
+                            "error": e,
+                        })
+                    }
+                };
+                entries.push(entry);
+            }
+
+            let payload = json!({
+                "total": entries.len(),
+                "succeeded": succeeded,
+                "failed": failed,
+                "results": entries,
+            });
+            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        })
+    }
+
     #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that. Orchestration runs through `crate::workflows::run_transaction`, the same code path the `wflow-do transaction` CLI uses.")]
     async fn transaction(
         &self,
@@ -4055,7 +4199,8 @@ impl WorkflowyMcpServer {
                 "tag must be non-empty and contain no whitespace",
             ));
         }
-        let needle = format!("#{}", tag.trim_start_matches('#'));
+        let bare_tag = tag.trim_start_matches('#').to_string();
+        let needle = format!("#{}", bare_tag);
 
         // Resolve every id eagerly so a short-hash miss is reported
         // before we start mutating. Sequential because the resolver is
@@ -4069,11 +4214,15 @@ impl WorkflowyMcpServer {
         use futures::StreamExt;
         let stream = futures::stream::iter(ids.into_iter().enumerate().map(|(idx, id)| {
             let needle = needle.clone();
+            let bare_tag = bare_tag.clone();
             async move {
                 let outcome = match self.client.get_node(&id).await {
                     Ok(node) => {
-                        if node.name.contains(&needle) {
-                            // Already tagged — no-op.
+                        // Whole-tag check via parse_tags — a bare
+                        // `name.contains("#lead")` silently shadowed
+                        // `#leadership` and skipped 38 nodes during the
+                        // 2026-05-24 pillar-tag backfill.
+                        if crate::utils::tag_parser::text_contains_tag(&node.name, &bare_tag) {
                             (idx, Ok(false))
                         } else {
                             let new_name = format!("{} {}", node.name.trim_end(), needle);
@@ -7282,6 +7431,54 @@ mod tests {
             serde_json::from_value(v).expect("null target_parent_id must deserialise");
         assert!(params.target_parent_id.is_none());
         assert_eq!(params.pillar.as_deref(), Some("lead"));
+    }
+
+    #[tokio::test]
+    async fn read_batch_rejects_empty_operations() {
+        let server = new_test_server();
+        let err = server
+            .read_batch(Parameters(ReadBatchParams { operations: Vec::new() }))
+            .await
+            .expect_err("empty operations must reject");
+        assert!(err.to_string().to_lowercase().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn read_batch_rejects_unknown_op_kind() {
+        let server = new_test_server();
+        let err = server
+            .read_batch(Parameters(ReadBatchParams {
+                operations: vec![ReadBatchOpParams {
+                    op: "delete_node".to_string(),
+                    node_id: Some(NodeId::from(valid_id())),
+                    max_depth: None,
+                }],
+            }))
+            .await
+            .expect_err("unknown op kind must reject");
+        assert!(err.to_string().contains("delete_node"));
+    }
+
+    #[tokio::test]
+    async fn read_batch_requires_node_id_for_get_node_and_get_subtree() {
+        let server = new_test_server();
+        for op in ["get_node", "get_subtree"] {
+            let err = server
+                .read_batch(Parameters(ReadBatchParams {
+                    operations: vec![ReadBatchOpParams {
+                        op: op.to_string(),
+                        node_id: None,
+                        max_depth: None,
+                    }],
+                }))
+                .await
+                .expect_err("missing node_id must reject");
+            assert!(
+                err.to_string().contains("node_id is required"),
+                "op {} error did not name the requirement: {}",
+                op, err,
+            );
+        }
     }
 
     #[tokio::test]

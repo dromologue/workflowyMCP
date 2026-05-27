@@ -172,7 +172,7 @@ behave the same way.
 
 | Category | Tools |
 |----------|-------|
-| Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path` |
+| Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`, `read_batch` |
 | Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `reorder_nodes`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
 | Mirror discipline | `create_mirror` (convention-based: duplicates the canonical's name into a new parent and writes `mirror_of:` to the new node's note), `audit_mirrors` |
 | Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |

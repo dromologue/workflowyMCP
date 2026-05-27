@@ -1099,8 +1099,16 @@ pub async fn apply_bulk_op(
             BulkOp::Uncomplete => client.set_completion(&node.id, false).await.is_ok(),
             BulkOp::AddTag => {
                 let tag = operation_tag.expect("validated by requires_tag check above");
-                let new_name = format!("{} #{}", node.name, tag.trim_start_matches('#'));
-                client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
+                let bare = tag.trim_start_matches('#');
+                // Idempotent: whole-tag boundary check so `#lead` doesn't
+                // shadow-double-tag a node carrying `#leadership` (matches
+                // bulk_tag's check; same 2026-05-24 hazard).
+                if crate::utils::tag_parser::text_contains_tag(&node.name, bare) {
+                    true
+                } else {
+                    let new_name = format!("{} #{}", node.name.trim_end(), bare);
+                    client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
+                }
             }
             BulkOp::RemoveTag => {
                 let tag = operation_tag

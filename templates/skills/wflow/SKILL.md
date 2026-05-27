@@ -1,7 +1,7 @@
 ---
 name: wflow
 description: Integrated second-brain skill built on Workflowy plus any additional services the user has configured (declared in $SECONDBRAIN_DIR/memory/services.md). Capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__reorder_nodes, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__bulk_update, mcp__workflowy__find_backlinks
+allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__read_batch, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__reorder_nodes, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__complete_node, mcp__workflowy__duplicate_node, mcp__workflowy__create_from_template, mcp__workflowy__batch_create_nodes, mcp__workflowy__transaction, mcp__workflowy__bulk_update, mcp__workflowy__bulk_tag, mcp__workflowy__create_mirror, mcp__workflowy__audit_mirrors, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__find_backlinks, mcp__workflowy__find_by_tag_and_path, mcp__workflowy__node_at_path, mcp__workflowy__path_of, mcp__workflowy__resolve_link, mcp__workflowy__since, mcp__workflowy__convert_markdown, mcp__workflowy__export_subtree, mcp__workflowy__review, mcp__workflowy__build_name_index
 # Additional service tool namespaces (e.g. mcp__SERVICENAME__*) are listed in $SECONDBRAIN_DIR/memory/services.md and must be added to allowed-tools when configured.
 ---
 
@@ -54,41 +54,85 @@ The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every n
 
 ---
 
-## UUID Parameter Discipline (read before EVERY write call)
+## UUID Parameter Discipline (the canonical hazard; everything below cross-references this)
 
-Most preventable write-failure mode. Before any tool call that takes a UUID parameter (`move_node`, `edit_node`, `delete_node`, `complete_node`, `get_node`, `parent_id` on `create_node`, `new_parent_id` on `move_node`, every parameter typed `NodeId`), run this check — every time, no exceptions:
+The most preventable failure mode on this skill, and the single load-bearing discipline. **Before any tool call that takes a UUID parameter — write or read — run this check.**
 
-1. **Have the UUID string in front of you.** Full UUID (`550e8400-e29b-41d4-a716-446655440000`), 12-char URL-suffix short hash, or 8-char doc-prefix short hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the write call yet.
+**The hazard.** Some host surfaces (claude.ai web / mobile in particular) strip bare top-level string parameters. When the model emits a UUID and the host serialiser turns it into `null` — or emits the literal string `"null"`, or the model itself emits `null` when the UUID isn't to hand — the call either rejects with a path-aware deserialization error, lands at the workspace root, or silently misroutes to the most-recently-discussed contextual destination. The fault is symmetric: writes (`move_node`, `edit_node`, `create_node`, `parent_id`, `new_parent_id`) and reads (`get_node`, `list_children`, `get_subtree`, `node_id`) both suffer it.
 
-2. **NEVER write the literal string `null`, `"null"`, or any placeholder between parameter tags. Every UUID-typed parameter gets an explicit UUID. No exceptions.** This is the definitive rule, and the skill *deliberately* does not rely on the server's `parent_id: null = workspace root` affordance documented in server contract #5. Three observed pathologies make the affordance unsafe in practice: (a) on some host surfaces (claude.ai web / mobile) the host or model emits `null` when the UUID isn't immediately to hand, treating it as a placeholder — calls land on the wrong node or are rejected with a path-aware deserialization error; (b) when the literal string `"null"` rather than JSON `null` is passed, behaviour was observed routing to the most-recently-discussed contextual destination on three consecutive calls in a single session — neither workspace-root semantics nor a clean rejection; (c) even when the server *would* accept `null`, passing the cached workspace-root UUID explicitly is preferable because it makes the destination auditable in tool-result transcripts. **If the UUID isn't on screen in your reasoning, resolve it before the write call. Do not pass `null` even when the schema accepts it.** If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
+**The rules, every UUID parameter, every time:**
 
-3. **If the error reads `invalid parameters at \`.<field>\`: invalid type: null, expected a string`** — you typed `null` for `<field>`. Don't apologise and retry with `null`. Find the actual UUID for that field, then retry. The error names the field on purpose.
+1. **Have the UUID on screen.** Full UUID, 12-char URL-suffix hash, or 8-char doc-prefix hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the call yet.
 
-4. **Path-less version of the error** (`invalid type: null, expected a string` with no `at \`.<field>\``) means the running MCP binary is pre-2026-05-03. Restart Claude Desktop / re-launch the host process to pick up the path-aware deserializer.
+2. **NEVER write the literal `null`, `"null"`, or any placeholder between parameter tags. Every UUID-typed parameter gets an explicit UUID. No exceptions** — including parameters whose schema accepts `null` as the workspace-root sentinel; pass the cached workspace-root UUID instead so the destination is auditable in tool-result transcripts. If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
 
-5. **Workaround for surfaces that persistently strip bare-string UUIDs to `null`:** route writes through a tool whose parameters are an `operations` array — `transaction(operations=[{op: "move", node_id: "<uuid>", new_parent_id: "<uuid>"}, ...])` for multi-write batches, `batch_create_nodes(operations=[...])` for multi-creates. The UUIDs sit inside nested array items, dodging the bare-top-level-string encoding bug. Trade-off: one rollback unit per transaction. Last resort: `wflow-do` CLI, which bypasses host-side encoding entirely.
+3. **If the error reads `invalid parameters at \`.<field>\`: invalid type: null, expected a string`** — you typed `null` for `<field>`. Find the actual UUID. The error names the field on purpose. *Path-less variant* (`invalid type: null, expected a string` with no `at \`.<field>\``) means the running MCP binary is pre-2026-05-03 — restart the host to pick up the path-aware deserializer.
+
+4. **Recovery for hosts that persistently strip:** route through tools whose UUIDs sit inside a nested `operations` array. UUIDs in operation objects survive hosts that strip top-level strings.
+   - **Multi-writes:** `transaction(operations=[{op:"move",node_id,new_parent_id}, …])`. Trade-off: one rollback unit per transaction.
+   - **Multi-creates:** `batch_create_nodes(operations=[…])`.
+   - **Multi-reads:** `read_batch(operations=[{op:"get_subtree"|"list_children"|"get_node", node_id, max_depth?}, …])`.
+   - **Last resort:** the `wflow-do` CLI bypasses host-side encoding entirely.
+
+Every discipline section that follows (Read-path, Multi-write batch, synthesis pattern 2, the scope_resolved audit) builds on this. They cross-reference rather than re-explain.
+
+---
+
+## Read-path discipline for freshly-created nodes (the sweep trap)
+
+The read-side compound of UUID Parameter Discipline. For established material the persistent name index at `$WORKFLOWY_INDEX_PATH` is the clean second channel; for material created within the last ~30 minutes the index can still be empty for that subtree, and the live-read channel is exposed to the encoding hazard described above.
+
+**The discipline, in order:**
+
+1. **Check index freshness against node age.** Pull `updated_at` from `$WORKFLOWY_INDEX_PATH` (`jq '.updated_at' "$WORKFLOWY_INDEX_PATH"`) and compare against the target's `created_at`. If `index.updated_at > node.created_at`, the index covers the subtree.
+
+2. **Index fresh → reconstruct from local JSON.** Walk `parent_id` links from the target downward. No walk budget, no host encoding, no rate limiter. Always prefer for established material.
+
+3. **Node newer than index → scoped reindex first.** `build_name_index(parent_id=<UUID>)` from the same session that created the node, or `wflow-do reindex --root <UUID>` from the shell. The 30-minute background refresher is a backstop, not the primary refresh path.
+
+4. **End-of-capture reflex.** Fire the scoped reindex immediately after writes settle on any workflow that may want to read the new content same-session. Sub-second cost; keeps the read path open.
+
+5. **Live read needed →** `read_batch(operations=[…])` per UUID Parameter Discipline rule 4. Never a bare `get_subtree(node_id=<UUID>)` when the host has shown stripping behaviour.
+
+6. **Last resort.** Workflowy OPML/text export into `$SECONDBRAIN_DIR/drafts/`. Evidence the discipline broke down, not a routine path.
+
+**Why this matters.** Without freshness-checking, an unscoped `get_subtree` on a freshly-created reference document can return an empty shell (headings present, bodies absent) and the agent proceeds to "distil" the shell. Cheap check; expensive miss.
+
+---
+
+## Pillar-node descriptions are the carved-out exception to "content in sub-nodes"
+
+The general convention when writing material into Workflowy: **content goes in sub-nodes, never in the description** of an existing node. A node's description (its note) is reserved for source attribution, backlinks (`mirror_of:`, `canonical_of:`), or a one-line gloss — never the body of the content. This preserves the tree structure that `audit_mirrors`, `bulk_tag`, search, and the visualiser all assume.
+
+**The exception: pillar / bucket nodes.** Pillar-level nodes (Distillations pillars, Cross-pillar concept maps root, Themes parent root, any OP source MOC that serves as a pillar home) carry a generic, evergreen content description as their note that *describes the pillar itself* — its scope, the type of material it holds, what belongs there. That description IS node-level metadata, not content. It's appropriate on the node because it doesn't decay session-over-session and because it's *about* the node, not stored *in* the node. A first-pass at pillar review on 2026-05-24 created `📋 pillar review` summary children with composition / outcome sub-nodes under each bucket (following the general rule); the user corrected this, the children were deleted, and a generic content description was set as the note on each of the eight pillar / bucket nodes.
+
+**How to apply:**
+
+1. For pillar / bucket-level nodes — a generic content description on the node as its note. Not a session log entry, not "what changed this week"; a description of what the pillar contains at a level of generality that holds across sessions.
+2. For every other node (atomic notes, source MOCs, theme sub-buckets when not bucket-level, session logs, journal entries, captured tasks) — content goes in sub-nodes. The description holds source attribution, backlinks, or a one-line gloss.
+3. The exception is narrow. If unsure whether a node qualifies as pillar/bucket-level, default to the general rule (sub-nodes). The exception applies only when the description genuinely describes the pillar's purpose generically.
+
+The user-specific pillar descriptions and the list of which nodes qualify as pillar/bucket-level live in `distillation_taxonomy.md`. This convention layer carries the rule; the taxonomy carries the data.
 
 ---
 
 ## Multi-write batch discipline (transaction-over-move)
 
-Rule 5 of UUID Parameter Discipline names `transaction` as the *workaround* for surfaces that strip bare-string UUIDs to null. This section promotes that to a *default*: when a workflow will perform 2+ writes that share a logical batch — moves with a common destination, edits across a set of related nodes, deletes within one subtree — route through `transaction(operations=[…])` from the start, not after a failure proves the host is dropping UUIDs.
+When a workflow performs 2+ writes that share a logical batch — moves with a common destination, edits across related nodes, deletes within one subtree — route through `transaction(operations=[…])` from the start. UUID Parameter Discipline rule 4 already names `transaction` as the operations-array recovery; this section promotes it to a default beyond that recovery role.
 
-**Why default to transaction (belt-and-braces with rule 5):**
+**Two reasons beyond rule 4:**
 
-1. **Single rollback unit.** A failure mid-batch rolls back what already landed; sequential per-op calls leave partial state stranded for manual cleanup.
-2. **Dodges the null-UUID encoding bug at the host boundary.** UUIDs nested inside `operations[]` array items aren't subject to the host-side bare-top-level-string stripping that has surfaced repeatedly on web / mobile surfaces. The workaround is reliable; using `transaction` by default neutralises the failure mode before it can land.
-3. **Auditable plan.** A single `transaction` call presents the full operation list before execution. Sequential calls require the agent to reason about partial state across many tool turns — the cognitive load is where drift creeps in.
+1. **Single rollback unit.** A failure mid-batch rolls back what already landed; sequential per-op calls leave partial state stranded.
+2. **Auditable plan.** A single `transaction` call presents the full operation list before execution; sequential calls force the agent to reason about partial state across many tool turns.
 
 **When NOT to use transaction:**
 
-- **Single-shot writes.** One `create_node`, one `move_node`, one `edit_node`. The transaction wrapper adds no rollback value when there's nothing to roll back.
-- **Interactive per-item triage.** Workflows that ask the user about each item (inbox triage, reading-list management) should land each move on confirmation — bundling them defeats the per-item gate.
-- **Operations that are not transaction-supported ops.** `create_mirror`, `bulk_update`, `reorder_nodes`, `bulk_tag`, and `complete_node` are their own tools. Don't wrap them. (The `transaction` schema does accept `complete` / `uncomplete` if completion needs to be part of a rollback unit.)
+- **Single-shot writes.** No rollback value for a single create / move / edit.
+- **Interactive per-item triage** (inbox triage, reading-list management) — bundling defeats the per-item user gate.
+- **Non-transaction-supported ops** — `create_mirror`, `bulk_update`, `reorder_nodes`, `bulk_tag` are their own tools. (The `transaction` schema does accept `complete` / `uncomplete` if completion needs to be inside the rollback unit.)
 
-**Sizing.** The transaction tool runs operations sequentially server-side (best-effort atomicity wrapper, not true upstream atomicity). For batches > ~80 ops, chunk into multiple transactions to keep individual call latencies reasonable; rollback granularity per chunk is the trade-off.
-
-**Op ordering inside a transaction.** Cascading deletes (deleting a parent cascades children) must come *last* in the operations array — earlier ops on the same subtree get 404'd if the parent is deleted first.
+**Sizing.** Chunk batches > ~80 ops into multiple transactions.
+**Op ordering.** Cascading deletes come *last* — earlier ops on the same subtree get 404'd if the parent is deleted first.
 
 ---
 
@@ -260,6 +304,12 @@ The detailed implementation of each workflow lives in the user's customised copy
 ### Synthesise (slower, compounding)
 
 - **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes via `create_mirror(canonical_node_id, target_parent_id, pillar?)` — the mirror's name is copied from the canonical and its description gets `mirror_of: <canonical_uuid>` so `audit_mirrors` can surface drift later. Pass `pillar` when the canonical lacks a `canonical_of:` marker; existing markers are never overwritten.
+- **Sweep an existing node into the second brain** — take an already-in-Workflowy node (reference document, transcript, discussion thread) and distil its subtree into the canonical pillars/themes:
+  1. **Resolve precisely.** `resolve_link` with a scope hint (`search_parent_id` / `search_parent_path`), never an unscoped walk — unscoped on a large workspace times out at the 20 s subtree budget before finding anything.
+  2. **Establish a clean read path** per Read-path discipline above — freshness check, reconstruct or reindex, `read_batch` for live reads, export as last resort.
+  3. **Apply the routing-plan gate (pattern 1) and the novelty check** before writing. A sweep is the highest-risk place to silently duplicate a canonical that already covers the source.
+  4. **Route per `distillation_taxonomy.md`** — pillar / theme / cross-pillar classification reads from the taxonomy, not from the sweep content. The taxonomy is canonical on borderline cases.
+  5. **Write via the MOC-batch-mirror sequence (pattern 2).** Single MOC create, batched atomic notes, selective mirrors, session-log entry.
 - **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
 - **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
 - **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.
@@ -269,7 +319,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 #### Three patterns every synthesis workflow shares
 
 1. **The routing-plan gate.** Before writing anything to Distillations, build a draft routing table — *candidate atom name; destination pillar; mirror destinations; sources integrated* — and gate on user confirmation. Pair this with a **novelty check**: for each candidate atom, run a narrowed `find_node` / `search_nodes` (with `use_index=true` against the destination pillar UUID) for the key concept; if a canonical already covers the same ground, propose a mirror or backlink rather than a new atom. Both passes are cheap and both reduce drift between the user's mental model and what lands in the graph. Worth writing into "Distil single source", "Distil reading list", and "Synthesis capture" alike.
-2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (the nested-array shape protects against the bare-string-UUID encoding bug); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) `create_node` the session log under the cached `Session logs` UUID and append the local mirror at `$SECONDBRAIN_DIR/session-logs/`; (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
+2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (operations-array shape per UUID Parameter Discipline rule 4); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) `create_node` the session log under the cached `Session logs` UUID and append the local mirror at `$SECONDBRAIN_DIR/session-logs/`; (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
 3. **The Journal-scan + range-stamp convention.** When the user keeps a journal, every synthesis or review session begins with a scan of Journal entries over the period since the last journal-bearing session log. The session log's description (or first child) MUST stamp `Journal range covered: YYYY-MM-DD → YYYY-MM-DD` — the next session reads that stamp to know where to pick up. First-run convention: if no prior journal-bearing session log exists, scan back ~30 days. Lift only principle-level insights as atomic notes; personal-context entries stay in the Journal. Skip this pattern entirely if the user doesn't keep a journal.
 
 #### Discipline lessons (each one paid for by an eval failure)
@@ -290,7 +340,7 @@ These shorten the gap between "the skill said X" and "the agent actually did X" 
 
 - **Uniform per-pillar mirroring.** When a synthesis produces 3+ atomic notes and two or more of them substantively bear on the same destination pillar, *all atoms* in the synthesis that touch that pillar get mirrored there — not just the most obviously-anchored ones. Per-atom mirror judgement is where drift creeps in: the agent picks the strongest contributors and silently drops a third atom even though it also bears on the destination. If an atom is genuinely orthogonal, skip the mirror but mark it explicitly in the routing table from pattern 1 above. (Eval Test 9: first "causality not difficulty" note arguably touches leadership but had no Lead mirror.)
 
-- **Audit `scope_resolved` after every scoped call.** Every MCP tool that takes an `Option<NodeId>` for parent_id (`create_node`, `batch_create_nodes`, `insert_content`, `create_mirror`, `list_children`, `find_node`, `search_nodes`) returns a `scope_resolved` field in its response: `workspace_root` when the resolved scope was None (caller passed null or omitted), `scoped:<full-uuid>` otherwise. After every call where parent_id was null/omitted, read the field and confirm the resolved scope matches the intended destination — `workspace_root` must mean "I genuinely intended to write at the workspace root", not "I forgot the UUID". If the audit fails, halt the workflow and resolve the destination explicitly before any follow-up write. For `create_mirror` specifically — when batching multiple mirror passes across a synthesis — prefer `dry_run=true` first: the preview returns `scope_resolved`, the would-be `mirror_name`, and `would_annotate_canonical` without writing, so the destination check is verifiable before the eight production calls land. (Failure-report 2026-05-09: callers couldn't tell whether null parent_id had landed at workspace root, an inferred parent, or a cached focus; on `create_mirror` the same opacity made eight sequential null-null mirror calls unverifiable. Adding scope_resolved + dry_run to the response shape closes the gap.)
+- **Audit `scope_resolved` on every scoped call.** Every parent-scoped tool (`create_node`, `batch_create_nodes`, `insert_content`, `create_mirror`, `list_children`, `find_node`, `search_nodes`) returns `scope_resolved: "workspace_root"` or `scope_resolved: "scoped:<uuid>"`. Read it after every call where parent_id was null / omitted and confirm the scope matches the intent — `workspace_root` must mean "intended workspace root", not "forgot the UUID". If it doesn't, halt and resolve explicitly before any follow-up write. For batched `create_mirror` passes, use `dry_run=true` first: it returns `scope_resolved`, the would-be `mirror_name`, and `would_annotate_canonical` without writing — verifiable preview before production. (Underlying hazard: UUID Parameter Discipline above.)
 
 ---
 

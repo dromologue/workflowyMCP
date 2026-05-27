@@ -43,6 +43,21 @@ pub fn parse_tags(text: &str) -> ParsedTags {
     ParsedTags { tags, assignees }
 }
 
+/// Whole-tag idempotency check: does `text` already carry `tag` as a complete
+/// tag (case-insensitive, leading `#` optional)?
+///
+/// Routes through `parse_tags` rather than a bare `name.contains("#tag")` so a
+/// shorter pillar tag is not silently shadowed by a longer existing tag —
+/// `text_contains_tag("#leadership", "lead")` returns false. The substring
+/// shape was the 2026-05-24 `bulk_tag` shadowing bug.
+pub fn text_contains_tag(text: &str, tag: &str) -> bool {
+    let needle = tag.trim_start_matches('#').to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    parse_tags(text).tags.iter().any(|t| t == &needle)
+}
+
 /// Parse tags from a node's name and description combined.
 pub fn parse_node_tags(node: &WorkflowyNode) -> ParsedTags {
     let mut combined = parse_tags(&node.name);
@@ -118,6 +133,26 @@ mod tests {
         let result = parse_tags("#follow-up @team-lead");
         assert_eq!(result.tags, vec!["follow-up"]);
         assert_eq!(result.assignees, vec!["team-lead"]);
+    }
+
+    #[test]
+    fn text_contains_tag_matches_whole_tag_not_substring() {
+        // Shadow check: shorter tag must not match longer existing tag.
+        assert!(!text_contains_tag("#leadership notes", "lead"));
+        assert!(!text_contains_tag("Working on #learning", "learn"));
+        assert!(!text_contains_tag("#transformation work", "transform"));
+        // Whole-tag presence is detected (leading # optional).
+        assert!(text_contains_tag("Note about #lead and follow", "lead"));
+        assert!(text_contains_tag("Note about #lead and follow", "#lead"));
+        // Case-insensitive match.
+        assert!(text_contains_tag("Note about #Lead", "lead"));
+        // Hyphen is a tag char, so `#lead` does not match `#lead-time`.
+        assert!(!text_contains_tag("Working on #lead-time", "lead"));
+        // Empty / missing tag.
+        assert!(!text_contains_tag("anything", ""));
+        assert!(!text_contains_tag("anything", "#"));
+        // Absent tag.
+        assert!(!text_contains_tag("just text", "anything"));
     }
 
     #[test]

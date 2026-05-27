@@ -330,6 +330,14 @@ enum Cmd {
         #[arg(long)]
         input: Option<String>,
     },
+    /// Batched reads (get_node | list_children | get_subtree). Reads JSON
+    /// array from `--input` (path) or stdin:
+    /// `[{"op":"get_node","node_id":"..."},{"op":"list_children","node_id":null},{"op":"get_subtree","node_id":"...","max_depth":5}]`.
+    /// Mirrors MCP `read_batch`.
+    ReadBatch {
+        #[arg(long)]
+        input: Option<String>,
+    },
     /// Sequential transaction with best-effort rollback. Reads JSON array
     /// from `--input` (path) or stdin. Mirrors MCP `transaction`.
     Transaction {
@@ -547,6 +555,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::BulkUpdate { .. } => "bulk-update",
         Cmd::BulkTag { .. } => "bulk-tag",
         Cmd::BatchCreate { .. } => "batch-create",
+        Cmd::ReadBatch { .. } => "read-batch",
         Cmd::Transaction { .. } => "transaction",
         Cmd::Export { .. } => "export",
         Cmd::HealthCheck => "health-check",
@@ -1645,6 +1654,113 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }))?
             );
         }
+        Cmd::ReadBatch { input } => {
+            // Surface-parity counterpart to MCP `read_batch`. Dispatches
+            // get_node / list_children / get_subtree per op, in input
+            // order, with per-op status. No host-encoding hazard on the
+            // CLI surface — the value here is wire-shape symmetry with
+            // the MCP tool so the same JSON payload runs against either.
+            let body = read_input_or_stdin(input.as_deref())?;
+            let ops_raw: Vec<serde_json::Value> = serde_json::from_str(&body)
+                .map_err(|e| format!("read-batch: input must be a JSON array — {}", e))?;
+            if ops_raw.is_empty() {
+                return Err("read-batch: operations must not be empty".into());
+            }
+            const VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+            let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ops_raw.len());
+            for (idx, raw) in ops_raw.iter().enumerate() {
+                let op_kind = raw["op"].as_str()
+                    .ok_or_else(|| format!("read-batch: operations[{}] missing string `op`", idx))?
+                    .to_string();
+                if !VALID_OPS.contains(&op_kind.as_str()) {
+                    return Err(format!(
+                        "read-batch: operations[{}].op = {:?}; expected one of {:?}",
+                        idx, op_kind, VALID_OPS
+                    ).into());
+                }
+                let node_id = raw["node_id"].as_str().map(String::from);
+                let max_depth = raw["max_depth"].as_u64().map(|d| d as usize);
+                if matches!(op_kind.as_str(), "get_node" | "get_subtree") && node_id.is_none() {
+                    return Err(format!(
+                        "read-batch: operations[{}].node_id required for op={}",
+                        idx, op_kind
+                    ).into());
+                }
+                let result: std::result::Result<serde_json::Value, String> = match op_kind.as_str() {
+                    "get_node" => {
+                        let id = node_id.as_deref().expect("validated");
+                        match client.get_node(id).await {
+                            Ok(n) => Ok(json!({"node": n})),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "list_children" => {
+                        let res = match node_id.as_deref() {
+                            Some(i) => client.get_children(i).await,
+                            None => client.get_top_level_nodes().await,
+                        };
+                        match res {
+                            Ok(children) => Ok(json!({"children": children})),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "get_subtree" => {
+                        let id = node_id.as_deref().expect("validated");
+                        let depth = max_depth.unwrap_or(5);
+                        let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
+                            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+                        ));
+                        match client
+                            .get_subtree_with_controls(Some(id), depth, defaults::MAX_SUBTREE_NODES, controls)
+                            .await
+                        {
+                            Ok(fetch) => Ok(json!({
+                                "nodes": fetch.nodes,
+                                "truncated": fetch.truncated,
+                                "truncation_limit": fetch.limit,
+                                "truncation_reason": fetch.truncation_reason.map(|r| r.as_str()),
+                            })),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    _ => unreachable!("validated above"),
+                };
+                let entry = match result {
+                    Ok(data) => {
+                        succeeded += 1;
+                        json!({
+                            "index": idx,
+                            "op": op_kind,
+                            "node_id": node_id,
+                            "ok": true,
+                            "data": data,
+                        })
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        json!({
+                            "index": idx,
+                            "op": op_kind,
+                            "node_id": node_id,
+                            "ok": false,
+                            "error": e,
+                        })
+                    }
+                };
+                entries.push(entry);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "total": entries.len(),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "results": entries,
+                }))?
+            );
+        }
         Cmd::Transaction { input } => {
             // Both sequential apply and best-effort rollback live in
             // `crate::workflows::run_transaction` — same code path the
@@ -2339,7 +2455,7 @@ mod tests {
             "recent-changes", "project-summary",
             // Bulk writes
             "insert", "smart-insert", "duplicate", "template",
-            "bulk-update", "bulk-tag", "batch-create", "transaction", "export",
+            "bulk-update", "bulk-tag", "batch-create", "read-batch", "transaction", "export",
             // Diagnostics
             "health-check", "cancel-all", "build-name-index", "recent-tools",
             // Existing diagnostics + index
@@ -2396,6 +2512,7 @@ mod tests {
             ("bulk_update", "bulk-update"),
             ("bulk_tag", "bulk-tag"),
             ("batch_create_nodes", "batch-create"),
+            ("read_batch", "read-batch"),
             ("transaction", "transaction"),
             ("export_subtree", "export"),
             ("audit_mirrors", "audit-mirrors"),

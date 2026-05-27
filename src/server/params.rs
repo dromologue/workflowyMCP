@@ -430,6 +430,30 @@ pub struct BatchCreateNodesParams {
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "One read operation in a read_batch call.")]
+pub struct ReadBatchOpParams {
+    #[schemars(description = "Operation kind: get_node | list_children | get_subtree")]
+    pub op: String,
+    /// Required for `get_node` and `get_subtree`. For `list_children` the
+    /// field is optional / nullable — omit (or pass `null`) to list the
+    /// workspace root's top-level nodes, matching the bare `list_children`
+    /// semantics.
+    #[schemars(description = "Target node ID (UUID or short hash). Required for get_node and get_subtree; optional for list_children (omit/null = workspace root).")]
+    pub node_id: Option<NodeId>,
+    #[schemars(description = "Maximum depth to traverse (get_subtree only; defaults to 5).")]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(description = "Run many reads in one call (get_node / list_children / get_subtree). Operations are dispatched in input order; results carry per-operation status. The operations-array wrapper inherits the same host-encoding resilience that batch_create_nodes already gives writes — a UUID inside an operation object survives the same hosts that strip bare-string node_id parameters.")]
+pub struct ReadBatchParams {
+    #[schemars(description = "List of read operations to apply, in order.")]
+    pub operations: Vec<ReadBatchOpParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "One operation inside a transaction. `op` is one of: create, edit, delete, move, complete, uncomplete.")]
 pub struct TransactionOpParams {
     #[schemars(description = "Operation kind: create | edit | delete | move | complete | uncomplete")]
