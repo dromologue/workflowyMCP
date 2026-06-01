@@ -391,6 +391,24 @@ If the MCP wedges mid-session (a write returns `Tool execution failed` and `work
 2. Save the in-flight plan as a markdown file in `$SECONDBRAIN_DIR/drafts/` with the date prefix and a clear "RESUME EXECUTION" header.
 3. Tell the user the next session will resume from the draft.
 
+#### Upstream rate-limiting (HTTP 429) runbook
+
+Distinct from a crashed server and from a transport-layer drop: here Workflowy is alive and authenticating fine but **throttling the account's quota**. In a bulk write session this is the single biggest time-sink, so treat it as a normal operating condition.
+
+- **Symptom.** Mid-session, every MCP call — read, write, even `workflowy_status` — stops returning and holds for the full client transport timeout (~4 minutes). It looks like a crashed server but is not.
+- **Diagnosis.** The moment a probe returns from cache, `workflowy_status` shows `degraded_kind: "rate_limited"` and a non-null `retry_after_remaining_ms` (and the error carries `429` + `retry_after`). `probe_suppressed: true` confirms the probe is short-circuiting on cached posture so it does not burn the very quota you are waiting to recover.
+- **Trip point.** Roughly the **third write-batch** in quick succession within one working window. Reads add pressure but writes dominate; a `transaction` of several ops counts as one batch.
+- **Recovery.** Wait real wall-clock time — about **90 seconds** reliably clears the window, and `retry_after_remaining_ms` counts it down. Do **not** poll `workflowy_status` during the window (the probe holds too). When it clears, `retry_after_remaining_ms` returns `null` and the first call goes straight through.
+- **Shared-bridge corollary.** Multiple MCP servers (Workflowy, Filesystem, and any others) share one local MCP client. A held Workflowy 429 call blocks that shared client, so calls to *other* servers queued behind it also time out — they are **not** independently broken. Local-file work proceeds fine *between* Workflowy calls; schedule notes, logs, and memory edits into the Workflowy cool-down gaps.
+- **Sustainable cadence.** A few small write batches, then a verify-read, then pause. One small batch per working turn is the safe rhythm once the limit is warm.
+
+#### The write ok-counter is not a commit signal
+
+`per_tool_health.<tool>.ok` (including `transaction.ok`) increments on **receipt** of the call at the server, **not** on durable commit. When a write's response is lost to a 429 hold, the operation **rolls back** but the counter has already advanced — and a `status: "applied"` returned just before a window closes is not sufficient on its own either.
+
+- A rising ok-count does **not** prove a write landed. **The only reliable confirmation that a mutation persisted is a live re-read of the node.** Make verify-after-write the discipline for any batch that ran near a rate-limit window.
+- This is why verify-before-reapply is safe: re-reading first means a rolled-back batch is reapplied exactly once and a landed batch is skipped — no double-apply risk.
+
 ---
 
 ## Memory file schemas

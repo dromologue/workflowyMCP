@@ -450,6 +450,29 @@ impl WorkflowyClient {
         self.stamp_rate_limited(retry_after_ms);
     }
 
+    /// Build the synthetic 429 returned when a call is short-circuited
+    /// inside an open `retry_after` window (no HTTP issued). Shared by the
+    /// two suppression sites — the diagnostic probe (`probe_top_level`)
+    /// and the request path (`request_cancellable`) — so the wire shape
+    /// (`status: 429` + a `{"error": ..., "retry_after": N}` body) cannot
+    /// drift between them. The `retry_after` is the *remaining* seconds in
+    /// the open window, so a caller parsing it waits the right amount.
+    /// `classify_degraded_kind` routes both the cached and live 429 paths
+    /// to `rate_limited` uniformly off this shape.
+    fn rate_limit_window_error(&self, posture: &RateLimitPosture, context: &str) -> WorkflowyError {
+        let remaining_secs = posture
+            .retry_after_remaining_ms
+            .map(|ms| ms.div_ceil(1000))
+            .unwrap_or(0);
+        WorkflowyError::ApiError {
+            status: 429,
+            message: format!(
+                "{{\"error\":\"rate limit exceeded ({context})\",\"retry_after\":{remaining_secs}}}"
+            ),
+            source: None,
+        }
+    }
+
     /// Snapshot of the most recent upstream rate-limit headers. Each field
     /// is `None` if Workflowy has not (yet) returned that header — callers
     /// must not assume the upstream sends them.
@@ -544,17 +567,10 @@ impl WorkflowyClient {
         // to `rate_limited` without special-casing the cached path.
         let posture = self.rate_limit_posture();
         if posture.in_retry_window {
-            let remaining_secs = posture
-                .retry_after_remaining_ms
-                .map(|ms| ms.div_ceil(1000))
-                .unwrap_or(0);
-            return Err(WorkflowyError::ApiError {
-                status: 429,
-                message: format!(
-                    "{{\"error\":\"rate limit exceeded (cached — probe suppressed inside open retry_after window)\",\"retry_after\":{remaining_secs}}}"
-                ),
-                source: None,
-            });
+            return Err(self.rate_limit_window_error(
+                &posture,
+                "cached — probe suppressed inside open retry_after window",
+            ));
         }
         let response: serde_json::Value = self
             .try_request_cancellable("GET", "/nodes", &None, None, deadline)
@@ -1336,6 +1352,26 @@ impl WorkflowyClient {
         cancel: Option<&CancelGuard>,
         deadline: Option<Instant>,
     ) -> Result<T> {
+        // Fail-fast inside an open retry_after window. Pre-2026-06-01 a
+        // call (read or write) issued while the upstream's 429 window was
+        // still open queued behind the rate limiter and held for the full
+        // MCP transport timeout (~4 min) before returning "no result" —
+        // the single biggest time-sink in a bulk write session, and
+        // indistinguishable from a crashed server. Short-circuit with the
+        // same synthetic 429 the diagnostic probe uses so the caller gets
+        // a structured rate-limit error (carrying the remaining
+        // retry_after) within microseconds and can wait the window out
+        // instead of hanging. The probe path bypasses this (it calls
+        // try_request_cancellable directly) and owns its own suppression,
+        // so the two don't double-fire. WHY: 2026-06-01 429-storm session.
+        let posture = self.rate_limit_posture();
+        if posture.in_retry_window {
+            return Err(self.rate_limit_window_error(
+                &posture,
+                "request suppressed inside open retry_after window",
+            ));
+        }
+
         let mut attempt = 0;
 
         loop {

@@ -490,11 +490,37 @@ macro_rules! tool_handler {
         let __result: Result<CallToolResult, McpError> =
             $self.run_handler($tool, $kind, __fut).await;
         match &__result {
+            // A success-shaped result flagged `is_error: true` means the
+            // handler ran to completion but the *operation* did not
+            // succeed — the canonical case is a `transaction` that rolled
+            // back (rollback path completed, nothing durably committed).
+            // Record it as a failure so `per_tool_health.<tool>.ok`
+            // counts durable commits only and never implies a write
+            // landed when it rolled back. WHY: 2026-06-01 429-storm
+            // session — a rising transaction.ok counter masked rolled-
+            // back batches and the assistant re-applied writes it
+            // thought had failed.
+            Ok(r) if r.is_error == Some(true) => __recorder.finish_err(op_err_summary(r)),
             Ok(_) => __recorder.finish_ok(),
             Err(e) => __recorder.finish_err(e.to_string()),
         }
         __result
     }};
+}
+
+/// Concise op-log error summary for a success-shaped [`CallToolResult`]
+/// that carries `is_error: true`. Pulls the first text content (the
+/// operation's own envelope, e.g. a transaction's `rolled_back` payload)
+/// so the op log records *why* the operation did not commit; falls back
+/// to a fixed label when there is no text content. `finish_err` truncates
+/// the result to the op-log's `MAX_ERROR_LEN`, so a large envelope is
+/// safe to pass through verbatim.
+fn op_err_summary(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .unwrap_or_else(|| "operation reported is_error".to_string())
 }
 
 /// Validate a node_id parameter, returning McpError on failure. The
@@ -4119,7 +4145,23 @@ impl WorkflowyMcpServer {
                     format!("failed to serialise outcome: {e}"),
                 )
             })?;
-            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            let content = vec![Content::text(payload.to_string())];
+            // A rolled-back transaction completed its rollback path but
+            // durably committed nothing. Flag is_error:true so (a) MCP
+            // clients see the operation as unsuccessful while still
+            // receiving the full rollback envelope as content, and (b)
+            // tool_handler! records the op-log entry as a non-commit, so
+            // per_tool_health.transaction.ok stays commit-accurate. WHY:
+            // 2026-06-01 429-storm — the ok counter must not imply a write
+            // landed when it rolled back. The handler still returns Ok at
+            // the Rust level (rollback is part of the contract, not a
+            // protocol error), so `transaction_rejects_unknown_op_kind`'s
+            // Ok-with-rolled-back-payload expectation holds.
+            if matches!(&outcome, crate::workflows::TransactionOutcome::RolledBack { .. }) {
+                Ok(CallToolResult::error(content))
+            } else {
+                Ok(CallToolResult::success(content))
+            }
         })
     }
 
@@ -7591,6 +7633,72 @@ mod tests {
         assert!(body.contains("frobnicate"), "expected error to mention bad op: {body}");
     }
 
+    /// A rolled-back transaction is a non-commit: it must be flagged
+    /// `is_error: true` on the wire AND recorded as `Err` in the op log,
+    /// so `per_tool_health.transaction.ok` counts durable commits only.
+    /// Pinned because the 2026-06-01 429-storm session showed the ok
+    /// counter advancing on transactions that rolled back under a 429 —
+    /// the rising count made the assistant believe writes had landed when
+    /// nothing committed, causing real rework. The handler still returns
+    /// Ok at the Rust level (rollback is part of the contract), so the
+    /// caller still receives the full rollback envelope as content.
+    #[tokio::test]
+    async fn rolled_back_transaction_records_as_noncommit_not_ok() {
+        let server = new_test_server();
+        let result = server
+            .transaction(Parameters(TransactionParams {
+                operations: vec![TransactionOpParams {
+                    op: "frobnicate".to_string(),
+                    node_id: None,
+                    parent_id: None,
+                    new_parent_id: None,
+                    name: None,
+                    description: None,
+                    priority: None,
+                }],
+            }))
+            .await
+            .expect("handler returns Ok with rolled-back payload");
+
+        // Wire surface: is_error:true so MCP clients see the operation as
+        // unsuccessful, while the rollback envelope still rides as content.
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a rolled-back transaction must be flagged is_error:true",
+        );
+        assert!(result_text(&result).contains("rolled_back"));
+
+        // Op log: recorded as a failure, so the ok counter stays
+        // commit-accurate.
+        let entries = server.op_log.recent(10, None);
+        let txn = entries
+            .iter()
+            .find(|e| e.tool == "transaction")
+            .expect("transaction op must be recorded");
+        assert_eq!(
+            txn.status,
+            crate::utils::OpStatus::Err,
+            "a rolled-back transaction (no durable commit) must record as Err, not Ok, \
+             so per_tool_health.transaction.ok cannot imply a write landed when it rolled back",
+        );
+    }
+
+    /// Grep pin: `tool_handler!` must record a success-shaped result
+    /// flagged `is_error: true` as `finish_err`, not `finish_ok`. This is
+    /// what makes `per_tool_health.<tool>.ok` commit-accurate for
+    /// transactions (and any future handler that returns is_error:true).
+    /// Regressing it re-opens the 2026-06-01 trap where the ok counter
+    /// masked rolled-back batches.
+    #[test]
+    fn tool_handler_records_is_error_true_results_as_finish_err() {
+        let src = include_str!("mod.rs");
+        assert!(
+            src.contains("Ok(r) if r.is_error == Some(true) => __recorder.finish_err(op_err_summary(r))"),
+            "tool_handler! must map an is_error:true result to finish_err so per_tool_health.ok counts durable commits only (2026-06-01 429-storm)",
+        );
+    }
+
     #[tokio::test]
     async fn cancel_registry_flips_guards_held_by_walk_controls() {
         let server = new_test_server();
@@ -10534,6 +10642,81 @@ mod load_tests {
             elapsed < Duration::from_millis(50),
             "suppressed probe must return immediately; took {:?} — confirms no HTTP request was issued",
             elapsed,
+        );
+    }
+
+    /// The request path (`request_cancellable`) fails fast inside an open
+    /// retry_after window instead of queuing behind the rate limiter and
+    /// holding for the full MCP transport timeout. Pinned because the
+    /// 2026-06-01 429-storm session showed a write issued inside the
+    /// window held ~4 minutes before returning "no result" — the single
+    /// biggest time-sink in a bulk session and indistinguishable from a
+    /// crashed server. The assertion mirrors the probe-suppression test:
+    /// against an unreachable upstream a real attempt would block on
+    /// connect for the whole deadline, so a sub-50 ms return proves the
+    /// short-circuit fired before any HTTP request. The error carries the
+    /// 429 + retry_after shape so the caller can branch on it.
+    #[tokio::test]
+    async fn request_path_fails_fast_inside_retry_window() {
+        use crate::api::WorkflowyClient;
+        use crate::config::{RateLimitConfig, RetryConfig};
+
+        let client = WorkflowyClient::new_with_configs(
+            "http://127.0.0.1:1/".to_string(),
+            "test".to_string(),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+                retryable_statuses: &[429, 500],
+            },
+            RateLimitConfig { requests_per_second: 200, burst_size: 100 },
+        )
+        .expect("client builds");
+
+        client._test_stamp_rate_limited(Some(60_000));
+
+        // get_node routes through request_cancellable; a real attempt
+        // would block on connect to the unreachable address.
+        let started = Instant::now();
+        let res = client.get_node("11111111-1111-1111-1111-111111111111").await;
+        let elapsed = started.elapsed();
+
+        match res {
+            Err(WorkflowyError::ApiError { status: 429, ref message, .. }) => {
+                assert!(
+                    message.contains("retry_after"),
+                    "suppressed request must carry retry_after hint: {message}",
+                );
+            }
+            other => panic!("expected synthetic 429 from suppressed request path, got {:?}", other),
+        }
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "request inside open window must fail fast; took {:?} — confirms no HTTP request was issued and no 4-min hold",
+            elapsed,
+        );
+    }
+
+    /// Grep pin: `request_cancellable` must short-circuit on
+    /// `in_retry_window` before entering its retry loop. Without this the
+    /// fail-fast regresses to the 4-minute hold the 2026-06-01 session hit.
+    #[test]
+    fn request_cancellable_short_circuits_inside_retry_window() {
+        let src = include_str!("../api/client.rs");
+        // Locate the request_cancellable body and confirm the preflight
+        // check appears before the `let mut attempt` loop entry.
+        let fn_start = src
+            .find("pub async fn request_cancellable")
+            .expect("request_cancellable must exist");
+        let loop_start = src[fn_start..]
+            .find("let mut attempt = 0;")
+            .expect("request_cancellable must have its retry loop")
+            + fn_start;
+        let preflight = &src[fn_start..loop_start];
+        assert!(
+            preflight.contains("posture.in_retry_window") && preflight.contains("rate_limit_window_error"),
+            "request_cancellable must fail fast via rate_limit_window_error inside an open retry_after window, BEFORE the retry loop — else a call issued inside the window holds for the full transport timeout (2026-06-01 429-storm)",
         );
     }
 
