@@ -531,6 +531,39 @@ divergent step on each surface and lift only the step that doesn't
 diverge. The lift goal is "no duplicate logic", not "one function for
 everything".
 
+**2026-06-16 cross-surface reuse pass.** A full MCP↔CLI audit found the
+project had lifted every footprint-bearing orchestration but left the
+*read-and-filter predicates* and two write orchestrations un-lifted, and
+those had silently drifted. The pass closed them:
+
+- **Mutating lifts** (`workflows.rs`): `duplicate_subtree` + `instantiate_template`,
+  sharing one private `deep_copy_subtree(client, source, target, transform, ctx)`
+  helper (a per-node `Fn(&WorkflowyNode) -> (String, Option<String>)` closure is
+  the only thing that differs between deep-copy and template-instantiate — the
+  BFS walk, truncation refusal, and footprint are shared). `walk_parent_chain`
+  (cycle-guarded parent walk for `path_of`). Pinned by
+  `duplicate_and_template_route_through_workflows`.
+- **Pure predicate helpers** (`utils/`): `tag_parser::node_has_tag`,
+  `tag_parser::add_tag_to_name` / `remove_tag_from_name`,
+  `link_parser::node_links_to`, `html::strip_html`,
+  `aggregation::filter_bulk_candidates`. Each replaced a pair of
+  divergent inline copies; two were correctness bugs (CLI `bulk-tag`
+  had no idempotency; MCP tag-search used a substring scan that shadowed
+  longer tags). Routing pinned by `read_predicates_route_through_shared_helpers`.
+- **Shared constants** (`defaults.rs`): `READ_BATCH_VALID_OPS`,
+  `BULK_UPDATE_VALID_OPS`, `SECONDS_PER_DAY`, `DEFAULT_REVIEW_ROOT` —
+  previously hand-written inline in both binaries.
+
+The pass deliberately did NOT touch three flagged items, on Principle-7
+grounds (the simplest design that satisfies the contract): the CLI's
+`classify()` error-cause stringifier (cosmetic stderr label; sharing it
+needs a net-new string-classifier, not reuse of an existing one), the
+byte-identical `PartialReason` / `ReorderPartialReason` enums (6 lines,
+serialise-identical, split documented by outcome), and a per-node regex
+recompile inside `apply_bulk_op` (the single-source `remove_tag_from_name`
+helper is preferable to threading a precompiled regex). Recorded as
+deferred follow-ups in `tasks/todo.local.md`.
+
 ---
 
 ## Anti-Patterns to Avoid

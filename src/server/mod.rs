@@ -15,10 +15,9 @@ use rmcp::{
     transport::stdio,
 };
 use chrono::Utc;
-use regex::Regex;
 // `serde::Deserialize` moved to params.rs along with the param structs.
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tracing::{error, info, warn};
 
 use crate::api::{BatchCreateOp, FetchControls, SubtreeFetch, TruncationReason, WorkflowyClient};
@@ -32,7 +31,7 @@ use crate::utils::name_index::NameIndex;
 use crate::utils::node_paths::{build_node_path_with_map, build_node_map};
 use crate::utils::op_log::OpLog;
 use crate::utils::subtree::{is_todo, is_completed};
-use crate::utils::tag_parser::parse_node_tags;
+use crate::utils::tag_parser::node_has_tag;
 use crate::validation::validate_node_id;
 use std::time::{Duration, Instant};
 
@@ -403,7 +402,7 @@ fn load_recent_session_logs_blob_for_review() -> String {
     if !dir.exists() {
         return String::new();
     }
-    let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
+    let cutoff = chrono::Utc::now().timestamp() - 7 * defaults::SECONDS_PER_DAY;
     let mut blob = String::new();
     if let Ok(read) = std::fs::read_dir(&dir) {
         for ent in read.flatten() {
@@ -639,13 +638,12 @@ struct ProbeOutcome {
 /// against children's names. Compiles the pattern once per call —
 /// good enough since these paths are short, but if it shows up in a
 /// hot loop, hoist into a `OnceLock`.
-fn strip_html(s: &str) -> String {
-    let re = match regex::Regex::new(r"<[^>]+>") {
-        Ok(r) => r,
-        Err(_) => return s.to_string(),
-    };
-    re.replace_all(s, "").to_string()
-}
+// Canonical HTML stripper lives in `utils::html` so the server and the
+// lifted `resolve_link` builder (and the CLI through it) share one
+// implementation — pre-2026-06-16 `resolve_link` had a char-scanner copy
+// that diverged on an unterminated `<`. Re-exported under the local name
+// so the existing call sites read unchanged.
+use crate::utils::html::strip_html;
 
 /// Result of an on-demand short-hash resolution walk. Carries enough
 /// signal for the resolver to distinguish "walked the whole tree, the
@@ -1938,16 +1936,20 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Create a new node in Workflowy. PREFER passing `parent_id` directly to the destination over the create-then-move pattern: a single create with parent_id has half the failure surface of create-at-root + move (verified 2026-04-25 — a created-at-root MOC was stranded for hours when follow-up move calls were dropped at the transport layer). Pattern 6d (brief 2026-04-25): omitting parent_id (or passing null) places the node at the workspace root — both have the same semantics. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves. When reads/mutations have failed in the last 30 s the success message is suffixed `⚠ DEGRADED: …` — do NOT chain follow-up writes on the new UUID until `workflowy_status` confirms the previously-failing tool is back to `healthy`.")]
+    #[tool(description = "Create a new node in Workflowy. PREFER passing `parent_id` directly to the destination over the create-then-move pattern: a single create with parent_id has half the failure surface of create-at-root + move (verified 2026-04-25 — a created-at-root MOC was stranded for hours when follow-up move calls were dropped at the transport layer). `parent_id` is REQUIRED (2026-06-16 hardening): pass the destination UUID/short-hash, or the empty string \"\" for the deliberate workspace-root choice. Omitting it or passing null is REJECTED with a field-named error — the old null/omit-means-root affordance was retired because a host that stripped or coerced the parameter could silently strand a write at the root. The success message always names the resolved parent (or 'workspace root') so the caller can audit placement before issuing follow-up moves. When reads/mutations have failed in the last 30 s the success message is suffixed `⚠ DEGRADED: …` — do NOT chain follow-up writes on the new UUID until `workflowy_status` confirms the previously-failing tool is back to `healthy`.")]
     async fn create_node(
         &self,
         Parameters(params): Parameters<CreateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "create_node", ToolKind::Write, params, {
-        info!(name = %params.name, parent = ?params.parent_id, "Creating node");
-        let resolved_parent = match &params.parent_id {
-            Some(pid) => Some(self.validate_and_resolve(pid).await?),
-            None => None,
+        info!(name = %params.name, parent = %params.parent_id, "Creating node");
+        // `parent_id` is a required NodeId (2026-06-16 hardening): omit/null
+        // were rejected at the wire. The empty-string sentinel `""` is the
+        // explicit "workspace root" choice; anything else resolves.
+        let resolved_parent = if params.parent_id.is_empty() {
+            None
+        } else {
+            Some(self.validate_and_resolve(&params.parent_id).await?)
         };
 
         // Brief 2026-04-25 Test β: fail-closed semantics. When reads
@@ -1977,7 +1979,7 @@ impl WorkflowyMcpServer {
                 let placement = resolved_parent
                     .as_deref()
                     .map(|p| format!("under `{}`", p))
-                    .unwrap_or_else(|| "at workspace root (no parent_id supplied)".to_string());
+                    .unwrap_or_else(|| "at workspace root (parent_id=\"\")".to_string());
                 let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 let mut msg = format!(
                     "scope_resolved: {}\n\nCreated node '{}' (id: `{}`) {}",
@@ -2050,6 +2052,32 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "delete_node", ToolKind::Write, params, {
         info!(node_id = %params.node_id, "Deleting node");
         let resolved = self.validate_and_resolve(&params.node_id).await?;
+
+        // Name-echo guard (host-coercion defence). When the caller supplies
+        // `expect_name`, fetch the resolved node and refuse the delete unless
+        // its current name matches. A host that coerced a null/placeholder
+        // `node_id` into a plausible-but-unintended UUID lands on a node whose
+        // name won't match the echo — so the irreversible delete is refused
+        // with a structured validation error instead of destroying the wrong
+        // node. Performed BEFORE cache invalidation so a refused delete leaves
+        // no side effect. Shared comparison: `workflows::destructive_echo_matches`.
+        if let Some(expected) = params.expect_name.as_deref() {
+            let current = self
+                .client
+                .get_node_with_propagation_retry(&resolved)
+                .await
+                .map_err(|e| tool_error("delete_node", Some(&resolved), e))?;
+            if !crate::workflows::destructive_echo_matches(&current.name, expected) {
+                return Err(tool_invalid_params(
+                    "delete_node",
+                    Some(&resolved),
+                    format!(
+                        "delete refused: node is named {:?} but expect_name was {:?} — the node_id may have been coerced to a different node than intended; re-resolve and confirm before retrying",
+                        current.name, expected
+                    ),
+                ));
+            }
+        }
 
         // Pre-call invalidation — see invalidate_for_mutation docs.
         self.invalidate_for_mutation(&[&resolved]);
@@ -2214,23 +2242,13 @@ impl WorkflowyMcpServer {
         match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
             Ok(fetch) => {
                 let banner = truncation_banner_from_fetch(&fetch);
-                let tag_lower = params.tag.to_lowercase();
+                // Whole-tag match via the shared `node_has_tag` predicate:
+                // `#lead` must not match `#leadership`. Pre-2026-06-16 this
+                // used a `to_lowercase().contains` substring scan that
+                // shadowed shorter tags.
                 let mut results: Vec<&WorkflowyNode> = fetch.nodes
                     .iter()
-                    .filter(|n| {
-                        let in_name = n.name.to_lowercase().contains(&tag_lower);
-                        let in_desc = n
-                            .description
-                            .as_ref()
-                            .map(|d| d.to_lowercase().contains(&tag_lower))
-                            .unwrap_or(false);
-                        let in_tags = n
-                            .tags
-                            .as_ref()
-                            .map(|tags| tags.iter().any(|t| t.to_lowercase().contains(&tag_lower)))
-                            .unwrap_or(false);
-                        in_name || in_desc || in_tags
-                    })
+                    .filter(|n| node_has_tag(n, &params.tag))
                     .collect();
 
                 results.truncate(max_results);
@@ -2275,12 +2293,14 @@ impl WorkflowyMcpServer {
         // imposing the outer wall-clock arm; the inline checks are the
         // primary AND only safety net here.
         record_op!(self, "insert_content", params, {
-        // None / null = workspace root. The schema accepts both
-        // shapes; the workflow accepts an `Option<&str>` parent so
-        // both surfaces share the same root semantics.
-        let resolved_parent: Option<String> = match params.parent_id.as_deref() {
-            None | Some("") => None,
-            Some(id) => Some(self.validate_and_resolve(id).await?),
+        // `parent_id` is a required NodeId (2026-06-16 hardening): omit/null
+        // rejected at the wire. The empty-string sentinel `""` is the
+        // explicit "workspace root" choice; the workflow takes an
+        // `Option<&str>` parent so `None` = root downstream.
+        let resolved_parent: Option<String> = if params.parent_id.is_empty() {
+            None
+        } else {
+            Some(self.validate_and_resolve(&params.parent_id).await?)
         };
         info!(parent_id = ?resolved_parent, "Inserting content");
         let parent_label: String = resolved_parent
@@ -2965,19 +2985,33 @@ impl WorkflowyMcpServer {
                 let target = node_map.get(resolved.as_str());
                 let target_name = target.map(|n| n.name.as_str()).unwrap_or("unknown");
 
-                // Match workflowy.com links containing the target node ID.
-                // `regex::escape` guarantees a valid pattern, so the Regex::new
-                // call below cannot fail.
-                let link_re = Regex::new(&format!(
-                    r"https?://workflowy\.com/#/{}",
-                    regex::escape(&resolved)
-                )).expect("escaped pattern is always valid regex");
-
+                // Backlink match via the shared `node_links_to` predicate
+                // — the UNION of "canonical workflowy.com/#/<uuid> link"
+                // and "bare 12-char trailing short hash". Pre-2026-06-16
+                // the MCP matched the full URL only (regex) while the CLI
+                // did a bare substring scan; both now share this predicate.
+                // Per-field probes so the response can report which field
+                // carried the link (`name` / `note` / `both`). Each probe
+                // routes through the shared `node_links_to` predicate
+                // against a synthetic single-field node so the match logic
+                // (URL ∪ short-hash) is identical to the CLI.
+                let links_to = |name: &str, desc: Option<&str>| {
+                    crate::utils::link_parser::node_links_to(
+                        &WorkflowyNode {
+                            name: name.to_string(),
+                            description: desc.map(str::to_string),
+                            ..WorkflowyNode::default()
+                        },
+                        &resolved,
+                    )
+                };
                 let mut backlinks: Vec<serde_json::Value> = Vec::new();
                 for node in &nodes {
                     if node.id == resolved { continue; }
-                    let in_name = link_re.is_match(&node.name);
-                    let in_desc = node.description.as_ref().map(|d| link_re.is_match(d)).unwrap_or(false);
+                    let in_name = links_to(&node.name, None);
+                    let in_desc = node.description.as_deref()
+                        .map(|d| links_to("", Some(d)))
+                        .unwrap_or(false);
                     if in_name || in_desc {
                         let path = build_node_path_with_map(&node.id, &node_map);
                         let link_in = match (in_name, in_desc) {
@@ -3058,105 +3092,32 @@ impl WorkflowyMcpServer {
         let include_children = params.include_children.unwrap_or(true);
         info!(node_id = %resolved_node, target = %resolved_target, "Duplicating node");
 
-        match self.walk_subtree(Some(&resolved_node), 10).await {
-            // duplicate_node refuses truncated input outright (producing a
-            // partial copy is worse than failing), so the truncation
-            // surface never reaches the JSON response — destructure
-            // matches that contract.
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
-                if truncated {
-                    return Err(tool_invalid_params(
-                        "duplicate_node",
-                        Some(params.node_id.as_str()),
-                        format!(
-                            "Cannot duplicate: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
-                            node_limit
-                        ),
-                    ));
-                }
-                let subtree: Vec<&WorkflowyNode> = if include_children {
-                    all_nodes.iter().collect()
-                } else {
-                    all_nodes.iter().filter(|n| n.id == resolved_node).collect()
-                };
+        // Orchestration lives in the shared workflow so the MCP handler
+        // and the `wflow-do duplicate` subcommand cannot drift (BFS
+        // ordering, truncated-subtree refusal, name_prefix). The wrapper
+        // applies the footprint + translates errors; the typed outcome
+        // projects into the historical JSON shape below.
+        let cancel_guard = self.cancel_registry.guard();
+        let ctx = crate::workflows::WorkflowContext::new(Some(&cancel_guard), None);
+        let (outcome, footprint) = crate::workflows::duplicate_subtree(
+            &self.client,
+            &resolved_node,
+            &resolved_target,
+            include_children,
+            params.name_prefix.as_deref(),
+            &ctx,
+        )
+        .await
+        .map_err(|e| workflow_error_to_mcp("duplicate_node", Some(&resolved_node), e))?;
+        self.apply_footprint(&footprint);
 
-                if subtree.is_empty() {
-                    return Err(tool_invalid_params(
-                        "duplicate_node",
-                        Some(params.node_id.as_str()),
-                        format!("Node '{}' not found", params.node_id),
-                    ));
-                }
-
-                // Build depth-first ordering from subtree
-                let mut id_map: HashMap<String, String> = HashMap::new();
-                let mut created_count = 0;
-
-                // Process root first
-                let root = subtree.iter().find(|n| n.id == resolved_node).unwrap();
-                let root_name = if let Some(prefix) = &params.name_prefix {
-                    format!("{}{}", prefix, root.name)
-                } else {
-                    root.name.clone()
-                };
-
-                match self.client.create_node(&root_name, root.description.as_deref(), Some(&resolved_target), None).await {
-                    Ok(created) => {
-                        id_map.insert(root.id.clone(), created.id.clone());
-                        created_count += 1;
-
-                        // Process children in order
-                        if include_children {
-                            // Build children-of map for ordering
-                            let mut children_of: HashMap<&str, Vec<&WorkflowyNode>> = HashMap::new();
-                            for n in &subtree {
-                                if let Some(pid) = &n.parent_id {
-                                    children_of.entry(pid.as_str()).or_default().push(n);
-                                }
-                            }
-
-                            // BFS to maintain tree order
-                            let mut queue = std::collections::VecDeque::new();
-                            if let Some(children) = children_of.get(root.id.as_str()) {
-                                for child in children { queue.push_back(*child); }
-                            }
-
-                            while let Some(node) = queue.pop_front() {
-                                let new_parent = node.parent_id.as_ref()
-                                    .and_then(|pid| id_map.get(pid))
-                                    .cloned()
-                                    .unwrap_or_else(|| created.id.clone());
-
-                                match self.client.create_node(&node.name, node.description.as_deref(), Some(&new_parent), None).await {
-                                    Ok(new_node) => {
-                                        id_map.insert(node.id.clone(), new_node.id.clone());
-                                        created_count += 1;
-                                        if let Some(children) = children_of.get(node.id.as_str()) {
-                                            for child in children { queue.push_back(*child); }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to duplicate child node");
-                                        return Err(tool_error("duplicate_node", Some(&resolved_node), format!("duplicating child: {}", e)));
-                                    }
-                                }
-                            }
-                        }
-
-                        self.cache.invalidate_node(&resolved_target);
-                        let result = json!({
-                            "success": true,
-                            "original_id": resolved_node,
-                            "new_root_id": created.id,
-                            "nodes_created": created_count
-                        });
-                        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
-                    }
-                    Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
-                }
-            }
-            Err(e) => Err(tool_error("duplicate_node", Some(&resolved_node), e)),
-        }
+        let result = json!({
+            "success": true,
+            "original_id": outcome.original_id,
+            "new_root_id": outcome.new_root_id,
+            "nodes_created": outcome.nodes_created,
+        });
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
         })
     }
 
@@ -3172,99 +3133,31 @@ impl WorkflowyMcpServer {
         let vars = params.variables.unwrap_or_default();
         info!(template = %resolved_template, "Creating from template");
 
-        let var_re = Regex::new(r"\{\{(\w+)\}\}").expect("static template-variable pattern is valid");
-        let substitute = |text: &str| -> String {
-            var_re.replace_all(text, |caps: &regex::Captures| {
-                vars.get(&caps[1]).cloned().unwrap_or_else(|| caps[0].to_string())
-            }).to_string()
-        };
+        // Orchestration (BFS copy, regex `{{var}}` substitution with
+        // unmatched-variable passthrough, truncated-subtree refusal)
+        // lives in the shared workflow so the MCP handler and the
+        // `wflow-do template` subcommand cannot drift.
+        let cancel_guard = self.cancel_registry.guard();
+        let ctx = crate::workflows::WorkflowContext::new(Some(&cancel_guard), None);
+        let (outcome, footprint) = crate::workflows::instantiate_template(
+            &self.client,
+            &resolved_template,
+            &resolved_target,
+            &vars,
+            &ctx,
+        )
+        .await
+        .map_err(|e| workflow_error_to_mcp("create_from_template", Some(&resolved_template), e))?;
+        self.apply_footprint(&footprint);
 
-        match self.walk_subtree(Some(&resolved_template), 10).await {
-            // create_from_template refuses truncated input — same contract
-            // as duplicate_node, no JSON-truncation fields reach the
-            // response.
-            Ok(SubtreeFetch { nodes: all_nodes, truncated, limit: node_limit, .. }) => {
-                if truncated {
-                    return Err(tool_invalid_params(
-                        "create_from_template",
-                        Some(params.template_node_id.as_str()),
-                        format!(
-                            "Cannot instantiate template: source subtree exceeds {} nodes. Refusing to produce a partial copy.",
-                            node_limit
-                        ),
-                    ));
-                }
-                let subtree: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-                if subtree.is_empty() {
-                    return Err(tool_invalid_params(
-                        "create_from_template",
-                        Some(params.template_node_id.as_str()),
-                        format!("Template '{}' not found", params.template_node_id),
-                    ));
-                }
-
-                let mut id_map: HashMap<String, String> = HashMap::new();
-                let mut created_count = 0;
-                let applied_vars: Vec<&String> = vars.keys().collect();
-
-                let root = subtree.iter().find(|n| n.id == resolved_template).unwrap();
-                let root_name = substitute(&root.name);
-                let root_desc = root.description.as_ref().map(|d| substitute(d));
-
-                match self.client.create_node(&root_name, root_desc.as_deref(), Some(&resolved_target), None).await {
-                    Ok(created) => {
-                        let new_root_id = created.id.clone();
-                        id_map.insert(root.id.clone(), created.id);
-                        created_count += 1;
-
-                        let mut children_of: HashMap<&str, Vec<&WorkflowyNode>> = HashMap::new();
-                        for n in &subtree {
-                            if let Some(pid) = &n.parent_id {
-                                children_of.entry(pid.as_str()).or_default().push(n);
-                            }
-                        }
-
-                        let mut queue = std::collections::VecDeque::new();
-                        if let Some(children) = children_of.get(root.id.as_str()) {
-                            for child in children { queue.push_back(*child); }
-                        }
-
-                        while let Some(node) = queue.pop_front() {
-                            let new_parent = node.parent_id.as_ref()
-                                .and_then(|pid| id_map.get(pid))
-                                .cloned()
-                                .unwrap_or_else(|| new_root_id.clone());
-
-                            let name = substitute(&node.name);
-                            let desc = node.description.as_ref().map(|d| substitute(d));
-
-                            match self.client.create_node(&name, desc.as_deref(), Some(&new_parent), None).await {
-                                Ok(new_node) => {
-                                    id_map.insert(node.id.clone(), new_node.id);
-                                    created_count += 1;
-                                    if let Some(children) = children_of.get(node.id.as_str()) {
-                                        for child in children { queue.push_back(*child); }
-                                    }
-                                }
-                                Err(e) => return Err(tool_error("create_from_template", Some(&resolved_template), format!("instantiating child: {}", e))),
-                            }
-                        }
-
-                        self.cache.invalidate_node(&resolved_target);
-                        let result = json!({
-                            "success": true,
-                            "template_id": resolved_template,
-                            "new_root_id": new_root_id,
-                            "nodes_created": created_count,
-                            "variables_applied": applied_vars
-                        });
-                        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
-                    }
-                    Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
-                }
-            }
-            Err(e) => Err(tool_error("create_from_template", Some(&resolved_template), e)),
-        }
+        let result = json!({
+            "success": true,
+            "template_id": outcome.template_id,
+            "new_root_id": outcome.new_root_id,
+            "nodes_created": outcome.nodes_created,
+            "variables_applied": outcome.variables_applied,
+        });
+        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
         })
     }
 
@@ -3290,14 +3183,13 @@ impl WorkflowyMcpServer {
         // ops once the apply step starts.
         let bulk_op = crate::workflows::BulkOp::parse(&params.operation)
             .ok_or_else(|| {
-                let valid = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
                 tool_invalid_params(
                     "bulk_update",
                     None,
                     format!(
                         "Invalid operation '{}'. Must be one of: {}",
                         params.operation,
-                        valid.join(", "),
+                        defaults::BULK_UPDATE_VALID_OPS.join(", "),
                     ),
                 )
             })?;
@@ -3325,34 +3217,22 @@ impl WorkflowyMcpServer {
                     ));
                 }
 
-                let candidates: Vec<&WorkflowyNode> = all_nodes.iter().collect();
-
                 let node_map = build_node_map(&all_nodes);
-                let query_lower = params.query.as_ref().map(|q| q.to_lowercase());
-                let tag_lower = params.tag.as_ref().map(|t| {
-                    let t = t.trim_start_matches('#');
-                    t.to_lowercase()
-                });
 
-                // Filter
-                let matched: Vec<&WorkflowyNode> = candidates.into_iter().filter(|n| {
-                    if let Some(q) = &query_lower {
-                        let in_name = n.name.to_lowercase().contains(q);
-                        let in_desc = n.description.as_ref().map(|d| d.to_lowercase().contains(q)).unwrap_or(false);
-                        if !in_name && !in_desc { return false; }
-                    }
-                    if let Some(tag) = &tag_lower {
-                        let parsed = parse_node_tags(n);
-                        if !parsed.tags.iter().any(|t| t == tag) { return false; }
-                    }
-                    let completed = is_completed(n);
-                    match status {
-                        "pending" if completed => return false,
-                        "completed" if !completed => return false,
-                        _ => {}
-                    }
-                    true
-                }).collect();
+                // Candidate selection is shared with the `wflow-do
+                // bulk-update` subcommand via `filter_bulk_candidates`
+                // (query + whole-tag + status). We pass `usize::MAX` so
+                // the over-limit case becomes the structured error below
+                // rather than a silent `take` — the MCP surface tells the
+                // caller to narrow, while the CLI applies its own `--limit`
+                // as a cap.
+                let matched: Vec<&WorkflowyNode> = crate::utils::aggregation::filter_bulk_candidates(
+                    &all_nodes,
+                    params.query.as_deref(),
+                    params.tag.as_deref(),
+                    status,
+                    usize::MAX,
+                );
 
                 if matched.len() > limit {
                     return Err(tool_invalid_params(
@@ -3843,8 +3723,10 @@ impl WorkflowyMcpServer {
         // Validate every node id eagerly so we don't waste round-trips
         // on a known-bad batch.
         for op in &params.operations {
-            if let Some(pid) = &op.parent_id {
-                check_node_id(pid)?;
+            // `parent_id` is a required NodeId; `""` is the explicit
+            // workspace-root sentinel (skip UUID-shape validation for it).
+            if !op.parent_id.is_empty() {
+                check_node_id(&op.parent_id)?;
             }
         }
 
@@ -3853,9 +3735,12 @@ impl WorkflowyMcpServer {
         // miss), so we resolve sequentially before the batch dispatches.
         let mut resolved_ops: Vec<BatchCreateOp> = Vec::with_capacity(params.operations.len());
         for o in params.operations.into_iter() {
-            let parent_id = match o.parent_id {
-                Some(pid) => Some(self.resolve_node_ref(&pid).await?),
-                None => None,
+            // Per-op `parent_id` is a required NodeId (2026-06-16 hardening):
+            // omit/null rejected at the wire. `""` = explicit workspace root.
+            let parent_id = if o.parent_id.is_empty() {
+                None
+            } else {
+                Some(self.resolve_node_ref(&o.parent_id).await?)
             };
             resolved_ops.push(BatchCreateOp {
                 name: o.name,
@@ -3955,15 +3840,14 @@ impl WorkflowyMcpServer {
 
             // Eager op-kind + required-id validation so a known-bad batch
             // fails at the wire boundary before any API touch.
-            const VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
             for (i, op) in params.operations.iter().enumerate() {
-                if !VALID_OPS.contains(&op.op.as_str()) {
+                if !defaults::READ_BATCH_VALID_OPS.contains(&op.op.as_str()) {
                     return Err(tool_invalid_params(
                         "read_batch",
                         None,
                         format!(
                             "operations[{}].op = {:?}; expected one of {:?}",
-                            i, op.op, VALID_OPS
+                            i, op.op, defaults::READ_BATCH_VALID_OPS
                         ),
                     ));
                 }
@@ -4119,6 +4003,7 @@ impl WorkflowyMcpServer {
                     name: op.name.clone(),
                     description: op.description.clone(),
                     priority: op.priority,
+                    expect_name: op.expect_name.clone(),
                 });
             }
 
@@ -4174,51 +4059,39 @@ impl WorkflowyMcpServer {
             let resolved = self.validate_and_resolve(&params.node_id).await?;
             let max_depth = params.max_depth.unwrap_or(50);
 
-            // Walk parent_id chain. We stop at the first None, the first
-            // missing-node error, the first cycle (id we've seen), or the
-            // depth cap. Each step is one HTTP call; for typical Workflowy
-            // trees (depth 5-10) this is cheap. The outer
-            // `run_handler` wrapper observes the cancel registry on
-            // every iteration, so a `cancel_all` fires this loop's next
-            // `await` and returns within the cancel-poll slice.
-            let mut segments: Vec<serde_json::Value> = Vec::new();
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut current_id: Option<String> = Some(resolved.clone());
-            let mut depth = 0usize;
-            while let Some(id) = current_id.take() {
-                if !seen.insert(id.clone()) {
-                    tracing::warn!(node_id = %id, "path_of: cycle detected, stopping walk");
-                    break;
-                }
-                if depth >= max_depth {
-                    tracing::warn!(max_depth, "path_of: max_depth reached, returning partial path");
-                    break;
-                }
-                depth += 1;
-                match self.client.get_node(&id).await {
-                    Ok(node) => {
-                        segments.push(json!({ "id": node.id, "name": node.name }));
-                        current_id = node.parent_id;
-                    }
-                    Err(e) => {
-                        tracing::warn!(node_id = %id, error = %e, "path_of: get_node failed; returning partial path");
-                        break;
-                    }
-                }
-            }
-            // Reverse so index 0 is root, last is the requested node.
-            segments.reverse();
-            let display_path = segments
+            // Parent-chain walk is shared with the `wflow-do path-of`
+            // subcommand via `walk_parent_chain` (cycle guard + depth cap
+            // + cancel/deadline polling live there). The outer
+            // `run_handler` wrapper already imposes the Bulk deadline, so
+            // a `default()` context suffices; the cancel guard is shared
+            // via the registry the wrapper observes.
+            let ctx = crate::workflows::WorkflowContext::default();
+            let chain = crate::workflows::walk_parent_chain(
+                &self.client,
+                &resolved,
+                max_depth,
+                &ctx,
+            )
+            .await
+            .map_err(|e| workflow_error_to_mcp("path_of", Some(&resolved), e))?;
+
+            let segments: Vec<serde_json::Value> = chain
+                .segments
                 .iter()
-                .map(|s| s["name"].as_str().unwrap_or("(untitled)").to_string())
+                .map(|s| json!({ "id": s.id, "name": s.name }))
+                .collect();
+            let display_path = chain
+                .segments
+                .iter()
+                .map(|s| if s.name.is_empty() { "(untitled)".to_string() } else { s.name.clone() })
                 .collect::<Vec<_>>()
                 .join(" > ");
             let payload = json!({
                 "node_id": resolved,
                 "path": display_path,
                 "segments": segments,
-                "depth": segments.len(),
-                "truncated": depth >= max_depth,
+                "depth": chain.segments.len(),
+                "truncated": chain.truncated,
             });
             Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
         })
@@ -4255,30 +4128,31 @@ impl WorkflowyMcpServer {
         let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
         use futures::StreamExt;
         let stream = futures::stream::iter(ids.into_iter().enumerate().map(|(idx, id)| {
-            let needle = needle.clone();
             let bare_tag = bare_tag.clone();
             async move {
                 let outcome = match self.client.get_node(&id).await {
                     Ok(node) => {
-                        // Whole-tag check via parse_tags — a bare
-                        // `name.contains("#lead")` silently shadowed
+                        // Whole-tag idempotency via the shared helper —
+                        // `None` means the node already carries the tag
+                        // (a bare `name.contains("#lead")` silently shadowed
                         // `#leadership` and skipped 38 nodes during the
-                        // 2026-05-24 pillar-tag backfill.
-                        if crate::utils::tag_parser::text_contains_tag(&node.name, &bare_tag) {
-                            (idx, Ok(false))
-                        } else {
-                            let new_name = format!("{} {}", node.name.trim_end(), needle);
-                            match self
-                                .client
-                                .edit_node(&id, Some(&new_name), None)
-                                .await
-                            {
-                                Ok(_) => {
-                                    self.cache.invalidate_node(&id);
-                                    self.name_index.invalidate_node(&id);
-                                    (idx, Ok(true))
+                        // 2026-05-24 pillar-tag backfill). Same helper the CLI
+                        // `bulk-tag` and `apply_bulk_op(AddTag)` use.
+                        match crate::utils::tag_parser::add_tag_to_name(&node.name, &bare_tag) {
+                            None => (idx, Ok(false)),
+                            Some(new_name) => {
+                                match self
+                                    .client
+                                    .edit_node(&id, Some(&new_name), None)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        self.cache.invalidate_node(&id);
+                                        self.name_index.invalidate_node(&id);
+                                        (idx, Ok(true))
+                                    }
+                                    Err(e) => (idx, Err(e.to_string())),
                                 }
-                                Err(e) => (idx, Err(e.to_string())),
                             }
                         }
                     }
@@ -4440,21 +4314,15 @@ impl WorkflowyMcpServer {
             Ok(fetch) => {
                 let banner = truncation_banner_from_fetch(&fetch);
                 let node_map = build_node_map(&fetch.nodes);
-                let tag_lower = params.tag.to_lowercase();
                 let prefix_lower = params.path_prefix.to_lowercase();
 
                 let mut hits: Vec<serde_json::Value> = Vec::new();
                 for node in &fetch.nodes {
-                    // Tag check: covers #tag in name/description plus the
-                    // explicit tags array.
-                    let in_name = node.name.to_lowercase().contains(&tag_lower);
-                    let in_desc = node.description.as_ref()
-                        .map(|d| d.to_lowercase().contains(&tag_lower))
-                        .unwrap_or(false);
-                    let in_tags = node.tags.as_ref()
-                        .map(|tags| tags.iter().any(|t| t.to_lowercase().contains(&tag_lower)))
-                        .unwrap_or(false);
-                    if !(in_name || in_desc || in_tags) { continue; }
+                    // Whole-tag match via the shared `node_has_tag`
+                    // predicate (name + description). Pre-2026-06-16 this
+                    // used a substring scan that let `#lead` match
+                    // `#leadership`.
+                    if !node_has_tag(node, &params.tag) { continue; }
 
                     let path = build_node_path_with_map(&node.id, &node_map);
                     if !path.to_lowercase().contains(&prefix_lower) { continue; }
@@ -4485,10 +4353,8 @@ impl WorkflowyMcpServer {
     /// Distillations subtree — the only place the wflow Mirror
     /// Discipline convention is applied today. Hard-coding the UUID
     /// keeps tool calls one-arg in the common case while leaving
-    /// `root_id` open for narrower or wider scopes.
-    #[doc(hidden)]
-    const DEFAULT_REVIEW_ROOT: &'static str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
-
+    /// `root_id` open for narrower or wider scopes. Value lives in
+    /// `defaults::DEFAULT_REVIEW_ROOT` (shared with the CLI).
     #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope OR in the persistent name index), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171, walked in chunks (one per direct child of the root) to avoid the 10 000-node walk cap on large pillars. Canonical resolution widens to the name index by default so cross-pillar mirrors don't false-positive as BROKEN (Fix A for the 2026-05-16 weekly-synthesis report). Pass chunked=false to force a single walk; pass cross_scope_resolve=false to restore the legacy in-scope-only classifier. Returns a JSON object with scope, scanned count, truncated flag, per-chunk envelope (when chunked), and findings array.")]
     async fn audit_mirrors(
         &self,
@@ -4497,7 +4363,7 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "audit_mirrors", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => self.validate_and_resolve(rid).await?,
-            None => Self::DEFAULT_REVIEW_ROOT.to_string(),
+            None => defaults::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
         // Default behaviour: chunked when the scope is the default
@@ -4619,7 +4485,7 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "review", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => self.validate_and_resolve(rid).await?,
-            None => Self::DEFAULT_REVIEW_ROOT.to_string(),
+            None => defaults::DEFAULT_REVIEW_ROOT.to_string(),
         };
         let max_depth = params.max_depth.unwrap_or(8);
         let days_stale = params.days_stale.unwrap_or(90);
@@ -4982,12 +4848,15 @@ impl WorkflowyMcpServer {
     ) -> Result<CallToolResult, McpError> {
         tool_handler!(self, "create_mirror", ToolKind::Bulk, params, {
         // Resolve both endpoints through the same path every other
-        // tool uses so short hashes / UUIDs / null target_parent are
-        // accepted with consistent error envelopes.
+        // tool uses so short hashes / UUIDs are accepted with consistent
+        // error envelopes. `target_parent_id` is a required NodeId
+        // (2026-06-16 hardening): omit/null rejected at the wire; `""` is
+        // the explicit workspace-root sentinel.
         let canonical_id = self.validate_and_resolve(&params.canonical_node_id).await?;
-        let target_parent: Option<String> = match params.target_parent_id.as_deref() {
-            None | Some("") => None,
-            Some(id) => Some(self.validate_and_resolve(id).await?),
+        let target_parent: Option<String> = if params.target_parent_id.is_empty() {
+            None
+        } else {
+            Some(self.validate_and_resolve(&params.target_parent_id).await?)
         };
         let scope_resolved = scope_resolved_label(target_parent.as_deref());
         let dry_run = params.dry_run.unwrap_or(false);
@@ -5348,19 +5217,22 @@ mod tests {
         .unwrap();
         assert_eq!(params.name, "New Node");
         assert_eq!(params.description.as_deref(), Some("A description"));
-        assert_eq!(params.parent_id.as_deref(), Some("parent-uuid"));
+        assert_eq!(params.parent_id, "parent-uuid");
         assert_eq!(params.priority, Some(5));
     }
 
     #[test]
     fn test_create_node_params_minimal() {
+        // Minimal valid create_node now carries an explicit parent_id
+        // (2026-06-16 hardening). `""` is the workspace-root sentinel.
         let params: CreateNodeParams = serde_json::from_value(json!({
-            "name": "Just a name"
+            "name": "Just a name",
+            "parent_id": ""
         }))
         .unwrap();
         assert_eq!(params.name, "Just a name");
         assert_eq!(params.description, None);
-        assert_eq!(params.parent_id, None);
+        assert!(params.parent_id.is_empty(), "\"\" is the explicit root sentinel");
         assert_eq!(params.priority, None);
     }
 
@@ -5407,39 +5279,82 @@ mod tests {
             "content": "Line 1\n  Child 1\n  Child 2\nLine 2"
         }))
         .unwrap();
-        assert_eq!(
-            params.parent_id.as_ref().map(|n| n.as_ref()),
-            Some("target-node"),
-        );
+        assert_eq!(params.parent_id, "target-node");
         assert!(params.content.contains("Child 1"));
     }
 
-    /// Failure-report 2026-05-03 fix #1: every parent-scoped tool
-    /// must accept `parent_id: null` as "workspace root", and the
-    /// `insert_content` shape was the divergent one rejecting null
-    /// at the schema layer. Pin the new contract: null deserializes
-    /// to None, and an omitted field deserializes to None.
+    /// Hardening 2026-06-16 (supersedes the 2026-05-03 null-accepts-as-root
+    /// contract): the four write tools require an EXPLICIT `parent_id`.
+    /// `null` and an omitted field are both REJECTED at the wire (closing
+    /// the host-stripping / host-coercion silent-misroute path); the
+    /// empty-string sentinel `""` is the deliberate "workspace root"
+    /// choice, and a UUID scopes. This single test pins the contract for
+    /// all four structs so a future relaxation of any one of them fails
+    /// the build.
     #[test]
-    fn insert_content_params_accepts_null_parent_id() {
-        let with_null: InsertContentParams = serde_json::from_value(json!({
-            "parent_id": null,
-            "content": "root level"
-        }))
-        .expect("null parent_id must deserialize as None");
-        assert!(with_null.parent_id.is_none(), "null must map to None");
+    fn write_tools_require_explicit_parent_id_reject_null_and_omit() {
+        // ---- create_node ----
+        assert!(
+            serde_json::from_value::<CreateNodeParams>(json!({"name": "x"})).is_err(),
+            "create_node: omitted parent_id must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<CreateNodeParams>(json!({"name": "x", "parent_id": null}))
+                .is_err(),
+            "create_node: null parent_id must be rejected"
+        );
+        let root: CreateNodeParams =
+            serde_json::from_value(json!({"name": "x", "parent_id": ""})).expect("\"\" = root");
+        assert!(root.parent_id.is_empty());
+        serde_json::from_value::<CreateNodeParams>(
+            json!({"name": "x", "parent_id": "550e8400-e29b-41d4-a716-446655440000"}),
+        )
+        .expect("uuid parent scopes");
 
-        let omitted: InsertContentParams = serde_json::from_value(json!({
-            "content": "root level"
-        }))
-        .expect("omitted parent_id must deserialize as None");
-        assert!(omitted.parent_id.is_none(), "omitted must map to None");
+        // ---- insert_content ----
+        assert!(
+            serde_json::from_value::<InsertContentParams>(json!({"content": "c"})).is_err(),
+            "insert_content: omitted parent_id must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<InsertContentParams>(json!({"content": "c", "parent_id": null}))
+                .is_err(),
+            "insert_content: null parent_id must be rejected"
+        );
+        serde_json::from_value::<InsertContentParams>(json!({"content": "c", "parent_id": ""}))
+            .expect("\"\" = root");
 
-        let with_value: InsertContentParams = serde_json::from_value(json!({
-            "parent_id": "550e8400-e29b-41d4-a716-446655440000",
-            "content": "scoped"
-        }))
-        .expect("valid uuid must deserialize as Some");
-        assert!(with_value.parent_id.is_some());
+        // ---- create_mirror (target_parent_id) ----
+        let canon = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            serde_json::from_value::<CreateMirrorParams>(json!({"canonical_node_id": canon}))
+                .is_err(),
+            "create_mirror: omitted target_parent_id must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<CreateMirrorParams>(
+                json!({"canonical_node_id": canon, "target_parent_id": null})
+            )
+            .is_err(),
+            "create_mirror: null target_parent_id must be rejected"
+        );
+        serde_json::from_value::<CreateMirrorParams>(
+            json!({"canonical_node_id": canon, "target_parent_id": ""}),
+        )
+        .expect("\"\" = root");
+
+        // ---- batch_create_nodes (per-op parent_id) ----
+        assert!(
+            serde_json::from_value::<BatchCreateOpParams>(json!({"name": "x"})).is_err(),
+            "batch op: omitted parent_id must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<BatchCreateOpParams>(json!({"name": "x", "parent_id": null}))
+                .is_err(),
+            "batch op: null parent_id must be rejected"
+        );
+        serde_json::from_value::<BatchCreateOpParams>(json!({"name": "x", "parent_id": ""}))
+            .expect("\"\" = root");
     }
 
     #[test]
@@ -6640,7 +6555,7 @@ mod tests {
             .create_node(Parameters(CreateNodeParams {
                 name: "x".into(),
                 description: None,
-                parent_id: Some(NodeId::from("ffffffffffff")),
+                parent_id: NodeId::from("ffffffffffff"),
                 priority: None,
             }))
             .await
@@ -7434,7 +7349,7 @@ mod tests {
         let err = server
             .create_mirror(Parameters(CreateMirrorParams {
                 canonical_node_id: NodeId::from(id),
-                target_parent_id: Some(NodeId::from(id)),
+                target_parent_id: NodeId::from(id),
                 priority: None,
                 pillar: None,
                 dry_run: None,
@@ -7456,22 +7371,24 @@ mod tests {
     }
 
     /// Pin the parameter shape so the schema published to the MCP
-    /// client matches what the handler reads. `target_parent_id` was
-    /// originally `NodeId` (non-optional) — the 2026-05-04 update
-    /// loosened it to `Option<NodeId>` so callers can mirror under the
-    /// workspace root via null, matching `create_node`. Adding
-    /// `pillar` is a separate change that a deserialise-and-check
-    /// confirms is wired through schemars correctly.
+    /// client matches what the handler reads. `target_parent_id` history:
+    /// originally `NodeId`; 2026-05-04 loosened to `Option<NodeId>` so
+    /// callers could mirror under root via null; 2026-06-16 re-tightened
+    /// to required `NodeId` with the `""` root sentinel (host-coercion
+    /// hardening — null/omit are now REJECTED, see
+    /// `write_tools_require_explicit_parent_id_reject_null_and_omit`).
+    /// `pillar` remains optional; a deserialise-and-check confirms it is
+    /// wired through schemars correctly when root is given explicitly.
     #[test]
-    fn create_mirror_params_accept_null_target_parent_and_optional_pillar() {
+    fn create_mirror_params_root_via_empty_string_and_optional_pillar() {
         let v = serde_json::json!({
             "canonical_node_id": "550e8400-e29b-41d4-a716-446655440000",
-            "target_parent_id": null,
+            "target_parent_id": "",
             "pillar": "lead",
         });
         let params: CreateMirrorParams =
-            serde_json::from_value(v).expect("null target_parent_id must deserialise");
-        assert!(params.target_parent_id.is_none());
+            serde_json::from_value(v).expect("\"\" target_parent_id is the root sentinel");
+        assert!(params.target_parent_id.is_empty(), "\"\" = workspace root");
         assert_eq!(params.pillar.as_deref(), Some("lead"));
     }
 
@@ -7582,13 +7499,13 @@ mod tests {
         let bad = BatchCreateOpParams {
             name: "x".to_string(),
             description: None,
-            parent_id: Some(NodeId::from("not-a-uuid")),
+            parent_id: NodeId::from("not-a-uuid"),
             priority: None,
         };
         let good = BatchCreateOpParams {
             name: "y".to_string(),
             description: None,
-            parent_id: None,
+            parent_id: NodeId::from(""),
             priority: None,
         };
         let err = server
@@ -7624,6 +7541,7 @@ mod tests {
                     name: None,
                     description: None,
                     priority: None,
+                    expect_name: None,
                 }],
             }))
             .await
@@ -7655,6 +7573,7 @@ mod tests {
                     name: None,
                     description: None,
                     priority: None,
+                    expect_name: None,
                 }],
             }))
             .await
@@ -8505,6 +8424,43 @@ mod tests {
         );
     }
 
+    /// Read-predicate routing pin (2026-06-16). The whole-tag match
+    /// (`node_has_tag`), the backlink match (`node_links_to`), and the
+    /// `bulk_update` candidate filter (`filter_bulk_candidates`) are the
+    /// single source of truth for those predicates across both surfaces.
+    /// This test asserts both `server/mod.rs` and `bin/wflow_do.rs`
+    /// reference each helper by name — so neither file can quietly
+    /// re-inline the predicate and drift (the pre-fix state, where MCP
+    /// `tag_search` used a buggy substring scan while the CLI used a
+    /// whole-tag check). Modelled on
+    /// `link_parsing_routes_through_extract_workflowy_short_hash`.
+    #[test]
+    fn read_predicates_route_through_shared_helpers() {
+        let consumers: &[(&str, &str)] = &[
+            ("server/mod.rs", include_str!("mod.rs")),
+            ("bin/wflow_do.rs", include_str!("../bin/wflow_do.rs")),
+        ];
+        let required: &[&str] = &["node_has_tag", "node_links_to", "filter_bulk_candidates"];
+        let mut missing: Vec<String> = Vec::new();
+        for (label, src) in consumers {
+            for helper in required {
+                if !src.contains(helper) {
+                    missing.push(format!("{} does not reference `{}`", label, helper));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Read predicates must route through the shared helpers \
+             (`node_has_tag` in utils::tag_parser, `node_links_to` in \
+             utils::link_parser, `filter_bulk_candidates` in \
+             utils::aggregation). A surface that re-inlines one of these \
+             can silently drift — the whole-tag vs substring tag-match \
+             divergence the 2026-06-16 refactor closed. Missing:\n  {}",
+            missing.join("\n  "),
+        );
+    }
+
     /// [C-server-006] `scope_resolved_label` is the single renderer
     /// for the diagnostic `scope_resolved` field. Format is stable:
     /// `"workspace_root"` for `None`, otherwise `"scoped:<full-uuid>"`.
@@ -8658,7 +8614,7 @@ mod tests {
             .collect();
         let content = lines.join("\n");
         let params = InsertContentParams {
-            parent_id: Some(NodeId::from("550e8400-e29b-41d4-a716-446655440000")),
+            parent_id: NodeId::from("550e8400-e29b-41d4-a716-446655440000"),
             content,
         };
         let err = server
@@ -9378,6 +9334,7 @@ mod load_tests {
         let err = server
             .delete_node(Parameters(DeleteNodeParams {
                 node_id: NodeId::from(target_uuid),
+                expect_name: None,
             }))
             .await
             .expect_err("404 must surface a tool_error");
@@ -9410,6 +9367,90 @@ mod load_tests {
         assert!(
             err.to_string().contains("move_node"),
             "move_node error must name the operation: {err}"
+        );
+    }
+
+    /// Destructive-op name-echo guard (2026-06-16 host-coercion defence).
+    /// When `delete_node` is called with `expect_name` that does not match
+    /// the resolved node's current name, the delete is REFUSED with a
+    /// structured validation error — and no DELETE is issued (no DELETE mock
+    /// is mounted, so a delete attempt would mismatch and fail differently).
+    /// This is the irreversible-delete protection: a host that coerced
+    /// `node_id` to a plausible-but-wrong UUID lands on a node whose name
+    /// won't match the echo.
+    #[tokio::test]
+    async fn delete_node_refuses_on_name_echo_mismatch() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"node": {"id": id_a(), "name": "Real Project"}}),
+            ))
+            .mount(&mock)
+            .await;
+        let server = server_against(&mock).await;
+        let err = server
+            .delete_node(Parameters(DeleteNodeParams {
+                node_id: NodeId::from(id_a()),
+                expect_name: Some("A Totally Different Node".to_string()),
+            }))
+            .await
+            .expect_err("mismatched expect_name must refuse the delete");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delete refused"),
+            "error must be the refusal, not a delete failure: {msg}"
+        );
+        assert!(
+            msg.contains("Real Project") && msg.contains("A Totally Different Node"),
+            "refusal must name both the actual and the echoed name: {msg}"
+        );
+    }
+
+    /// The matching-echo path proceeds: when `expect_name` equals the node's
+    /// current name (trimmed), the delete is issued and succeeds.
+    #[tokio::test]
+    async fn delete_node_proceeds_on_name_echo_match() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"node": {"id": id_a(), "name": "Real Project"}}),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+        let server = server_against(&mock).await;
+        let result = server
+            .delete_node(Parameters(DeleteNodeParams {
+                node_id: NodeId::from(id_a()),
+                // Leading/trailing whitespace is trimmed on both sides.
+                expect_name: Some("  Real Project  ".to_string()),
+            }))
+            .await
+            .expect("matching expect_name must allow the delete");
+        assert!(body_text(&result).contains("Deleted"));
+    }
+
+    /// Routing invariant: both destructive-delete surfaces — the
+    /// `delete_node` MCP handler (mod.rs) and the `transaction` delete step
+    /// (workflows.rs) — perform their name-echo check through the single
+    /// shared helper `workflows::destructive_echo_matches`, never a hand-
+    /// rolled comparison. Pins Helper-First (constitution §4) so a future
+    /// edit can't silently diverge the two surfaces' echo semantics (e.g.
+    /// one trimming and one not, or one case-insensitive).
+    #[test]
+    fn delete_name_echo_routes_through_shared_helper() {
+        let handler_src = include_str!("mod.rs");
+        let workflows_src = include_str!("../workflows.rs");
+        assert!(
+            handler_src.contains("destructive_echo_matches("),
+            "delete_node handler must route its name-echo check through destructive_echo_matches"
+        );
+        assert!(
+            workflows_src.contains("destructive_echo_matches("),
+            "transaction delete step must route its name-echo check through destructive_echo_matches"
         );
     }
 
@@ -9546,6 +9587,7 @@ mod load_tests {
                     name: None,
                     description: None,
                     priority: None,
+                    expect_name: None,
                 }],
             }))
             .await;
@@ -9698,7 +9740,7 @@ mod load_tests {
         let started = Instant::now();
         let result = server
             .insert_content(Parameters(InsertContentParams {
-                parent_id: Some(NodeId::from(id_a())),
+                parent_id: NodeId::from(id_a()),
                 content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
             }))
             .await
@@ -9759,7 +9801,7 @@ mod load_tests {
                 .create_node(Parameters(CreateNodeParams {
                     name: "wedged".to_string(),
                     description: None,
-                    parent_id: None,
+                    parent_id: NodeId::from(""),
                     priority: None,
                 }))
                 .await
@@ -10115,7 +10157,7 @@ mod load_tests {
         let call = tokio::spawn(async move {
             server_for_call
                 .insert_content(Parameters(InsertContentParams {
-                    parent_id: Some(NodeId::from(id_a())),
+                    parent_id: NodeId::from(id_a()),
                     content: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
                 }))
                 .await
@@ -10400,6 +10442,35 @@ mod load_tests {
             !body.contains("\"link\": link,\n                        \"node\""),
             "CLI must NOT emit the pre-2026-05-22 `{{link, node}}` hit shape — that's the drift the lift closed",
         );
+    }
+
+    /// `duplicate_node` and `create_from_template` orchestration is
+    /// lifted into `crate::workflows::{duplicate_subtree,
+    /// instantiate_template}` (2026-06-16) so the MCP handler and the
+    /// `wflow-do` subcommands cannot reimplement the BFS deep-copy
+    /// inline and drift again (pre-lift the CLI used a frontier-stack
+    /// DFS, lacked name_prefix + truncation refusal on `duplicate`, and
+    /// used a literal `str::replace` with no unmatched-var passthrough
+    /// on `template`). Grep-pinned on BOTH source files: each must
+    /// reference both lifted workflow functions. Modelled on
+    /// `link_parsing_routes_through_extract_workflowy_short_hash`.
+    #[test]
+    fn duplicate_and_template_route_through_workflows() {
+        let server_src = include_str!("mod.rs");
+        let cli_src = include_str!("../bin/wflow_do.rs");
+
+        for (label, src) in [("server/mod.rs", server_src), ("bin/wflow_do.rs", cli_src)] {
+            assert!(
+                src.contains("duplicate_subtree"),
+                "{label} must route through `crate::workflows::duplicate_subtree` — \
+                 inlining the BFS deep-copy is the drift the 2026-06-16 lift closed",
+            );
+            assert!(
+                src.contains("instantiate_template"),
+                "{label} must route through `crate::workflows::instantiate_template` — \
+                 inlining the template substitution is the drift the 2026-06-16 lift closed",
+            );
+        }
     }
 
     /// The on-demand resolve walk budget (`RESOLVE_WALK_TIMEOUT_MS`)

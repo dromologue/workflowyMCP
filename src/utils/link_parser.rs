@@ -99,6 +99,46 @@ pub fn extract_workflowy_short_hash(input: &str) -> Option<String> {
     None
 }
 
+/// Backlink predicate: does `node` reference `target_uuid` in its name
+/// or description?
+///
+/// True iff the name OR description contains either (a) the canonical
+/// Workflowy link URL `https://workflowy.com/#/{uuid}` for the full
+/// target UUID, OR (b) the bare 12-char trailing short hash of the
+/// target. The hash comparison is case-insensitive; the full-URL match
+/// is a plain substring (UUIDs are already lowercase hex on the wire).
+///
+/// Single source of truth for the backlink match predicate, shared by
+/// the MCP `find_backlinks` handler and the `wflow-do backlinks`
+/// subcommand. Pre-2026-06-16 the MCP matched the full URL only (via a
+/// regex) while the CLI did a bare substring scan over the UUID and its
+/// short hash; this helper is the UNION of both, so a node linking via
+/// either form is found on both surfaces.
+pub fn node_links_to(node: &crate::types::WorkflowyNode, target_uuid: &str) -> bool {
+    let uuid = target_uuid.trim();
+    if uuid.is_empty() {
+        return false;
+    }
+    let full_url = format!("https://workflowy.com/#/{}", uuid);
+    let short_hash = if uuid.len() >= 12 {
+        &uuid[uuid.len() - 12..]
+    } else {
+        uuid
+    };
+    let short_lower = short_hash.to_lowercase();
+
+    let field_links = |text: &str| -> bool {
+        text.contains(&full_url) || text.to_lowercase().contains(&short_lower)
+    };
+
+    field_links(&node.name)
+        || node
+            .description
+            .as_deref()
+            .map(field_links)
+            .unwrap_or(false)
+}
+
 /// Pull the value of `?<key>=<value>` (or `&<key>=<value>`) out of a
 /// URL-like string. Matches the key case-insensitively. Stops at the
 /// next `&` or `#`. Returns `None` when the key is absent.
@@ -142,6 +182,51 @@ fn normalise_hex_candidate(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::WorkflowyNode;
+
+    fn node_with(name: &str, desc: Option<&str>) -> WorkflowyNode {
+        WorkflowyNode {
+            id: "n1".into(),
+            name: name.into(),
+            description: desc.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn node_links_to_matches_full_url_and_short_hash() {
+        let target = "550e8400e29b41d4a716446655440000";
+        let short_hash = "446655440000"; // trailing 12 chars
+
+        // Full canonical URL in the name.
+        let n1 = node_with(
+            "see https://workflowy.com/#/550e8400e29b41d4a716446655440000 for context",
+            None,
+        );
+        assert!(node_links_to(&n1, target));
+
+        // Full canonical URL in the description.
+        let n2 = node_with(
+            "plain",
+            Some("ref https://workflowy.com/#/550e8400e29b41d4a716446655440000"),
+        );
+        assert!(node_links_to(&n2, target));
+
+        // Bare 12-char short hash anywhere in the text.
+        let n3 = node_with(&format!("linked to {}", short_hash), None);
+        assert!(node_links_to(&n3, target));
+
+        // Case-insensitive on the short hash.
+        let n4 = node_with(&short_hash.to_uppercase(), None);
+        assert!(node_links_to(&n4, target));
+
+        // No reference → no match.
+        let n5 = node_with("unrelated text", Some("nothing here"));
+        assert!(!node_links_to(&n5, target));
+
+        // Empty target → never matches.
+        assert!(!node_links_to(&n1, ""));
+    }
 
     #[test]
     fn bare_12_char_hash_passes_through() {

@@ -3,6 +3,7 @@ pub mod aggregation;
 pub mod cache;
 pub mod cancel;
 pub mod date_parser;
+pub mod html;
 pub mod job_queue;
 pub mod link_parser;
 pub mod name_index;

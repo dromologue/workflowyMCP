@@ -18,8 +18,7 @@ use workflowy_mcp_server::{
     error::WorkflowyError,
 };
 
-/// Default subtree root for audit/review (Justin's Distillations node).
-const DEFAULT_REVIEW_ROOT: &str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
+use workflowy_mcp_server::defaults::DEFAULT_REVIEW_ROOT;
 
 #[derive(Parser)]
 #[command(name = "wflow-do", about = "Workflowy CLI — bypasses the MCP transport for direct API access")]
@@ -82,7 +81,15 @@ enum Cmd {
         nodes: Vec<String>,
     },
     /// Delete a node.
-    Delete { node_id: String },
+    Delete {
+        node_id: String,
+        /// Optional name-echo guard: the current name of the node you intend
+        /// to delete. If set and it does not match the resolved node's name,
+        /// the delete is refused. Mirrors the MCP `delete_node.expect_name`
+        /// host-coercion defence.
+        #[arg(long)]
+        expect_name: Option<String>,
+    },
     /// Edit a node's name and/or description.
     Edit {
         node_id: String,
@@ -284,6 +291,10 @@ enum Cmd {
         target_parent_id: String,
         #[arg(long, default_value_t = true)]
         include_children: bool,
+        /// Prefix prepended to the ROOT copy's name (descendants
+        /// unchanged). Parity with MCP `duplicate_node.name_prefix`.
+        #[arg(long = "name-prefix")]
+        name_prefix: Option<String>,
     },
     /// Copy a template node with `{{variable}}` substitution. Mirrors
     /// MCP `create_from_template`. `--var KEY=VALUE` (repeatable).
@@ -590,7 +601,14 @@ fn dry_run_line(cmd: &Cmd) -> Option<String> {
             parent_id,
             nodes.len(),
         )),
-        Cmd::Delete { node_id } => Some(format!("DRY-RUN delete node_id={}", node_id)),
+        Cmd::Delete { node_id, expect_name } => Some(format!(
+            "DRY-RUN delete node_id={}{}",
+            node_id,
+            expect_name
+                .as_deref()
+                .map(|n| format!(" expect_name={:?}", n))
+                .unwrap_or_default()
+        )),
         Cmd::Edit { node_id, name, description } => Some(format!(
             "DRY-RUN edit node_id={} name={:?} description_len={}",
             node_id,
@@ -757,7 +775,23 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }
             }
         }
-        Cmd::Delete { node_id } => {
+        Cmd::Delete { node_id, expect_name } => {
+            // Name-echo guard (host-coercion defence) — parity with MCP
+            // `delete_node.expect_name`. Shared comparison helper so the
+            // two surfaces cannot drift.
+            if let Some(expected) = expect_name.as_deref() {
+                let current = client.get_node(node_id).await?;
+                if !workflowy_mcp_server::workflows::destructive_echo_matches(
+                    &current.name,
+                    expected,
+                ) {
+                    return Err(format!(
+                        "delete refused: node {} is named {:?} but --expect-name was {:?} — re-resolve and confirm before retrying",
+                        node_id, current.name, expected
+                    )
+                    .into());
+                }
+            }
             client.delete_node_with_propagation_retry(node_id).await?;
             if cli.json {
                 println!("{}", json!({ "ok": true, "node_id": node_id }));
@@ -828,8 +862,15 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::TagSearch { tag, parent, depth, limit } => {
-            use workflowy_mcp_server::utils::tag_parser::parse_node_tags;
-            let needle = tag.trim_start_matches('#').trim_start_matches('@').to_lowercase();
+            use workflowy_mcp_server::utils::tag_parser::node_has_tag;
+            // Whole-tag match via the shared `node_has_tag` predicate so
+            // the CLI cannot drift from MCP `tag_search`. We check both a
+            // `#tag` and an `@assignee` interpretation of the needle so a
+            // bare needle still matches either axis (the CLI's historic
+            // tag-OR-assignee behaviour).
+            let bare = tag.trim_start_matches('#').trim_start_matches('@');
+            let as_tag = format!("#{}", bare);
+            let as_assignee = format!("@{}", bare);
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
@@ -839,11 +880,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             let hits: Vec<_> = fetch
                 .nodes
                 .iter()
-                .filter(|n| {
-                    let parsed = parse_node_tags(n);
-                    parsed.tags.iter().any(|t| t.eq_ignore_ascii_case(&needle))
-                        || parsed.assignees.iter().any(|a| a.eq_ignore_ascii_case(&needle))
-                })
+                .filter(|n| node_has_tag(n, &as_tag) || node_has_tag(n, &as_assignee))
                 .take(*limit)
                 .collect();
             let payload = json!({
@@ -914,25 +951,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 .get_subtree_with_controls(parent.as_deref(), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
             // A backlink is a node whose name or description references the
-            // target via a Workflowy link or its UUID.
+            // target. The match predicate is the shared `node_links_to`
+            // (UNION of canonical-URL and 12-char short-hash forms) so the
+            // CLI cannot drift from MCP `find_backlinks`.
+            use workflowy_mcp_server::utils::link_parser::node_links_to;
             let needle_full = node_id.as_str();
-            let needle_short = if needle_full.len() >= 12 {
-                &needle_full[needle_full.len() - 12..]
-            } else {
-                needle_full
-            };
             let hits: Vec<_> = fetch
                 .nodes
                 .iter()
                 .filter(|n| n.id != *needle_full)
-                .filter(|n| {
-                    let blob = format!(
-                        "{} {}",
-                        n.name,
-                        n.description.as_deref().unwrap_or(""),
-                    );
-                    blob.contains(needle_full) || blob.contains(needle_short)
-                })
+                .filter(|n| node_links_to(n, needle_full))
                 .collect();
             let payload = json!({
                 "target": node_id,
@@ -945,8 +973,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
         }
         Cmd::FindByTagAndPath { tag, segments, depth } => {
             use workflowy_mcp_server::utils::node_paths::{build_node_map, build_node_path_with_map};
-            use workflowy_mcp_server::utils::tag_parser::parse_node_tags;
-            let needle = tag.trim_start_matches('#').trim_start_matches('@').to_lowercase();
+            use workflowy_mcp_server::utils::tag_parser::node_has_tag;
             let prefix_lower: Vec<String> = segments.iter().map(|s| s.to_lowercase()).collect();
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
@@ -959,8 +986,10 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 .nodes
                 .iter()
                 .filter(|n| {
-                    let parsed = parse_node_tags(n);
-                    if !parsed.tags.iter().any(|t| t.eq_ignore_ascii_case(&needle)) {
+                    // Whole-tag match via the shared `node_has_tag`
+                    // predicate so the CLI cannot drift from MCP
+                    // `find_by_tag_and_path`.
+                    if !node_has_tag(n, tag) {
                         return false;
                     }
                     let path = build_node_path_with_map(&n.id, &map);
@@ -979,14 +1008,20 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
         }
         Cmd::NodeAtPath { segments, root } => {
             // Walk segment by segment via list_children. ONE call per segment.
+            // Strip HTML on each child name before comparing, matching MCP
+            // `node_at_path` — Workflowy node names can carry inline markup
+            // (`<b>`, links) that the raw `eq_ignore_ascii_case` the CLI
+            // used pre-2026-06-16 failed to see through.
+            use workflowy_mcp_server::utils::html::strip_html;
             let mut current: Option<String> = root.clone();
             for seg in segments {
+                let needle = seg.trim().to_lowercase();
                 let children = match current.as_deref() {
                     Some(id) => client.get_children_with_propagation_retry(id).await?,
                     None => client.get_top_level_nodes().await?,
                 };
                 let target = children.iter().find(|c| {
-                    c.name.trim().eq_ignore_ascii_case(seg.trim())
+                    strip_html(&c.name).to_lowercase().trim() == needle
                 });
                 match target {
                     Some(n) => current = Some(n.id.clone()),
@@ -1000,18 +1035,23 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
         Cmd::PathOf { node_id, max_depth } => {
-            // Walk parent_id chain via repeated get_node calls.
-            let mut path: Vec<serde_json::Value> = Vec::new();
-            let mut cursor = node_id.clone();
-            for _ in 0..*max_depth {
-                let n = client.get_node_with_propagation_retry(&cursor).await?;
-                path.push(json!({ "id": n.id.clone(), "name": n.name.clone() }));
-                match n.parent_id {
-                    Some(pid) if !pid.is_empty() => cursor = pid,
-                    _ => break,
-                }
-            }
-            path.reverse();
+            // Parent-chain walk shared with MCP `path_of` via
+            // `walk_parent_chain` — the cycle guard lives there, so a
+            // malformed parent loop terminates instead of spinning to the
+            // depth cap (the pre-2026-06-16 CLI had no guard).
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let chain = workflowy_mcp_server::workflows::walk_parent_chain(
+                &client,
+                node_id,
+                *max_depth,
+                &ctx,
+            )
+            .await?;
+            let path: Vec<serde_json::Value> = chain
+                .segments
+                .iter()
+                .map(|s| json!({ "id": s.id, "name": s.name }))
+                .collect();
             let payload = json!({ "node_id": node_id, "path": path });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
@@ -1408,58 +1448,30 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }))?
             );
         }
-        Cmd::Duplicate { node_id, target_parent_id, include_children } => {
-            // Walk source subtree, recreate under the target parent.
-            let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-                defaults::SUBTREE_FETCH_TIMEOUT_MS,
-            ));
-            let depth = if *include_children { 10 } else { 0 };
-            let fetch = client
-                .get_subtree_with_controls(Some(node_id), depth, defaults::MAX_SUBTREE_NODES, controls)
-                .await?;
-            if fetch.truncated {
-                return Err("duplicate: source subtree exceeds the walk cap; refusing to duplicate a partial view".into());
-            }
-            // Build parent → children map keyed off the source root.
-            use std::collections::HashMap;
-            let mut by_parent: HashMap<&str, Vec<&workflowy_mcp_server::types::WorkflowyNode>> = HashMap::new();
-            for n in &fetch.nodes {
-                if let Some(pid) = &n.parent_id {
-                    by_parent.entry(pid.as_str()).or_default().push(n);
-                }
-            }
-            // BFS-recreate.
-            let root_node = fetch.nodes.iter().find(|n| n.id == *node_id)
-                .ok_or("duplicate: source root not found in fetched subtree")?;
-            let new_root = client
-                .create_node(&root_node.name, root_node.description.as_deref(), Some(target_parent_id), None)
-                .await?;
-            let mut id_map: HashMap<String, String> = HashMap::new();
-            id_map.insert(root_node.id.clone(), new_root.id.clone());
-            let mut total_created = 1usize;
-            if *include_children {
-                let mut frontier: Vec<String> = vec![root_node.id.clone()];
-                while let Some(src_id) = frontier.pop() {
-                    let new_pid = id_map[&src_id].clone();
-                    if let Some(children) = by_parent.get(src_id.as_str()) {
-                        for child in children {
-                            let n = client
-                                .create_node(&child.name, child.description.as_deref(), Some(&new_pid), None)
-                                .await?;
-                            id_map.insert(child.id.clone(), n.id);
-                            frontier.push(child.id.clone());
-                            total_created += 1;
-                        }
-                    }
-                }
-            }
+        Cmd::Duplicate { node_id, target_parent_id, include_children, name_prefix } => {
+            // Facade over the lifted `crate::workflows::duplicate_subtree`
+            // — the same orchestration the MCP `duplicate_node` handler
+            // uses (BFS ordering, truncated-subtree refusal, name_prefix).
+            // The CLI passes the default WorkflowContext (no cancel, no
+            // deadline) and discards the footprint (no cache / name index
+            // out here).
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) = workflowy_mcp_server::workflows::duplicate_subtree(
+                &client,
+                node_id,
+                target_parent_id,
+                *include_children,
+                name_prefix.as_deref(),
+                &ctx,
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "source_id": node_id,
-                    "new_root_id": new_root.id,
+                    "source_id": outcome.original_id,
+                    "new_root_id": outcome.new_root_id,
                     "target_parent_id": target_parent_id,
-                    "total_created": total_created,
+                    "total_created": outcome.nodes_created,
                 }))?
             );
         }
@@ -1473,61 +1485,35 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 })?;
                 substitutions.insert(k.to_string(), v.to_string());
             }
-            let apply = |s: &str| -> String {
-                let mut out = s.to_string();
-                for (k, v) in &substitutions {
-                    out = out.replace(&format!("{{{{{}}}}}", k), v);
-                }
-                out
-            };
-            let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-                defaults::SUBTREE_FETCH_TIMEOUT_MS,
-            ));
-            let fetch = client
-                .get_subtree_with_controls(Some(template_node_id), 10, defaults::MAX_SUBTREE_NODES, controls)
-                .await?;
-            let mut by_parent: HashMap<&str, Vec<&workflowy_mcp_server::types::WorkflowyNode>> = HashMap::new();
-            for n in &fetch.nodes {
-                if let Some(pid) = &n.parent_id {
-                    by_parent.entry(pid.as_str()).or_default().push(n);
-                }
-            }
-            let root_node = fetch.nodes.iter().find(|n| n.id == *template_node_id)
-                .ok_or("template: template root not found")?;
-            let new_root = client
-                .create_node(&apply(&root_node.name), root_node.description.as_deref().map(apply).as_deref(), Some(target_parent_id), None)
-                .await?;
-            let mut id_map: HashMap<String, String> = HashMap::new();
-            id_map.insert(root_node.id.clone(), new_root.id.clone());
-            let mut total_created = 1usize;
-            let mut frontier: Vec<String> = vec![root_node.id.clone()];
-            while let Some(src_id) = frontier.pop() {
-                let new_pid = id_map[&src_id].clone();
-                if let Some(children) = by_parent.get(src_id.as_str()) {
-                    for child in children {
-                        let n = client
-                            .create_node(&apply(&child.name), child.description.as_deref().map(apply).as_deref(), Some(&new_pid), None)
-                            .await?;
-                        id_map.insert(child.id.clone(), n.id);
-                        frontier.push(child.id.clone());
-                        total_created += 1;
-                    }
-                }
-            }
+            // Facade over the lifted `crate::workflows::instantiate_template`.
+            // This GAINS regex `{{var}}` substitution with unmatched-variable
+            // passthrough — the pre-lift CLI used a literal `str::replace`
+            // per known key with no passthrough concept; the canonical
+            // (MCP) regex form is strictly better (an unknown `{{x}}`
+            // survives verbatim, and overlapping keys can't corrupt each
+            // other). Same orchestration the MCP handler runs.
+            let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
+            let (outcome, _footprint) = workflowy_mcp_server::workflows::instantiate_template(
+                &client,
+                template_node_id,
+                target_parent_id,
+                &substitutions,
+                &ctx,
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "template_id": template_node_id,
-                    "new_root_id": new_root.id,
+                    "template_id": outcome.template_id,
+                    "new_root_id": outcome.new_root_id,
                     "target_parent_id": target_parent_id,
-                    "total_created": total_created,
+                    "total_created": outcome.nodes_created,
+                    "variables_applied": outcome.variables_applied,
                 }))?
             );
         }
         Cmd::BulkUpdate { operation, query, tag, root, status, operation_tag, limit, depth } => {
-            use workflowy_mcp_server::utils::subtree::is_completed;
-            use workflowy_mcp_server::utils::tag_parser::parse_node_tags;
-            let valid_ops = ["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
+            let valid_ops = defaults::BULK_UPDATE_VALID_OPS;
             if !valid_ops.contains(&operation.as_str()) {
                 return Err(format!("bulk-update: invalid operation {:?}; valid: {:?}", operation, valid_ops).into());
             }
@@ -1546,29 +1532,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     fetch.limit,
                 ).into());
             }
-            let q = query.as_deref().map(|s| s.to_lowercase());
-            let t = tag.as_deref().map(|s| s.trim_start_matches('#').to_lowercase());
-            let matched: Vec<&_> = fetch.nodes.iter()
-                .filter(|n| {
-                    if let Some(q) = &q {
-                        let in_name = n.name.to_lowercase().contains(q);
-                        let in_desc = n.description.as_deref().map(|d| d.to_lowercase().contains(q)).unwrap_or(false);
-                        if !in_name && !in_desc { return false; }
-                    }
-                    if let Some(t) = &t {
-                        let parsed = parse_node_tags(n);
-                        if !parsed.tags.iter().any(|x| x == t) { return false; }
-                    }
-                    let completed = is_completed(n);
-                    match status.as_str() {
-                        "pending" if completed => return false,
-                        "completed" if !completed => return false,
-                        _ => {}
-                    }
-                    true
-                })
-                .take(*limit)
-                .collect();
+            // Candidate selection shared with MCP `bulk_update` via
+            // `filter_bulk_candidates` (query + whole-tag + status). The
+            // CLI applies `--limit` as a cap directly inside the helper.
+            let matched = workflowy_mcp_server::utils::aggregation::filter_bulk_candidates(
+                &fetch.nodes,
+                query.as_deref(),
+                tag.as_deref(),
+                status.as_str(),
+                *limit,
+            );
             // Apply step delegated to the shared workflow — same
             // code path the MCP `bulk_update` handler uses.
             let bulk_op = workflowy_mcp_server::workflows::BulkOp::parse(operation)
@@ -1601,14 +1574,23 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
         Cmd::BulkTag { tag, nodes } => {
             let tag_clean = tag.trim_start_matches('#');
             let mut affected = 0usize;
+            let mut already_tagged = 0usize;
             for id in nodes {
                 let n = match client.get_node(id).await {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                let new_name = format!("{} #{}", n.name, tag_clean);
-                if client.edit_node(id, Some(&new_name), None).await.is_ok() {
-                    affected += 1;
+                // Whole-tag idempotency via the shared helper — `None` means
+                // the node already carries the tag (skip the write). Pre-fix
+                // the CLI blindly re-appended the tag, double-tagging on
+                // re-runs and shadowing longer tags (`#lead` vs `#leadership`).
+                match workflowy_mcp_server::utils::tag_parser::add_tag_to_name(&n.name, tag_clean) {
+                    None => already_tagged += 1,
+                    Some(new_name) => {
+                        if client.edit_node(id, Some(&new_name), None).await.is_ok() {
+                            affected += 1;
+                        }
+                    }
                 }
             }
             println!(
@@ -1617,6 +1599,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     "tag": tag_clean,
                     "node_count": nodes.len(),
                     "affected_count": affected,
+                    "already_tagged": already_tagged,
                 }))?
             );
         }
@@ -1666,7 +1649,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             if ops_raw.is_empty() {
                 return Err("read-batch: operations must not be empty".into());
             }
-            const VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
+            use workflowy_mcp_server::defaults::READ_BATCH_VALID_OPS as VALID_OPS;
             let mut succeeded = 0usize;
             let mut failed = 0usize;
             let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ops_raw.len());
@@ -1782,6 +1765,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     name: raw["name"].as_str().map(str::to_string),
                     description: raw["description"].as_str().map(str::to_string),
                     priority: raw["priority"].as_i64().map(|p| p as i32),
+                    expect_name: raw["expect_name"].as_str().map(str::to_string),
                 });
             }
             let ctx = workflowy_mcp_server::workflows::WorkflowContext::default();
@@ -2232,8 +2216,7 @@ async fn cmd_reindex(
 use workflowy_mcp_server::audit::{build_review, ReviewReport};
 #[cfg(test)]
 use workflowy_mcp_server::audit::audit_mirrors;
-
-const SECONDS_PER_DAY: i64 = 86_400;
+use workflowy_mcp_server::defaults::SECONDS_PER_DAY;
 
 /// Read recent session-log files (last 7 days) into a single blob the
 /// review function can scan for URL/DOI matches. Returns `""` if

@@ -36,14 +36,16 @@ use crate::utils::tag_parser::parse_node_tags;
 fn node_entry(
     node: &WorkflowyNode,
     map: &std::collections::HashMap<&str, &WorkflowyNode>,
-    extras: &[(&str, Value)],
+    extras: Vec<(&str, Value)>,
 ) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("id".into(), json!(node.id));
     obj.insert("name".into(), json!(node.name));
     obj.insert("path".into(), json!(build_node_path_with_map(&node.id, map)));
+    // Move the extra values in (owned `json!(...)` temporaries the callers
+    // build per node) rather than cloning each.
     for (k, v) in extras {
-        obj.insert((*k).to_string(), v.clone());
+        obj.insert(k.to_string(), v);
     }
     Value::Object(obj)
 }
@@ -76,7 +78,7 @@ pub fn compute_overdue(
             Some(node_entry(
                 n,
                 &map,
-                &[
+                vec![
                     ("due_date", json!(due.to_string())),
                     ("days_overdue", json!(days)),
                     ("completed", json!(is_completed(n))),
@@ -117,7 +119,7 @@ pub fn compute_upcoming(
             Some(node_entry(
                 n,
                 &map,
-                &[
+                vec![
                     ("due_date", json!(due.to_string())),
                     ("days_until_due", json!((due - today).num_days())),
                     ("completed", json!(is_completed(n))),
@@ -151,7 +153,7 @@ pub fn compute_recent_changes(
             Some(node_entry(
                 n,
                 &map,
-                &[
+                vec![
                     ("modifiedAt", json!(ts)),
                     ("completed", json!(is_completed(n))),
                 ],
@@ -211,13 +213,69 @@ pub fn filter_todos(
             node_entry(
                 n,
                 &map,
-                &[
+                vec![
                     ("note", json!(n.description)),
                     ("completed", json!(is_completed(n))),
                     ("completed_at", json!(n.completed_at)),
                 ],
             )
         })
+        .collect()
+}
+
+/// Select the candidate nodes a `bulk_update` will act on, applying the
+/// same filter both surfaces inlined before 2026-06-16.
+///
+/// - `query` (optional): case-insensitive `contains` against the node's
+///   name OR description.
+/// - `tag` (optional): whole-tag match via `node_has_tag` (so `lead`
+///   does not match `#leadership`). The leading `#`/`@` is optional —
+///   `node_has_tag` normalises it.
+/// - `status`: `"pending"` drops completed nodes, `"completed"` drops
+///   pending nodes, anything else (`"all"`) keeps both.
+/// - `limit`: caps the returned slice (the caller enforces its own
+///   over-limit error separately for the MCP surface).
+///
+/// Pure — no clock, no client. Both the MCP `bulk_update` handler and
+/// the `wflow-do bulk-update` subcommand route through this so the
+/// candidate selection cannot drift; the apply step is already shared
+/// via `workflows::apply_bulk_op`.
+pub fn filter_bulk_candidates<'a>(
+    nodes: &'a [WorkflowyNode],
+    query: Option<&str>,
+    tag: Option<&str>,
+    status: &str,
+    limit: usize,
+) -> Vec<&'a WorkflowyNode> {
+    let q = query.map(|s| s.to_lowercase());
+    nodes
+        .iter()
+        .filter(|n| {
+            if let Some(q) = &q {
+                let in_name = n.name.to_lowercase().contains(q);
+                let in_desc = n
+                    .description
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(q))
+                    .unwrap_or(false);
+                if !in_name && !in_desc {
+                    return false;
+                }
+            }
+            if let Some(tag) = tag {
+                if !crate::utils::tag_parser::node_has_tag(n, tag) {
+                    return false;
+                }
+            }
+            let completed = is_completed(n);
+            match status {
+                "pending" if completed => return false,
+                "completed" if !completed => return false,
+                _ => {}
+            }
+            true
+        })
+        .take(limit)
         .collect()
 }
 
@@ -513,6 +571,38 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn filter_bulk_candidates_applies_query_tag_status_and_limit() {
+        let mut a = node("a", "Buy milk #shop");
+        a.description = Some("from the store".into());
+        let b = node("b", "Read leadership book #leadership");
+        let mut c = node("c", "done task #shop");
+        c.completed_at = Some(1700000000000);
+        let d = node("d", "unrelated note");
+        let nodes = vec![a, b, c.clone(), d];
+
+        // Query matches name OR description.
+        let q = filter_bulk_candidates(&nodes, Some("store"), None, "all", 100);
+        assert_eq!(q.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+
+        // Whole-tag match: `#shop` must NOT be matched by `sho`, and
+        // `#lead` must NOT match `#leadership`.
+        let shop = filter_bulk_candidates(&nodes, None, Some("shop"), "all", 100);
+        assert_eq!(shop.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["a", "c"]);
+        let lead = filter_bulk_candidates(&nodes, None, Some("lead"), "all", 100);
+        assert!(lead.is_empty(), "`lead` must not match `#leadership`");
+
+        // Status gate via is_completed: pending drops c, completed keeps only c.
+        let pending = filter_bulk_candidates(&nodes, None, Some("shop"), "pending", 100);
+        assert_eq!(pending.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        let completed = filter_bulk_candidates(&nodes, None, Some("shop"), "completed", 100);
+        assert_eq!(completed.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["c"]);
+
+        // Limit caps the slice.
+        let capped = filter_bulk_candidates(&nodes, None, Some("shop"), "all", 1);
+        assert_eq!(capped.len(), 1);
     }
 
     #[test]

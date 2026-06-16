@@ -66,7 +66,7 @@ The most preventable failure mode on this skill, and the single load-bearing dis
 
 1. **Have the UUID on screen.** Full UUID, 12-char URL-suffix hash, or 8-char doc-prefix hash. If you don't have it, resolve first via `node_at_path` / `resolve_link` / `find_node` / `list_children` or read it from `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. Don't make the call yet.
 
-2. **NEVER write the literal `null`, `"null"`, or any placeholder between parameter tags. Every UUID-typed parameter gets an explicit UUID. No exceptions** — including parameters whose schema accepts `null` as the workspace-root sentinel; pass the cached workspace-root UUID instead so the destination is auditable in tool-result transcripts. If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
+2. **NEVER write the literal `null`, `"null"`, or any placeholder between parameter tags. Every UUID-typed parameter gets an explicit UUID. No exceptions.** As of 2026-06-16 the four write tools (`create_node`, `batch_create_nodes`, `insert_content`, `create_mirror`) REQUIRE an explicit `parent_id` — omitting it or passing `null` is rejected at the wire with a field-named error. For the deliberate "workspace root" destination pass the empty string `""` (the root sentinel); otherwise pass the destination UUID / short hash so the placement is auditable. If you catch yourself about to type `null`, stop. Re-read the last few tool results; the UUID exists somewhere.
 
 3. **If the error reads `invalid parameters at \`.<field>\`: invalid type: null, expected a string`** — you typed `null` for `<field>`. Find the actual UUID. The error names the field on purpose. *Path-less variant* (`invalid type: null, expected a string` with no `at \`.<field>\``) means the running MCP binary is pre-2026-05-03 — restart the host to pick up the path-aware deserializer.
 
@@ -75,6 +75,8 @@ The most preventable failure mode on this skill, and the single load-bearing dis
    - **Multi-creates:** `batch_create_nodes(operations=[…])`.
    - **Multi-reads:** `read_batch(operations=[{op:"get_subtree"|"list_children"|"get_node", node_id, max_depth?}, …])`.
    - **Last resort:** the `wflow-do` CLI bypasses host-side encoding entirely.
+
+5. **Destructive ops carry a heightened guard.** For `delete_node` and any `transaction` delete op, resolve the target and **visually confirm both its UUID and its current name on screen immediately before the call** — not from memory, not from a UUID carried several turns back. Never issue a delete with `null` or any placeholder in `node_id`. The host-coercion path means a `null` delete can land on an unintended-but-plausible node — the most-recently-discussed one — and a delete cannot be rolled back. The wire-level deserializer guard does not protect you here, because some hosts coerce `null` to a real contextual UUID before the server sees it. The server offers a name-echo guard: pass `expect_name` (the node's current name) on `delete_node` and on any `transaction` delete op, and the server refuses the delete unless the resolved node's trimmed name matches. Always pass it on any delete whose `node_id` was resolved indirectly — and otherwise treat this rule as enforced by your own attention, not by the schema.
 
 Every discipline section that follows (Read-path, Multi-write batch, synthesis pattern 2, the scope_resolved audit) builds on this. They cross-reference rather than re-explain.
 
@@ -147,7 +149,7 @@ The user has up to four complementary layers:
 3. **Claude** — bidirectional reader and writer.
 4. **secondBrain directory** (`$SECONDBRAIN_DIR/`) — the operational outside. Holds drafts, session logs, the cached node-ID memory file, the services configuration, and external-facing briefs.
 
-The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written both to Workflowy and to `$SECONDBRAIN_DIR/session-logs/`.
+The discipline that turns this into a wiki rather than a notebook is **writing synthesis back**. Sessions that produce a useful summary, comparison, or framework should end with atomic notes saved into Workflowy (under a Distillations subtree if the user follows that pattern), mirrored into the right pillar/theme, and a session log entry written to `$SECONDBRAIN_DIR/session-logs/`. The session log is a local-filesystem record — the local file is the audit trail. (A user who wants an in-Workflowy navigation node for logs may keep one, but it is optional, not a dual-write obligation; the filesystem is canonical.)
 
 ---
 
@@ -321,7 +323,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 #### Three patterns every synthesis workflow shares
 
 1. **The routing-plan gate.** Before writing anything to Distillations, build a draft routing table — *candidate atom name; destination pillar; mirror destinations; sources integrated* — and gate on user confirmation. Pair this with a **novelty check**: for each candidate atom, run a narrowed `find_node` / `search_nodes` (with `use_index=true` against the destination pillar UUID) for the key concept; if a canonical already covers the same ground, propose a mirror or backlink rather than a new atom. Both passes are cheap and both reduce drift between the user's mental model and what lands in the graph. Worth writing into "Distil single source", "Distil reading list", and "Synthesis capture" alike.
-2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (operations-array shape per UUID Parameter Discipline rule 4); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) `create_node` the session log under the cached `Session logs` UUID and append the local mirror at `$SECONDBRAIN_DIR/session-logs/`; (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
+2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (operations-array shape per UUID Parameter Discipline rule 4); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) write the session log to `$SECONDBRAIN_DIR/session-logs/` (filesystem-canonical; no Workflowy write required for the log); (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
 3. **The Journal-scan + range-stamp convention.** When the user keeps a journal, every synthesis or review session begins with a scan of Journal entries over the period since the last journal-bearing session log. The session log's description (or first child) MUST stamp `Journal range covered: YYYY-MM-DD → YYYY-MM-DD` — the next session reads that stamp to know where to pick up. First-run convention: if no prior journal-bearing session log exists, scan back ~30 days. Lift only principle-level insights as atomic notes; personal-context entries stay in the Journal. Skip this pattern entirely if the user doesn't keep a journal.
 
 #### Discipline lessons (each one paid for by an eval failure)
@@ -350,10 +352,10 @@ These shorten the gap between "the skill said X" and "the agent actually did X" 
 
 Every session that mutated the second-brain should:
 
-1. Write a session log entry **both** to Workflowy (under the user's Session logs node, if they have one) and locally at `$SECONDBRAIN_DIR/session-logs/YYYY-MM-DD-<brief-name>.md`.
+1. Write a session log entry to `$SECONDBRAIN_DIR/session-logs/YYYY-MM-DD-<brief-name>.md`. The session log is a local-filesystem record (filesystem-canonical); a Workflowy navigation node for logs is optional, not a dual-write obligation.
 2. Move any pending drafts from `drafts/` to `session-logs/` once their writes have landed.
 3. **Update the canonicals when the session made a structural change to Workflowy** — see the next subsection. This is the discipline that prevents `memory/workflowy_node_links.md` and `memory/distillation_taxonomy.md` from drifting silently out of sync with the live tree.
-4. **If this session resumes a previously-partial one, create a new sibling session-log node — don't edit the original.** Name the new node `[YYYY-MM-DD] — [original brief title] (resumption: complete)`. The original log captures the failure mode and routing decisions; the resumption log captures the resolution and final tally. Both stay readable, the audit trail is two-stage, and any later session reading the subtree sees the full arc instead of a description that's been overwritten. Same rule applies to the local `$SECONDBRAIN_DIR/session-logs/` mirror — write a new dated file with a `-resumption` or `-completion` suffix; don't overwrite the partial log.
+4. **If this session resumes a previously-partial one, write a new dated file in `$SECONDBRAIN_DIR/session-logs/` — don't overwrite the original.** Use a `-resumption` or `-completion` suffix. The original log captures the failure mode and routing decisions; the resumption log captures the resolution and final tally. Both stay readable, the audit trail is two-stage, and any later session reading the directory sees the full arc instead of a file that's been overwritten.
 
 ### Structural-change discipline (update the canonicals)
 
@@ -437,8 +439,9 @@ Every node a synthesis session might write to. **Read this section into working 
 | Pillar 1 — distillations   | <TBD>   | <TBD>         | pillar canonical |
 | Pillar 2 — distillations   | <TBD>   | <TBD>         | pillar canonical |
 | Cross-pillar concept maps  | <TBD>   | <TBD>         | irreducibly cross-pillar claims |
-| Session logs               | <TBD>   | <TBD>         | every synthesis session writes here |
 | Themes (parent)            | <TBD>   | <TBD>         | parent for theme mirror destinations |
+
+(Session logs are not a Workflowy write target — they are written to `$SECONDBRAIN_DIR/session-logs/` on the local filesystem. See End-of-session discipline.)
 
 ## Structural Nodes (rarely change)
 

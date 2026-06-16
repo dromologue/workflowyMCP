@@ -255,6 +255,32 @@ pub fn session_logs_dir() -> Option<std::path::PathBuf> {
     secondbrain_dir().map(|p| p.join("session-logs"))
 }
 
+// --- Operation allow-lists & windows shared by the MCP server and the CLI ---
+// Single source of truth: pre-2026-06-16 these were hand-written inline in
+// both `src/server/mod.rs` and `src/bin/wflow_do.rs`, so adding a new op kind
+// meant editing two validation sites that could silently drift.
+
+/// Valid `op` kinds for `read_batch` (MCP) / `wflow-do read-batch` (CLI).
+pub const READ_BATCH_VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
+
+/// Valid `operation` kinds for `bulk_update` (MCP) / `wflow-do bulk-update` (CLI).
+pub const BULK_UPDATE_VALID_OPS: &[&str] =
+    &["delete", "add_tag", "remove_tag", "complete", "uncomplete"];
+
+/// Seconds in a day — used for the recent-changes / session-log time windows.
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Default scope for the `review` and `audit_mirrors` tools when no `root_id`
+/// is supplied: the author's Distillations subtree.
+///
+/// NOTE (machine-specific value): this is a personal default baked into the
+/// repo, which the project's "no machine-specific IDs" principle wants gone.
+/// Centralising it here (it was duplicated in `server/mod.rs` and
+/// `wflow_do.rs`) is the reuse fix; migrating it to a `WORKFLOWY_REVIEW_ROOT`
+/// env var with no hardcoded fallback is tracked separately in
+/// `tasks/todo.local.md`.
+pub const DEFAULT_REVIEW_ROOT: &str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
+
 #[cfg(test)]
 mod tests {
     use super::*;

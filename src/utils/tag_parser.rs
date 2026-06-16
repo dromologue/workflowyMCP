@@ -58,6 +58,68 @@ pub fn text_contains_tag(text: &str, tag: &str) -> bool {
     parse_tags(text).tags.iter().any(|t| t == &needle)
 }
 
+/// Append `tag` (with or without a leading `#`) to `name` as a whole tag,
+/// returning the new name — or `None` when `name` already carries the tag
+/// (whole-tag, case-insensitive). The `None`-on-present return encodes
+/// idempotency so every caller skips the write uniformly.
+///
+/// Single source of truth for "add this tag to a node name", shared by the
+/// `bulk_tag` tool (MCP handler + `wflow-do bulk-tag` CLI) and
+/// `workflows::apply_bulk_op(AddTag)`. Pre-2026-06-16 the CLI re-implemented
+/// the append without the whole-tag idempotency check and double-tagged on
+/// re-runs; routing all three sites here closes that drift by construction.
+pub fn add_tag_to_name(name: &str, tag: &str) -> Option<String> {
+    let bare = tag.trim_start_matches('#');
+    if bare.is_empty() || text_contains_tag(name, bare) {
+        return None;
+    }
+    Some(format!("{} #{}", name.trim_end(), bare))
+}
+
+/// Remove every whole-tag occurrence of `tag` from `name`, returning the new
+/// name (unchanged if the tag is absent). Whole-tag boundary via `\b`/`$` so
+/// removing `#lead` does not touch `#leadership`. Shared by
+/// `workflows::apply_bulk_op(RemoveTag)`.
+pub fn remove_tag_from_name(name: &str, tag: &str) -> String {
+    let bare = tag.trim_start_matches('#');
+    if bare.is_empty() {
+        return name.to_string();
+    }
+    let pat = Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(bare)))
+        .expect("escaped pattern is always valid regex");
+    pat.replace_all(name, "").to_string()
+}
+
+/// Whole-tag predicate over a node: does the node carry `needle` as a
+/// complete tag (case-insensitive, leading `#`/`@` optional)?
+///
+/// Routes through `parse_node_tags` (name + description) so the match
+/// is whole-tag, not the buggy substring scan the MCP `tag_search` and
+/// `find_by_tag_and_path` handlers previously used — `#lead` must not
+/// match `#leadership`. When `needle` starts with `@` the assignee list
+/// is checked; otherwise the tag list. A bare needle (no sigil) checks
+/// the tag list, mirroring how callers pass `#tag` and `@person`.
+///
+/// Single source of truth shared by the `tag_search` /
+/// `find_by_tag_and_path` MCP handlers and the matching `wflow-do`
+/// subcommands so the predicate cannot drift between surfaces.
+pub fn node_has_tag(node: &WorkflowyNode, needle: &str) -> bool {
+    let is_assignee = needle.starts_with('@');
+    let bare = needle
+        .trim_start_matches('#')
+        .trim_start_matches('@')
+        .to_lowercase();
+    if bare.is_empty() {
+        return false;
+    }
+    let parsed = parse_node_tags(node);
+    if is_assignee {
+        parsed.assignees.iter().any(|a| a == &bare)
+    } else {
+        parsed.tags.iter().any(|t| t == &bare)
+    }
+}
+
 /// Parse tags from a node's name and description combined.
 pub fn parse_node_tags(node: &WorkflowyNode) -> ParsedTags {
     let mut combined = parse_tags(&node.name);
@@ -166,6 +228,41 @@ mod tests {
         let result = parse_node_tags(&node);
         assert_eq!(result.tags, vec!["project", "review"]);
         assert_eq!(result.assignees, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn node_has_tag_matches_whole_tag_not_substring() {
+        let node = WorkflowyNode {
+            id: "n1".into(),
+            name: "Notes on #leadership and #lead".into(),
+            description: Some("assigned @team-lead".into()),
+            ..Default::default()
+        };
+        // Whole-tag presence (leading # optional).
+        assert!(node_has_tag(&node, "lead"));
+        assert!(node_has_tag(&node, "#lead"));
+        assert!(node_has_tag(&node, "leadership"));
+        // Case-insensitive.
+        assert!(node_has_tag(&node, "#LEAD"));
+        // Assignee via leading @.
+        assert!(node_has_tag(&node, "@team-lead"));
+        // A tag-form needle must not match an assignee, and vice versa.
+        assert!(!node_has_tag(&node, "team-lead"));
+        assert!(!node_has_tag(&node, "@lead"));
+        // Empty / sigil-only needle.
+        assert!(!node_has_tag(&node, ""));
+        assert!(!node_has_tag(&node, "#"));
+        // Absent tag.
+        assert!(!node_has_tag(&node, "transform"));
+
+        // A node carrying only the longer tag must NOT match the shorter.
+        let only_long = WorkflowyNode {
+            id: "n2".into(),
+            name: "#leadership only".into(),
+            ..Default::default()
+        };
+        assert!(!node_has_tag(&only_long, "lead"));
+        assert!(node_has_tag(&only_long, "leadership"));
     }
 
     #[test]

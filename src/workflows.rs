@@ -40,19 +40,29 @@
 //!
 //! ## Workflow contract
 //!
-//! Every workflow function takes:
-//! 1. `client: &WorkflowyClient` — the shared HTTP layer.
-//! 2. The typed inputs the operation needs (resolved IDs preferred).
-//! 3. `ctx: &WorkflowContext<'_>` — optional cancel guard + deadline.
-//!    The MCP passes the active server context; the CLI passes
-//!    `WorkflowContext::default()`. Workflows that don't need
-//!    mid-orchestration cancel/deadline ignore the field.
+//! This module hosts two shapes of shared logic, both taking a
+//! `client: &WorkflowyClient` (and, when they do time-bounded work, a
+//! `ctx: &WorkflowContext<'_>` carrying an optional cancel guard + deadline —
+//! the MCP passes the active server context, the CLI passes
+//! `WorkflowContext::default()`):
 //!
-//! And returns:
-//! - `Ok((TypedResult, MutationFootprint))` on success.
-//! - `Err(WorkflowyError)` on failure, with `InvalidInput` reserved for
-//!   caller-supplied parameter problems (mapped to MCP
-//!   `tool_invalid_params` envelopes by the wrapper).
+//! 1. **Mutating orchestrations** (`create_mirror_via_convention`,
+//!    `insert_content_via_indented`, `run_transaction`, `apply_bulk_op`,
+//!    `reorder_nodes_via_priority`, `smart_insert_under_target`) return
+//!    `Ok((TypedResult, MutationFootprint))` — the footprint declares which
+//!    node IDs need cache + name-index invalidation; the MCP wrapper applies
+//!    it, the CLI discards it.
+//! 2. **Read-only / pure shared steps** (`create_mirror_dry_run`,
+//!    `audit_mirrors_walk`, `resolve_link_via_walk_and_scan`,
+//!    `extract_unresolved_mirror_targets`, the `build_resolve_link_*_payload`
+//!    builders, `parse_indented_content`, `find_node_by_short_hash`,
+//!    `destructive_echo_matches`, `scope_resolved_label`) mutate nothing, so
+//!    they return `Result<T>` / `T` and carry no footprint. A `MutationFootprint`
+//!    there would always be empty — returning one would be cargo-cult.
+//!
+//! Either way, failures are `Err(WorkflowyError)`, with `InvalidInput`
+//! reserved for caller-supplied parameter problems (mapped to MCP
+//! `tool_invalid_params` envelopes by the wrapper).
 
 use std::time::Instant;
 
@@ -197,6 +207,94 @@ pub fn scope_resolved_label(resolved: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------
+// path_of (parent-chain walk, shared between MCP and CLI)
+// ---------------------------------------------------------------------
+
+/// One step in a root→node path: the node's id and name.
+#[derive(Debug, Clone, Serialize)]
+pub struct PathSegment {
+    pub id: String,
+    pub name: String,
+}
+
+/// Result of walking a node's parent chain to the root.
+///
+/// `segments` are ordered root-first (index 0 is the topmost ancestor
+/// reached, the last entry is the requested node). `truncated` is true
+/// when the walk stopped because it hit `max_depth` rather than the
+/// natural root (a `None`/empty parent).
+#[derive(Debug, Clone)]
+pub struct ParentChain {
+    pub segments: Vec<PathSegment>,
+    pub truncated: bool,
+}
+
+/// Walk the parent-id chain from `node_id` up to the workspace root and
+/// return the ordered segments plus a truncation flag.
+///
+/// Single source of truth for the `path_of` parent walk, shared by the
+/// MCP `path_of` handler and the `wflow-do path-of` subcommand. The MCP
+/// handler keeps its own JSON shaping (display string, depth, truncated)
+/// around this walk; the CLI prints its own shape.
+///
+/// The walk stops at the first `None`/empty parent (the natural root),
+/// the first cycle (a node id already seen — guards against a malformed
+/// parent loop), the first `get_node` error (returns the partial path),
+/// or `max_depth` (sets `truncated`). Pre-2026-06-16 the CLI walked the
+/// chain with NO cycle guard, so a malformed parent loop spun until the
+/// depth cap; lifting both surfaces here gives the CLI the same guard
+/// the MCP handler already had. Uses `get_node_with_propagation_retry`
+/// so a freshly-moved node's stale parent listing doesn't abort the walk
+/// — the more robust of the two prior variants, now shared.
+pub async fn walk_parent_chain(
+    client: &WorkflowyClient,
+    node_id: &str,
+    max_depth: usize,
+    ctx: &WorkflowContext<'_>,
+) -> Result<ParentChain> {
+    let mut segments: Vec<PathSegment> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_id: Option<String> = Some(node_id.to_string());
+    let mut depth = 0usize;
+    let mut hit_depth_cap = false;
+
+    while let Some(id) = current_id.take() {
+        if ctx.is_cancelled() {
+            return Err(WorkflowyError::Cancelled);
+        }
+        if ctx.is_past_deadline() {
+            return Err(WorkflowyError::Timeout);
+        }
+        if !seen.insert(id.clone()) {
+            tracing::warn!(node_id = %id, "walk_parent_chain: cycle detected, stopping walk");
+            break;
+        }
+        if depth >= max_depth {
+            tracing::warn!(max_depth, "walk_parent_chain: max_depth reached, returning partial path");
+            hit_depth_cap = true;
+            break;
+        }
+        depth += 1;
+        match client.get_node_with_propagation_retry(&id).await {
+            Ok(node) => {
+                segments.push(PathSegment { id: node.id, name: node.name });
+                current_id = match node.parent_id {
+                    Some(pid) if !pid.is_empty() => Some(pid),
+                    _ => None,
+                };
+            }
+            Err(e) => {
+                tracing::warn!(node_id = %id, error = %e, "walk_parent_chain: get_node failed; returning partial path");
+                break;
+            }
+        }
+    }
+    // Reverse so index 0 is root, last is the requested node.
+    segments.reverse();
+    Ok(ParentChain { segments, truncated: hit_depth_cap })
+}
+
+// ---------------------------------------------------------------------
 // create_mirror
 // ---------------------------------------------------------------------
 
@@ -266,29 +364,40 @@ pub struct CreateMirrorDryRun {
 /// regardless of surface — the failure-report 2026-05-09 fix asked
 /// for "would-be canonical_id and target_parent_id without writing"
 /// and this is the single function that produces it.
+/// Mirror-of-self refusal — shared by the dry-run and production
+/// `create_mirror` workflows so the constraint and its message live once.
+fn refuse_self_mirror(canonical_id: &str, target_parent_id: Option<&str>) -> Result<()> {
+    if target_parent_id == Some(canonical_id) {
+        return Err(WorkflowyError::InvalidInput {
+            reason: "target_parent_id cannot equal canonical_node_id — \
+                     a node cannot mirror itself into its own subtree"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Trim a pillar argument and drop it when empty. Shared normalisation so
+/// the dry-run and production paths agree on what "no pillar" means.
+fn normalise_pillar(pillar: Option<&str>) -> Option<String> {
+    pillar
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 pub async fn create_mirror_dry_run(
     client: &WorkflowyClient,
     canonical_id: &str,
     target_parent_id: Option<&str>,
     pillar: Option<&str>,
 ) -> Result<CreateMirrorDryRun> {
-    if let Some(parent) = target_parent_id {
-        if parent == canonical_id {
-            return Err(WorkflowyError::InvalidInput {
-                reason: "target_parent_id cannot equal canonical_node_id — \
-                         a node cannot mirror itself into its own subtree"
-                    .to_string(),
-            });
-        }
-    }
+    refuse_self_mirror(canonical_id, target_parent_id)?;
     let canonical = client.get_node(canonical_id).await?;
     let canonical_desc = canonical.description.clone().unwrap_or_default();
     let canonical_already_marked =
         crate::audit::extract_marker(&canonical_desc, "canonical_of:").is_some();
-    let pillar_norm = pillar
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let pillar_norm = normalise_pillar(pillar);
     let would_annotate = pillar_norm.is_some() && !canonical_already_marked;
     Ok(CreateMirrorDryRun {
         canonical_id: canonical_id.to_string(),
@@ -312,15 +421,7 @@ pub async fn create_mirror_via_convention(
 
     // 1. Mirror-of-self refusal: cheap and produces a clearer error
     //    than letting the API surface the consequence downstream.
-    if let Some(parent) = target_parent_id {
-        if parent == canonical_id {
-            return Err(WorkflowyError::InvalidInput {
-                reason: "target_parent_id cannot equal canonical_node_id — \
-                         a node cannot mirror itself into its own subtree"
-                    .to_string(),
-            });
-        }
-    }
+    refuse_self_mirror(canonical_id, target_parent_id)?;
 
     // 2. Read the canonical to copy its name verbatim.
     let canonical = client.get_node(canonical_id).await?;
@@ -350,7 +451,7 @@ pub async fn create_mirror_via_convention(
     let canonical_already_marked =
         extract_marker(&canonical_desc, "canonical_of:").is_some();
     let mut annotated = false;
-    if let Some(p) = pillar.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(p) = normalise_pillar(pillar) {
         if !canonical_already_marked {
             let marker_line = format!("canonical_of: {}", p);
             let new_desc = if canonical_desc.is_empty() {
@@ -694,6 +795,23 @@ pub struct TxnOp {
     pub name: Option<String>,
     pub description: Option<String>,
     pub priority: Option<i32>,
+    /// Optional name-echo guard for `delete` ops. See
+    /// [`destructive_echo_matches`] and the `delete_node` handler — when set,
+    /// the delete step refuses unless the target's current name matches.
+    pub expect_name: Option<String>,
+}
+
+/// Destructive-op name-echo comparison. Single source of truth shared by the
+/// `delete_node` MCP handler and the `transaction` delete step so the two
+/// surfaces cannot drift. Both sides are trimmed; the comparison is
+/// case-sensitive because node names are user content — a case difference is a
+/// real difference, not noise. The guard exists because a host can coerce a
+/// `null`/placeholder `node_id` into a plausible-but-unintended UUID *before*
+/// the server's deserializer sees it (host-coercion hazard, 2026-06-16); the
+/// wire-level `NodeId` null-rejection cannot catch that, but a name mismatch
+/// against the caller's echo can — and a delete is irreversible.
+pub fn destructive_echo_matches(current_name: &str, echoed_name: &str) -> bool {
+    current_name.trim() == echoed_name.trim()
 }
 
 /// Inverse of a successful transaction step. Applied in LIFO order
@@ -883,6 +1001,22 @@ async fn apply_txn_step(
             let node_id = op.node_id.ok_or_else(|| WorkflowyError::InvalidInput {
                 reason: "delete requires `node_id`".to_string(),
             })?;
+            // Name-echo guard (host-coercion defence; see
+            // `destructive_echo_matches`). When the op carries `expect_name`,
+            // refuse unless the target's current name matches — a coerced
+            // `node_id` pointing at the wrong node fails this check before the
+            // irreversible delete lands.
+            if let Some(expected) = op.expect_name.as_deref() {
+                let current = client.get_node(&node_id).await?;
+                if !destructive_echo_matches(&current.name, expected) {
+                    return Err(WorkflowyError::InvalidInput {
+                        reason: format!(
+                            "delete refused: node `{}` is named {:?} but expect_name was {:?} — the node_id may have been coerced to a different node than intended; re-resolve and confirm before retrying",
+                            node_id, current.name, expected
+                        ),
+                    });
+                }
+            }
             client.delete_node(&node_id).await?;
             footprint.invalidate_node(&node_id);
             let summary = json!({ "op": "delete", "id": node_id });
@@ -1099,24 +1233,19 @@ pub async fn apply_bulk_op(
             BulkOp::Uncomplete => client.set_completion(&node.id, false).await.is_ok(),
             BulkOp::AddTag => {
                 let tag = operation_tag.expect("validated by requires_tag check above");
-                let bare = tag.trim_start_matches('#');
-                // Idempotent: whole-tag boundary check so `#lead` doesn't
-                // shadow-double-tag a node carrying `#leadership` (matches
-                // bulk_tag's check; same 2026-05-24 hazard).
-                if crate::utils::tag_parser::text_contains_tag(&node.name, bare) {
-                    true
-                } else {
-                    let new_name = format!("{} #{}", node.name.trim_end(), bare);
-                    client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
+                // Whole-tag idempotency via the shared helper: `None` means
+                // the node already carries the tag (skip the write, count as
+                // success); `Some(new_name)` is the appended form.
+                match crate::utils::tag_parser::add_tag_to_name(&node.name, tag) {
+                    None => true,
+                    Some(new_name) => {
+                        client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
+                    }
                 }
             }
             BulkOp::RemoveTag => {
-                let tag = operation_tag
-                    .expect("validated by requires_tag check above")
-                    .trim_start_matches('#');
-                let pat = regex::Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(tag)))
-                    .expect("escaped pattern is always valid regex");
-                let new_name = pat.replace_all(&node.name, "").to_string();
+                let tag = operation_tag.expect("validated by requires_tag check above");
+                let new_name = crate::utils::tag_parser::remove_tag_from_name(&node.name, tag);
                 client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
             }
         };
@@ -1435,6 +1564,346 @@ pub async fn reorder_nodes_via_priority(
 }
 
 // ---------------------------------------------------------------------
+// duplicate_subtree / instantiate_template (deep-copy a subtree)
+// ---------------------------------------------------------------------
+
+// Pre-2026-06-16 the deep-copy orchestration that backs both
+// `duplicate_node` and `create_from_template` was inlined twice on each
+// surface — four copies in total — and they had silently diverged:
+//
+// - The MCP `duplicate_node` walked at depth 10, ordered children via a
+//   `children_of` map + BFS (deterministic sibling order), supported a
+//   `name_prefix`, and refused to run against a truncated subtree. The
+//   CLI `duplicate` walked at depth 10/0, recreated via a frontier-stack
+//   DFS (non-deterministic sibling order under the API's ordering), had
+//   no `name_prefix`, and DID refuse truncation.
+// - The MCP `create_from_template` substituted `{{var}}` via a regex with
+//   unmatched-variable passthrough (an unknown `{{x}}` is left intact),
+//   BFS-ordered, refused truncation. The CLI `template` substituted via
+//   literal `str::replace("{{k}}", v)` per known var (a substring replace
+//   with NO passthrough behaviour distinct from the regex — the two agree
+//   for known vars but the CLI silently dropped nothing and could corrupt
+//   on overlapping keys), DFS-ordered, did NOT refuse truncation.
+//
+// The lift collapses all four into one private BFS deep-copy helper
+// (`deep_copy_subtree`) parameterised by a per-node name/description
+// transform, with two thin public wrappers. CANONICAL behaviour is the
+// MCP form throughout: BFS ordering (deterministic), regex substitution
+// with unmatched-variable passthrough, truncated-subtree refusal. The CLI
+// GAINS `name_prefix` + truncation refusal on `duplicate`, and regex
+// substitution + unmatched-var passthrough on `template`.
+
+/// Outcome of a [`duplicate_subtree`] call. Carries the new root id, the
+/// original source id, and the count of nodes created.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateOutcome {
+    /// The source node id that was duplicated.
+    pub original_id: String,
+    /// The id of the freshly-created root copy.
+    pub new_root_id: String,
+    /// Total nodes created (root + descendants when `include_children`).
+    pub nodes_created: usize,
+}
+
+/// Outcome of an [`instantiate_template`] call. Like [`DuplicateOutcome`]
+/// but names the template source and lists the variable keys supplied.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateOutcome {
+    /// The template node id that was instantiated.
+    pub template_id: String,
+    /// The id of the freshly-created root copy.
+    pub new_root_id: String,
+    /// Total nodes created (root + descendants).
+    pub nodes_created: usize,
+    /// The variable keys the caller supplied (for the response shape —
+    /// not every key is necessarily present in the template text).
+    pub variables_applied: Vec<String>,
+}
+
+/// Compile the canonical template-variable pattern once. The pattern is a
+/// static literal, so compilation cannot fail at runtime; we surface it
+/// as a `WorkflowyError` rather than `expect()` to keep the workflow free
+/// of panics per the no-unwrap-outside-tests rule.
+fn template_var_regex() -> Result<regex::Regex> {
+    regex::Regex::new(r"\{\{(\w+)\}\}")
+        .map_err(|e| WorkflowyError::Internal(format!("template-variable pattern failed to compile: {e}")))
+}
+
+/// Build the per-node transform that performs `{{var}}` substitution on a
+/// string. UNMATCHED variables (keys not present in `vars`) are left
+/// intact — `{{unknown}}` survives verbatim. This is the canonical
+/// (MCP) substitution behaviour; the CLI's pre-lift literal-replace had
+/// no passthrough concept and could not be made to agree on overlapping
+/// keys. Applied to both name and description by [`instantiate_template`].
+fn substitute_vars(re: &regex::Regex, vars: &std::collections::HashMap<String, String>, text: &str) -> String {
+    re.replace_all(text, |caps: &regex::Captures| {
+        vars.get(&caps[1]).cloned().unwrap_or_else(|| caps[0].to_string())
+    })
+    .to_string()
+}
+
+/// Shared BFS deep-copy of a subtree. Both [`duplicate_subtree`] and
+/// [`instantiate_template`] route through this; they differ only in the
+/// per-node `transform` closure that maps a source node to the
+/// `(name, description)` the copy should carry.
+///
+/// CANONICAL traversal is BFS via a `children_of` map keyed off the
+/// source parent ids — this preserves the source's sibling order
+/// deterministically (a frontier-stack DFS does not, and the CLI's
+/// pre-lift DFS could reorder siblings). The walk, truncation refusal,
+/// and the empty-subtree check happen here so both wrappers inherit them.
+///
+/// `walk_depth` is the subtree depth to fetch; callers pass
+/// [`defaults::MAX_TREE_DEPTH`] for a full copy or `0` to copy only the
+/// root (the `include_children=false` path).
+///
+/// Returns `(new_root_id, nodes_created, footprint)`. The footprint
+/// declares the target parent (its children listing changed) for cache
+/// invalidation — the created nodes are brand-new ids the caller doesn't
+/// hold, so there is nothing stale to invalidate for them.
+async fn deep_copy_subtree<F>(
+    client: &WorkflowyClient,
+    source_id: &str,
+    target_parent_id: &str,
+    walk_depth: usize,
+    truncation_refusal_label: &str,
+    not_found_label: &str,
+    ctx: &WorkflowContext<'_>,
+    transform: F,
+) -> Result<(String, usize, MutationFootprint)>
+where
+    F: Fn(&WorkflowyNode) -> (String, Option<String>),
+{
+    let mut controls =
+        crate::api::client::FetchControls::with_timeout(std::time::Duration::from_millis(
+            defaults::SUBTREE_FETCH_TIMEOUT_MS,
+        ));
+    if let Some(guard) = ctx.cancel {
+        controls = controls.and_cancel(guard.clone());
+    }
+    // An explicit deadline on the context tightens the walk budget when
+    // the wrapping ToolKind budget is shorter than the default subtree
+    // timeout. The CLI passes no deadline, so it keeps the full budget.
+    if let Some(dl) = ctx.deadline {
+        controls.deadline = Some(dl);
+    }
+
+    let fetch = client
+        .get_subtree_with_controls(
+            Some(source_id),
+            walk_depth,
+            defaults::MAX_SUBTREE_NODES,
+            controls,
+        )
+        .await?;
+
+    // Refuse a partial copy outright: producing a silently-incomplete
+    // duplicate is worse than failing loudly. This is the MCP contract;
+    // the CLI gains it via this shared path.
+    if fetch.truncated {
+        return Err(WorkflowyError::InvalidInput {
+            reason: format!(
+                "Cannot {}: source subtree exceeds {} nodes. Refusing to produce a partial copy. \
+                 Narrow the source or copy sub-branches individually.",
+                truncation_refusal_label, fetch.limit,
+            ),
+        });
+    }
+
+    let nodes = &fetch.nodes;
+    let root = nodes.iter().find(|n| n.id == source_id).ok_or_else(|| {
+        WorkflowyError::InvalidInput {
+            reason: format!("{} '{}' not found", not_found_label, source_id),
+        }
+    })?;
+
+    let mut footprint = MutationFootprint::new();
+    // The target parent's children listing changes; the created nodes are
+    // new ids with nothing stale to invalidate.
+    footprint.invalidate_cache_only(target_parent_id);
+
+    // Create the root copy first so children can reparent under it.
+    let (root_name, root_desc) = transform(root);
+    let created_root = client
+        .create_node(&root_name, root_desc.as_deref(), Some(target_parent_id), None)
+        .await?;
+    let new_root_id = created_root.id.clone();
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    id_map.insert(root.id.clone(), created_root.id);
+    let mut created_count = 1usize;
+
+    // Only walk descendants when the fetch actually returned any (depth 0
+    // returns just the root, so the children map is empty and the loop is
+    // a no-op — covering the `include_children=false` path uniformly).
+    let mut children_of: std::collections::HashMap<&str, Vec<&WorkflowyNode>> =
+        std::collections::HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.as_str()).or_default().push(n);
+        }
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    if let Some(children) = children_of.get(root.id.as_str()) {
+        for child in children {
+            queue.push_back(*child);
+        }
+    }
+
+    while let Some(node) = queue.pop_front() {
+        // The underlying create_node honours ctx.cancel via the client's
+        // request path; we additionally bail between creates so a
+        // cancel/deadline stops the copy promptly rather than after one
+        // more round-trip. A bailed-out copy is an Internal error (the
+        // partial tree is already written) so the caller re-reads.
+        if ctx.is_cancelled() {
+            return Err(WorkflowyError::Internal(format!(
+                "copy cancelled after creating {} of {} nodes; re-read the target to inspect the partial tree",
+                created_count,
+                nodes.len(),
+            )));
+        }
+        if ctx.is_past_deadline() {
+            return Err(WorkflowyError::Internal(format!(
+                "copy timed out after creating {} of {} nodes; re-read the target to inspect the partial tree",
+                created_count,
+                nodes.len(),
+            )));
+        }
+
+        let new_parent = node
+            .parent_id
+            .as_ref()
+            .and_then(|pid| id_map.get(pid))
+            .cloned()
+            .unwrap_or_else(|| new_root_id.clone());
+
+        let (name, desc) = transform(node);
+        let created = client
+            .create_node(&name, desc.as_deref(), Some(&new_parent), None)
+            .await?;
+        id_map.insert(node.id.clone(), created.id);
+        created_count += 1;
+        if let Some(children) = children_of.get(node.id.as_str()) {
+            for child in children {
+                queue.push_back(*child);
+            }
+        }
+    }
+
+    Ok((new_root_id, created_count, footprint))
+}
+
+/// Deep-copy a node subtree to a new parent.
+///
+/// Both the MCP `duplicate_node` handler and the CLI `duplicate`
+/// subcommand route through this so they cannot drift. `include_children`
+/// selects a full copy (BFS over the whole subtree) vs. root-only;
+/// `name_prefix`, when set, prepends to the ROOT node's name only
+/// (descendants keep their names). The truncated-subtree refusal lives in
+/// the shared [`deep_copy_subtree`] helper.
+///
+/// IDs are expected pre-resolved by the caller (the MCP wrapper resolves
+/// short-hashes / links; the CLI passes through whatever the user gave).
+pub async fn duplicate_subtree(
+    client: &WorkflowyClient,
+    source_id: &str,
+    target_parent_id: &str,
+    include_children: bool,
+    name_prefix: Option<&str>,
+    ctx: &WorkflowContext<'_>,
+) -> Result<(DuplicateOutcome, MutationFootprint)> {
+    let walk_depth = if include_children { defaults::MAX_TREE_DEPTH } else { 0 };
+    let root_id = source_id.to_string();
+    let prefix = name_prefix.map(|p| p.to_string());
+
+    let transform = |node: &WorkflowyNode| -> (String, Option<String>) {
+        // The prefix applies to the ROOT only — identified by id equality
+        // with the source. Descendants copy verbatim.
+        let name = if node.id == root_id {
+            match &prefix {
+                Some(p) => format!("{}{}", p, node.name),
+                None => node.name.clone(),
+            }
+        } else {
+            node.name.clone()
+        };
+        (name, node.description.clone())
+    };
+
+    let (new_root_id, nodes_created, footprint) = deep_copy_subtree(
+        client,
+        source_id,
+        target_parent_id,
+        walk_depth,
+        "duplicate",
+        "Node",
+        ctx,
+        transform,
+    )
+    .await?;
+
+    Ok((
+        DuplicateOutcome {
+            original_id: source_id.to_string(),
+            new_root_id,
+            nodes_created,
+        },
+        footprint,
+    ))
+}
+
+/// Instantiate a template subtree under a new parent, substituting
+/// `{{variable}}` tokens in every copied node's name and description.
+///
+/// Both the MCP `create_from_template` handler and the CLI `template`
+/// subcommand route through this. CANONICAL substitution is regex
+/// `\{\{(\w+)\}\}` with UNMATCHED variables left intact — the CLI's
+/// pre-lift literal `str::replace` had no passthrough concept; routing it
+/// here is a behavioural improvement (an unknown `{{x}}` now survives
+/// verbatim instead of being silently left as-is only because no
+/// replace rule matched). Always a full BFS copy.
+pub async fn instantiate_template(
+    client: &WorkflowyClient,
+    template_id: &str,
+    target_parent_id: &str,
+    variables: &std::collections::HashMap<String, String>,
+    ctx: &WorkflowContext<'_>,
+) -> Result<(TemplateOutcome, MutationFootprint)> {
+    let re = template_var_regex()?;
+    let transform = |node: &WorkflowyNode| -> (String, Option<String>) {
+        let name = substitute_vars(&re, variables, &node.name);
+        let desc = node.description.as_ref().map(|d| substitute_vars(&re, variables, d));
+        (name, desc)
+    };
+
+    let (new_root_id, nodes_created, footprint) = deep_copy_subtree(
+        client,
+        template_id,
+        target_parent_id,
+        defaults::MAX_TREE_DEPTH,
+        "instantiate template",
+        "Template",
+        ctx,
+        transform,
+    )
+    .await?;
+
+    let mut variables_applied: Vec<String> = variables.keys().cloned().collect();
+    variables_applied.sort();
+
+    Ok((
+        TemplateOutcome {
+            template_id: template_id.to_string(),
+            new_root_id,
+            nodes_created,
+            variables_applied,
+        },
+        footprint,
+    ))
+}
+
+// ---------------------------------------------------------------------
 // audit_mirrors
 // ---------------------------------------------------------------------
 
@@ -1716,24 +2185,6 @@ pub const RESOLVE_LINK_RECOVERY_HINT: &str = "Supply `search_parent_path` to sco
 /// `resolve_link` payload returns a plain-text `name`. Mirrors the
 /// `strip_html` helper in `server/mod.rs`; lifted here so the workflow
 /// can be called by surfaces that don't import server internals.
-fn strip_html_for_resolve_link(s: &str) -> String {
-    // Tiny, conservative stripper: drop `<...>` runs without parsing
-    // entities. The pre-existing `strip_html` in server/mod.rs uses
-    // the same approach; this duplicates it intentionally to avoid
-    // routing the CLI through a server-internal helper.
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Build the JSON payload a `resolve_link` HIT returns on either
 /// surface. Both transports emit the same five fields so a caller
 /// migrating between MCP and CLI sees the same shape.
@@ -1749,7 +2200,7 @@ pub fn build_resolve_link_hit_payload(
     json!({
         "resolved_via": resolved_via,
         "id": node.id,
-        "name": strip_html_for_resolve_link(&node.name),
+        "name": crate::utils::html::strip_html(&node.name),
         "description": node.description,
         "parent_id": node.parent_id,
     })
@@ -1840,6 +2291,23 @@ pub fn build_resolve_link_miss_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `destructive_echo_matches` is the shared comparison both delete
+    /// surfaces use. Trim-tolerant on both sides, case-SENSITIVE (names are
+    /// user content), and exact on the trimmed core — so a different node's
+    /// name fails the guard.
+    #[test]
+    fn destructive_echo_matches_trims_but_is_case_sensitive_and_exact() {
+        assert!(destructive_echo_matches("Real Project", "Real Project"));
+        assert!(destructive_echo_matches("  Real Project  ", "Real Project"));
+        assert!(destructive_echo_matches("Real Project", "  Real Project"));
+        // Case difference is a real difference.
+        assert!(!destructive_echo_matches("Real Project", "real project"));
+        // A different node entirely.
+        assert!(!destructive_echo_matches("Real Project", "Archive"));
+        // Internal whitespace is significant (only the ends are trimmed).
+        assert!(!destructive_echo_matches("Real  Project", "Real Project"));
+    }
 
     /// Self-mirror is rejected at the validation step without an API
     /// call. Pinned because both surfaces depend on this preflight to
@@ -2554,5 +3022,122 @@ mod tests {
             hint.contains("search_parent_path"),
             "miss hint must still steer caller to a tighter scope: {hint}",
         );
+    }
+
+    // ------------------------------------------------------------------
+    // instantiate_template / duplicate_subtree transform tests
+    //
+    // These exercise the pure substitution transform directly (no
+    // client). The canonical (MCP) behaviour is regex `{{var}}` with
+    // UNMATCHED variables left intact — the property the CLI's pre-lift
+    // literal `str::replace` could not express.
+    // ------------------------------------------------------------------
+
+    fn vars(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// A known variable is substituted; an UNKNOWN `{{x}}` is left
+    /// verbatim (passthrough). Pinned because the passthrough is the
+    /// behavioural improvement the CLI gains from the lift — a literal
+    /// replace silently leaves unknown tokens too, but only by accident
+    /// of "no rule matched"; the regex form makes passthrough explicit
+    /// and total.
+    #[test]
+    fn substitute_vars_replaces_known_and_passes_through_unknown() {
+        let re = template_var_regex().expect("static pattern compiles");
+        let v = vars(&[("name", "Alice")]);
+        assert_eq!(substitute_vars(&re, &v, "Hi {{name}}"), "Hi Alice");
+        // Unknown variable survives verbatim.
+        assert_eq!(substitute_vars(&re, &v, "Hi {{name}} {{role}}"), "Hi Alice {{role}}");
+        // No variables at all — text is unchanged.
+        assert_eq!(substitute_vars(&re, &v, "plain text"), "plain text");
+    }
+
+    /// Multiple distinct variables in one string all substitute, and a
+    /// repeated variable substitutes every occurrence.
+    #[test]
+    fn substitute_vars_handles_multi_var_and_repeats() {
+        let re = template_var_regex().expect("static pattern compiles");
+        let v = vars(&[("a", "1"), ("b", "2")]);
+        assert_eq!(
+            substitute_vars(&re, &v, "{{a}}-{{b}}-{{a}}"),
+            "1-2-1",
+        );
+    }
+
+    /// The transform [`instantiate_template`] hands to [`deep_copy_subtree`]
+    /// substitutes BOTH the name and the description of a node. Verified
+    /// by replaying the closure the workflow builds (kept in sync with
+    /// the workflow body). The `None` description path is preserved.
+    #[test]
+    fn template_transform_applies_to_name_and_description() {
+        let re = template_var_regex().expect("static pattern compiles");
+        let v = vars(&[("who", "Bob")]);
+        let transform = |node: &WorkflowyNode| -> (String, Option<String>) {
+            let name = substitute_vars(&re, &v, &node.name);
+            let desc = node.description.as_ref().map(|d| substitute_vars(&re, &v, d));
+            (name, desc)
+        };
+        let with_desc = WorkflowyNode {
+            id: "n1".to_string(),
+            name: "Hello {{who}}".to_string(),
+            description: Some("note for {{who}} and {{unknown}}".to_string()),
+            parent_id: None,
+            ..Default::default()
+        };
+        let (name, desc) = transform(&with_desc);
+        assert_eq!(name, "Hello Bob");
+        assert_eq!(desc.as_deref(), Some("note for Bob and {{unknown}}"));
+
+        let no_desc = WorkflowyNode {
+            id: "n2".to_string(),
+            name: "{{who}}'s task".to_string(),
+            description: None,
+            parent_id: None,
+            ..Default::default()
+        };
+        let (name, desc) = transform(&no_desc);
+        assert_eq!(name, "Bob's task");
+        assert_eq!(desc, None);
+    }
+
+    /// The duplicate transform prepends `name_prefix` to the ROOT only
+    /// (id-matched), leaving descendants untouched and never touching
+    /// descriptions. Replays the closure [`duplicate_subtree`] builds.
+    #[test]
+    fn duplicate_transform_prefixes_root_only() {
+        let root_id = "root-1".to_string();
+        let prefix = Some("Copy of ".to_string());
+        let transform = |node: &WorkflowyNode| -> (String, Option<String>) {
+            let name = if node.id == root_id {
+                match &prefix {
+                    Some(p) => format!("{}{}", p, node.name),
+                    None => node.name.clone(),
+                }
+            } else {
+                node.name.clone()
+            };
+            (name, node.description.clone())
+        };
+        let root = WorkflowyNode {
+            id: "root-1".to_string(),
+            name: "Project".to_string(),
+            description: Some("keep me".to_string()),
+            parent_id: None,
+            ..Default::default()
+        };
+        let child = WorkflowyNode {
+            id: "child-1".to_string(),
+            name: "Task".to_string(),
+            description: None,
+            parent_id: Some("root-1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(transform(&root), ("Copy of Project".to_string(), Some("keep me".to_string())));
+        assert_eq!(transform(&child), ("Task".to_string(), None));
     }
 }

@@ -250,7 +250,8 @@ Behind the MCP layer, keep the domain API clean.
 **Status**: ✅ Tools are focused; input validation is enforced at the boundary via the `NodeId` newtype and `#[serde(deny_unknown_fields)]` on every parameter struct.
 
 **Implemented**:
-- `NodeId` newtype hand-written `Deserialize` rejects the literal strings `"null"` / `"undefined"` and whitespace-only at the parameter boundary, before the handler body runs. Empty string is preserved as the workspace-root sentinel for handlers that special-case it (`list_children`, `insert_content` etc.).
+- `NodeId` newtype hand-written `Deserialize` rejects the literal strings `"null"` / `"undefined"` and whitespace-only at the parameter boundary, before the handler body runs. Empty string is preserved as the workspace-root sentinel for handlers that special-case it (`list_children`, and — as of 2026-06-16 — the four write tools).
+- **Write-destination `parent_id` is required (2026-06-16 host-coercion hardening).** `create_node`, `batch_create_nodes` (per op), `insert_content`, and `create_mirror` (`target_parent_id`) take a required `NodeId`: omitting the field or passing `null` is rejected at the wire with a field-named error, and the empty-string sentinel `""` is the *explicit* "workspace root" choice. This closes the silent-misroute path where a host that stripped or coerced the parameter would land a write at the root undetected (the 2026-05-27 / 2026-06-16 observations). Reads (`list_children`, `find_node`, `search_nodes`) keep `Option` — a missing parent there means "list/scan from root" and carries no destructive intent. Pinned by `write_tools_require_explicit_parent_id_reject_null_and_omit`. Breaking change vs the 2026-05-04 "null = root" affordance; migration is "pass `\"\"` for root or an explicit UUID".
 - Every parameter struct in `src/server/params.rs` carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded `invalid_parameters at \`.field_name\`: unknown field` error rather than silently defaulting.
 - `Parameters<T>` wrapper routes deserialisation failures through `serde_path_to_error` so the error path names the offending field — pinned by `null_required_uuid_field_error_names_the_field` and the `literal_null_string_*` companions.
 - `insert_content` enforces the `MAX_INSERT_CONTENT_LINES` cap at the workflow level; oversized payloads return a typed `InvalidInput` with a chunking instruction.
@@ -268,12 +269,12 @@ Require confirmation for state changes. Provide dry-run mode.
 - Return a diff/preview of intended changes before execution
 - Use structured content for machine-readable change summaries
 
-**Status**: ⚠️ Partial. `dry_run` adopted on `create_mirror` (returns the would-be canonical / target / pillar resolution) and `bulk_update` (returns the matched node set without applying). Walk-shaped tools naturally surface a preview shape via the `truncated` + `truncation_reason` envelope. **Remaining gap**: `delete_node`, `move_node`, `insert_content` execute immediately.
+**Status**: ⚠️ Partial. `dry_run` adopted on `create_mirror` (returns the would-be canonical / target / pillar resolution) and `bulk_update` (returns the matched node set without applying). Walk-shaped tools naturally surface a preview shape via the `truncated` + `truncation_reason` envelope. `delete_node` and `transaction` delete ops carry an optional `expect_name` name-echo guard (2026-06-16) — a confirmation parameter for the highest-impact, irreversible mutation: the server refuses the delete unless the resolved node's current name (trimmed) matches the echo, defending the host-coercion path where `null`/placeholder `node_id` is coerced to a plausible-but-wrong UUID before the deserializer can fault it. **Remaining gap**: `delete_node`, `move_node`, `insert_content` still execute immediately (no `dry_run` preview).
 
 **Action items**:
 - Add `dry_run: Option<bool>` to `delete_node`, `move_node`, `insert_content` for symmetric preview surface.
 - Include "this action is irreversible" warning in the `delete_node` tool description string.
-- Consider requiring a confirmation-string parameter on `delete_node` (e.g. `confirm_delete: true`) for the highest-impact mutation.
+- ~~Consider requiring a confirmation-string parameter on `delete_node`~~ — **done** as the optional `expect_name` name-echo guard (stronger than a `confirm_delete: true` boolean: it echoes the target's name, so a coerced-to-wrong-node delete fails the check). Shared comparison `workflows::destructive_echo_matches`; pinned by `delete_node_refuses_on_name_echo_mismatch` + `delete_name_echo_routes_through_shared_helper`. Consider promoting `expect_name` from optional to required in a future major version if the host-coercion hazard persists.
 
 ---
 

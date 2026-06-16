@@ -69,8 +69,16 @@ pub struct CreateNodeParams {
     pub name: String,
     #[schemars(description = "Optional description/note for the node")]
     pub description: Option<String>,
-    #[schemars(description = "Parent node ID. Omit OR set to null to place the new node at the workspace root — both behave the same. The success message names the resolved parent so the caller can audit placement.")]
-    pub parent_id: Option<NodeId>,
+    /// Required, explicit destination (2026-06-16 host-coercion hardening).
+    /// Pass the empty string `""` for the *deliberate* "workspace root"
+    /// choice; pass a UUID / short hash to scope. Omitting the field or
+    /// passing `null` is REJECTED at the wire with a field-named error —
+    /// previously `null`/omit silently meant root, which let a host that
+    /// stripped or coerced the parameter strand a write at the root
+    /// undetected. The success message names the resolved parent so the
+    /// caller can audit placement.
+    #[schemars(description = "Required parent node ID (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
+    pub parent_id: NodeId,
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
     pub priority: Option<i32>,
 }
@@ -93,6 +101,16 @@ pub struct EditNodeParams {
 pub struct DeleteNodeParams {
     #[schemars(description = "The UUID of the node to delete")]
     pub node_id: NodeId,
+    /// Optional name-echo guard. When supplied, the server fetches the
+    /// resolved node and refuses the delete unless its current name (trimmed)
+    /// equals this string. Defends the irreversible-delete path against a
+    /// host that coerces a null/placeholder `node_id` to a plausible-but-
+    /// unintended UUID: the coerced node's name won't match the echo, so the
+    /// delete is refused with a typed error instead of destroying the wrong
+    /// node. Omit to skip the check (back-compatible).
+    #[serde(default)]
+    #[schemars(description = "Optional safety echo: the current name of the node you intend to delete. If set and it does not match the resolved node's name, the delete is refused. Use this on every delete where the node_id was resolved indirectly.")]
+    pub expect_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -157,16 +175,21 @@ pub struct TagSearchParams {
 pub struct InsertContentParams {
     /// Parent node ID. Omit OR set to `null` to insert at the workspace
     /// root — both behave the same. Failure-report 2026-05-03: until
-    /// 2026-05-04 this field was a non-optional `NodeId`, so a caller
-    /// passing `null` (matching the null-means-root convention used by
-    /// `create_node`, `batch_create_nodes`, `list_children`) hit
-    /// "invalid type: null, expected a string" at the schema layer
-    /// before the handler ran. Other tools accepted null, this one
-    /// didn't — that asymmetry was the root cause of the 39 % success
-    /// rate the report tracked. Fixed by aligning to the
-    /// `Option<NodeId>` shape every other parent-scoped tool uses.
-    #[schemars(description = "Parent node ID to insert content under. Omit OR pass null to insert at the workspace root — same behaviour as create_node and batch_create_nodes.")]
-    pub parent_id: Option<NodeId>,
+    /// Required, explicit destination (2026-06-16 host-coercion hardening).
+    /// Pass the empty string `""` for the deliberate "workspace root"
+    /// choice; pass a UUID / short hash to scope. Omitting or `null` is
+    /// REJECTED at the wire with a field-named error.
+    ///
+    /// History: 2026-05-04 this field was relaxed from a non-optional
+    /// `NodeId` to `Option<NodeId>` because a caller passing `null` hit a
+    /// schema error while `create_node` et al. accepted null — the
+    /// asymmetry drove a low success rate. The 2026-06-16 hardening
+    /// re-tightens ALL four write tools together (create_node,
+    /// batch_create_nodes, insert_content, create_mirror) to required
+    /// `NodeId` with `""`-means-root, so the surfaces stay symmetric AND
+    /// the null/stripped-parameter misroute is closed.
+    #[schemars(description = "Required parent node ID to insert content under (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
+    pub parent_id: NodeId,
     #[schemars(description = "Content in 2-space indented text format. Each line becomes a node, indentation creates hierarchy")]
     pub content: String,
 }
@@ -414,8 +437,12 @@ pub struct BatchCreateOpParams {
     pub name: String,
     #[schemars(description = "Optional note/description for the new node")]
     pub description: Option<String>,
-    #[schemars(description = "Optional parent node ID (UUID or short hash). Omit to create at workspace root.")]
-    pub parent_id: Option<NodeId>,
+    /// Required, explicit destination (2026-06-16 host-coercion hardening).
+    /// Pass empty string `""` for workspace root; UUID / short hash to
+    /// scope. Omitting or `null` is rejected at the wire with a
+    /// field-named error.
+    #[schemars(description = "Required parent node ID (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
+    pub parent_id: NodeId,
     #[schemars(description = "Optional priority/sort key (lower sorts earlier)")]
     pub priority: Option<i32>,
 }
@@ -475,6 +502,12 @@ pub struct TransactionOpParams {
     pub description: Option<String>,
     #[schemars(description = "Priority/sort key — optional for create and move")]
     pub priority: Option<i32>,
+    /// Optional name-echo guard for `delete` ops only (ignored otherwise).
+    /// Mirrors `delete_node.expect_name`: when set, the delete step refuses
+    /// unless the target's current name matches.
+    #[serde(default)]
+    #[schemars(description = "For delete ops: optional safety echo of the node's current name. If set and it does not match, the delete (and the whole transaction) is refused and rolled back.")]
+    pub expect_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -581,8 +614,13 @@ pub struct ExportSubtreeParams {
 pub struct CreateMirrorParams {
     #[schemars(description = "UUID or short hash of the canonical node to mirror. The mirror's name is copied verbatim from this node at creation time.")]
     pub canonical_node_id: NodeId,
-    #[schemars(description = "Parent under which the mirror should appear (UUID, short hash, or null for workspace root). Null = workspace root, no exceptions — the response's `scope_resolved` field names what the server actually resolved.")]
-    pub target_parent_id: Option<NodeId>,
+    /// Required, explicit destination (2026-06-16 host-coercion hardening).
+    /// Pass empty string `""` for workspace root; UUID / short hash to
+    /// scope. Omitting or `null` is rejected at the wire with a
+    /// field-named error. The response's `scope_resolved` field names what
+    /// the server actually resolved.
+    #[schemars(description = "Required parent under which the mirror should appear (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
+    pub target_parent_id: NodeId,
     #[schemars(description = "Optional priority/sort key for the mirror among its siblings (lower = earlier)")]
     pub priority: Option<i32>,
     #[schemars(description = "Optional pillar token (opaque, e.g. 'lead', 'build') to write to the canonical's `canonical_of:` marker if it lacks one. Skipped when omitted; if the canonical already has a canonical_of marker it is never overwritten.")]

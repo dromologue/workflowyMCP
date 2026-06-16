@@ -130,6 +130,15 @@ Reject or sanitize:
 - Excessively long strings
 - Deeply nested structures
 
+### Destructive-Operation Confirmation (host-coercion defence)
+
+The `NodeId` deserializer rejects literal/JSON `null` for UUID parameters, but that guard is necessarily blind to a host that coerces `null` (or a stripped parameter) into a *plausible-but-unintended* real UUID **before** the request reaches the server — the server then receives a well-formed ID pointing at the wrong node, and a delete is irreversible. For the highest-impact mutation, validation therefore extends beyond type-shape to an optional **name-echo precondition**:
+
+- `delete_node` and `transaction` delete ops accept `expect_name`. When supplied, the server fetches the resolved node and refuses the operation unless its current name (trimmed) matches the echo — a coerced-to-wrong-node delete lands on a differently-named node and fails the check.
+- The comparison is the single shared helper `workflows::destructive_echo_matches` (trim-tolerant, case-sensitive — node names are user content), so the MCP handler and the transaction step cannot diverge. Pinned by `delete_name_echo_routes_through_shared_helper`.
+- The check runs **before** cache invalidation and before the DELETE, so a refused delete leaves no side effect; the refusal routes through `tool_invalid_params` (a precondition failure, not an operational error).
+- Currently optional (back-compatible); the wflow skill's UUID Parameter Discipline prescribes passing it on every indirectly-resolved delete. Candidate for required-by-default in a future major version.
+
 ---
 
 ## Error Handling Security
