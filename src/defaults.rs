@@ -270,6 +270,19 @@ pub const BULK_UPDATE_VALID_OPS: &[&str] =
 /// Seconds in a day — used for the recent-changes / session-log time windows.
 pub const SECONDS_PER_DAY: i64 = 86_400;
 
+/// TTL for `create_node` idempotency-key entries (10 min). The window must
+/// comfortably cover a rate-limit `retry_after` (tens of seconds) plus a
+/// human/agent pause before a retry, but stay short enough that the in-memory
+/// store can't grow unbounded over a long session. After this, the same key
+/// is treated as fresh. 2026-06-17: best-effort idempotency.
+pub const IDEMPOTENCY_TTL_MS: u64 = 600_000;
+
+/// Hard cap on retained idempotency-key entries — a backstop so a session
+/// that supplies a unique key per call can't grow the map without bound.
+/// Oldest entries are evicted first when the cap is hit (in addition to the
+/// TTL prune on every access).
+pub const IDEMPOTENCY_MAX_ENTRIES: usize = 4_096;
+
 /// Default scope for the `review` and `audit_mirrors` tools when no `root_id`
 /// is supplied: the author's Distillations subtree.
 ///

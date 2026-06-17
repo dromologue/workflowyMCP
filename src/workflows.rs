@@ -495,10 +495,18 @@ pub async fn create_mirror_via_convention(
 /// shapes:
 ///
 /// - [`InsertContentOutcome::Complete`] — every line was inserted.
-/// - [`InsertContentOutcome::Partial`] — the workflow bailed because
-///   the cancel guard flipped or the deadline passed; the outcome
-///   carries enough state for the caller to resume from
-///   `last_inserted_id`.
+/// - [`InsertContentOutcome::Partial`] — the workflow stopped before
+///   inserting every line; the outcome carries enough state for the
+///   caller to resume from `last_inserted_id`. Three stop reasons (see
+///   [`PartialReason`]): cancel, deadline, OR a hard mid-batch API
+///   error. The error case (2026-06-17) used to `return Err(e)` and
+///   discard the accumulated `created_count` / `last_inserted_id`,
+///   leaving the caller unable to tell what landed without a separate
+///   read — exactly the write-path report's Recommendation D gap. The
+///   workflow now ALWAYS surfaces its progress; the reason discriminates
+///   a clean resume (cancel/timeout) from a hard error (error), and the
+///   `error` field carries the underlying failure string so the MCP
+///   surface can classify its proximate cause.
 ///
 /// The MCP handler used to compute these shapes inline; the CLI used
 /// to skip the partial path entirely (no cancel surface). Lifting it
@@ -519,17 +527,27 @@ pub enum InsertContentOutcome {
         total_count: usize,
         last_inserted_id: Option<String>,
         stopped_at_line: Option<String>,
+        /// Underlying error string when `reason == Error`; `None` for the
+        /// clean cancel/timeout stops. The MCP handler runs this through
+        /// `classify_operational_error` so the failure envelope carries the
+        /// same `proximate_cause` / `retry_after_secs` / `retryable` as a
+        /// non-batch failure of the same kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
 /// Why an `insert_content` call returned partial success rather than
-/// complete. Maps 1:1 to the cancel/deadline signals the workflow
-/// observes between API calls.
+/// complete. `Cancelled` / `Timeout` map to the cancel/deadline signals
+/// the workflow observes between API calls; `Error` is a hard mid-batch
+/// API failure (e.g. a 429 on the 10th of 24 lines) that stopped the
+/// batch with some lines already committed.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PartialReason {
     Cancelled,
     Timeout,
+    Error,
 }
 
 impl PartialReason {
@@ -537,6 +555,7 @@ impl PartialReason {
         match self {
             PartialReason::Cancelled => "cancelled",
             PartialReason::Timeout => "timeout",
+            PartialReason::Error => "error",
         }
     }
 }
@@ -633,6 +652,9 @@ pub async fn insert_content_via_indented(
     let mut last_inserted_id: Option<String> = None;
     let mut bailout_reason: Option<PartialReason> = None;
     let mut bailout_line: Option<String> = None;
+    // Set only when bailout_reason == Error; carries the underlying failure
+    // so the MCP surface can classify its proximate cause.
+    let mut bailout_error: Option<String> = None;
 
     for line in &parsed {
         // Pre-line cancel + deadline checks. A guard taken before the
@@ -700,11 +722,20 @@ pub async fn insert_content_via_indented(
                     bailout_line = Some(line.text.clone());
                     break;
                 }
-                error!(error = %e, line = %line.text, "Failed to insert line");
-                if let Some(pid) = parent_id {
-                    footprint.invalidate_cache_only(pid);
-                }
-                return Err(e);
+                // A hard mid-batch failure (e.g. a 429 on the Nth line).
+                // Pre-2026-06-17 this did `return Err(e)`, discarding the
+                // `created_count` / `last_inserted_id` already accumulated —
+                // the caller learnt nothing about what landed without a
+                // separate read (write-path report, Recommendation D). Now we
+                // stop the batch but surface the progress: capture the error
+                // and break into the Partial outcome below. The cache is
+                // invalidated once after the loop (the original early-return
+                // invalidation is preserved by the post-loop block).
+                error!(error = %e, line = %line.text, "Failed to insert line — stopping batch with partial progress");
+                bailout_reason = Some(PartialReason::Error);
+                bailout_line = Some(line.text.clone());
+                bailout_error = Some(e.to_string());
+                break;
             }
         }
     }
@@ -721,6 +752,7 @@ pub async fn insert_content_via_indented(
             total_count: total,
             last_inserted_id,
             stopped_at_line: bailout_line,
+            error: bailout_error,
         },
         None => InsertContentOutcome::Complete {
             parent_id: parent_id.map(str::to_string),
@@ -2546,6 +2578,86 @@ mod tests {
                 assert_eq!(created_count, 0);
             }
             other => panic!("must surface as Partial timeout; got {other:?}"),
+        }
+    }
+
+    /// Write-path report Recommendation D (2026-06-17): a hard mid-batch API
+    /// error must NOT discard the lines already committed. It returns
+    /// `Ok(Partial { reason: Error, .. })` carrying the accumulated
+    /// `created_count` + `last_inserted_id` + the underlying error string,
+    /// instead of the pre-fix `return Err(e)` that left the caller unable to
+    /// tell what landed without a separate read. First line creates OK;
+    /// second line's create returns 500 → the batch stops with one commit
+    /// recorded.
+    #[tokio::test]
+    async fn insert_content_hard_error_returns_partial_with_committed_count() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Line "a" → 200 with an id.
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(serde_json::json!({"name": "a"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"item_id": "00000000-0000-0000-0000-0000000000aa"})),
+            )
+            .mount(&mock)
+            .await;
+        // Line "b" → 500 (hard error), no retry (fast_retry max_attempts=1).
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(serde_json::json!({"name": "b"})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("backend boom"))
+            .mount(&mock)
+            .await;
+
+        let client = WorkflowyClient::new_with_configs(
+            mock.uri(),
+            "test-key".to_string(),
+            crate::config::RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 10,
+                max_delay_ms: 20,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            },
+            crate::config::RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            },
+        )
+        .expect("client builds against mock");
+
+        let parsed = parse_indented_content("a\nb");
+        let ctx = WorkflowContext::default();
+        let (outcome, _footprint) = insert_content_via_indented(&client, None, parsed, &ctx)
+            .await
+            .expect("hard error must surface as Ok(Partial), not Err");
+
+        match outcome {
+            InsertContentOutcome::Partial {
+                reason,
+                created_count,
+                total_count,
+                last_inserted_id,
+                error,
+                ..
+            } => {
+                assert!(matches!(reason, PartialReason::Error), "reason must be Error");
+                assert_eq!(created_count, 1, "the one committed line must be reported");
+                assert_eq!(total_count, 2);
+                assert_eq!(
+                    last_inserted_id.as_deref(),
+                    Some("00000000-0000-0000-0000-0000000000aa"),
+                    "resume cursor must point at the last committed node"
+                );
+                assert!(
+                    error.is_some(),
+                    "the underlying error must travel so the surface can classify it"
+                );
+            }
+            other => panic!("must surface as Partial error; got {other:?}"),
         }
     }
 

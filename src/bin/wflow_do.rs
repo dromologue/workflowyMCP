@@ -1359,8 +1359,11 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             };
             // Shared workflow handles parsing, cap enforcement,
             // partial-success reporting. CLI passes a default
-            // (no-cancel, no-deadline) context so the workflow runs
-            // to completion or fails on the first hard error.
+            // (no-cancel, no-deadline) context. A hard mid-batch API
+            // error no longer propagates as Err (which would discard the
+            // committed-count); it returns a Partial { reason: "error" }
+            // carrying created_count + last_inserted_id, same as the MCP
+            // surface (write-path report Recommendation D, 2026-06-17).
             let parsed = workflowy_mcp_server::workflows::parse_indented_content(&body);
             if parsed.is_empty() {
                 println!("insert: nothing to insert (no non-blank lines)");
@@ -1378,11 +1381,24 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             // The CLI surfaces both the Complete and Partial shapes —
             // unlike pre-2026-05-04, where the CLI had no partial
             // surface at all. Both shapes are JSON so shell pipelines
-            // can route on `status`.
+            // can route on `status` (and `reason` within partial).
+            let is_error_partial = matches!(
+                &outcome,
+                workflowy_mcp_server::workflows::InsertContentOutcome::Partial {
+                    reason: workflowy_mcp_server::workflows::PartialReason::Error,
+                    ..
+                }
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::to_value(&outcome)?)?
             );
+            // Exit non-zero on a hard-error partial so shell pipelines see
+            // the failure, while the full resume cursor is already on stdout.
+            // Cancel/timeout partials exit 0 — they are expected resume points.
+            if is_error_partial {
+                std::process::exit(1);
+            }
         }
         Cmd::SmartInsert { search_query, content, depth } => {
             // Find a single matching parent by name, then insert under it.

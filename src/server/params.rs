@@ -81,6 +81,17 @@ pub struct CreateNodeParams {
     pub parent_id: NodeId,
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
     pub priority: Option<i32>,
+    /// Optional best-effort idempotency key. Supply a stable, caller-generated
+    /// token (e.g. a UUID) to make a retry of THIS create safe: if the same
+    /// key was already used for a successful create within the server's
+    /// retention window, the call returns the original node instead of writing
+    /// a duplicate. Covers retry-after-success and retry-after-fail-before-write;
+    /// does NOT cover an ambiguous timeout after the write was sent (the server
+    /// never saw the success to record it) — there, read back before retrying.
+    /// Server-process-scoped: not shared with the `wflow-do` CLI (a one-shot
+    /// process has no prior call to dedupe against).
+    #[schemars(description = "Optional best-effort idempotency key (a stable caller-generated token). A repeated key replays the original create instead of writing a duplicate, within the server's retention window. Does not cover an ambiguous post-write timeout — read back before retrying in that case.")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]

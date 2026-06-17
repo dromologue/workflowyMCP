@@ -295,6 +295,25 @@ partial-success envelope is reachable on every surface — lowered from
 observed hanging the full 4 minutes with no diagnostic on claude.ai
 web.
 
+**Typed write failures (2026-06-17).** Every error response carries a
+structured envelope — `{operation, node_id, proximate_cause, retryable,
+retry_after_secs, hint, error}` — so a caller never sees a bare "tool
+failed" it can't reason about. A rate-limit (429) classifies as
+`proximate_cause: "rate_limited"` with `retryable: true` and a typed
+`retry_after_secs`, distinct from an opaque `unknown`, so the right move
+(wait `retry_after_secs`, then retry) is explicit. And `insert_content`
+reports the committed-count cursor (`created_count` + `last_inserted_id`)
+on **every** failure — a hard mid-batch error, not just a timeout — so
+you learn exactly what landed without a separate read and resume from the
+cursor. Workflowy exposes no client-supplied ID or idempotency header, so
+`create_node` takes an optional best-effort `idempotency_key` — a repeated
+key replays the original node (with a reportable `idempotent_replay:`
+message) instead of double-writing, covering retry-after-success and
+retry-before-write but NOT an ambiguous post-write timeout (read back to
+confirm there). For batches the resume cursor — not a key — is the
+double-write-safe retry path. Replay the original failure sequence with
+[`scripts/repro-write-path-429.sh`](scripts/repro-write-path-429.sh).
+
 For the full list (transport-timeout retry, `authenticated`/`api_reachable`
 decoupling, `null` parameter handling and the `scope_resolved` audit
 field, the 2026-05-04 `move_node` unification that collapsed the

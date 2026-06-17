@@ -98,6 +98,16 @@ pub enum ProximateCause {
     /// invalid value, etc.). Distinguishes validation failures from
     /// operational ones — added 2026-05-03 alongside `tool_invalid_params`.
     InvalidParams,
+    /// Upstream returned 429 (or we short-circuited inside an open
+    /// `retry_after` window). A *recoverable transient*, distinct from
+    /// `UpstreamError`: the correct response is to wait the `retry_after`
+    /// and retry, not to treat the write as failed. Added 2026-06-17
+    /// because `tool_error` previously fell a 429 through to `Unknown`,
+    /// so a rate-limited write surfaced `proximate_cause: "unknown"` with
+    /// no `retry_after` in the hint even though the status path
+    /// (`classify_degraded_kind`) already classified the same 429 as
+    /// `rate_limited`. The two envelopes now agree.
+    RateLimited,
     Unknown,
 }
 
@@ -114,6 +124,7 @@ impl ProximateCause {
             ProximateCause::NotFound => "not_found",
             ProximateCause::AuthFailure => "auth_failure",
             ProximateCause::InvalidParams => "invalid_params",
+            ProximateCause::RateLimited => "rate_limited",
             ProximateCause::Unknown => "unknown",
         }
     }
@@ -308,6 +319,11 @@ fn tool_invalid_params(operation: &str, node_id: Option<&str>, msg: impl Into<St
         "node_id": node_id,
         "hint": "see error field for the validation failure detail",
         "proximate_cause": ProximateCause::InvalidParams.as_str(),
+        // A validation failure is never retryable — the same params fail the
+        // same way. Symmetric with `tool_error`'s envelope so a client reads
+        // one error model across both helpers. `retry_after_secs` is absent
+        // (not applicable); callers treat a missing key as null.
+        "retryable": false,
         "error": msg,
     });
     McpError::new(
@@ -317,10 +333,39 @@ fn tool_invalid_params(operation: &str, node_id: Option<&str>, msg: impl Into<St
     )
 }
 
-fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Display) -> McpError {
-    let err_str = err.to_string();
+/// Classification of an operational error string into the discrete fields
+/// the error envelope exposes. Single source of truth shared by
+/// [`tool_error`] (which builds an `McpError`) and the `insert_content`
+/// error-partial payload (which builds a `CallToolResult::error` JSON
+/// content). Both must agree on `proximate_cause` / `retryable` /
+/// `retry_after_secs` for one error, so the classification lives in one
+/// place rather than being re-derived per call site. Added 2026-06-17
+/// alongside the write-path report's Recommendation D.
+struct ErrorClassification {
+    code: ErrorCode,
+    hint: &'static str,
+    cause: ProximateCause,
+    retryable: bool,
+    retry_after_secs: Option<u64>,
+}
+
+/// Classify an operational error string. The 429/rate-limit branch is FIRST
+/// so it cannot be shadowed by a later string match (pre-2026-06-17 a 429
+/// fell through to `Unknown`, burying the `retry_after`). `retryable` is
+/// derived from the cause — not hand-set per branch — so it cannot drift
+/// from the classification.
+fn classify_operational_error(err_str: &str) -> ErrorClassification {
     let lower = err_str.to_lowercase();
-    let (code, hint, cause) = if lower.contains("404") || lower.contains("not found") {
+    // `retry_after_secs` mirrors `workflowy_status.retry_after_remaining_ms`
+    // — a typed number, not a prose hint. `None` on every non-429 path.
+    let retry_after_secs = parse_retry_after_secs(err_str);
+    let (code, hint, cause) = if lower.contains("429") || lower.contains("rate limit") {
+        (
+            ErrorCode::INTERNAL_ERROR,
+            "rate limited (recoverable) — wait retry_after_secs then retry the same call",
+            ProximateCause::RateLimited,
+        )
+    } else if lower.contains("404") || lower.contains("not found") {
         (
             ErrorCode::RESOURCE_NOT_FOUND,
             "node may not yet exist (propagation lag), or has been deleted",
@@ -369,18 +414,66 @@ fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Displa
             ProximateCause::Unknown,
         )
     };
+    // A recoverable transient (rate limit, timeout, upstream blip, lock
+    // contention, propagation-lag 404, preemption) is worth retrying; an
+    // auth failure or unknown fault is not. The 2026-06-17 write-path report
+    // called `retryable` one of the two fields that would have changed the
+    // session.
+    let retryable = matches!(
+        cause,
+        ProximateCause::RateLimited
+            | ProximateCause::Timeout
+            | ProximateCause::UpstreamError
+            | ProximateCause::LockContention
+            | ProximateCause::CacheMiss
+            | ProximateCause::NotFound
+            | ProximateCause::Cancelled
+    );
+    ErrorClassification {
+        code,
+        hint,
+        cause,
+        retryable,
+        retry_after_secs,
+    }
+}
+
+fn tool_error(operation: &str, node_id: Option<&str>, err: impl std::fmt::Display) -> McpError {
+    let err_str = err.to_string();
+    let c = classify_operational_error(&err_str);
     let data = serde_json::json!({
         "operation": operation,
         "node_id": node_id,
-        "hint": hint,
-        "proximate_cause": cause.as_str(),
+        "hint": c.hint,
+        "proximate_cause": c.cause.as_str(),
+        "retryable": c.retryable,
+        "retry_after_secs": c.retry_after_secs,
         "error": err_str,
     });
     McpError::new(
-        code,
-        format!("{}: {} [{}]", operation, err_str, cause.as_str()),
+        c.code,
+        format!("{}: {} [{}]", operation, err_str, c.cause.as_str()),
         Some(data),
     )
+}
+
+/// Parse `retry_after` seconds from an error string that embeds a 429 body
+/// like `{"error":"...","retry_after":9}` (the shape
+/// `WorkflowyClient::rate_limit_window_error` and upstream 429s both
+/// produce). Returns `None` when no `retry_after` is present — every
+/// non-rate-limited error path. Kept deliberately tolerant: the number may
+/// be wrapped in a `RetryExhausted { reason: "..." }` Display string, so we
+/// scan for the key rather than assuming the whole string is clean JSON.
+fn parse_retry_after_secs(err_str: &str) -> Option<u64> {
+    let idx = err_str.find("retry_after")?;
+    let tail = &err_str[idx + "retry_after".len()..];
+    // Skip the `":` / `:` between key and value, then take the digit run.
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u64>().ok()
 }
 
 /// Read recent session-log files (under `$SECONDBRAIN_DIR/session-logs`,
@@ -455,6 +548,14 @@ macro_rules! record_op {
         let __recorder = $self.op_log.record($tool, &__pj);
         let __result: Result<CallToolResult, McpError> = async move $body.await;
         match &__result {
+            // A success-shaped result flagged `is_error: true` (the canonical
+            // case is the insert_content error-partial — partial progress but
+            // a hard mid-batch failure) is a non-commit: record it as Err so
+            // `per_tool_health.<tool>.ok` stays commit-accurate, mirroring
+            // `tool_handler!`. WHY: write-path report Recommendation D,
+            // 2026-06-17 — extends the 2026-06-01 commit-accurate-counter rule
+            // to the `record_op!` path that `insert_content` uses.
+            Ok(r) if r.is_error == Some(true) => __recorder.finish_err(op_err_summary(r)),
             Ok(_) => __recorder.finish_ok(),
             Err(e) => __recorder.finish_err(e.to_string()),
         }
@@ -829,6 +930,13 @@ pub struct WorkflowyMcpServer {
     /// via `get_recent_tool_calls` to self-diagnose hangs and
     /// unexpected returns within a session.
     op_log: OpLog,
+    /// Best-effort idempotency store for `create_node` (2026-06-17). Keyed by
+    /// a caller-supplied `idempotency_key`; a repeated key replays the
+    /// original create's result instead of writing a duplicate. In-memory and
+    /// server-process-scoped — see [`crate::utils::idempotency`] for the
+    /// covered/not-covered retry shapes (notably: an ambiguous timeout after
+    /// the POST is NOT covered).
+    idempotency: Arc<crate::utils::idempotency::IdempotencyStore>,
     /// Wall-clock budget for single-node read tools. Defaults to
     /// [`defaults::READ_NODE_TIMEOUT_MS`]; tests dial it down via
     /// [`Self::with_read_budget_ms`] so failure-mode coverage runs in
@@ -961,6 +1069,10 @@ impl WorkflowyMcpServer {
             tree_size_estimate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_resolve_walk_scopes: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             op_log: OpLog::new(),
+            idempotency: Arc::new(crate::utils::idempotency::IdempotencyStore::new(
+                defaults::IDEMPOTENCY_TTL_MS,
+                defaults::IDEMPOTENCY_MAX_ENTRIES,
+            )),
             read_budget_ms: defaults::READ_NODE_TIMEOUT_MS,
             bulk_budget_ms: defaults::INSERT_CONTENT_TIMEOUT_MS,
             probe_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1952,6 +2064,34 @@ impl WorkflowyMcpServer {
             Some(self.validate_and_resolve(&params.parent_id).await?)
         };
 
+        // Best-effort idempotency (2026-06-17): if the caller supplied a key
+        // already used for a successful create within the retention window,
+        // replay the original result instead of writing a duplicate. Checked
+        // BEFORE any invalidation or write so a replay has zero side effects.
+        // The message is explicit and reportable: it names the key, the
+        // original node, the age, and the residual the key does NOT cover.
+        if let Some(key) = params.idempotency_key.as_deref() {
+            let now = crate::utils::idempotency::now_unix_ms();
+            if let Some(hit) = self.idempotency.check(key, now) {
+                let age_s = hit.age_ms / 1000;
+                let placement = hit
+                    .parent_id
+                    .as_deref()
+                    .map(|p| format!("under `{}`", p))
+                    .unwrap_or_else(|| "at workspace root".to_string());
+                let msg = format!(
+                    "idempotent_replay: NO new node created — idempotency_key `{}` was already \
+                     used {}s ago for a successful create. Returning the original node '{}' \
+                     (id: `{}`) {}. If you did NOT intend a retry, reissue with a fresh key. \
+                     (Best-effort, server-process-scoped; an ambiguous timeout AFTER a prior \
+                     write was sent is NOT covered by this key — read the node back to confirm \
+                     before assuming a single write.)",
+                    key, age_s, hit.name, hit.item_id, placement
+                );
+                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+            }
+        }
+
         // Brief 2026-04-25 Test β: fail-closed semantics. When reads
         // or mutations have failed in the last 30 s the create may
         // succeed at the API layer but the assistant will not be
@@ -1998,6 +2138,18 @@ impl WorkflowyMcpServer {
                     parent_id: resolved_parent.clone(),
                     ..Default::default()
                 }]);
+                // Record the idempotency key only on a confirmed success, so a
+                // later retry with the same key replays this result instead of
+                // double-writing.
+                if let Some(key) = params.idempotency_key.as_deref() {
+                    self.idempotency.record(
+                        key.to_string(),
+                        created.id.clone(),
+                        params.name.clone(),
+                        resolved_parent.clone(),
+                        crate::utils::idempotency::now_unix_ms(),
+                    );
+                }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
             Err(e) => Err(tool_error("create_node", resolved_parent.as_deref(), e)),
@@ -2363,8 +2515,9 @@ impl WorkflowyMcpServer {
                 total_count,
                 last_inserted_id,
                 stopped_at_line,
+                error,
             } => {
-                let payload = json!({
+                let mut payload = json!({
                     "status": "partial",
                     "scope_resolved": scope_resolved,
                     "reason": reason.as_str(),
@@ -2383,6 +2536,27 @@ impl WorkflowyMcpServer {
                         last_inserted_id.as_deref().unwrap_or("none"),
                     ),
                 });
+                // A hard mid-batch error is a genuine failure that left a
+                // resumable cursor — distinct from cancel/timeout, which are
+                // expected, success-shaped resume points. Classify the
+                // carried error through the SAME helper `tool_error` uses so
+                // the partial envelope's proximate_cause / retry_after_secs /
+                // retryable match a non-batch failure of the same kind, then
+                // flag is_error:true so the caller (and the commit-accurate
+                // op-log counter) see it as unsuccessful while still
+                // receiving committed_count + last_inserted_id. WHY:
+                // write-path report Recommendation D, 2026-06-17.
+                if matches!(reason, crate::workflows::PartialReason::Error) {
+                    let err_str = error.unwrap_or_default();
+                    let c = classify_operational_error(&err_str);
+                    let obj = payload.as_object_mut().expect("payload is a JSON object");
+                    obj.insert("proximate_cause".into(), json!(c.cause.as_str()));
+                    obj.insert("retryable".into(), json!(c.retryable));
+                    obj.insert("retry_after_secs".into(), json!(c.retry_after_secs));
+                    obj.insert("hint".into(), json!(c.hint));
+                    obj.insert("error".into(), json!(err_str));
+                    return Ok(CallToolResult::error(vec![Content::text(payload.to_string())]));
+                }
                 Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
             }
         }
@@ -6361,6 +6535,17 @@ mod tests {
             ("internal lock contention on cache", "lock_contention"),
             ("stale cache entry detected", "cache_miss"),
             ("some completely unknown failure mode", "unknown"),
+            // 429 must classify as rate_limited, not fall through to
+            // `unknown` — the write-path report's core gap. Both the
+            // synthetic in-window shape and the retry-exhausted Display form.
+            (
+                "{\"error\":\"rate limit exceeded (request suppressed inside open retry_after window)\",\"retry_after\":9}",
+                "rate_limited",
+            ),
+            (
+                "RetryExhausted: 3 attempts: API error 429: {\"error\":\"rate limit exceeded\",\"retry_after\":26}",
+                "rate_limited",
+            ),
         ];
         for (err_str, expected_cause) in cases {
             let mcp_err = tool_error("test_tool", Some("550e8400-e29b-41d4-a716-446655440000"), err_str);
@@ -6383,6 +6568,57 @@ mod tests {
                 "error message must include [{expected_cause}]: {msg}"
             );
         }
+    }
+
+    /// Write-path failure report (2026-06-17): a 429 reaching the per-call
+    /// envelope must classify as `rate_limited`, expose the `retry_after`
+    /// as a typed `retry_after_secs` number, and flag `retryable: true` —
+    /// the three fields that turn "writes fail with no diagnostic" into an
+    /// actionable wait-and-retry. The status path already classified 429;
+    /// this pins the per-call path to agree.
+    #[test]
+    fn tool_error_rate_limited_envelope_carries_retry_after_and_retryable() {
+        let synthetic = "{\"error\":\"rate limit exceeded (request suppressed inside open retry_after window)\",\"retry_after\":9}";
+        let err = tool_error("create_node", None, synthetic);
+        let json = serde_json::to_value(&err).expect("McpError serialises");
+        let data = &json["data"];
+        assert_eq!(data["proximate_cause"].as_str(), Some("rate_limited"));
+        assert_eq!(
+            data["retry_after_secs"].as_u64(),
+            Some(9),
+            "retry_after must be lifted to a typed field: {json}"
+        );
+        assert_eq!(
+            data["retryable"].as_bool(),
+            Some(true),
+            "a rate-limited write is retryable: {json}"
+        );
+
+        // A non-rate-limited operational failure: retryable per cause,
+        // retry_after_secs absent (serialises as null).
+        let auth = tool_error("create_node", None, "API error 401: unauthorized");
+        let auth_json = serde_json::to_value(&auth).expect("serialises");
+        assert_eq!(auth_json["data"]["retryable"].as_bool(), Some(false));
+        assert!(auth_json["data"]["retry_after_secs"].is_null());
+    }
+
+    /// `parse_retry_after_secs` must pull the number out of both the clean
+    /// synthetic body and a `RetryExhausted` Display wrapper, and return
+    /// `None` for anything without the key.
+    #[test]
+    fn parse_retry_after_secs_extracts_from_both_shapes() {
+        assert_eq!(
+            parse_retry_after_secs("{\"error\":\"x\",\"retry_after\":9}"),
+            Some(9)
+        );
+        assert_eq!(
+            parse_retry_after_secs(
+                "RetryExhausted: 3 attempts: API error 429: {\"error\":\"x\",\"retry_after\":26}"
+            ),
+            Some(26)
+        );
+        assert_eq!(parse_retry_after_secs("API error 500: backend down"), None);
+        assert_eq!(parse_retry_after_secs("plain timeout, no key"), None);
     }
 
     /// Brief 2026-04-25 follow-up Test ε: workflowy_status returns a
@@ -6557,6 +6793,7 @@ mod tests {
                 description: None,
                 parent_id: NodeId::from("ffffffffffff"),
                 priority: None,
+                idempotency_key: None,
             }))
             .await
             .expect_err("unindexed short hash rejected");
@@ -7617,6 +7854,7 @@ mod tests {
             "tool_handler! must map an is_error:true result to finish_err so per_tool_health.ok counts durable commits only (2026-06-01 429-storm)",
         );
     }
+
 
     #[tokio::test]
     async fn cancel_registry_flips_guards_held_by_walk_controls() {
@@ -8780,6 +9018,130 @@ mod load_tests {
             .unwrap_or_default()
     }
 
+    /// Write-path report Recommendation D (2026-06-17): a hard mid-batch
+    /// failure in `insert_content` must surface as `is_error: true` with the
+    /// committed-count cursor (`created_count`, `last_inserted_id`) AND the
+    /// same classification fields a non-batch failure of that kind carries
+    /// (`proximate_cause`, `retry_after_secs`, `retryable`). Line "a" → 200;
+    /// line "b" → 429 with a retry_after body. The caller must learn one
+    /// line landed, that it was rate-limited, and how long to wait — without
+    /// a separate read.
+    #[tokio::test]
+    async fn insert_content_hard_error_partial_surfaces_committed_count_and_rate_limit() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "a"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": "00000000-0000-0000-0000-0000000000aa"})),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "b"})))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(json!({"error": "rate limit exceeded", "retry_after": 7})),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let result = server
+            .insert_content(Parameters(InsertContentParams {
+                parent_id: NodeId::from(""), // workspace root sentinel
+                content: "a\nb".to_string(),
+            }))
+            .await
+            .expect("handler returns Ok (the error-partial is is_error:true, not Err)");
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a hard-error partial must be flagged is_error:true"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body_text(&result)).expect("JSON body");
+        assert_eq!(v["status"], "partial");
+        assert_eq!(v["reason"], "error");
+        assert_eq!(v["created_count"], 1, "the one committed line must be reported");
+        assert_eq!(v["last_inserted_id"], "00000000-0000-0000-0000-0000000000aa");
+        assert_eq!(v["proximate_cause"], "rate_limited");
+        assert_eq!(v["retry_after_secs"], 7);
+        assert_eq!(v["retryable"], true);
+
+        // Op log must record this as a non-commit (Err), not Ok — proves
+        // `record_op!` (which insert_content uses, not tool_handler!) maps an
+        // is_error:true result to finish_err. Without that, the ok counter
+        // would imply a clean insert when the batch failed mid-way.
+        let entries = server.op_log.recent(10, None);
+        let ic = entries
+            .iter()
+            .find(|e| e.tool == "insert_content")
+            .expect("insert_content op must be recorded");
+        assert_eq!(
+            ic.status,
+            crate::utils::OpStatus::Err,
+            "a hard-error insert_content partial must record as Err so the ok counter stays commit-accurate",
+        );
+    }
+
+    /// Best-effort idempotency (2026-06-17): two `create_node` calls with the
+    /// same `idempotency_key` must hit the upstream exactly ONCE — the second
+    /// replays the original result. The mock's `.expect(1)` is the hard
+    /// assertion (verified on drop); the response-text check confirms the
+    /// caller gets a reportable `idempotent_replay` message with the original
+    /// id, and a third call with a DIFFERENT key writes again.
+    #[tokio::test]
+    async fn create_node_idempotency_key_replays_without_second_write() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "once"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": "00000000-0000-0000-0000-0000000000c1"})),
+            )
+            .expect(1) // ← the key assertion: same idempotency_key ⇒ one upstream write
+            .mount(&mock)
+            .await;
+        // A different key writes again — separate matcher, separate expectation.
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "twice"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": "00000000-0000-0000-0000-0000000000c2"})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        let mk = |name: &str, key: &str| CreateNodeParams {
+            name: name.to_string(),
+            description: None,
+            parent_id: NodeId::from(""),
+            priority: None,
+            idempotency_key: Some(key.to_string()),
+        };
+
+        let first = server.create_node(Parameters(mk("once", "K1"))).await.expect("first create");
+        assert!(body_text(&first).contains("00000000-0000-0000-0000-0000000000c1"));
+        assert!(!body_text(&first).contains("idempotent_replay"), "first call is a real create");
+
+        let replay = server.create_node(Parameters(mk("once", "K1"))).await.expect("replay");
+        let t = body_text(&replay);
+        assert!(t.contains("idempotent_replay"), "second same-key call must replay: {t}");
+        assert!(t.contains("00000000-0000-0000-0000-0000000000c1"), "replay returns original id: {t}");
+
+        // Fresh key ⇒ a real second write (proves the dedup is key-scoped).
+        let other = server.create_node(Parameters(mk("twice", "K2"))).await.expect("fresh-key create");
+        assert!(body_text(&other).contains("00000000-0000-0000-0000-0000000000c2"));
+        // mock drop verifies each POST matcher was hit exactly once.
+    }
+
     /// Failure 2 from the 2026-04-30 report — the headline failure: the
     /// upstream accepts the connection and never responds. Without a
     /// budget the call wedges for ~3.5 min. With `with_read_budget` the
@@ -9803,6 +10165,7 @@ mod load_tests {
                     description: None,
                     parent_id: NodeId::from(""),
                     priority: None,
+                    idempotency_key: None,
                 }))
                 .await
         });
