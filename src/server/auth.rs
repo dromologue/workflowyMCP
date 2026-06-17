@@ -14,6 +14,7 @@
 //! is captured anyway so Phase 2 (multi-tenant) can key per-user state on it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::Request,
@@ -25,7 +26,18 @@ use axum::{
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{info, warn};
+
+/// Outbound timeout for JWKS fetches. A slow/hanging provider must not be able
+/// to tie up the auth middleware (and thus inbound connections) indefinitely.
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum interval between JWKS refetches triggered by a `kid` cache miss.
+/// Caps the amplification where a flood of tokens bearing random `kid`s would
+/// otherwise each trigger an outbound JWKS GET (unauthenticated DoS lever). At
+/// most one refetch per window regardless of attack volume; key rotation still
+/// converges within one window.
+const JWKS_REFETCH_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// OAuth configuration for the resource server. Built from env in the
 /// `workflowy-mcp-http` binary; see `docs/REMOTE-CONNECTOR.md`.
@@ -45,6 +57,14 @@ pub struct OAuthConfig {
     /// no trailing slash). Used to build the `resource` identifier and the
     /// `resource_metadata` URL named in the 401 challenge.
     pub public_base_url: String,
+    /// Authorised OAuth subjects (`sub` claim). **Empty = permissive**: any
+    /// token valid for this issuer/audience is authorised (authentication only).
+    /// Non-empty turns the gate into authorisation — only listed subjects pass,
+    /// and a token whose `sub` is absent or unlisted is refused with 403. This
+    /// is the single-tenant identity lock: a valid token proves "authenticated
+    /// against our IdP", not "is the account owner"; the allow-list closes that
+    /// gap. Sourced from `MCP_ALLOWED_SUBJECTS` (comma-separated).
+    pub allowed_subjects: Vec<String>,
 }
 
 impl OAuthConfig {
@@ -105,15 +125,41 @@ pub struct TokenValidator {
     cfg: OAuthConfig,
     http: reqwest::Client,
     keys: RwLock<JwkSet>,
+    /// When the JWKS was last refetched on a `kid` miss; gates the cooldown.
+    last_refetch: RwLock<Option<Instant>>,
 }
 
 impl TokenValidator {
     pub fn new(cfg: OAuthConfig) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(JWKS_FETCH_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            http,
             keys: RwLock::new(JwkSet { keys: Vec::new() }),
+            last_refetch: RwLock::new(None),
         }
+    }
+
+    /// True if `sub` is authorised under the configured allow-list. An empty
+    /// allow-list is permissive (any authenticated token); a non-empty list
+    /// admits only its members and refuses a missing/unlisted `sub`. Pure — the
+    /// caller logs and builds the 403, so this stays unit-testable without a
+    /// live JWT.
+    pub fn subject_allowed(&self, sub: Option<&str>) -> bool {
+        if self.cfg.allowed_subjects.is_empty() {
+            return true;
+        }
+        matches!(sub, Some(s) if self.cfg.allowed_subjects.iter().any(|a| a == s))
+    }
+
+    /// Whether the allow-list is empty (permissive mode). Used to surface the
+    /// authenticated subject at startup/first-call so the operator can discover
+    /// it and lock the connector down.
+    pub fn allow_list_is_empty(&self) -> bool {
+        self.cfg.allowed_subjects.is_empty()
     }
 
     async fn fetch_jwks(&self) -> anyhow::Result<JwkSet> {
@@ -128,11 +174,23 @@ impl TokenValidator {
         Ok(set)
     }
 
-    /// Resolve a decoding key for `kid`, refetching JWKS once on a cache miss.
+    /// Resolve a decoding key for `kid`, refetching JWKS at most once per
+    /// `JWKS_REFETCH_COOLDOWN` on a cache miss. The cooldown caps an
+    /// unauthenticated amplification lever: without it, a flood of tokens
+    /// bearing random `kid`s would each force an outbound JWKS GET.
     async fn decoding_key(&self, kid: &str) -> anyhow::Result<DecodingKey> {
         if let Some(jwk) = self.keys.read().find(kid) {
             return Ok(DecodingKey::from_jwk(jwk)?);
         }
+        // Unknown kid: only refetch if the cooldown has elapsed. Stamp the
+        // refetch time BEFORE the fetch so a failing/slow provider can't be
+        // hammered either.
+        if let Some(t) = *self.last_refetch.read() {
+            if t.elapsed() < JWKS_REFETCH_COOLDOWN {
+                anyhow::bail!("no JWKS key for kid {kid}; refetch on cooldown");
+            }
+        }
+        *self.last_refetch.write() = Some(Instant::now());
         let fresh = self.fetch_jwks().await?;
         let key = fresh
             .find(kid)
@@ -201,12 +259,47 @@ pub async fn require_bearer(validator: Arc<TokenValidator>, req: Request, next: 
     };
 
     match validator.validate(token).await {
-        Ok(_sub) => next.run(req).await,
+        Ok(sub) => {
+            if validator.subject_allowed(sub.as_deref()) {
+                if validator.allow_list_is_empty() {
+                    // Permissive mode: ANY valid token is authorised. Surface
+                    // the subject so the operator can populate
+                    // MCP_ALLOWED_SUBJECTS and lock the connector to their
+                    // identity. (The `sub` is an opaque IdP id, not a secret.)
+                    info!(
+                        subject = sub.as_deref().unwrap_or("<none>"),
+                        "authenticated; allow-list empty — ANY valid token is authorised. \
+                         Set MCP_ALLOWED_SUBJECTS to this subject to restrict access."
+                    );
+                }
+                next.run(req).await
+            } else {
+                warn!(
+                    subject = sub.as_deref().unwrap_or("<none>"),
+                    "subject not in MCP_ALLOWED_SUBJECTS — access denied"
+                );
+                forbidden()
+            }
+        }
         Err(e) => {
             warn!(error = %e, "bearer token rejected");
             unauthorized(&validator.cfg, "invalid_token", "token validation failed")
         }
     }
+}
+
+/// 403 for an authenticated-but-unauthorised subject. No `WWW-Authenticate`
+/// challenge: the token is valid, re-authenticating won't help — the subject is
+/// simply not on this connector's allow-list.
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "forbidden",
+            "error_description": "authenticated subject is not authorised for this connector",
+        })),
+    )
+        .into_response()
 }
 
 fn unauthorized(cfg: &OAuthConfig, error: &str, desc: &str) -> Response {
@@ -232,6 +325,7 @@ mod tests {
             jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
             audience: vec!["https://app.fly.dev/mcp".to_string()],
             public_base_url: "https://app.fly.dev/".to_string(),
+            allowed_subjects: vec![],
         }
     }
 
@@ -250,6 +344,27 @@ mod tests {
         let m = protected_resource_metadata_json(&cfg());
         assert_eq!(m["resource"], "https://app.fly.dev/mcp");
         assert_eq!(m["authorization_servers"][0], "https://issuer.example.com");
+    }
+
+    #[test]
+    fn empty_allow_list_authorises_any_subject() {
+        // Permissive mode (single-tenant default): authentication is the gate.
+        let v = TokenValidator::new(cfg());
+        assert!(v.allow_list_is_empty());
+        assert!(v.subject_allowed(Some("anyone")));
+        assert!(v.subject_allowed(None));
+    }
+
+    #[test]
+    fn nonempty_allow_list_admits_only_listed_subjects() {
+        let mut c = cfg();
+        c.allowed_subjects = vec!["user_owner".to_string()];
+        let v = TokenValidator::new(c);
+        assert!(!v.allow_list_is_empty());
+        assert!(v.subject_allowed(Some("user_owner")));
+        // Unlisted subject and a token with no `sub` are both refused.
+        assert!(!v.subject_allowed(Some("intruder")));
+        assert!(!v.subject_allowed(None));
     }
 
     #[tokio::test]

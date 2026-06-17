@@ -60,6 +60,15 @@ pub fn build_router(server: super::WorkflowyMcpServer, cfg: &HttpServerConfig) -
              expose this publicly (delete_node / bulk_update are reachable)."
         );
     } else {
+        if cfg.oauth.allowed_subjects.is_empty() {
+            warn!(
+                "⚠ MCP_ALLOWED_SUBJECTS is empty — ANY token valid for the OAuth issuer is \
+                 authorised for full read/write (delete_node / bulk_update are reachable). \
+                 Set MCP_ALLOWED_SUBJECTS to your OAuth subject id to lock the connector to \
+                 your identity; the authenticated subject is logged on each call so you can \
+                 discover it."
+            );
+        }
         let validator = Arc::new(TokenValidator::new(cfg.oauth.clone()));
         mcp_router = mcp_router.layer(axum::middleware::from_fn(
             move |req: Request, next: Next| {
@@ -125,6 +134,7 @@ mod tests {
                 jwks_url: "https://issuer.example.com/jwks".into(),
                 audience: vec!["https://app.example.com/mcp".into()],
                 public_base_url: "https://app.example.com".into(),
+                allowed_subjects: vec![],
             },
             allowed_hosts: vec![],
             allowed_origins: vec![],

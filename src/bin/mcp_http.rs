@@ -91,6 +91,10 @@ fn http_config_from_env() -> anyhow::Result<HttpServerConfig> {
             jwks_url,
             audience,
             public_base_url,
+            // Identity lock for the single-tenant connector. Empty = permissive
+            // (any valid token authorised); set to your OAuth subject id(s) to
+            // restrict access to the account owner. See docs/REMOTE-CONNECTOR.md.
+            allowed_subjects: split_env("MCP_ALLOWED_SUBJECTS"),
         },
         allowed_hosts: split_env("MCP_ALLOWED_HOSTS"),
         allowed_origins: split_env("MCP_ALLOWED_ORIGINS"),

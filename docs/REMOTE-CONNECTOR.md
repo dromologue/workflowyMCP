@@ -19,9 +19,17 @@ keeps working exactly as before. Both transports share `build_and_spawn` in
 cannot drift between them.
 
 > **Phase 1 is single-tenant.** The Workflowy API key is a deployment secret, so
-> the connector always acts as one Workflowy account; a valid OAuth token is the
-> *gate*, and the token identity is not yet used. Multi-tenant (bring-your-own
-> Workflowy key, per-tenant state isolation) is a planned Phase 2.
+> the connector always acts as one Workflowy account. A valid OAuth token proves
+> *authentication against your IdP* — not that the caller is the account owner —
+> so set **`MCP_ALLOWED_SUBJECTS`** to your own OAuth `sub` to turn the gate into
+> authorisation (see §2.5). Multi-tenant (bring-your-own Workflowy key,
+> per-tenant state isolation) is a planned Phase 2.
+>
+> **Authentication ≠ authorisation.** With `MCP_ALLOWED_SUBJECTS` empty the
+> connector authorises *any* token valid for your issuer/audience — if your
+> provider allows open sign-up, anyone who finds the URL gets full read/write
+> (incl. `delete_node` / `bulk_update`). Always set the subject allow-list on a
+> public deployment.
 
 ## 1. Endpoints
 
@@ -59,6 +67,40 @@ In the provider, you need:
    desktop, mobile, and Cowork each use a different ephemeral localhost port.
 4. The token **audience** set to this connector's resource id
    (`<MCP_PUBLIC_BASE_URL>/mcp`) → `MCP_OAUTH_AUDIENCE` (defaults to that value).
+
+## 2.5. Lock the connector to your identity (`MCP_ALLOWED_SUBJECTS`)
+
+A valid token only proves the caller authenticated against *your* provider — not
+that they are *you*. If the provider permits open sign-up, that is not enough.
+Pin the connector to your OAuth subject:
+
+1. Deploy (or run) with the allow-list **unset** the first time — the gate is
+   permissive but logs the authenticated subject on every call.
+2. Connect from claude.ai once, then read your subject from the logs:
+
+   ```bash
+   fly logs --app <app> | grep 'authenticated; allow-list empty'
+   # → ... subject="user_01XXXX..." authenticated; allow-list empty ...
+   ```
+
+3. Set the allow-list to that subject (a restart, not a rebuild):
+
+   ```bash
+   fly secrets set --app <app> MCP_ALLOWED_SUBJECTS="user_01XXXX..."
+   ```
+
+From then on, a token whose `sub` is absent or unlisted is refused with **403**
+(authenticated, but not authorised). Multiple owners → comma-separate the list.
+The server logs a stark startup warning whenever the gate is active but the
+allow-list is empty.
+
+### JWKS hardening (no configuration required)
+
+The resource server fetches the provider JWKS with a 5 s timeout (a hanging
+provider can't stall the auth middleware) and refetches at most once per 60 s on
+an unknown `kid`, so a flood of tokens bearing random `kid`s can't amplify into
+unbounded outbound JWKS fetches. Legitimate key rotation still converges within
+one cooldown window.
 
 ## 3. Deploy to Fly.io
 
@@ -167,7 +209,8 @@ MCP_AUTH_DISABLED=1 WORKFLOWY_API_KEY=wf_xxx cargo run --bin workflowy-mcp-http
 
 See `.env.example`. Connector-only vars: `BIND_ADDR`, `PORT`,
 `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL`, `MCP_PUBLIC_BASE_URL`,
-`MCP_OAUTH_AUDIENCE`, `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`,
+`MCP_OAUTH_AUDIENCE`, `MCP_ALLOWED_SUBJECTS` (identity lock — see §2.5),
+`MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`,
 `MCP_AUTH_DISABLED`. Shared with the stdio binary: `WORKFLOWY_API_KEY`
 (required), `WORKFLOWY_INDEX_PATH`, `SECONDBRAIN_DIR`, `WORKFLOWY_REVIEW_ROOT`
 (default scope for `review` / `audit_mirrors`; no hardcoded fallback).
