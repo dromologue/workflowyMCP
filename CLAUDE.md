@@ -308,6 +308,9 @@ Environment variables loaded from `.env` via dotenvy (`src/config.rs`):
 - `WORKFLOWY_API_KEY` (required)
 - `WORKFLOWY_INDEX_PATH` (optional) — disk path for the persistent name index. Unset or empty disables persistence. The repository ships no machine-specific default; each user (or MCP host config) wires the path explicitly.
 - `SECONDBRAIN_DIR` (optional) — root of the user's operational `secondBrain` directory (drafts, session logs, briefs, memory). The `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip).
+- `WORKFLOWY_REVIEW_ROOT` (optional) — default root node for `review` and `audit_mirrors` when `root_id` is omitted (read via `defaults::default_review_root()`, shared by the MCP handlers and the `wflow-do` CLI). **No hardcoded fallback** (constitution: "no machine-specific IDs"); when unset, both tools return a typed invalid-params error asking for an explicit `root_id`. Replaced the former hardcoded `DEFAULT_REVIEW_ROOT` const.
+
+Remote-connector-only variables (the `workflowy-mcp-http` binary) — `BIND_ADDR`, `PORT`, `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL`, `MCP_PUBLIC_BASE_URL`, `MCP_OAUTH_AUDIENCE` (comma-list), `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, `MCP_AUTH_DISABLED` — are documented in `docs/REMOTE-CONNECTOR.md` and `.env.example`.
 
 ## Templates and setup
 

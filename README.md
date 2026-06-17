@@ -106,9 +106,9 @@ guard must be told your public hostname via `MCP_ALLOWED_HOSTS`).
 
 ## Environment variables
 
-The server reads three env vars at runtime. The repository ships no
-machine-specific defaults: a path you don't set is a feature you don't
-use. Set them in the `env` block of your MCP host config (Claude Code:
+The server reads four env vars at runtime. The repository ships no
+machine-specific defaults: a path or node ID you don't set is a feature you
+don't use. Set them in the `env` block of your MCP host config (Claude Code:
 `~/.claude.json`; Claude Desktop: `claude_desktop_config.json`) and,
 when you also use the `wflow-do` CLI from a shell, in your shell
 profile (`~/.zshrc` or `~/.bashrc`).
@@ -118,6 +118,7 @@ profile (`~/.zshrc` or `~/.bashrc`).
 | `WORKFLOWY_API_KEY` | Yes | Bearer token for the Workflowy API. |
 | `SECONDBRAIN_DIR` | Optional | Absolute path to your operational secondBrain directory (drafts, session logs, briefs, memory). When set, the `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip). |
 | `WORKFLOWY_INDEX_PATH` | Optional | Absolute path to the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Unset or empty disables persistence — the index then lives only in memory for the lifetime of each process. |
+| `WORKFLOWY_REVIEW_ROOT` | Optional | Default root node for the `review` and `audit_mirrors` tools when `root_id` is omitted (your review-anchor / "Distillations" node). No hardcoded fallback — if unset, those two tools require an explicit `root_id`. |
 
 Example MCP host `env` block (Claude Code or Desktop):
 
@@ -125,7 +126,8 @@ Example MCP host `env` block (Claude Code or Desktop):
 "env": {
   "WORKFLOWY_API_KEY": "<your token>",
   "SECONDBRAIN_DIR": "/absolute/path/to/secondBrain",
-  "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json"
+  "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json",
+  "WORKFLOWY_REVIEW_ROOT": "<your review-anchor node id, optional>"
 }
 ```
 

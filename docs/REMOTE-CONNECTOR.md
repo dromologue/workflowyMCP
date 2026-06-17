@@ -99,6 +99,37 @@ claude.ai → **Settings → Connectors → Add custom connector** → paste
 `https://<app>.fly.dev/mcp` → complete the OAuth consent. The Workflowy tools
 then appear in chats. Repeat in the desktop app (same account, same connector).
 
+## Using the connector
+
+Once connected, the full Workflowy tool surface (search, navigate, create, edit,
+todos, scheduling, mirrors, …) is available in any claude.ai chat. A first smoke
+test:
+
+> *"Use the Workflowy connector: run a health check, then show me 5 nodes under
+> &lt;a parent node id you know&gt;."*
+
+Two habits make sessions reliable — the tree is large and the Workflowy API is
+rate-limited:
+
+- **Scope reads; never walk the whole workspace.** Pass an explicit `parent_id`
+  (a UUID), or run `build_name_index` once and then `search_nodes` /
+  `find_node` with `use_index=true`. An unscoped search from the root times out
+  against the 20 s / 10 000-node budget and the server will refuse it. Prefer the
+  scoped aggregates (`list_todos`, `daily_review`, `get_node`, `list_children`).
+  Set `WORKFLOWY_REVIEW_ROOT` (a Fly secret) so `review` / `audit_mirrors` have a
+  default scope, or pass `root_id` each call.
+- **Respect rate limits.** Call `workflowy_status` *once*; if it reports
+  `rate_limited` with a `retry_after`, wait that long and don't poll again —
+  each probe consumes a token from the window you're waiting on.
+
+If your MCP client ever drops bare-string id parameters (some do), route reads
+through `read_batch` (an operations-array wrapper built for that wire hazard).
+
+> **Skill (optional):** the repo's `templates/skills/wflow/` skill turns the raw
+> tools into a second-brain workflow (capture, triage, distil, review). Bundle it
+> with `scripts/bundle-skill.sh` and upload to claude.ai → Settings → Skills; it
+> applies the same scoping/rate-limit discipline automatically.
+
 ## 5. Local testing
 
 With a provider test tenant:
@@ -131,7 +162,8 @@ See `.env.example`. Connector-only vars: `BIND_ADDR`, `PORT`,
 `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL`, `MCP_PUBLIC_BASE_URL`,
 `MCP_OAUTH_AUDIENCE`, `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`,
 `MCP_AUTH_DISABLED`. Shared with the stdio binary: `WORKFLOWY_API_KEY`
-(required), `WORKFLOWY_INDEX_PATH`, `SECONDBRAIN_DIR`.
+(required), `WORKFLOWY_INDEX_PATH`, `SECONDBRAIN_DIR`, `WORKFLOWY_REVIEW_ROOT`
+(default scope for `review` / `audit_mirrors`; no hardcoded fallback).
 
 ## 7. Troubleshooting (gotchas hit in a real WorkOS AuthKit + Fly bring-up)
 

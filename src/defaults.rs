@@ -284,15 +284,21 @@ pub const IDEMPOTENCY_TTL_MS: u64 = 600_000;
 pub const IDEMPOTENCY_MAX_ENTRIES: usize = 4_096;
 
 /// Default scope for the `review` and `audit_mirrors` tools when no `root_id`
-/// is supplied: the author's Distillations subtree.
+/// is supplied, read from the `WORKFLOWY_REVIEW_ROOT` env var.
 ///
-/// NOTE (machine-specific value): this is a personal default baked into the
-/// repo, which the project's "no machine-specific IDs" principle wants gone.
-/// Centralising it here (it was duplicated in `server/mod.rs` and
-/// `wflow_do.rs`) is the reuse fix; migrating it to a `WORKFLOWY_REVIEW_ROOT`
-/// env var with no hardcoded fallback is tracked separately in
-/// `tasks/todo.local.md`.
-pub const DEFAULT_REVIEW_ROOT: &str = "7e351f77-c7b4-4709-86a7-ea6733a63171";
+/// There is **no hardcoded fallback** — the repo ships no personal node IDs
+/// (constitution: "no machine-specific IDs"). When the env var is unset and the
+/// caller omits `root_id`, both tools return a typed invalid-params error
+/// asking for an explicit `root_id`. Each user sets `WORKFLOWY_REVIEW_ROOT`
+/// (their Distillations / review-anchor node) via `.env` or their MCP host
+/// config. Shared by the MCP handlers and the `wflow-do` CLI so the two
+/// surfaces can't drift.
+pub fn default_review_root() -> Option<String> {
+    std::env::var("WORKFLOWY_REVIEW_ROOT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 #[cfg(test)]
 mod tests {

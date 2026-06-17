@@ -4535,9 +4535,10 @@ impl WorkflowyMcpServer {
     /// Distillations subtree — the only place the wflow Mirror
     /// Discipline convention is applied today. Hard-coding the UUID
     /// keeps tool calls one-arg in the common case while leaving
-    /// `root_id` open for narrower or wider scopes. Value lives in
-    /// `defaults::DEFAULT_REVIEW_ROOT` (shared with the CLI).
-    #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope OR in the persistent name index), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). Default scope is Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171, walked in chunks (one per direct child of the root) to avoid the 10 000-node walk cap on large pillars. Canonical resolution widens to the name index by default so cross-pillar mirrors don't false-positive as BROKEN (Fix A for the 2026-05-16 weekly-synthesis report). Pass chunked=false to force a single walk; pass cross_scope_resolve=false to restore the legacy in-scope-only classifier. Returns a JSON object with scope, scanned count, truncated flag, per-chunk envelope (when chunked), and findings array.")]
+    /// `root_id` open for narrower or wider scopes. The default comes from
+    /// `defaults::default_review_root()` (the `WORKFLOWY_REVIEW_ROOT` env var;
+    /// shared with the CLI). No hardcoded node ID.
+    #[tool(description = "Audit canonical_of: / mirror_of: markers across a subtree per the wflow Mirror Discipline convention. Reports BROKEN (mirror_of UUID does not resolve in scope OR in the persistent name index), DRIFTED (mirror name diverges from canonical's), ORPHAN (claimed canonical lacks a canonical_of: marker), and LONELY (canonical_of marker present but no mirrors point at it). When root_id is omitted the default scope is the WORKFLOWY_REVIEW_ROOT env node; if that env var is unset the call errors asking for an explicit root_id. The scope is walked in chunks (one per direct child of the root) to avoid the 10 000-node walk cap on large pillars. Canonical resolution widens to the name index by default so cross-pillar mirrors don't false-positive as BROKEN (Fix A for the 2026-05-16 weekly-synthesis report). Pass chunked=false to force a single walk; pass cross_scope_resolve=false to restore the legacy in-scope-only classifier. Returns a JSON object with scope, scanned count, truncated flag, per-chunk envelope (when chunked), and findings array.")]
     async fn audit_mirrors(
         &self,
         Parameters(params): Parameters<AuditMirrorsParams>,
@@ -4545,7 +4546,14 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "audit_mirrors", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => self.validate_and_resolve(rid).await?,
-            None => defaults::DEFAULT_REVIEW_ROOT.to_string(),
+            None => defaults::default_review_root().ok_or_else(|| {
+                tool_invalid_params(
+                    "audit_mirrors",
+                    None,
+                    "no root_id provided and WORKFLOWY_REVIEW_ROOT is not set; \
+                     pass root_id explicitly or set the env var to your review-anchor node",
+                )
+            })?,
         };
         let max_depth = params.max_depth.unwrap_or(8);
         // Default behaviour: chunked when the scope is the default
@@ -4659,7 +4667,7 @@ impl WorkflowyMcpServer {
         external
     }
 
-    #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under `$SECONDBRAIN_DIR/session-logs/` in the last 7 days (skipped if the env var is unset). Default scope: Distillations.")]
+    #[tool(description = "Surface what's worth re-reading under a subtree. Four buckets: (a) revisit-due — nodes tagged #revisit whose description carries `revisit_due: YYYY-MM-DD` past today; (b) multi-pillar — nodes with mirror_of count or distinct pillar-tag count >= 3; (c) stale cross-pillar — concept maps whose last_modified is older than days_stale (default 90); (d) source-MOC re-cited — source-MOC-shaped nodes whose description URLs/DOIs appear in any session-log file under `$SECONDBRAIN_DIR/session-logs/` in the last 7 days (skipped if the env var is unset). Default scope when root_id is omitted: the WORKFLOWY_REVIEW_ROOT env node (errors asking for an explicit root_id if that env var is unset).")]
     async fn review(
         &self,
         Parameters(params): Parameters<ReviewParams>,
@@ -4667,7 +4675,14 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "review", ToolKind::Walk, params, {
         let root = match &params.root_id {
             Some(rid) => self.validate_and_resolve(rid).await?,
-            None => defaults::DEFAULT_REVIEW_ROOT.to_string(),
+            None => defaults::default_review_root().ok_or_else(|| {
+                tool_invalid_params(
+                    "review",
+                    None,
+                    "no root_id provided and WORKFLOWY_REVIEW_ROOT is not set; \
+                     pass root_id explicitly or set the env var to your review-anchor node",
+                )
+            })?,
         };
         let max_depth = params.max_depth.unwrap_or(8);
         let days_stale = params.days_stale.unwrap_or(90);

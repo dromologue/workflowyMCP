@@ -18,7 +18,7 @@ use workflowy_mcp_server::{
     error::WorkflowyError,
 };
 
-use workflowy_mcp_server::defaults::DEFAULT_REVIEW_ROOT;
+use workflowy_mcp_server::defaults::default_review_root;
 
 #[derive(Parser)]
 #[command(name = "wflow-do", about = "Workflowy CLI — bypasses the MCP transport for direct API access")]
@@ -1880,7 +1880,13 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             // Walk orchestration routed through the shared workflow
             // so the CLI and the MCP `audit_mirrors` tool cannot
             // drift — see `crate::workflows::audit_mirrors_walk`.
-            let scope = root.as_deref().unwrap_or(DEFAULT_REVIEW_ROOT);
+            let review_root = default_review_root();
+            let scope = root.as_deref().or(review_root.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no --root provided and WORKFLOWY_REVIEW_ROOT not set; \
+                     pass --root or set the env var to your review-anchor node"
+                )
+            })?;
             let do_chunked = chunked.unwrap_or(root.is_none());
             let do_cross_resolve = cross_scope_resolve.unwrap_or(true);
             // Use the same depth budget the MCP handler defaults to
@@ -2056,7 +2062,13 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             }
         }
         Cmd::Review { root, days_stale } => {
-            let scope = root.as_deref().unwrap_or(DEFAULT_REVIEW_ROOT);
+            let review_root = default_review_root();
+            let scope = root.as_deref().or(review_root.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no --root provided and WORKFLOWY_REVIEW_ROOT not set; \
+                     pass --root or set the env var to your review-anchor node"
+                )
+            })?;
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));

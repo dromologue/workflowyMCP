@@ -654,11 +654,11 @@ pub struct CreateMirrorParams {
 #[serde(deny_unknown_fields)]
 #[schemars(description = "Audit canonical_of/mirror_of markers across a subtree per the wflow Mirror Discipline convention")]
 pub struct AuditMirrorsParams {
-    #[schemars(description = "Root of the audit (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
+    #[schemars(description = "Root of the audit. Default when omitted: the WORKFLOWY_REVIEW_ROOT env node (errors asking for an explicit root_id if that env var is unset).")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 8)")]
     pub max_depth: Option<usize>,
-    #[schemars(description = "Chunked walk: list root's direct children and walk each separately, then aggregate. Avoids the 10 000-node walk cap on large subtrees. Defaults to true when root_id is omitted (default Distillations scope), false when an explicit root is supplied. Pass true to force chunking for any scope; pass false to opt out.")]
+    #[schemars(description = "Chunked walk: list root's direct children and walk each separately, then aggregate. Avoids the 10 000-node walk cap on large subtrees. Defaults to true when root_id is omitted (the default env scope), false when an explicit root is supplied. Pass true to force chunking for any scope; pass false to opt out.")]
     pub chunked: Option<bool>,
     #[schemars(description = "Widen canonical resolution beyond the walked scope by consulting the persistent name index. Mirror Discipline is built around cross-pillar references, so a canonical living outside the walk is the normal case rather than a fault. Defaults to true. Set false to restore the legacy in-scope-only classifier (any cross-scope mirror will then classify as BROKEN).")]
     pub cross_scope_resolve: Option<bool>,
@@ -671,7 +671,7 @@ pub struct AuditMirrorsParams {
 #[serde(deny_unknown_fields)]
 #[schemars(description = "Surface revisit-due, multi-pillar, stale, and recently-cited content under a subtree")]
 pub struct ReviewParams {
-    #[schemars(description = "Root of the review (default: Distillations 7e351f77-c7b4-4709-86a7-ea6733a63171)")]
+    #[schemars(description = "Root of the review. Default when omitted: the WORKFLOWY_REVIEW_ROOT env node (errors asking for an explicit root_id if that env var is unset).")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 8)")]
     pub max_depth: Option<usize>,
