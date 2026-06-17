@@ -116,8 +116,41 @@ fly secrets set --app <app> \
   MCP_OAUTH_JWKS_URL=https://your-tenant.provider.com/oauth2/jwks \
   MCP_PUBLIC_BASE_URL=https://<app>.fly.dev
 
+# Deploy with a LEAST-PRIVILEGE, app-scoped token (preferred — see §3.5):
+./scripts/deploy.sh
+# ...or, the broad way (uses your full personal/org session):
 fly deploy
 ```
+
+### 3.5. Least-privilege deploy tokens
+
+A deploy carries full control of the app — including the power to set
+`MCP_AUTH_DISABLED=1` and reopen the connector to anyone. So don't deploy with
+the broad token from `fly auth login` (it can act across your *entire* Fly org).
+Deploy with an **app-scoped deploy token** instead: it can only touch this one
+app, and it carries a short expiry so a leak ages out on its own.
+
+`scripts/deploy.sh` does this for you. On first run it mints the token, writes it
+to `.fly.deploy.token` (gitignored, mode 600), and deploys with it; subsequent
+runs reuse the file. The script never prints the token.
+
+```bash
+./scripts/deploy.sh                 # mint-if-absent, then deploy
+FLY_TOKEN_EXPIRY=168h ./scripts/deploy.sh   # override the default 720h (30d)
+```
+
+To manage tokens by hand:
+
+```bash
+fly tokens create deploy -a <app> --name "deploy-<app>" --expiry 720h  # mint
+fly tokens list                                                        # audit
+fly tokens revoke <token-id>                                           # kill a leaked one
+```
+
+Back the token up in your password manager (or re-mint — they're cheap). In CI,
+skip the file entirely and pass the token as the `FLY_API_TOKEN` env var; the
+script and `fly deploy` both honour it. Default Fly token expiry is *20 years* if
+you omit `--expiry`, so always set one.
 
 The default `fly.toml` runs **volumeless**: the name index lives in memory and
 rebuilds opportunistically from tool-call walks (one less moving part, and the

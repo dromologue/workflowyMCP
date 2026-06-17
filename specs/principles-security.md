@@ -28,6 +28,9 @@ Every component should have the minimum permissions required.
 - Process data in memory; avoid unnecessary persistence
 - Run with minimal filesystem permissions
 
+**Implemented (deploy credential, remote connector)**:
+- Deploys use an **app-scoped Fly deploy token**, not the broad `fly auth login` org session. A deploy can set `MCP_AUTH_DISABLED=1` (reopening the connector), so the credential that performs it is scoped to the single app and given a short `--expiry` (default 720h via `scripts/deploy.sh`) — a leaked token can neither touch the rest of the Fly org nor outlive its window. The token is written to `.fly.deploy.token` (gitignored, mode 600) and never echoed; revoke via `fly tokens revoke <id>`. See `docs/REMOTE-CONNECTOR.md` §3.5.
+
 ### 3. Secure by Default
 
 The safe option should require zero configuration.
