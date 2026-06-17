@@ -122,8 +122,15 @@ rate-limited:
   `rate_limited` with a `retry_after`, wait that long and don't poll again —
   each probe consumes a token from the window you're waiting on.
 
-If your MCP client ever drops bare-string id parameters (some do), route reads
-through `read_batch` (an operations-array wrapper built for that wire hazard).
+- **Route scoped reads through `read_batch` on this connector.** **Confirmed in
+  production (claude.ai web):** the host strips bare-string id parameters before
+  they reach the server, so a scoped `search_nodes` / `find_node` /
+  `build_name_index` call arrives with no `parent_id` and collapses to a refused
+  root walk — it looks like the server rejecting your scope, but the id never
+  arrived. `read_batch` nests the id *inside* the operations object, where it
+  survives intact, so it is the reliable read path until the host-side stripping
+  is fixed upstream. (This is why the `wflow` / `wflow-connector` skills route
+  connector reads through `read_batch` by default.)
 
 > **Skill (optional):** the repo's `templates/skills/wflow/` skill turns the raw
 > tools into a second-brain workflow (capture, triage, distil, review). Bundle it
