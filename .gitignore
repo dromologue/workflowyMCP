@@ -5,6 +5,9 @@ dist/
 # ignores it, so it stays out even if dist/ artefacts are ever force-added).
 dist/daily-second-brain-workflow.dispatch.md
 .env
+# Personal Fly deployment config (carries the user's unique app name). The
+# committed template is fly.toml.example; copy it to fly.toml locally.
+/fly.toml
 *.log
 .DS_Store
 coverage/

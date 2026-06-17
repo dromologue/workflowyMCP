@@ -1049,6 +1049,14 @@ where
 mod params;
 pub use params::*;
 
+// Remote claude.ai connector surface: Streamable HTTP transport + OAuth
+// resource-server gate. Parallel to the stdio transport in this file; both
+// share `build_and_spawn` below so server construction can't drift.
+pub mod auth;
+pub mod http;
+pub use auth::OAuthConfig;
+pub use http::{run_http_server, HttpServerConfig};
+
 // --- Tool router and handler ---
 
 #[tool_router]
@@ -5314,9 +5322,12 @@ fn spawn_index_refresher(server: WorkflowyMcpServer) {
 }
 
 /// Start the MCP server on stdio transport
-pub async fn run_server(client: Arc<WorkflowyClient>) -> anyhow::Result<()> {
-    info!("Starting Workflowy MCP Server on stdio");
-
+/// Build the server with name-index persistence and start its background
+/// index tasks (saver + 30-min refresher). Shared by both transports —
+/// `run_server` (stdio / Claude Desktop) and `run_http_server` (Streamable
+/// HTTP / claude.ai connector) — so the two surfaces cannot drift on server
+/// construction, the same way `wflow-do` shares the workflow orchestrations.
+pub(crate) fn build_and_spawn(client: Arc<WorkflowyClient>) -> WorkflowyMcpServer {
     let save_path = resolve_index_save_path();
     if let Some(p) = &save_path {
         info!(path = %p.display(), "name index persistence enabled");
@@ -5332,6 +5343,14 @@ pub async fn run_server(client: Arc<WorkflowyClient>) -> anyhow::Result<()> {
 
     spawn_index_saver(Arc::clone(&server.name_index));
     spawn_index_refresher(server.clone());
+
+    server
+}
+
+pub async fn run_server(client: Arc<WorkflowyClient>) -> anyhow::Result<()> {
+    info!("Starting Workflowy MCP Server on stdio");
+
+    let server = build_and_spawn(client);
 
     let service = server.serve(stdio()).await.inspect_err(|e| {
         error!("MCP serve error: {:?}", e);

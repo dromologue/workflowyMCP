@@ -17,6 +17,14 @@ path = "src/cli/task_map.rs"
 name = "wflow-do"
 path = "src/bin/wflow_do.rs"
 
+# Remote MCP connector for claude.ai (web/desktop/mobile): the same
+# WorkflowyMcpServer tool surface as the stdio binary, served over
+# Streamable HTTP behind an OAuth resource-server gate. See
+# docs/REMOTE-CONNECTOR.md.
+[[bin]]
+name = "workflowy-mcp-http"
+path = "src/bin/mcp_http.rs"
+
 [dependencies]
 # Floor versions match the latest stable releases as of 2026-05-24.
 # `rmcp 1.x` confirmed compatible with our `Parameters` wrapper-name
@@ -49,9 +57,25 @@ clap = { version = "4.6", features = ["derive"] }
 futures = "0.3"
 lazy_static = "1.5"
 rand = "0.10"
-rmcp = { version = "1.7", features = ["server", "transport-io"] }
+rmcp = { version = "1.7", features = [
+    "server",
+    "transport-io",
+    # Remote-connector transport for claude.ai custom connectors: the
+    # server-side Streamable HTTP service + its in-memory session store,
+    # mounted into axum via the `tower` Service impl. The stdio binary
+    # (Claude Desktop) keeps using "transport-io" unchanged.
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+    "tower",
+] }
 schemars = "1.2"
 sha2 = "0.11"
+# Remote-connector HTTP surface (workflowy-mcp-http binary only). axum
+# hosts the rmcp Streamable HTTP service + the OAuth resource-server
+# metadata/gate; jsonwebtoken validates the managed provider's JWTs
+# against its JWKS. The stdio server binary does not link these paths.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+jsonwebtoken = "9"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
@@ -59,6 +83,9 @@ tokio-test = "0.4"
 proptest = "1.4"
 tempfile = "3"
 wiremock = "0.6"
+# Drives the connector axum Router in unit tests via ServiceExt::oneshot
+# (no socket bind) — see src/server/http.rs tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

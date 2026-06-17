@@ -195,16 +195,17 @@ Cache aggressively but transparently. Expose configuration for rate-limit behavi
 
 - Language: **Rust** (2021 edition).
 - Async runtime: Tokio.
-- MCP SDK: rmcp 0.16 (proc-macro tool registration).
+- MCP SDK: rmcp 1.7 (proc-macro tool registration; streamable-http-server transport for the remote connector).
 - Serialization: serde + schemars (JSON Schema generation).
 - HTTP: reqwest with exponential backoff retry.
-- Transport: stdio (Claude Desktop compatible). Streamable HTTP planned for remote deployments.
+- Transport: stdio (Claude Desktop) **and** Streamable HTTP (remote claude.ai connector, `workflowy-mcp-http`). Both share `build_and_spawn` over one `WorkflowyMcpServer`.
+- Remote connector only: axum (HTTP host for the rmcp service + OAuth metadata/gate) and jsonwebtoken (JWKS bearer validation). Deployed to Fly.io; see `docs/REMOTE-CONNECTOR.md`.
 
 ---
 
 ## What We Will NOT Do
 
-- Support authentication methods other than API key (until Streamable HTTP introduces OAuth 2.1).
+- Support authentication methods other than API key on the **stdio** transport. (The **Streamable HTTP** connector adds an OAuth 2.1 resource-server gate in front; the Workflowy upstream auth remains an API key.)
 - Implement real-time sync or webhooks.
 - Build a web UI or standalone application.
 - Support Workflowy features not exposed via the public API.

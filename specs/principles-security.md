@@ -46,6 +46,11 @@ When something goes wrong, fail into a safe state.
 - Network errors abort operations (not continue without data)
 - Unknown inputs are rejected (not sanitized and processed)
 
+**Implemented (remote connector, `workflowy-mcp-http`)**:
+- The OAuth gate **fails closed**: if `MCP_OAUTH_ISSUER` / `MCP_OAUTH_JWKS_URL` / `MCP_PUBLIC_BASE_URL` are missing, the binary refuses to start. The only way to run unauthenticated is the explicit `MCP_AUTH_DISABLED=1` (local testing), which logs a stark startup warning — there is no silent unauthenticated default.
+- Every `/mcp` request without a valid bearer JWT is denied with 401 (never partial access). Tokens are validated for signature (against the provider JWKS), `iss`, `aud`, and expiry; symmetric (HMAC) algorithms are rejected up front to remove alg-confusion ambiguity on an asymmetric JWKS.
+- Discovery endpoints (`/.well-known/oauth-protected-resource`, `/healthz`) are deliberately public; the gate is scoped to the MCP route only. Pinned by `server::http::tests` (401-without-token, public-metadata, gate-removed-when-disabled) and `server::auth::tests`.
+
 ### 5. Trust Nothing External
 
 All external input is hostile until validated.
