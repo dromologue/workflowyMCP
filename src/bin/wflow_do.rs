@@ -385,8 +385,8 @@ enum Cmd {
     /// Show the most recent N tool invocations recorded by the running
     /// MCP server's op log. Mirrors MCP `get_recent_tool_calls`. Off-server
     /// the local client has no op log, so this prints an empty list — the
-    /// command exists for surface parity. Use against the live MCP via
-    /// the Workflowy connector when you need real data.
+    /// command exists for surface parity. Use against the live
+    /// Workflowy MCP server when you need real data.
     RecentTools {
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -1848,7 +1848,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 serde_json::to_string_pretty(&json!({
                     "ok": true,
                     "cancelled_count": 0,
-                    "note": "wflow-do is single-shot; cancel-all is a no-op against the local client. Use against the running MCP server via the Workflowy connector when you need to preempt in-flight tree walks.",
+                    "note": "wflow-do is single-shot; cancel-all is a no-op against the local client. Use against the running Workflowy MCP server when you need to preempt in-flight tree walks.",
                 }))?
             );
         }

@@ -60,9 +60,9 @@ The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every n
 
 The most preventable failure mode on this skill, and the single load-bearing discipline. **Before any tool call that takes a UUID parameter — write or read — run this check.**
 
-**The hazard.** Some host surfaces (claude.ai web / mobile in particular) strip bare top-level string parameters. When the model emits a UUID and the host serialiser turns it into `null` — or emits the literal string `"null"`, or the model itself emits `null` when the UUID isn't to hand — the call either rejects with a path-aware deserialization error, lands at the workspace root, or silently misroutes to the most-recently-discussed contextual destination. The fault is symmetric: writes (`move_node`, `edit_node`, `create_node`, `parent_id`, `new_parent_id`) and reads (`get_node`, `list_children`, `get_subtree`, `node_id`) both suffer it.
+**The hazard.** Some MCP host surfaces strip bare top-level string parameters. When the model emits a UUID and the host serialiser turns it into `null` — or emits the literal string `"null"`, or the model itself emits `null` when the UUID isn't to hand — the call either rejects with a path-aware deserialization error, lands at the workspace root, or silently misroutes to the most-recently-discussed contextual destination. The fault is symmetric: writes (`move_node`, `edit_node`, `create_node`, `parent_id`, `new_parent_id`) and reads (`get_node`, `list_children`, `get_subtree`, `node_id`) both suffer it.
 
-**The wire-level guard is not a backstop you can rely on.** The server's `NodeId` deserializer rejects literal `"null"` strings and JSON `null` for required fields, but the 2026-05-27 observation on claude.ai web confirms that hosts can coerce `null` to a contextual UUID _before_ the server sees it — every `null` passed for parent / canonical IDs during that session resolved silently to the intended node, masking the misroute by luck. Until the host-side coercion is closed (server-side hardening tracked in `tasks/todo.local.md`), **this discipline is the only line of defence**. Treat the rules below as enforced by your own attention, not by the schema.
+**The wire-level guard is not a backstop you can rely on.** The server's `NodeId` deserializer rejects literal `"null"` strings and JSON `null` for required fields, but the 2026-05-27 observation confirms that some hosts can coerce `null` to a contextual UUID _before_ the server sees it — every `null` passed for parent / canonical IDs during that session resolved silently to the intended node, masking the misroute by luck. Until the host-side coercion is closed (server-side hardening tracked in `tasks/todo.local.md`), **this discipline is the only line of defence**. Treat the rules below as enforced by your own attention, not by the schema.
 
 **The rules, every UUID parameter, every time:**
 
@@ -161,9 +161,9 @@ A three-step probe at session start. All steps must complete before any workflow
 
 ### Step 0 — Tool availability probe
 
-Confirm the MCP tool surface this skill needs is actually loaded **before** doing anything else. claude.ai connectors can be disabled, removed, or fail to load silently; the skill must fail loud rather than silently degrade to filesystem-staging.
+Confirm the MCP tool surface this skill needs is actually loaded **before** doing anything else. MCP servers can be disabled, removed, or fail to load silently; the skill must fail loud rather than silently degrade to filesystem-staging.
 
-**The probe is unconditional.** Run it on every wflow session, regardless of host. Claude Desktop, Cowork, and claude.ai all lazy-load MCP tools on first `tool_search`; "the connector was working last session" is not a substitute for probing this session. Deferring the probe until a write is imminent is how the gap bites — the agent forgets, captures degrade silently to disk, and the user finds out a session later.
+**The probe is unconditional.** Run it on every wflow session, regardless of host. Hosts lazy-load MCP tools on first `tool_search`; "the MCP server was working last session" is not a substitute for probing this session. Deferring the probe until a write is imminent is how the gap bites — the agent forgets, captures degrade silently to disk, and the user finds out a session later.
 
 #### What to probe
 
@@ -173,7 +173,7 @@ Confirm the MCP tool surface this skill needs is actually loaded **before** doin
 
 #### How to probe
 
-Use the **exact server name** as the `tool_search` query — descriptive phrases match the wrong connector (`"filesystem write file"` loads Netlify, `"list_allowed_directories"` loads Gmail, only `"Filesystem"` works):
+Use the **exact server name** as the `tool_search` query — descriptive phrases match the wrong MCP server (`"filesystem write file"` loads Netlify, `"list_allowed_directories"` loads Gmail, only `"Filesystem"` works):
 
 - `tool_search(query="Workflowy")`
 - `tool_search(query="Filesystem")`
@@ -190,7 +190,7 @@ Verify each surface with a read-only call:
 If any required tool is unreachable:
 
 1. Stop the bootstrap. Do not proceed to Step 1.
-2. Name the missing tool and tell the user how to fix it: claude.ai connectors at `https://claude.ai/settings/connectors`, or Claude Desktop's `claude_desktop_config.json`. Confirm with the corresponding health-check tool.
+2. Name the missing tool and tell the user how to fix it: check the MCP server configuration for their host (e.g. `claude_desktop_config.json` for Claude Desktop). Confirm with the corresponding health-check tool.
 3. Ask explicitly before staging a draft to disk. Never silently degrade. If the user consents, write to the universally allowlisted fallback path with the failure mode tagged in the filename (`...-mcp-down.md`) so the next session's Step 1 resumes execution.
 
 ### Step 1 — secondBrain draft check
@@ -385,7 +385,7 @@ Both files are **canonical at the `$SECONDBRAIN_DIR/memory/` path**. They are no
 1. State explicitly which point applies — surfaces the change so the user can sanity-check it.
 2. Edit the relevant canonical at its `$SECONDBRAIN_DIR/memory/` path.
 3. Append a change-log entry to `workflowy_node_links.md` under a "Change log" section dated today, naming the change in one or two sentences. The change log is what lets a future session diff "what changed in Workflowy structure since I last looked" without walking the tree.
-4. If the user uploads the skill bundle to claude.ai web for that surface, remind them that the bundle ships generic — their personal data files live only at `$SECONDBRAIN_DIR/memory/` and are read at session start; uploading the skill bundle alone does not push the canonicals.
+4. If the user distributes the skill bundle to another host, remind them that the bundle ships generic — their personal data files live only at `$SECONDBRAIN_DIR/memory/` and are read at session start; the skill bundle alone does not carry the canonicals.
 
 **Why this is the discipline, not a soft suggestion.** When the canonicals drift, the agent reads structurally-outdated UUIDs at Bootstrap and routes content to nodes that no longer exist (or that have moved). The update discipline is what prevents that.
 

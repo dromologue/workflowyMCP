@@ -28,9 +28,6 @@ Every component should have the minimum permissions required.
 - Process data in memory; avoid unnecessary persistence
 - Run with minimal filesystem permissions
 
-**Implemented (deploy credential, remote connector)**:
-- Deploys use an **app-scoped Fly deploy token**, not the broad `fly auth login` org session. A deploy can set `MCP_AUTH_DISABLED=1` (reopening the connector), so the credential that performs it is scoped to the single app and given a short `--expiry` (default 720h via `scripts/deploy.sh`) — a leaked token can neither touch the rest of the Fly org nor outlive its window. The token is written to `.fly.deploy.token` (gitignored, mode 600) and never echoed; revoke via `fly tokens revoke <id>`. See `docs/REMOTE-CONNECTOR.md` §3.5.
-
 ### 3. Secure by Default
 
 The safe option should require zero configuration.
@@ -48,13 +45,6 @@ When something goes wrong, fail into a safe state.
 - Corrupted config prevents startup (not uses defaults)
 - Network errors abort operations (not continue without data)
 - Unknown inputs are rejected (not sanitized and processed)
-
-**Implemented (remote connector, `workflowy-mcp-http`)**:
-- The OAuth gate **fails closed**: if `MCP_OAUTH_ISSUER` / `MCP_OAUTH_JWKS_URL` / `MCP_PUBLIC_BASE_URL` are missing, the binary refuses to start. The only way to run unauthenticated is the explicit `MCP_AUTH_DISABLED=1` (local testing), which logs a stark startup warning — there is no silent unauthenticated default.
-- Every `/mcp` request without a valid bearer JWT is denied with 401 (never partial access). Tokens are validated for signature (against the provider JWKS), `iss`, `aud`, and expiry; symmetric (HMAC) algorithms are rejected up front to remove alg-confusion ambiguity on an asymmetric JWKS.
-- **Authentication ≠ authorisation — the subject allow-list (`MCP_ALLOWED_SUBJECTS`).** A valid token proves the caller authenticated against the configured IdP, not that they are the account owner; with open provider sign-up that is not a sufficient gate for a single-tenant connector with full read/write (`delete_node` / `bulk_update`). When `MCP_ALLOWED_SUBJECTS` is set, only those OAuth `sub` claims pass — a missing or unlisted subject is refused with **403** (authenticated but not authorised; no `WWW-Authenticate` challenge, since re-auth wouldn't help). Empty list = permissive (single-tenant default for first-run discovery), and the server logs a stark startup warning plus the authenticated subject on each call so the operator can discover their `sub` and lock down. Pinned by `server::auth::tests::{empty_allow_list_authorises_any_subject, nonempty_allow_list_admits_only_listed_subjects}`.
-- **JWKS fetch hardening.** The provider JWKS is fetched with a 5 s timeout (a hanging provider can't stall the auth middleware and starve inbound connections) and refetched at most once per 60 s on an unknown `kid` (caps the unauthenticated amplification where a flood of random-`kid` tokens would each force an outbound JWKS GET). Key rotation still converges within one cooldown window.
-- Discovery endpoints (`/.well-known/oauth-protected-resource`, `/healthz`) are deliberately public; the gate is scoped to the MCP route only. Pinned by `server::http::tests` (401-without-token, public-metadata, gate-removed-when-disabled) and `server::auth::tests`.
 
 ### 5. Trust Nothing External
 

@@ -1,6 +1,6 @@
 # Workflowy MCP Server
 
-A Rust MCP server that gives Claude (Code, Desktop, or web) read/write access
+A Rust MCP server that gives Claude (Code or Desktop) read/write access
 to your Workflowy graph, plus a generic template for turning that raw access
 into a working second brain.
 
@@ -23,8 +23,8 @@ live wherever `$SECONDBRAIN_DIR` points, never in this repo.
 ## Quick install
 
 You need: Rust 1.75+ (`rustup install stable`), a Workflowy account with an
-API key (Settings → API in Workflowy), and an MCP host (Claude Code,
-Claude Desktop, or claude.ai web).
+API key (Settings → API in Workflowy), and an MCP host (Claude Code
+or Claude Desktop).
 
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
@@ -54,53 +54,6 @@ Verify by calling the `workflowy_status` tool — the host should return
 binary; check the env-var section below.
 
 That's it for plain MCP usage.
-
----
-
-## Remote connector for claude.ai (web / desktop / mobile)
-
-The steps above wire the **stdio** binary into a local host (Claude Code /
-Desktop). To use Workflowy from **claude.ai as a custom connector**, run the
-second binary, **`workflowy-mcp-http`**, which serves the *same* tool surface
-over MCP **Streamable HTTP** behind an **OAuth 2.1** gate. The stdio binary is
-unchanged; both share one server construction path (`build_and_spawn`).
-
-**How it fits together:** claude.ai connectors are remote MCP servers reached
-over HTTPS with OAuth. A managed provider (WorkOS AuthKit, Stytch, Auth0, …) is
-the *authorization server*; this binary is the *resource server* — it validates
-the provider's bearer JWTs and publishes RFC 9728 discovery metadata. You host
-it on a public HTTPS URL (Fly.io recommended).
-
-The gist (full walkthrough — provider setup, Fly deploy, troubleshooting — in
-**[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md)**):
-
-1. **OAuth provider:** enable dynamic client registration; note the issuer +
-   JWKS URL from `<issuer>/.well-known/oauth-authorization-server`.
-2. **Deploy:** `cp fly.toml.example fly.toml` (set a unique `app`), then
-   `fly apps create … && fly secrets set WORKFLOWY_API_KEY=… MCP_OAUTH_ISSUER=…
-   MCP_OAUTH_JWKS_URL=… MCP_PUBLIC_BASE_URL=https://<app>.fly.dev &&
-   fly deploy`.
-3. **Connect:** claude.ai → Settings → Connectors → Add custom connector →
-   `https://<app>.fly.dev/mcp` → complete the OAuth consent.
-4. Verify: `curl https://<app>.fly.dev/.well-known/oauth-protected-resource`.
-
-**Endpoints:** `/mcp` (bearer-gated MCP), `/.well-known/oauth-protected-resource`
-(public discovery), `/healthz` (public). The gate **fails closed** — missing
-OAuth env aborts startup unless `MCP_AUTH_DISABLED=1` (local testing only; never
-public, the tool surface includes `delete_node`/`bulk_update`).
-
-**Single-tenant (Phase 1):** the Workflowy key is one deployment secret, so the
-connector acts as one account and the OAuth login is the access gate. Multi-tenant
-(bring-your-own key) is planned, not built.
-
-**Using it well:** the connector talks to a large tree over a rate-limited API.
-The `wflow-connector` skill primes the operational discipline that keeps sessions
-healthy — scoped reads (never root-wide walks; pass explicit parent UUIDs or
-`build_name_index` + `use_index=true`), rate-limit patience (don't poll
-`workflowy_status` inside a `retry_after` window), and verify-after-write. See
-[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md) §7 for the gotchas
-(notably: a provider may stamp the token `aud` as the client id, and rmcp's host
-guard must be told your public hostname via `MCP_ALLOWED_HOSTS`).
 
 ---
 
@@ -156,8 +109,8 @@ index. After bootstrap, the assistant follows
 [`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) as the
 operating manual.
 
-The detailed long-form walkthrough — multi-surface deployment, large-tree
-convergence, troubleshooting — lives in [`docs/SETUP.md`](docs/SETUP.md).
+The detailed long-form walkthrough — large-tree convergence,
+troubleshooting — lives in [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 
@@ -178,7 +131,7 @@ skill, then customise):
 
 **Precedence rule.** When the skill needs data from the two memory files,
 it prefers the canonical at `$SECONDBRAIN_DIR/memory/<file>.md`. If that
-path isn't readable (e.g. claude.ai web with no Filesystem allowlist), it
+path isn't readable (e.g. a host with no filesystem access), it
 falls back to the bundled copy at `~/.claude/skills/wflow/<file>.md`. The
 bundled copy is overwritten on each skill ZIP rebuild, so canonical edits
 need to be re-bundled before they reach surfaces that depend on the
@@ -338,11 +291,10 @@ expiry, bulk operations return a structured partial-success payload
 (`status: "partial"`, `created_count`, `last_inserted_id`, etc.) so the
 caller can resume — no "no result received" without diagnostic. The
 180 s bulk budget leaves 60 s of margin under the MCP transport's
-4-min hard timeout (Claude Desktop, claude.ai web) so the
+4-min hard timeout (Claude Desktop) so the
 partial-success envelope is reachable on every surface — lowered from
 210 s on 2026-05-09 after a sub-cap `insert_content` payload was
-observed hanging the full 4 minutes with no diagnostic on claude.ai
-web.
+observed hanging the full 4 minutes with no diagnostic.
 
 **Typed write failures (2026-06-17).** Every error response carries a
 structured envelope — `{operation, node_id, proximate_cause, retryable,

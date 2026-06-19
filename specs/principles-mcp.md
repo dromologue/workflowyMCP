@@ -38,24 +38,19 @@ Agents may retry or parallelize requests. Design for this.
 
 ## 3. Transport & Cancellation
 
-Support stdio for maximum compatibility. Add Streamable HTTP for networked deployments.
+Support stdio for maximum compatibility.
 
 - **stdio**: Baseline, preferred for Claude Desktop integration
-- **Streamable HTTP**: Future, for remote/multi-tenant deployments (SSE deprecated)
 - Implement request cancellation and timeouts to prevent resource stranding
 
-**Status**: ✅ stdio implemented; cancellation + per-tool timeouts fully wired. ✅ Streamable HTTP transport implemented (remote claude.ai connector, single-tenant).
+**Status**: ✅ stdio implemented; cancellation + per-tool timeouts fully wired.
 
 **Implemented**:
 - `CancelRegistry` (generation counter) shared across the server. `cancel_all` bumps the generation; every outstanding tree walk returns partial results on its next checkpoint with `truncation_reason: "cancelled"` within ~50 ms.
 - `tool_handler!(name, kind, params, body)` macro wraps every non-diagnostic handler. The `ToolKind` taxonomy (`Read` / `Write` / `Bulk` / `Walk`) selects the wall-clock budget from `defaults::*_TIMEOUT_MS`; the wrapper races the handler future against the cancel guard and the deadline.
 - `WorkflowContext { cancel, deadline }` plumbs both signals through `workflows::*` functions so partial-success outcomes (e.g. `InsertContentOutcome::Partial`) are observable from both surfaces.
-- **Streamable HTTP** (`workflowy-mcp-http` binary, `src/server/http.rs`): the rmcp `StreamableHttpService` (stateful sessions, `LocalSessionManager`) mounted in axum at `/mcp`, behind an OAuth resource-server gate (`src/server/auth.rs`). Both transports share `build_and_spawn` in `server/mod.rs` so server construction + the background name-index tasks cannot drift. SSE is not exposed (deprecated). See `docs/REMOTE-CONNECTOR.md`.
 
-**Transport parallel-surface invariant**: a new transport is a new *runner* over the same `WorkflowyMcpServer` + `tool_router`, never a fork of the tool surface — the same discipline `wflow-do` applies to the CLI. `build_and_spawn` is the single construction path; both `run_server` (stdio) and `run_http_server` (HTTP) call it.
-
-**Action items**:
-- Phase 2: multi-tenant (bring-your-own Workflowy key + per-tenant state isolation). Not blocking single-tenant connector use.
+**Transport parallel-surface invariant**: a new transport is a new *runner* over the same `WorkflowyMcpServer` + `tool_router`, never a fork of the tool surface — the same discipline `wflow-do` applies to the CLI. `build_and_spawn` is the single construction path; `run_server` (stdio) calls it.
 
 ---
 
@@ -79,7 +74,7 @@ Use elicitation to fill missing parameters or confirm risky actions. Gate with c
 
 ## 5. Security First
 
-Follow MCP security best practices. OAuth 2.1 mandatory for HTTP transports.
+Follow MCP security best practices.
 
 - stdio uses Bearer token auth (appropriate — no OAuth needed)
 - Non-predictable session identifiers (N/A for stdio)
@@ -90,7 +85,6 @@ Follow MCP security best practices. OAuth 2.1 mandatory for HTTP transports.
 
 **Action items**:
 - Audit all error messages for accidental secret leakage
-- When adding Streamable HTTP: implement OAuth 2.1
 - Validate node IDs are UUID format before sending to API (prevent injection)
 
 ---
@@ -220,11 +214,7 @@ Containerize, declare transport, publish minimal images.
 - Binary distribution (Rust compiles to single binary — good)
 - README with tool catalog, schemas, examples, security notes
 
-**Status**: ✅ Binary builds. ✅ Multi-stage `Dockerfile` (slim `debian:bookworm-slim` runtime, non-root `connector` user) + `fly.toml` for the remote connector. **Remaining gap**: README MCP-specific tool catalog table.
-
-**Implemented**:
-- `Dockerfile` builds only `workflowy-mcp-http`; `ca-certificates` for TLS to Workflowy + the OAuth JWKS; runs as uid 10001.
-- `fly.toml` declares the persistent volume for the name index (`/data`), `force_https`, and a `/healthz` check. Secrets via `fly secrets set` (never committed). See `docs/REMOTE-CONNECTOR.md`.
+**Status**: ✅ Binary builds (Rust compiles to a single binary). **Remaining gap**: README MCP-specific tool catalog table.
 
 **Action items**:
 - Update README with tool catalog table (name, description, params, examples).
@@ -295,10 +285,9 @@ Require confirmation for state changes. Provide dry-run mode.
 | P1 | #7 Correlation IDs | Low | Medium |
 | P1 | #6 Error codes | Low | Medium |
 | P1 | #3 Timeouts | Low | Medium |
-| P2 | #12 Dockerfile | Low | Low |
+| P2 | #12 README tool catalog | Low | Low |
 | P2 | #4 Elicitation | Medium | Low (blocked) |
 | P2 | #9 Prompts/Resources | Medium | Low |
-| P3 | #3 Streamable HTTP | High | Future |
 
 ---
 

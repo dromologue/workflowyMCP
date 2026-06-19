@@ -37,7 +37,6 @@ cargo build --release        # compile (optimized, LTO)
 cargo test --lib             # run all unit tests
 cargo test                   # run all tests (unit + integration)
 cargo run --bin workflowy-mcp-server  # start MCP server (stdio / Claude Desktop)
-cargo run --bin workflowy-mcp-http    # start remote connector (Streamable HTTP / claude.ai)
 cargo check                  # type-check without building
 
 # Skill bundling (claude.ai upload)
@@ -188,16 +187,6 @@ Per-level child fetches run via `futures::stream::buffer_unordered(SUBTREE_FETCH
 
 The `wflow-do` binary at `src/bin/wflow_do.rs` is in **full surface parity** with the MCP tool list above. Every non-diagnostic MCP tool has a matching CLI subcommand routed through the same `WorkflowyClient`. New MCP tools must land with their `wflow-do` subcommand in the same commit. The build-time test `cli_covers_every_non_diagnostic_mcp_tool` enumerates the (mcp-tool → cli-subcommand) pairs and fails CI if a tool is added without its CLI counterpart. `convert_markdown` (pure local transform) is intentionally excluded; `cancel_all` and `get_recent_tool_calls` ship as no-op CLI surfaces because the op log only exists in the running MCP server. (`create_mirror` was a stub through 2026-05-04; the failure-report follow-up replaced the stub with a real convention-based implementation, and the `create-mirror` CLI subcommand landed in the same commit.)
 
-### Remote connector (`workflowy-mcp-http`)
-
-A third binary at `src/bin/mcp_http.rs` serves the **same** `WorkflowyMcpServer` tool surface over the MCP **Streamable HTTP** transport, for use as a **claude.ai custom connector** (web/desktop/mobile). It is a new *transport runner*, not a fork of the tool surface — the same parallel-surface discipline `wflow-do` applies to the CLI. Both `run_server` (stdio) and `run_http_server` (HTTP) call the shared `build_and_spawn(client)` in `server/mod.rs`, so server construction and the background name-index tasks cannot drift between transports.
-
-- **`src/server/http.rs`** — `run_http_server` + `build_router`. Mounts the rmcp `StreamableHttpService` (stateful sessions via `LocalSessionManager`) in axum at `/mcp`; serves public `/.well-known/oauth-protected-resource` (RFC 9728 discovery) and `/healthz`. The per-session `service_factory` clones the already-`Clone` server.
-- **`src/server/auth.rs`** — OAuth resource-server gate. `TokenValidator` validates bearer JWTs against a managed provider's JWKS (cached, 5 s fetch timeout, refetch rate-limited to once/60 s on a `kid` miss to cap amplification), checking `iss` / `aud` / expiry and rejecting symmetric algs. `require_bearer` middleware wraps the `/mcp` route only; on auth failure returns 401 with a `WWW-Authenticate ... resource_metadata="…"` challenge so claude.ai can bootstrap the OAuth flow, and on an authenticated-but-unauthorised subject returns 403.
-- **Single-tenant (Phase 1):** the Workflowy key is a deployment secret; a valid token is the gate. **Authentication ≠ authorisation:** `MCP_ALLOWED_SUBJECTS` (comma-separated OAuth `sub` allow-list) pins the connector to the account owner's identity — empty = permissive (logs the subject + a startup warning so the operator can discover their `sub` and lock down), non-empty = only-listed-subjects-pass-or-403. The gate **fails closed** — missing OAuth env aborts startup unless `MCP_AUTH_DISABLED=1` (local testing, logged loudly). Phase 2 (multi-tenant: per-user Workflowy key linking + per-tenant state isolation) is sketched but not built.
-- **Deploy:** `Dockerfile` (slim runtime, non-root) + `fly.toml` (persistent `/data` volume for the name index, `force_https`, `/healthz` check). Full guide in [`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md). Config reference in `.env.example`.
-- Pinned by `server::http::tests` (401-without-token / public-metadata / gate-removed-when-disabled / healthz) and `server::auth::tests`.
-
 ### Shared workflow orchestration (`src/workflows.rs`)
 
 Workflow orchestration that used to be duplicated between the MCP server's `#[tool]` handlers and the `wflow-do` CLI subcommands lives in `src/workflows.rs`. Functions there take `&WorkflowyClient` plus typed inputs and a `&WorkflowContext<'_>`, return `(TypedResult, MutationFootprint)`, and are called by both surfaces — the MCP handler wraps with `tool_handler!` (cancel + op-log + deadline) and applies the footprint via `apply_footprint`; the CLI propagates errors via `?` and discards the footprint. This is the same pattern `audit::audit_mirrors`, `audit::build_review`, and `utils::aggregation::*` already follow for pure functions; `workflows.rs` extends it to functions that need an API client.
@@ -309,8 +298,6 @@ Environment variables loaded from `.env` via dotenvy (`src/config.rs`):
 - `WORKFLOWY_INDEX_PATH` (optional) — disk path for the persistent name index. Unset or empty disables persistence. The repository ships no machine-specific default; each user (or MCP host config) wires the path explicitly.
 - `SECONDBRAIN_DIR` (optional) — root of the user's operational `secondBrain` directory (drafts, session logs, briefs, memory). The `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip).
 - `WORKFLOWY_REVIEW_ROOT` (optional) — default root node for `review` and `audit_mirrors` when `root_id` is omitted (read via `defaults::default_review_root()`, shared by the MCP handlers and the `wflow-do` CLI). **No hardcoded fallback** (constitution: "no machine-specific IDs"); when unset, both tools return a typed invalid-params error asking for an explicit `root_id`. Replaced the former hardcoded `DEFAULT_REVIEW_ROOT` const.
-
-Remote-connector-only variables (the `workflowy-mcp-http` binary) — `BIND_ADDR`, `PORT`, `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL`, `MCP_PUBLIC_BASE_URL`, `MCP_OAUTH_AUDIENCE` (comma-list), `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, `MCP_AUTH_DISABLED` — are documented in `docs/REMOTE-CONNECTOR.md` and `.env.example`.
 
 ## Templates and setup
 

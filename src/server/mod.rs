@@ -1049,14 +1049,6 @@ where
 mod params;
 pub use params::*;
 
-// Remote claude.ai connector surface: Streamable HTTP transport + OAuth
-// resource-server gate. Parallel to the stdio transport in this file; both
-// share `build_and_spawn` below so server construction can't drift.
-pub mod auth;
-pub mod http;
-pub use auth::OAuthConfig;
-pub use http::{run_http_server, HttpServerConfig};
-
 // --- Tool router and handler ---
 
 #[tool_router]
@@ -5336,12 +5328,10 @@ fn spawn_index_refresher(server: WorkflowyMcpServer) {
     });
 }
 
-/// Start the MCP server on stdio transport
 /// Build the server with name-index persistence and start its background
-/// index tasks (saver + 30-min refresher). Shared by both transports —
-/// `run_server` (stdio / Claude Desktop) and `run_http_server` (Streamable
-/// HTTP / claude.ai connector) — so the two surfaces cannot drift on server
-/// construction, the same way `wflow-do` shares the workflow orchestrations.
+/// index tasks (saver + 30-min refresher). Used by the stdio transport
+/// (`run_server`); kept as a standalone constructor so server construction
+/// and the background name-index tasks live in one place.
 pub(crate) fn build_and_spawn(client: Arc<WorkflowyClient>) -> WorkflowyMcpServer {
     let save_path = resolve_index_save_path();
     if let Some(p) = &save_path {
