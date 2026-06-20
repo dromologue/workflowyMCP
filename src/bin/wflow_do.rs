@@ -2095,9 +2095,22 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             }
         }
         Cmd::Index { out } => {
-            let default = workflowy_mcp_server::defaults::session_logs_dir()
-                .map(|p| p.join("INDEX.md").to_string_lossy().into_owned());
-            let target = match (out.as_deref(), default.as_deref()) {
+            // When --out is given we honour it verbatim. Otherwise we derive the
+            // default under $SECONDBRAIN_DIR — but route through the *checked*
+            // accessor so a stale/missing SECONDBRAIN_DIR fails loud (naming the
+            // resolved path) instead of silently writing INDEX.md to a directory
+            // nobody provisioned (2026-06-02 relocation hazard).
+            let derived: Option<String> = match out.as_deref() {
+                Some(_) => None,
+                None => workflowy_mcp_server::defaults::secondbrain_dir_checked()?
+                    .map(|root| {
+                        root.join("session-logs")
+                            .join("INDEX.md")
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
+            };
+            let target = match (out.as_deref(), derived.as_deref()) {
                 (Some(o), _) => o,
                 (None, Some(d)) => d,
                 (None, None) => {
@@ -2542,6 +2555,23 @@ mod tests {
                 help.contains(cli_subcommand),
                 "MCP tool `{}` has no CLI subcommand `{}` — parity broken",
                 mcp_tool, cli_subcommand,
+            );
+        }
+        // Tie the pair list to the single-source non-diagnostic catalogue so the
+        // two cannot drift: every non-diagnostic tool must appear here AND a new
+        // non-diagnostic tool added to the catalogue must land its CLI pair.
+        // `convert_markdown` is the one documented exclusion — a pure local
+        // transform with no API surface, so it has no CLI subcommand (it is still
+        // a non-diagnostic tool the skill's allowed-tools must list).
+        for tool in workflowy_mcp_server::defaults::NON_DIAGNOSTIC_MCP_TOOLS {
+            if *tool == "convert_markdown" {
+                continue;
+            }
+            assert!(
+                expected_pairs.iter().any(|(m, _)| m == tool),
+                "non-diagnostic tool `{}` (defaults::NON_DIAGNOSTIC_MCP_TOOLS) has no \
+                 CLI parity pair in this test",
+                tool,
             );
         }
     }

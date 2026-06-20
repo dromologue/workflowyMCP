@@ -255,6 +255,50 @@ pub fn session_logs_dir() -> Option<std::path::PathBuf> {
     secondbrain_dir().map(|p| p.join("session-logs"))
 }
 
+/// Resolve **and validate** the secondBrain root, distinguishing the three
+/// states the bare [`secondbrain_dir`] accessor collapses into one `Option`:
+///
+/// - env var unset/empty → `Ok(None)` — the feature is disabled; the caller
+///   skips gracefully (identical contract to `secondbrain_dir() == None`).
+/// - env var set but the directory (or its `memory/` subdir) is missing →
+///   `Err(msg)` — a misconfiguration. The message names the resolved path so
+///   the operator can fix the dual-config gap (`.zshrc` vs MCP host config,
+///   which are separate authorities) rather than silently writing drafts /
+///   logs / index files to an unexpected location or against a freshly-created
+///   empty tree.
+/// - env var set and the directory tree exists → `Ok(Some(path))`.
+///
+/// WHY: surfaced 2026-06-02 — the secondBrain relocation showed how a stale
+/// `SECONDBRAIN_DIR` lets a write path (`wflow-do index`) proceed against a
+/// non-existent root and create files where nobody expects them. Write paths
+/// call this and fail loud (Principle 1: silently-wrong is unacceptable); read
+/// paths that already skip on `None` may keep using the bare accessor.
+pub fn secondbrain_dir_checked() -> Result<Option<std::path::PathBuf>, String> {
+    let Some(root) = secondbrain_dir() else {
+        return Ok(None);
+    };
+    if !root.is_dir() {
+        return Err(format!(
+            "{} is set to {} but that directory does not exist; fix the path \
+             (it must be kept in lockstep across your shell profile AND your MCP \
+             host config) or unset it to disable secondBrain features",
+            SECONDBRAIN_DIR_ENV,
+            root.display(),
+        ));
+    }
+    let memory = root.join("memory");
+    if !memory.is_dir() {
+        return Err(format!(
+            "{} is set to {} but its `memory/` subdirectory is missing ({}); the \
+             path is likely stale or does not point at a provisioned secondBrain",
+            SECONDBRAIN_DIR_ENV,
+            root.display(),
+            memory.display(),
+        ));
+    }
+    Ok(Some(root))
+}
+
 // --- Operation allow-lists & windows shared by the MCP server and the CLI ---
 // Single source of truth: pre-2026-06-16 these were hand-written inline in
 // both `src/server/mod.rs` and `src/bin/wflow_do.rs`, so adding a new op kind
@@ -269,6 +313,55 @@ pub const BULK_UPDATE_VALID_OPS: &[&str] =
 
 /// Seconds in a day — used for the recent-changes / session-log time windows.
 pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Canonical list of **non-diagnostic** MCP tool names (without the
+/// `mcp__workflowy__` namespace prefix). "Non-diagnostic" excludes the
+/// in-process / liveness tools (`health_check`, `workflowy_status`,
+/// `cancel_all`, `build_name_index`, `get_recent_tool_calls`) that don't
+/// touch user content. This is the surface every consumer-facing window —
+/// the `wflow-do` CLI and the wflow skill's `allowed-tools` frontmatter —
+/// must cover. Pinned for the CLI by `cli_covers_every_non_diagnostic_mcp_tool`
+/// and for the skill template by `skill_allowed_tools_covers_every_non_diagnostic_mcp_tool`.
+pub const NON_DIAGNOSTIC_MCP_TOOLS: &[&str] = &[
+    "get_node",
+    "list_children",
+    "create_node",
+    "edit_node",
+    "delete_node",
+    "move_node",
+    "reorder_nodes",
+    "complete_node",
+    "search_nodes",
+    "tag_search",
+    "find_node",
+    "get_subtree",
+    "find_backlinks",
+    "find_by_tag_and_path",
+    "node_at_path",
+    "path_of",
+    "resolve_link",
+    "since",
+    "list_todos",
+    "list_overdue",
+    "list_upcoming",
+    "daily_review",
+    "get_recent_changes",
+    "get_project_summary",
+    "insert_content",
+    "smart_insert",
+    "duplicate_node",
+    "create_from_template",
+    "bulk_update",
+    "bulk_tag",
+    "batch_create_nodes",
+    "read_batch",
+    "transaction",
+    "export_subtree",
+    "audit_mirrors",
+    "create_mirror",
+    "review",
+    "convert_markdown",
+];
 
 /// TTL for `create_node` idempotency-key entries (10 min). The window must
 /// comfortably cover a rate-limit `retry_after` (tens of seconds) plus a
@@ -410,6 +503,42 @@ mod tests {
         std::env::set_var(key, "/tmp/wflow-secondbrain-test");
         let got = session_logs_dir().expect("env path");
         assert_eq!(got.to_string_lossy(), "/tmp/wflow-secondbrain-test/session-logs");
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn secondbrain_dir_checked_distinguishes_unset_missing_and_present() {
+        let key = SECONDBRAIN_DIR_ENV;
+        let prev = std::env::var(key).ok();
+
+        // Unset → Ok(None): feature disabled, no error (graceful skip).
+        std::env::remove_var(key);
+        assert!(matches!(secondbrain_dir_checked(), Ok(None)), "unset must be Ok(None)");
+
+        // Set but the directory does not exist → loud Err naming the path.
+        let missing = std::env::temp_dir().join("wflow-secondbrain-checked-missing-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        std::env::set_var(key, &missing);
+        let err = secondbrain_dir_checked().expect_err("missing dir must error");
+        assert!(err.contains(SECONDBRAIN_DIR_ENV) && err.contains(&*missing.to_string_lossy()));
+
+        // Set, directory exists, but `memory/` missing → still a loud Err.
+        let root = std::env::temp_dir().join("wflow-secondbrain-checked-present-xyz");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var(key, &root);
+        let err = secondbrain_dir_checked().expect_err("missing memory/ must error");
+        assert!(err.contains("memory"));
+
+        // Set, directory + memory/ present → Ok(Some(root)).
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        let got = secondbrain_dir_checked().expect("present must be Ok").expect("Some");
+        assert_eq!(got, root);
+
+        let _ = std::fs::remove_dir_all(&root);
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
