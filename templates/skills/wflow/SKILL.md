@@ -110,12 +110,12 @@ The read-side compound of UUID Parameter Discipline. For established material th
 
 The general convention when writing material into Workflowy: **content goes in sub-nodes, never in the description** of an existing node. A node's description (its note) is reserved for source attribution, backlinks (`mirror_of:`, `canonical_of:`), or a one-line gloss — never the body of the content. This preserves the tree structure that `audit_mirrors`, `bulk_tag`, search, and the visualiser all assume.
 
-**The exception: pillar / bucket nodes.** Pillar-level nodes (Distillations pillars, Cross-pillar concept maps root, Themes parent root, any OP source MOC that serves as a pillar home) carry a generic, evergreen content description as their note that *describes the pillar itself* — its scope, the type of material it holds, what belongs there. That description IS node-level metadata, not content. It's appropriate on the node because it doesn't decay session-over-session and because it's *about* the node, not stored *in* the node. A first-pass at pillar review on 2026-05-24 created `📋 pillar review` summary children with composition / outcome sub-nodes under each bucket (following the general rule); the user corrected this, the children were deleted, and a generic content description was set as the note on each of the eight pillar / bucket nodes.
+**The exception: pillar / bucket nodes.** Pillar-level nodes (Distillations pillars, Cross-pillar concept maps root, Themes parent root, any OP source cluster that serves as a pillar home) carry a generic, evergreen content description as their note that *describes the pillar itself* — its scope, the type of material it holds, what belongs there. That description IS node-level metadata, not content. It's appropriate on the node because it doesn't decay session-over-session and because it's *about* the node, not stored *in* the node. A first-pass at pillar review on 2026-05-24 created `📋 pillar review` summary children with composition / outcome sub-nodes under each bucket (following the general rule); the user corrected this, the children were deleted, and a generic content description was set as the note on each of the eight pillar / bucket nodes.
 
 **How to apply:**
 
 1. For pillar / bucket-level nodes — a generic content description on the node as its note. Not a session log entry, not "what changed this week"; a description of what the pillar contains at a level of generality that holds across sessions.
-2. For every other node (atomic notes, source MOCs, theme sub-buckets when not bucket-level, session logs, journal entries, captured tasks) — content goes in sub-nodes. The description holds source attribution, backlinks, or a one-line gloss.
+2. For every other node (atomic notes, source clusters, theme sub-buckets when not bucket-level, session logs, journal entries, captured tasks) — content goes in sub-nodes. The description holds source attribution, backlinks, or a one-line gloss.
 3. The exception is narrow. If unsure whether a node qualifies as pillar/bucket-level, default to the general rule (sub-nodes). The exception applies only when the description genuinely describes the pillar's purpose generically.
 
 The user-specific pillar descriptions and the list of which nodes qualify as pillar/bucket-level live in `distillation_taxonomy.md`. This convention layer carries the rule; the taxonomy carries the data.
@@ -139,6 +139,32 @@ When a workflow performs 2+ writes that share a logical batch — moves with a c
 
 **Sizing.** Chunk batches > ~80 ops into multiple transactions.
 **Op ordering.** Cascading deletes come *last* — earlier ops on the same subtree get 404'd if the parent is deleted first.
+
+---
+
+## The Distillation Standard (read before any synthesis write)
+
+Every node in your Distillations layer — heading or atom, canonical or mirror — should meet one standard. It is both the bar a fresh distillation clears at creation and the bar a cleanup pass enforces.
+
+1. **Every node is a self-standing claim.** Read on its own, stripped of any thinker parenthetical, it still states something. The thinker is a trailing `(Name)` attribution only — never the head of the name, never the organising axis. Structure on claims and topics, not on people. No bare-label or headline-led heads ("DDD in the AI Era — Author"); the head of a source's cluster is that source's **lead claim**, with supporting atoms beneath it.
+
+2. **Use real words, not index jargon.** Don't label nodes "MOC" / "source MOC" / "synthesis MOC" or tag them `#moc` — the term meant "Map of Content" and carries no meaning for a reader. A source's distilled cluster is simply its lead-claim head plus its atoms; a pillar / theme node is an index node.
+
+3. **Descriptions carry only graph plumbing.** A single `Source: <url>` line plus `canonical_of:` / `mirror_of:` markers — no `Author:` / `Published:` / `Captured:` lines, no capture-lines, no `— source MOC` / `— article` suffixes, no publication dates, no enumeration prefixes. Substantive content lives in the claim (the name) and in child atoms. **Judgement exception:** a description that *argues* something stays (evidence backing the claim, a backlink concept-map); one that only *records where the note came from* goes. When in doubt, strip.
+
+4. **Canonical first, then mirrors verbatim.** Edit the canonical's name, then rename each mirror to match byte-for-byte (a mirror keeps only its own `mirror_of:` description).
+
+---
+
+## Bulk-edit discipline (large convention sweeps)
+
+When sweeping many nodes at once — renames, tag strips, description cleanups, a Distillation-Standard pass:
+
+- **The on-disk name index can be stale.** It refreshes only every ~30 min, so a sweep run soon after another edit pass reads *pre-edit* names. Use the index only to enumerate the work-list by **UUID** (UUIDs never change); read each node's **current name live** before composing its edit, or you will overwrite a freshly-edited name with a stale one.
+- **Pass full UUIDs, never short hashes, in a sweep** — a short hash triggers a resolution walk that times out and burns rate budget.
+- **`export_subtree` / `bulk_update` may coerce their scope parameter to null** on some host surfaces — if scoped calls misbehave, enumerate per-container with `read_batch` instead.
+- **Stage deterministically, apply verbatim.** Build the new names/descriptions in a script → JSON plan → feed the strings verbatim into `transaction` ≤4-op batches. Never retype a UUID or a long claim by hand.
+- **Pace and verify.** A few seconds between write batches; verify-read periodically (re-read the node, confirm the new name AND an advanced `last_modified` — never trust `ok:true` alone). Never reindex under throttle.
 
 ---
 
@@ -315,7 +341,7 @@ The detailed implementation of each workflow lives in the user's customised copy
   2. **Establish a clean read path** per Read-path discipline above — freshness check, reconstruct or reindex, `read_batch` for live reads, export as last resort.
   3. **Apply the routing-plan gate (pattern 1) and the novelty check** before writing. A sweep is the highest-risk place to silently duplicate a canonical that already covers the source.
   4. **Route per `distillation_taxonomy.md`** — pillar / theme / cross-pillar classification reads from the taxonomy, not from the sweep content. The taxonomy is canonical on borderline cases.
-  5. **Write via the MOC-batch-mirror sequence (pattern 2).** Single MOC create, batched atomic notes, selective mirrors, session-log entry.
+  5. **Write via the head-batch-mirror sequence (pattern 2).** Single cluster-head create, batched atomic notes, selective mirrors, session-log entry.
 - **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
 - **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
 - **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.
@@ -325,7 +351,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 #### Three patterns every synthesis workflow shares
 
 1. **The routing-plan gate.** Before writing anything to Distillations, build a draft routing table — *candidate atom name; destination pillar; mirror destinations; sources integrated* — and gate on user confirmation. Pair this with a **novelty check**: for each candidate atom, run a narrowed `find_node` / `search_nodes` (with `use_index=true` against the destination pillar UUID) for the key concept; if a canonical already covers the same ground, propose a mirror or backlink rather than a new atom. Both passes are cheap and both reduce drift between the user's mental model and what lands in the graph. Worth writing into "Distil single source", "Distil reading list", and "Synthesis capture" alike.
-2. **The MOC-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source MOC under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (operations-array shape per UUID Parameter Discipline rule 4); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) write the session log to `$SECONDBRAIN_DIR/session-logs/` (filesystem-canonical; no Workflowy write required for the log); (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
+2. **The head-batch-mirror sequence.** Once the routing table is confirmed, execute in this order: (a) `create_node` the source cluster under its destination parent with the destination's explicit cached UUID; (b) `batch_create_nodes(operations=[...])` for the atomic-note children with `parent_id` populated on every operation (operations-array shape per UUID Parameter Discipline rule 4); (c) `create_mirror` selectively — mirror an atom into a destination only when it is a **substantive contribution** to that destination's canon, skip when it merely touches; (d) write the session log to `$SECONDBRAIN_DIR/session-logs/` (filesystem-canonical; no Workflowy write required for the log); (e) only fall to `transaction.move` as a corrective when a placement misses. This sequence has roughly half the failure surface of create-then-move chains and should be the prescribed default.
 3. **The Journal-scan + range-stamp convention.** When the user keeps a journal, every synthesis or review session begins with a scan of Journal entries over the period since the last journal-bearing session log. The session log's description (or first child) MUST stamp `Journal range covered: YYYY-MM-DD → YYYY-MM-DD` — the next session reads that stamp to know where to pick up. First-run convention: if no prior journal-bearing session log exists, scan back ~30 days. Lift only principle-level insights as atomic notes; personal-context entries stay in the Journal. Skip this pattern entirely if the user doesn't keep a journal.
 
 #### Discipline lessons (each one paid for by an eval failure)
