@@ -80,55 +80,13 @@ fn per_tool_health(log: &OpLog) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
-/// Discrete proximate-cause classification for a tool failure. Brief
-/// 2026-04-25 Test γ requires every error to carry one of these
-/// values so callers can route on the cause rather than parsing
-/// human-readable hint strings. Variants map 1:1 to the brief's
-/// requested enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProximateCause {
-    Timeout,
-    LockContention,
-    CacheMiss,
-    UpstreamError,
-    Cancelled,
-    NotFound,
-    AuthFailure,
-    /// Caller-supplied parameter is wrong (missing required field,
-    /// invalid value, etc.). Distinguishes validation failures from
-    /// operational ones — added 2026-05-03 alongside `tool_invalid_params`.
-    InvalidParams,
-    /// Upstream returned 429 (or we short-circuited inside an open
-    /// `retry_after` window). A *recoverable transient*, distinct from
-    /// `UpstreamError`: the correct response is to wait the `retry_after`
-    /// and retry, not to treat the write as failed. Added 2026-06-17
-    /// because `tool_error` previously fell a 429 through to `Unknown`,
-    /// so a rate-limited write surfaced `proximate_cause: "unknown"` with
-    /// no `retry_after` in the hint even though the status path
-    /// (`classify_degraded_kind`) already classified the same 429 as
-    /// `rate_limited`. The two envelopes now agree.
-    RateLimited,
-    Unknown,
-}
-
-impl ProximateCause {
-    /// String form for the JSON-RPC `data.proximate_cause` field. Stable
-    /// over the lifetime of the API: callers may match on these values.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ProximateCause::Timeout => "timeout",
-            ProximateCause::LockContention => "lock_contention",
-            ProximateCause::CacheMiss => "cache_miss",
-            ProximateCause::UpstreamError => "upstream_error",
-            ProximateCause::Cancelled => "cancelled",
-            ProximateCause::NotFound => "not_found",
-            ProximateCause::AuthFailure => "auth_failure",
-            ProximateCause::InvalidParams => "invalid_params",
-            ProximateCause::RateLimited => "rate_limited",
-            ProximateCause::Unknown => "unknown",
-        }
-    }
-}
+// `ProximateCause` (the cause taxonomy + the string→cause classifier
+// `from_error_message` + `is_retryable`) lives in `utils::error_class` so the
+// MCP server and the `wflow-do` CLI share ONE implementation. Pre-2026-06-24
+// the CLI carried a hand-copied branch chain that drifted (it was missing the
+// `rate_limited` 429 branch the server added 2026-06-17). Re-exported here so
+// every existing `ProximateCause::*` reference in this module is unchanged.
+pub use crate::utils::error_class::ProximateCause;
 
 /// Build a structured `McpError` for a tool failure. Picks a JSON-RPC error
 /// code based on the underlying error class and attaches a `data` payload
@@ -355,85 +313,59 @@ struct ErrorClassification {
 /// derived from the cause — not hand-set per branch — so it cannot drift
 /// from the classification.
 fn classify_operational_error(err_str: &str) -> ErrorClassification {
-    let lower = err_str.to_lowercase();
     // `retry_after_secs` mirrors `workflowy_status.retry_after_remaining_ms`
     // — a typed number, not a prose hint. `None` on every non-429 path.
     let retry_after_secs = parse_retry_after_secs(err_str);
-    let (code, hint, cause) = if lower.contains("429") || lower.contains("rate limit") {
-        (
+    // The string→cause classification (429 branch first) and `retryable` are
+    // shared with the CLI via `ProximateCause` so the two surfaces cannot
+    // drift. The MCP-specific `ErrorCode` + human hint are mapped from the
+    // cause locally — they have no meaning to the CLI.
+    let cause = ProximateCause::from_error_message(err_str);
+    let (code, hint) = match cause {
+        ProximateCause::RateLimited => (
             ErrorCode::INTERNAL_ERROR,
             "rate limited (recoverable) — wait retry_after_secs then retry the same call",
-            ProximateCause::RateLimited,
-        )
-    } else if lower.contains("404") || lower.contains("not found") {
-        (
+        ),
+        ProximateCause::NotFound => (
             ErrorCode::RESOURCE_NOT_FOUND,
             "node may not yet exist (propagation lag), or has been deleted",
-            ProximateCause::NotFound,
-        )
-    } else if lower.contains("cancelled") {
-        (
+        ),
+        ProximateCause::Cancelled => (
             ErrorCode::INTERNAL_ERROR,
             "cancelled by cancel_all — the call was preempted, retry",
-            ProximateCause::Cancelled,
-        )
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        (
+        ),
+        ProximateCause::Timeout => (
             ErrorCode::INTERNAL_ERROR,
             "upstream timeout — narrow scope or wait for load to drop",
-            ProximateCause::Timeout,
-        )
-    } else if lower.contains("api error 5") {
-        (
+        ),
+        ProximateCause::UpstreamError => (
             ErrorCode::INTERNAL_ERROR,
             "Workflowy backend error — try again shortly",
-            ProximateCause::UpstreamError,
-        )
-    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthor") {
-        (
+        ),
+        ProximateCause::AuthFailure => (
             ErrorCode::INTERNAL_ERROR,
             "auth failure — check WORKFLOWY_API_KEY",
-            ProximateCause::AuthFailure,
-        )
-    } else if lower.contains("lock") {
-        (
+        ),
+        ProximateCause::LockContention => (
             ErrorCode::INTERNAL_ERROR,
             "internal lock contention — retry shortly",
-            ProximateCause::LockContention,
-        )
-    } else if lower.contains("cache") {
-        (
+        ),
+        ProximateCause::CacheMiss => (
             ErrorCode::INTERNAL_ERROR,
             "stale cache entry — retry; the cache has been invalidated",
-            ProximateCause::CacheMiss,
-        )
-    } else {
-        (
-            ErrorCode::INTERNAL_ERROR,
-            "see data field for details",
-            ProximateCause::Unknown,
-        )
+        ),
+        // `from_error_message` never yields InvalidParams (validation failures
+        // are caught at the parameter boundary, not here); fold it in with the
+        // generic fallthrough so the match stays total without a wildcard.
+        ProximateCause::InvalidParams | ProximateCause::Unknown => {
+            (ErrorCode::INTERNAL_ERROR, "see data field for details")
+        }
     };
-    // A recoverable transient (rate limit, timeout, upstream blip, lock
-    // contention, propagation-lag 404, preemption) is worth retrying; an
-    // auth failure or unknown fault is not. The 2026-06-17 write-path report
-    // called `retryable` one of the two fields that would have changed the
-    // session.
-    let retryable = matches!(
-        cause,
-        ProximateCause::RateLimited
-            | ProximateCause::Timeout
-            | ProximateCause::UpstreamError
-            | ProximateCause::LockContention
-            | ProximateCause::CacheMiss
-            | ProximateCause::NotFound
-            | ProximateCause::Cancelled
-    );
     ErrorClassification {
         code,
         hint,
         cause,
-        retryable,
+        retryable: cause.is_retryable(),
         retry_after_secs,
     }
 }
@@ -490,9 +422,25 @@ fn parse_retry_after_secs(err_str: &str) -> Option<u64> {
 /// own filesystem helper and pass it in.
 fn load_recent_session_logs_blob_for_review() -> String {
     let Some(dir) = crate::defaults::session_logs_dir() else {
+        // $SECONDBRAIN_DIR unset/empty → bucket (d) is intentionally disabled.
+        // Quiet skip: this is a deliberate opt-out, not a misconfiguration.
         return String::new();
     };
     if !dir.exists() {
+        // The env var IS set but the session-logs directory is missing — a
+        // likely-stale path rather than a deliberate opt-out. Warn (the
+        // read-path analogue of `secondbrain_dir_checked`'s fail-loud on write
+        // paths; 2026-06-24 residual of the 2026-06-02 relocation hazard) so a
+        // stale relocation is observable instead of silently dropping bucket
+        // (d). Behaviour is unchanged — still returns "" so `build_review`
+        // skips the bucket gracefully — but no longer silently.
+        tracing::warn!(
+            session_logs_dir = %dir.display(),
+            "review bucket (d): $SECONDBRAIN_DIR is set but its session-logs/ \
+             directory is missing — skipping the recent-session-log scan; the \
+             path may be stale (it must be kept in lockstep across your shell \
+             profile AND your MCP host config)"
+        );
         return String::new();
     }
     let cutoff = chrono::Utc::now().timestamp() - 7 * defaults::SECONDS_PER_DAY;
@@ -2037,7 +1985,12 @@ impl WorkflowyMcpServer {
         }
         self.name_index.ingest(std::slice::from_ref(&node));
 
+        // `scope_resolved` names what the server actually targeted after
+        // resolving `node_id` — the same host-coercion audit signal
+        // `list_children` carries, so a caller can confirm a coerced/stripped
+        // id didn't silently land on a different node (2026-06-24 residual).
         let payload = json!({
+            "scope_resolved": scope_resolved_label(Some(&resolved)),
             "node": node,
             "children": children,
         });
@@ -2187,7 +2140,8 @@ impl WorkflowyMcpServer {
         {
             Ok(_) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Updated node `{}`",
+                    "scope_resolved: {}\n\nUpdated node `{}`",
+                    scope_resolved_label(Some(&resolved)),
                     resolved
                 ))]))
             }
@@ -2237,7 +2191,8 @@ impl WorkflowyMcpServer {
         match self.client.delete_node_with_propagation_retry(&resolved).await {
             Ok(_) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Deleted node `{}`",
+                    "scope_resolved: {}\n\nDeleted node `{}`",
+                    scope_resolved_label(Some(&resolved)),
                     resolved
                 ))]))
             }
@@ -2267,7 +2222,8 @@ impl WorkflowyMcpServer {
             Ok(_) => {
                 let verb = if target_state { "Completed" } else { "Uncompleted" };
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "{} node `{}`",
+                    "scope_resolved: {}\n\n{} node `{}`",
+                    scope_resolved_label(Some(&resolved)),
                     verb, resolved
                 ))]))
             }
@@ -2313,8 +2269,12 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(_) => {
+                // Both `node_id` and `new_parent_id` are host-coercion-
+                // vulnerable, so name both resolved scopes for audit.
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Moved node `{}` under `{}`",
+                    "scope_resolved: node={}; new_parent={}\n\nMoved node `{}` under `{}`",
+                    scope_resolved_label(Some(&resolved_node)),
+                    scope_resolved_label(Some(&resolved_parent)),
                     resolved_node, resolved_parent
                 ))]))
             }
@@ -8752,7 +8712,11 @@ mod tests {
     /// build if a new tool is added without honouring the contract.
     /// The set is the union of: list_children, search_nodes,
     /// find_node, create_node, batch_create_nodes, insert_content,
-    /// create_mirror.
+    /// create_mirror, and (2026-06-24 residual) the single-node
+    /// UUID-bearing tools get_node, edit_node, delete_node, move_node,
+    /// complete_node — where a host-coerced node_id silently misrouting
+    /// was the named pain. Every UUID-bearing tool now names what it
+    /// actually targeted.
     #[test]
     fn every_scoped_tool_emits_scope_resolved_in_response() {
         let src = include_str!("mod.rs");
@@ -8767,6 +8731,11 @@ mod tests {
             "fn batch_create_nodes(",
             "fn insert_content(",
             "fn create_mirror(",
+            "fn get_node(",
+            "fn edit_node(",
+            "fn delete_node(",
+            "fn move_node(",
+            "fn complete_node(",
         ];
         let mut missing: Vec<&str> = Vec::new();
         for needle in &expected {
@@ -10304,7 +10273,11 @@ mod load_tests {
             .expect("complete_node must succeed against the body-matcher mock");
         let body = body_text(&result);
         assert!(
-            body.starts_with("Completed node"),
+            body.starts_with("scope_resolved: "),
+            "completion response carries the scope_resolved audit prefix: {body}"
+        );
+        assert!(
+            body.contains("Completed node"),
             "default `completed: None` must mean 'mark complete': {body}"
         );
     }
@@ -10333,7 +10306,11 @@ mod load_tests {
             .expect("complete_node must succeed against the body-matcher mock");
         let body = body_text(&result);
         assert!(
-            body.starts_with("Uncompleted node"),
+            body.starts_with("scope_resolved: "),
+            "uncompletion response carries the scope_resolved audit prefix: {body}"
+        );
+        assert!(
+            body.contains("Uncompleted node"),
             "explicit `completed: Some(false)` must mean 'uncomplete': {body}"
         );
     }

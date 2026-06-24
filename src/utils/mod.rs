@@ -3,6 +3,7 @@ pub mod aggregation;
 pub mod cache;
 pub mod cancel;
 pub mod date_parser;
+pub mod error_class;
 pub mod html;
 pub mod idempotency;
 pub mod job_queue;

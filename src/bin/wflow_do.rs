@@ -2383,29 +2383,14 @@ fn render_index(entries: &[IndexEntry]) -> String {
     s
 }
 
-/// Mirrors the proximate-cause classification in `src/server.rs::tool_error`
-/// so the CLI's stderr line matches what the MCP layer would emit. Kept as a
-/// local copy because `tool_error` is private and the spec forbids editing
-/// `server.rs`.
+/// Proximate-cause string for the CLI's stderr line. Routes through the SAME
+/// classifier the MCP layer uses (`ProximateCause::from_error_message` in
+/// `utils::error_class`) so the CLI label cannot drift from the server's. The
+/// pre-2026-06-24 local copy had already drifted: it lacked the `rate_limited`
+/// (429) branch the server gained 2026-06-17, so a rate-limited CLI error
+/// printed `unknown`. Sharing the classifier closes that gap by construction.
 fn classify(err: &str) -> &'static str {
-    let l = err.to_lowercase();
-    if l.contains("404") || l.contains("not found") {
-        "not_found"
-    } else if l.contains("cancelled") {
-        "cancelled"
-    } else if l.contains("timeout") || l.contains("timed out") {
-        "timeout"
-    } else if l.contains("api error 5") {
-        "upstream_error"
-    } else if l.contains("401") || l.contains("403") || l.contains("unauthor") {
-        "auth_failure"
-    } else if l.contains("lock") {
-        "lock_contention"
-    } else if l.contains("cache") {
-        "cache_miss"
-    } else {
-        "unknown"
-    }
+    workflowy_mcp_server::utils::error_class::ProximateCause::from_error_message(err).as_str()
 }
 
 // Bring the WorkflowyError type into scope so error messages render via Display.
@@ -2725,6 +2710,10 @@ mod tests {
 
     #[test]
     fn classify_covers_known_branches() {
+        // Now routes through the shared `ProximateCause::from_error_message`,
+        // so the CLI gains the `rate_limited` (429) branch it used to lack.
+        assert_eq!(classify("HTTP 429 too many requests"), "rate_limited");
+        assert_eq!(classify("rate limit exceeded"), "rate_limited");
         assert_eq!(classify("API error 404 not found"), "not_found");
         assert_eq!(classify("Cancelled by cancel_all"), "cancelled");
         assert_eq!(classify("request timed out"), "timeout");

@@ -39,7 +39,7 @@ When the intent is ambiguous, ask one clarifying question rather than guessing.
 
 ## Server contracts the workflows depend on
 
-Ten contracts the workflowy-mcp server ships — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them. Any additional service the user has configured (per `$SECONDBRAIN_DIR/memory/services.md`) ships its own contracts; document those alongside the service entry, not here.
+Eleven contracts the workflowy-mcp server ships — re-read this section if behaviour stops matching what the workflows describe; the routing decisions below assume them. Any additional service the user has configured (per `$SECONDBRAIN_DIR/memory/services.md`) ships its own contracts; document those alongside the service entry, not here.
 
 1. **`complete_node` is the native completion path; `bulk_update` accepts `complete` / `uncomplete`.** The legacy `#done` tag-as-completion-marker is deprecated for tasks (`#done` on reading-list entries to mark "I've distilled this source" remains a separate convention). Workflowy's wire field is `note` for descriptions and `completed` for the boolean.
 2. **`Parameters<T>` is the wrapper name on every tool's input.** If parameter-bearing calls suddenly silently misroute (every call acts as if you sent no arguments, only `workflowy_status` works), the server has regressed the wrapper name and the cowork client is validating against an empty schema. Recovery: route through `wflow-do` until the server is rebuilt.
@@ -51,6 +51,7 @@ Ten contracts the workflowy-mcp server ships — re-read this section if behavio
 8. **`reorder_nodes(parent_id, node_ids[])` is the primitive for ordering a set of siblings.** Workflowy's `move_node` priority is *position-relative-to-siblings* and renormalises after every call, so a naive forward `priority=0,1,2,…` loop fights itself when batched. The tool walks the desired list in REVERSE and issues `move_node` with `priority=0` per id — every move plants its node at position 0 and the previously-planted nodes shift one step right, so after N moves the head of the parent's children is the requested sequence. Side effect: ids not currently under `parent_id` are reparented (the primitive is built on `move_node`, not a sibling-only assertion). Capped at 200 ids per call. Returns `Complete` or `Partial { reason: cancelled | timeout }` with per-id `ok / error / skipped` entries; partial outcomes are safe to retry by re-issuing the full list. Use this any time a workflow says "reorder this set" — never roll a forward-priority loop.
 9. **Every error response is a typed envelope — branch on `proximate_cause`, not on the message string.** Failures carry `{operation, node_id, proximate_cause, retryable, retry_after_secs, hint, error}`. `proximate_cause` is one of `rate_limited` / `timeout` / `upstream_error` / `auth_failure` / `not_found` / `cancelled` / `lock_contention` / `cache_miss` / `invalid_params` / `unknown`. **`rate_limited` (429) is the one to act on:** `retryable:true` and `retry_after_secs:N` tell you to wait N seconds and re-issue the same call — it is a recoverable transient, NOT a failed write. Do not treat a bare top-line "tool failed" string (what some clients render) as undiagnosable; the structured `data` envelope carries the real cause. Pre-2026-06-17 a 429 was mislabelled `unknown` with the `retry_after` buried; it is now first-class. `retryable:false` (auth, invalid_params, unknown) means fix-and-retry or stop, never blind-retry.
 10. **The write ok-counter is receipt, not commit — a live re-read is the only proof.** `per_tool_health.<tool>.ok` counts handler receipts; a rolled-back `transaction` and an `is_error:true` `insert_content` partial both record as `Err` (commit-accurate since 2026-06-01 / 2026-06-17), but a write whose response was lost to a transport timeout is genuinely ambiguous. **`create_node` takes an optional best-effort `idempotency_key`** (2026-06-17): pass a stable token to make a retry of that create safe — a repeated key replays the original node with an `idempotent_replay:` message instead of double-writing. It covers retry-after-success and retry-before-write, but NOT an ambiguous timeout after the write was sent (the server never recorded the success) — so for a single-node create lost to a timeout you STILL read back before retrying. It's server-process-scoped (the `wflow-do` CLI has no key — a one-shot process can't dedupe). `insert_content` / `batch_create_nodes` take no key — their committed-count cursor / per-op `succeeded` (contract 6) make resume safe by construction. Make verify-after-write the discipline for any write near a rate-limit window.
+11. **`find_node` and `search_nodes` refuse a workspace-root scan when `parent_id` is omitted.** On a large tree an unscoped name search would burn the full walk budget, so the tools reject it rather than time out. Supply `parent_id` to scope the search, set `allow_root_scan=true` to accept the full walk deliberately, or set `use_index=true` to answer from the persistent name index in O(1) (name-only — description content still needs a live walk).
 
 The CLI fallback (`wflow-do`) is in full surface parity with the MCP — every non-diagnostic tool has a matching subcommand. Drift fails the build, so the fallback path is always available when transport drops. Workflow orchestration that used to be duplicated between server and CLI (`create_mirror`, with more to follow) is being lifted into a shared `crate::workflows` module so a fix lands in both surfaces.
 
@@ -79,6 +80,8 @@ The most preventable failure mode on this skill, and the single load-bearing dis
    - **Last resort:** the `wflow-do` CLI bypasses host-side encoding entirely.
 
 5. **Destructive ops carry a heightened guard.** For `delete_node` and any `transaction` delete op, resolve the target and **visually confirm both its UUID and its current name on screen immediately before the call** — not from memory, not from a UUID carried several turns back. Never issue a delete with `null` or any placeholder in `node_id`. The host-coercion path means a `null` delete can land on an unintended-but-plausible node — the most-recently-discussed one — and a delete cannot be rolled back. The wire-level deserializer guard does not protect you here, because some hosts coerce `null` to a real contextual UUID before the server sees it. The server offers a name-echo guard: pass `expect_name` (the node's current name) on `delete_node` and on any `transaction` delete op, and the server refuses the delete unless the resolved node's trimmed name matches. Always pass it on any delete whose `node_id` was resolved indirectly — and otherwise treat this rule as enforced by your own attention, not by the schema.
+
+**Side-effect-verification corollary.** When a write *appears* to succeed despite an obviously-malformed parameter (e.g. a `create_node` whose success message reports placement at the workspace root when you intended a specific parent), verify the side effect at the destination before chaining further writes. The first chain link being silently wrong is what produces the orphan-accumulation pattern.
 
 Every discipline section that follows (Read-path, Multi-write batch, synthesis pattern 2, the scope_resolved audit) builds on this. They cross-reference rather than re-explain.
 
@@ -139,6 +142,8 @@ When a workflow performs 2+ writes that share a logical batch — moves with a c
 
 **Sizing.** Chunk batches > ~80 ops into multiple transactions.
 **Op ordering.** Cascading deletes come *last* — earlier ops on the same subtree get 404'd if the parent is deleted first.
+
+**Dry-run standing rule.** Any write batch larger than **5 operations** follows a two-step pattern, no exceptions: (1) print the planned sequence — one line per operation, in execution order, naming the verb, the target / parent UUID, and the node name; (2) ask y/n before any real write — explicit confirmation, not "I'll proceed unless you object". This eliminates the "I created N things and now can't tell where they went" failure class — it costs ~30 seconds per batch, and without it an assistant creating nodes faster than it can verify destinations produces orphans the user only discovers after the fact. **Print the plan even when the destinations are obvious** — the point is not only the user's veto but forcing yourself to spell out the routing before committing, which is the moment ambiguities become visible. The `wflow-do` CLI supports `--dry-run` on any subcommand (it prints the planned op and exits without touching the API) if you want to stage the plan mechanically.
 
 ---
 
@@ -218,6 +223,19 @@ If any required tool is unreachable:
 1. Stop the bootstrap. Do not proceed to Step 1.
 2. Name the missing tool and tell the user how to fix it: check the MCP server configuration for their host (e.g. `claude_desktop_config.json` for Claude Desktop). Confirm with the corresponding health-check tool.
 3. Ask explicitly before staging a draft to disk. Never silently degrade. If the user consents, write to the universally allowlisted fallback path with the failure mode tagged in the filename (`...-mcp-down.md`) so the next session's Step 1 resumes execution.
+
+#### Degraded protocol (the third state)
+
+The Fail-loud protocol above fires on **unreachable** tools. A third state sits between healthy and unreachable: **degraded** — the MCP server process is responsive (auth fine, name index populated, no in-flight walks stuck) but upstream Workflowy API calls are timing out. `health_check` / `workflowy_status` returns `status: "degraded"` with `api_reachable: false` and `authenticated: true`. This is an upstream blip, not an MCP fault, and it does NOT warrant the Fail-loud stop-everything path.
+
+When `degraded` is observed:
+
+1. **Filesystem-only work continues normally** — taxonomy / memory edits, draft writing and review, audit, design discussion, session-log appends to `$SECONDBRAIN_DIR/session-logs/`. Each is a productive use of the wait. Do not stop and do not ask permission; the API is expected to recover.
+2. **Defer write-bound workflows** — anything requiring `create_node`, `edit_node`, `move_node`, `batch_create_nodes`, `transaction`, `reorder_nodes`, or any other Workflowy mutation. Tell the user explicitly: "Workflowy is degraded; write plan queued for when the API recovers." Hold the routing table in working memory, or commit it to a draft under `$SECONDBRAIN_DIR/drafts/` only if the session is about to end.
+3. **Re-probe periodically.** `workflowy_status` is sub-second even when degraded. Check every few minutes; the moment `status: "ok"` returns, fire the queued writes.
+4. **Do not stage drafts during degraded state** unless the user explicitly asks — staging-as-fallback is for *unreachable*, not *degraded*. Mis-routing degraded as unreachable wastes a productive filesystem window with permission-asking overhead; mis-routing it as healthy produces hung tool calls that race the transport timeout.
+
+The reflex on a single failed write is to escalate to "MCP is broken, let's stage". On a degraded probe that reflex is wrong — the right action is to keep working on what doesn't need the API while the API recovers.
 
 ### Step 1 — secondBrain draft check
 
@@ -327,7 +345,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 - **Daily prioritisation** — surface today's todos, overdue items, and recently-modified projects via `daily_review`. Suggest a focus block for the morning.
 - **Weekly prioritisation** — review last week's completions and unmoved items. Identify what to drop, what to escalate.
 - **Monthly prioritisation** — set themes; promote/demote pillar work.
-- **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo.
+- **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo. **When capture is incidental** (an action item surfaces mid-chat rather than being the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under `<inferred-domain>` — confirm?", (2) on user yes, the actual write. When the user's *primary* intent is capture ("capture: X"), the offer collapses to a domain confirmation in the first response and the create lands on yes.
 - **Project status** — for a named project, return current state (todos open, recent activity, blockers tagged).
 - **Inbox triage** — walk Inbox children, route each to the right subtree (or delete).
 - **Reading list management** — surface WIP reading, recent additions, items tagged for distillation.
@@ -373,6 +391,31 @@ These shorten the gap between "the skill said X" and "the agent actually did X" 
 - **Uniform per-pillar mirroring.** When a synthesis produces 3+ atomic notes and two or more of them substantively bear on the same destination pillar, *all atoms* in the synthesis that touch that pillar get mirrored there — not just the most obviously-anchored ones. Per-atom mirror judgement is where drift creeps in: the agent picks the strongest contributors and silently drops a third atom even though it also bears on the destination. If an atom is genuinely orthogonal, skip the mirror but mark it explicitly in the routing table from pattern 1 above. (Eval Test 9: first "causality not difficulty" note arguably touches leadership but had no Lead mirror.)
 
 - **Audit `scope_resolved` on every scoped call.** Every parent-scoped tool (`create_node`, `batch_create_nodes`, `insert_content`, `create_mirror`, `list_children`, `find_node`, `search_nodes`) returns `scope_resolved: "workspace_root"` or `scope_resolved: "scoped:<uuid>"`. Read it after every call where parent_id was null / omitted and confirm the scope matches the intent — `workspace_root` must mean "intended workspace root", not "forgot the UUID". If it doesn't, halt and resolve explicitly before any follow-up write. For batched `create_mirror` passes, use `dry_run=true` first: it returns `scope_resolved`, the would-be `mirror_name`, and `would_annotate_canonical` without writing — verifiable preview before production. (Underlying hazard: UUID Parameter Discipline above.)
+
+---
+
+## Explicit-check discipline (applies to every workflow, not just synthesis)
+
+Any workflow step that says "scan X" or "check Y" must explicitly state the result, *including the negative*. The user cannot tell, from a silent skip, whether you ran the check and found nothing, ran it and forgot to surface the result, or skipped it entirely — silent omission breaks the audit trail of what was checked. Three rules make it auditable:
+
+1. **Re-issue data calls at the start of each workflow**, even if "the same data" loaded earlier in the session. Resident knowledge from Bootstrap or a prior workflow is not a substitute for a fresh call — workflow timing changes the answer (a task completed since the morning probe, a fresh session log written, new reading material arriving). The journal check-in is the canonical place this fails: the morning probes loaded today's tasks / completions / fresh activity, and a journal-time check-in skips the calls because "it was just loaded". Re-issue them.
+2. **Report the negative result as a sentence, not as silence.** Phrasings: "Reading list: 3 items, none with action verbs." / "No fresh material from `<service>`." / "Session logs since yesterday: none open." A briefing that omits a section the user expects (because that section was empty) reads as if the check was skipped.
+3. **The discipline applies to triage and journal workflows even when the source is empty.** Say "no actions detected" / "nothing to triage" / "no items match `<filter>`" rather than producing an empty response. The discipline is *saying-it-explicitly*.
+
+---
+
+## Output formatting for content sent to Workflowy
+
+Content inserted into Workflowy via `insert_content` must use **2-space hierarchical indentation** (two spaces per level, no bullet characters):
+
+```
+Top level item
+  Child item
+    Grandchild item
+  Another child
+```
+
+Use `-` bullets only when outputting to the user in chat. Do not use `-` bullets or markdown headers in content sent to Workflowy.
 
 ---
 
@@ -438,6 +481,77 @@ Distinct from a crashed server and from a transport-layer drop: here Workflowy i
 
 - A rising ok-count does **not** prove a write landed. **The only reliable confirmation that a mutation persisted is a live re-read of the node.** Make verify-after-write the discipline for any batch that ran near a rate-limit window.
 - This is why verify-before-reapply is safe: re-reading first means a rolled-back batch is reapplied exactly once and a landed batch is skipped — no double-apply risk.
+
+---
+
+## MCP failure-handling: server-side vs transport-layer
+
+The Workflowy MCP exposes `workflowy_status` as the definitive arbiter of *where* a failure happened. Use it whenever you see two or more consecutive failures of the same call shape.
+
+`workflowy_status` returns, among other fields: `paths.<tool>` (`healthy` / `degraded` / `failing` / `untested`), `last_failure` (`{tool, at_unix_ms, reason, proximate_cause}` for the most recent server-recorded error), `per_tool_health.<tool>` (ok / err counts and rate), `degraded_kind` (the cause of `degraded`), `retry_after_remaining_ms` (ms left in an open 429 window, else `null`), and `probe_suppressed` (`true` when the probe short-circuited on cached posture rather than issuing an HTTP call — it does this inside an open `retry_after` window so the diagnostic doesn't consume the quota it is measuring).
+
+### The parity-test heuristic
+
+If you just observed N failures of `<tool>` but `workflowy_status` reports `paths.<tool>: healthy` with `0` errors in `per_tool_health.<tool>` and `last_failure: null` (or naming a *different* tool), **the failures never reached the server** — this is a client-side transport bug, not a server problem. Retrying makes it worse: it accumulates client state without ever touching upstream, and partial state already created cannot be cleaned up via the MCP because the cleanup calls are dropped too.
+
+When the parity test detects a transport-layer failure:
+
+1. **Stop the call sequence immediately.** Do not retry the failed call shape.
+2. **Capture state.** Note any orphan UUIDs created during the broken window (the `create_node` success message names where each node landed).
+3. **Tell the user.** Recommend manual cleanup in the Workflowy web UI — faster than the retry loop.
+4. **Fall back to** `wflow-do` for any remaining writes (Bash dispatch is independent of MCP tool dispatch, so it reaches the API even when MCP calls are silently dropped).
+5. **Treat further MCP-routed writes as suspect** until `workflowy_status` and your local view agree again.
+
+### Schema-empty failure mode (the dishonest-success cousin)
+
+A shape that looks like the parity-test pattern but is structurally different: every parameter-bearing tool behaves as if called with no arguments. `get_node` rejects with `missing field 'node_id'` on a known-good UUID; `list_children` silently returns the workspace root regardless of what you passed; `workflowy_status` (the one parameterless tool) works fine.
+
+Root cause: the server published a JSON schema with `"properties": {}` for every parameter-bearing tool (the `Parameters<T>` wrapper was renamed server-side — rmcp-macros identifier-matches that exact name on the function arg type to find the schema), so the client validated arguments against the empty schema and stripped them before they reached the server. Server-side counters look healthy because the call did reach the server — just with an empty argument object.
+
+**Diagnosis:** call `get_node` with a known-good UUID; if the reply is `missing field 'node_id'`, the schema is empty. Confirm by reading the tool list — every parameter-bearing tool's `inputSchema.properties` should be non-empty. **Mitigation:** the fix is server-side; until it ships, route writes through `wflow-do` (it bypasses the MCP tool surface, so it's unaffected) and tell the user about the schema-empty mode explicitly so they don't think they're imagining it.
+
+### Truncation routing (once you've decided to recover)
+
+The walk-shape rule (contract 4) decides *whether* to recover from `truncated: true`; this is *how*. Do NOT immediately retry — read `truncation_reason` and route:
+
+1. **`timeout` or `node_limit`** — the subtree exceeds what one walk can cover. For **name-based queries** (`search_nodes`, `find_node`): call `build_name_index(parent_id=<scope>)` once to populate the persistent name index, then re-issue the original query with `use_index=true` (O(1), ignores the walk budget; name-only — description-content matching still needs a live walk, so narrow `parent_id` to a subtree for content queries). For **non-name queries** (`tag_search`, `find_backlinks`, `daily_review`, etc.): the index doesn't help — narrow `parent_id` / `max_depth` and re-issue, or stage the walk over multiple smaller subtrees.
+2. **`cancelled`** — `cancel_all` was bumped during the walk. Safe to retry as-is.
+
+### Server-side failures
+
+When `last_failure` IS populated and matches what you observed, the server saw the failure. Read `data.proximate_cause` and route:
+
+- `not_found` — the server already retries 404s with backoff, so an exhausted-retry `not_found` means the node really doesn't exist or upstream propagation is unusually slow. Verify with `list_children` of the parent.
+- `timeout` — narrow scope (lower `max_depth`, pass a `parent_id` / `root_id`) before retrying.
+- `cancelled` — `cancel_all` preempted the call; safe to retry.
+- `rate_limited` — upstream 429; the account quota is spent, NOT a server fault. Read `retry_after_remaining_ms` from `workflowy_status` and wait it out (see the rate-limit runbook above). Do not retry inside the window.
+- `upstream_error` — Workflowy backend; back off and retry.
+- `auth_failure` — API key wrong or revoked; tell the user.
+- `lock_contention` / `cache_miss` — server-internal; retry after a short wait.
+
+### Fail-closed warning on `create_node`
+
+When reads or mutations have failed in the last 30 s, a successful `create_node` response is suffixed with a `⚠ DEGRADED: server in degraded state — <tool> failed N ms ago …` banner. When you see it, **do not chain follow-up writes on the new UUID** until `workflowy_status` shows the previously-failing tool back to `healthy`. Chaining `create → move → move → …` while the move path is wedged is what scatters orphaned nodes across the tree.
+
+---
+
+## Workflowy navigation notes
+
+- **Prefer `create_node(name, parent_id=<UUID>)` over create-then-move.** When you know the destination, pass `parent_id` directly. Create-at-root-then-move doubles the failure surface — a created-at-root node can be stranded for hours if follow-up `move_node` calls drop at the transport layer. The success message names the resolved parent, so you can audit placement at the moment of creation.
+- Prefer `list_children` with a known node ID over search for navigating the main structure.
+- `move_node` reliability (separate from the parameter-encoding issue in UUID Parameter Discipline): the server retries 404s automatically (propagation lag). For non-404 failures, retry 2–3 times and re-fetch the parent's children with `list_children` between attempts to avoid acting on stale IDs.
+- `edit_node`: the server splits `name` + `description` into two POSTs internally to dodge an upstream field-loss bug, so passing both together is safe.
+- When filing links, title raw URLs by fetching the page rather than storing a bare URL.
+
+---
+
+## Error handling
+
+- If a structural node is not found (e.g. no "Tasks" node), tell the user, confirm the node name, and fall to Bootstrap first-use population.
+- If no priority nodes exist yet (first use), skip the "load context" step and note that the user should set monthly priorities first to establish themes.
+- If `WebFetch` fails on a reading-list URL, note the failure and continue with the other items.
+- If a triage source (e.g. the Inbox) is empty, say so and suggest another workflow.
+- If `workflowy_status` itself fails, the MCP is wholly unresponsive — recommend a host restart and stop further work in this session.
 
 ---
 
@@ -602,4 +716,6 @@ Each `## <Service Name>` block holds:
 
 ## Customisation
 
-This template is generic. The user's customisations — preferred wording, project-specific routing rules, detailed workflow scripts — should be edited into their copy of the skill at `~/.claude/skills/wflow/SKILL.md`. Treat the template version (in this repo) as the upstream; pull updates manually when desired.
+This template is generic. The user's customisations — preferred wording, project-specific routing rules, detailed workflow scripts — should be edited into their own installed copy of the skill (typically at `$HOME/.claude/skills/wflow/SKILL.md` for local Claude Code, or the uploaded skill on claude.ai). Treat the template version (in this repo, at `templates/skills/wflow/SKILL.md`) as the upstream; pull updates into your copy manually when desired.
+
+**Propagation chain — how an edit to the template reaches a running session.** The canonical template lives at `templates/skills/wflow/SKILL.md` in the workflowy-mcp-server repo. To ship it to the claude.ai web/mobile surfaces it is bundled by `scripts/bundle-skill.sh` into `dist/wflow.skill.zip` (the repo's auto-bundle hook does this automatically on any edit under `templates/skills/wflow/`), and the user then re-uploads that zip at claude.ai → Settings → Skills and starts a fresh session. The full chain is `canonical templates/skills/wflow/SKILL.md → scripts/bundle-skill.sh → dist/wflow.skill.zip → manual re-upload`. Local Claude Code reads the installed copy from disk directly, so it sees changes without the bundle step; the upload is only needed for the web/mobile surfaces. The user's personal data files (`workflowy_node_links.md`, `distillation_taxonomy.md`, `services.md`) are never bundled — they live only at `$SECONDBRAIN_DIR/memory/` and are read at session start by the Bootstrap.

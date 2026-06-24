@@ -76,18 +76,41 @@ pub fn add_tag_to_name(name: &str, tag: &str) -> Option<String> {
     Some(format!("{} #{}", name.trim_end(), bare))
 }
 
+/// Compile the whole-tag strip pattern for `tag`. Returns `None` for an empty
+/// tag (nothing to strip). Whole-tag boundary via `\b`/`$` so removing `#lead`
+/// does not touch `#leadership`. Exposed so a bulk caller can compile the
+/// pattern ONCE and reuse it across many nodes (the `tag` is fixed for the
+/// whole bulk operation) rather than recompiling it per node — see
+/// `workflows::apply_bulk_op(RemoveTag)`. Single source of the pattern string,
+/// so the per-call and per-node paths cannot drift.
+pub fn compile_tag_strip_regex(tag: &str) -> Option<Regex> {
+    let bare = tag.trim_start_matches('#');
+    if bare.is_empty() {
+        return None;
+    }
+    Some(
+        Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(bare)))
+            .expect("escaped pattern is always valid regex"),
+    )
+}
+
+/// Strip every whole-tag occurrence matched by `re` (built via
+/// [`compile_tag_strip_regex`]) from `name`.
+pub fn strip_tag_with_regex(re: &Regex, name: &str) -> String {
+    re.replace_all(name, "").to_string()
+}
+
 /// Remove every whole-tag occurrence of `tag` from `name`, returning the new
 /// name (unchanged if the tag is absent). Whole-tag boundary via `\b`/`$` so
 /// removing `#lead` does not touch `#leadership`. Shared by
-/// `workflows::apply_bulk_op(RemoveTag)`.
+/// `workflows::apply_bulk_op(RemoveTag)`. For a bulk loop over many nodes,
+/// prefer [`compile_tag_strip_regex`] + [`strip_tag_with_regex`] to compile
+/// the pattern once.
 pub fn remove_tag_from_name(name: &str, tag: &str) -> String {
-    let bare = tag.trim_start_matches('#');
-    if bare.is_empty() {
-        return name.to_string();
+    match compile_tag_strip_regex(tag) {
+        None => name.to_string(),
+        Some(re) => strip_tag_with_regex(&re, name),
     }
-    let pat = Regex::new(&format!(r"\s*#{}(?:\b|$)", regex::escape(bare)))
-        .expect("escaped pattern is always valid regex");
-    pat.replace_all(name, "").to_string()
 }
 
 /// Whole-tag predicate over a node: does the node carry `needle` as a

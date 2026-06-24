@@ -1258,6 +1258,14 @@ pub async fn apply_bulk_op(
     let mut footprint = MutationFootprint::new();
     let mut affected = 0usize;
     let mut affected_ids = Vec::with_capacity(nodes.len());
+    // The remove-tag pattern depends only on `operation_tag`, which is fixed
+    // for the whole bulk operation — compile it ONCE here rather than per node
+    // inside the loop. `None` when the op isn't RemoveTag or the tag is empty.
+    let strip_re = if matches!(op, BulkOp::RemoveTag) {
+        operation_tag.and_then(crate::utils::tag_parser::compile_tag_strip_regex)
+    } else {
+        None
+    };
     for node in nodes {
         let success = match op {
             BulkOp::Delete => client.delete_node(&node.id).await.is_ok(),
@@ -1276,8 +1284,12 @@ pub async fn apply_bulk_op(
                 }
             }
             BulkOp::RemoveTag => {
-                let tag = operation_tag.expect("validated by requires_tag check above");
-                let new_name = crate::utils::tag_parser::remove_tag_from_name(&node.name, tag);
+                // Reuse the once-compiled pattern; `None` (empty tag) is a no-op
+                // rename, matching `remove_tag_from_name`'s empty-tag contract.
+                let new_name = match &strip_re {
+                    Some(re) => crate::utils::tag_parser::strip_tag_with_regex(re, &node.name),
+                    None => node.name.clone(),
+                };
                 client.edit_node(&node.id, Some(&new_name), None).await.is_ok()
             }
         };
