@@ -20,6 +20,7 @@ use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::types::NodeId;
+use crate::utils::lenient_int::{de_opt_string_or_int, de_string_or_int};
 
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -29,10 +30,12 @@ pub struct SearchNodesParams {
     #[schemars(description = "Text query to search for in node names and descriptions")]
     pub query: String,
     #[schemars(description = "Maximum number of results to return (default: 20)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_results: Option<usize>,
     #[schemars(description = "Parent node ID to scope the search under")]
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to search (default: 3). Increase for deeper searches in large trees")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     /// Mirror of `find_node`'s gate. Brief 2026-05-02 reported
     /// `search_nodes` with `parent_id: null` walking workspace root and
@@ -80,6 +83,7 @@ pub struct CreateNodeParams {
     #[schemars(description = "Required parent node ID (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
     pub parent_id: NodeId,
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
     /// Optional best-effort idempotency key. Supply a stable, caller-generated
     /// token (e.g. a UUID) to make a retry of THIS create safe: if the same
@@ -143,6 +147,7 @@ pub struct MoveNodeParams {
     #[schemars(description = "The UUID of the new parent node")]
     pub new_parent_id: NodeId,
     #[schemars(description = "Position among siblings in the new parent")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
 }
 
@@ -173,10 +178,12 @@ pub struct TagSearchParams {
     #[schemars(description = "Tag to search for (e.g. '#project' or '@person')")]
     pub tag: String,
     #[schemars(description = "Maximum results to return (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_results: Option<usize>,
     #[schemars(description = "Parent node ID to scope the search under")]
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -212,6 +219,7 @@ pub struct GetSubtreeParams {
     #[schemars(description = "The UUID of the root node")]
     pub node_id: NodeId,
     #[schemars(description = "Maximum depth to traverse (default: unlimited)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -224,10 +232,12 @@ pub struct FindNodeParams {
     #[schemars(description = "Match mode: 'exact' (default), 'contains', or 'starts_with'")]
     pub match_mode: Option<String>,
     #[schemars(description = "1-based selection index when multiple matches exist")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub selection: Option<usize>,
     #[schemars(description = "Parent node ID to scope the search under")]
     pub parent_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     #[schemars(description = "Opt in to scanning from the workspace root when parent_id is omitted. Disabled by default because unscoped contains-searches on large trees time out; use sparingly, or build a name index first with build_name_index")]
     pub allow_root_scan: Option<bool>,
@@ -244,10 +254,12 @@ pub struct SmartInsertParams {
     #[schemars(description = "Content in 2-space indented text format to insert")]
     pub content: String,
     #[schemars(description = "1-based selection index when multiple matches exist")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub selection: Option<usize>,
     #[schemars(description = "Insert position: 'top' or 'bottom' (default: 'bottom')")]
     pub position: Option<String>,
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -258,14 +270,19 @@ pub struct DailyReviewParams {
     #[schemars(description = "Optional root node ID to scope the review")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Max overdue items to return (default: 10)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub overdue_limit: Option<usize>,
     #[schemars(description = "Days ahead to look for upcoming items (default: 7)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub upcoming_days: Option<usize>,
     #[schemars(description = "Days back to look for recent changes (default: 1)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub recent_days: Option<usize>,
     #[schemars(description = "Max pending todos to return (default: 20)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub pending_limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -274,14 +291,17 @@ pub struct DailyReviewParams {
 #[schemars(description = "Get recently modified nodes within a time window")]
 pub struct GetRecentChangesParams {
     #[schemars(description = "Number of days to look back (default: 7)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub days: Option<usize>,
     #[schemars(description = "Optional root node ID to scope the search")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Include completed items (default: true)")]
     pub include_completed: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -294,8 +314,10 @@ pub struct ListOverdueParams {
     #[schemars(description = "Include completed items (default: false)")]
     pub include_completed: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -304,14 +326,17 @@ pub struct ListOverdueParams {
 #[schemars(description = "List items with upcoming due dates")]
 pub struct ListUpcomingParams {
     #[schemars(description = "Days ahead to look (default: 14)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub days: Option<usize>,
     #[schemars(description = "Optional root node ID to scope the search")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Include items without due dates (default: false)")]
     pub include_no_due_date: Option<bool>,
     #[schemars(description = "Maximum results (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -324,6 +349,7 @@ pub struct GetProjectSummaryParams {
     #[schemars(description = "Include tag and assignee counts (default: true)")]
     pub include_tags: Option<bool>,
     #[schemars(description = "Days back for recently modified list (default: 7)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub recently_modified_days: Option<usize>,
 }
 
@@ -334,8 +360,10 @@ pub struct FindBacklinksParams {
     #[schemars(description = "The node ID to find backlinks for")]
     pub node_id: NodeId,
     #[schemars(description = "Maximum results (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -350,8 +378,10 @@ pub struct ListTodosParams {
     #[schemars(description = "Optional text search within todos")]
     pub query: Option<String>,
     #[schemars(description = "Maximum results (default: 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -400,8 +430,10 @@ pub struct BulkUpdateParams {
     #[schemars(description = "Preview only, no mutations (default: false)")]
     pub dry_run: Option<bool>,
     #[schemars(description = "Safety limit on affected nodes (default: 20)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Maximum tree depth to search (default: 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -435,8 +467,10 @@ pub struct CancelAllParams {}
 #[schemars(description = "Return recent tool invocations from the in-memory ring buffer")]
 pub struct GetRecentToolCallsParams {
     #[schemars(description = "Maximum number of entries to return (default: 50, max bounded by buffer capacity)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
     #[schemars(description = "Only return entries finished at or after this unix-millis timestamp")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub since_unix_ms: Option<u64>,
 }
 
@@ -455,6 +489,7 @@ pub struct BatchCreateOpParams {
     #[schemars(description = "Required parent node ID (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
     pub parent_id: NodeId,
     #[schemars(description = "Optional priority/sort key (lower sorts earlier)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
 }
 
@@ -479,6 +514,7 @@ pub struct ReadBatchOpParams {
     #[schemars(description = "Target node ID (UUID or short hash). Required for get_node and get_subtree; optional for list_children (omit/null = workspace root).")]
     pub node_id: Option<NodeId>,
     #[schemars(description = "Maximum depth to traverse (get_subtree only; defaults to 5).")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -512,6 +548,7 @@ pub struct TransactionOpParams {
     #[schemars(description = "Description/note — optional for create and edit")]
     pub description: Option<String>,
     #[schemars(description = "Priority/sort key — optional for create and move")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
     /// Optional name-echo guard for `delete` ops only (ignored otherwise).
     /// Mirrors `delete_node.expect_name`: when set, the delete step refuses
@@ -536,6 +573,7 @@ pub struct PathOfParams {
     #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
     pub node_id: NodeId,
     #[schemars(description = "Maximum ancestors to walk (default 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -566,6 +604,7 @@ pub struct SinceParams {
     #[schemars(description = "Node ID (full UUID or 12-char short hash)")]
     pub node_id: NodeId,
     #[schemars(description = "Threshold timestamp in unix milliseconds. Returns whether node.last_modified >= this value.")]
+    #[serde(deserialize_with = "de_string_or_int")]
     pub timestamp_unix_ms: i64,
 }
 
@@ -580,8 +619,10 @@ pub struct FindByTagAndPathParams {
     #[schemars(description = "Optional scope root; defaults to workspace root")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 5)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     #[schemars(description = "Maximum results (default 50)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub limit: Option<usize>,
 }
 
@@ -616,6 +657,7 @@ pub struct ExportSubtreeParams {
     #[schemars(description = "Output format: opml | markdown | json")]
     pub format: String,
     #[schemars(description = "Maximum tree depth (default 10)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
 }
 
@@ -633,6 +675,7 @@ pub struct CreateMirrorParams {
     #[schemars(description = "Required parent under which the mirror should appear (UUID or short hash). Pass empty string \"\" for workspace root; omitting or null is rejected.")]
     pub target_parent_id: NodeId,
     #[schemars(description = "Optional priority/sort key for the mirror among its siblings (lower = earlier)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
     #[schemars(description = "Optional pillar token (opaque, e.g. 'lead', 'build') to write to the canonical's `canonical_of:` marker if it lacks one. Skipped when omitted; if the canonical already has a canonical_of marker it is never overwritten.")]
     pub pillar: Option<String>,
@@ -657,6 +700,7 @@ pub struct AuditMirrorsParams {
     #[schemars(description = "Root of the audit. Default when omitted: the WORKFLOWY_REVIEW_ROOT env node (errors asking for an explicit root_id if that env var is unset).")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 8)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     #[schemars(description = "Chunked walk: list root's direct children and walk each separately, then aggregate. Avoids the 10 000-node walk cap on large subtrees. Defaults to true when root_id is omitted (the default env scope), false when an explicit root is supplied. Pass true to force chunking for any scope; pass false to opt out.")]
     pub chunked: Option<bool>,
@@ -674,8 +718,10 @@ pub struct ReviewParams {
     #[schemars(description = "Root of the review. Default when omitted: the WORKFLOWY_REVIEW_ROOT env node (errors asking for an explicit root_id if that env var is unset).")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth (default 8)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     #[schemars(description = "Days without edit before a cross-pillar map is reported stale (default 90)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub days_stale: Option<i64>,
 }
 
@@ -686,8 +732,77 @@ pub struct BuildNameIndexParams {
     #[schemars(description = "Root node to start the walk from. Omit with allow_root_scan=true to walk the workspace root (expensive on large trees)")]
     pub root_id: Option<NodeId>,
     #[schemars(description = "Maximum tree depth to walk (default: 10)")]
+    #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
     #[schemars(description = "Opt in to an unscoped walk when root_id is omitted. Refused by default")]
     pub allow_root_scan: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-level pins for the 2026-06-24 Cowork-host stringified-integer
+    //! quirk: integer params arrive serialised as JSON strings. Every integer
+    //! MCP parameter routes through `lenient_int` so `"3100"` and `3100` reach
+    //! the handler as the same value, and `""` / `null` / omission map to
+    //! `None`. These tests exercise the actual param structs (not the helper
+    //! in isolation) so a field that loses its `deserialize_with` attribute
+    //! fails the build.
+    use super::*;
+
+    #[test]
+    fn create_node_priority_accepts_stringified_int() {
+        // The exact incident shape: create_node priority="3100".
+        let from_str: CreateNodeParams =
+            serde_json::from_str(r#"{"name":"n","parent_id":"","priority":"3100"}"#).unwrap();
+        let from_int: CreateNodeParams =
+            serde_json::from_str(r#"{"name":"n","parent_id":"","priority":3100}"#).unwrap();
+        assert_eq!(from_str.priority, Some(3100));
+        assert_eq!(from_str.priority, from_int.priority);
+    }
+
+    #[test]
+    fn get_subtree_max_depth_accepts_stringified_int() {
+        // The exact incident shape: get_subtree max_depth="2".
+        let from_str: GetSubtreeParams =
+            serde_json::from_str(r#"{"node_id":"abc","max_depth":"2"}"#).unwrap();
+        let from_int: GetSubtreeParams =
+            serde_json::from_str(r#"{"node_id":"abc","max_depth":2}"#).unwrap();
+        assert_eq!(from_str.max_depth, Some(2));
+        assert_eq!(from_str.max_depth, from_int.max_depth);
+    }
+
+    #[test]
+    fn optional_int_empty_string_null_and_omitted_map_to_none() {
+        let empty: GetSubtreeParams =
+            serde_json::from_str(r#"{"node_id":"abc","max_depth":""}"#).unwrap();
+        let null: GetSubtreeParams =
+            serde_json::from_str(r#"{"node_id":"abc","max_depth":null}"#).unwrap();
+        let omitted: GetSubtreeParams = serde_json::from_str(r#"{"node_id":"abc"}"#).unwrap();
+        assert_eq!(empty.max_depth, None);
+        assert_eq!(null.max_depth, None);
+        assert_eq!(omitted.max_depth, None);
+    }
+
+    #[test]
+    fn required_timestamp_accepts_stringified_int() {
+        // SinceParams::timestamp_unix_ms is the one required (non-Option) int.
+        let from_str: SinceParams =
+            serde_json::from_str(r#"{"node_id":"abc","timestamp_unix_ms":"1700000000000"}"#)
+                .unwrap();
+        let from_int: SinceParams =
+            serde_json::from_str(r#"{"node_id":"abc","timestamp_unix_ms":1700000000000}"#).unwrap();
+        assert_eq!(from_str.timestamp_unix_ms, 1_700_000_000_000);
+        assert_eq!(from_str.timestamp_unix_ms, from_int.timestamp_unix_ms);
+    }
+
+    #[test]
+    fn lenient_int_does_not_weaken_deny_unknown_fields() {
+        // Adding #[serde(default, ...)] to int fields must not open the struct
+        // to unknown fields — deny_unknown_fields still applies.
+        let err = serde_json::from_str::<GetSubtreeParams>(
+            r#"{"node_id":"abc","max_depth":"2","bogus":1}"#,
+        );
+        assert!(err.is_err(), "deny_unknown_fields must still reject typos");
+    }
 }
 

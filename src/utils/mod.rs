@@ -6,6 +6,7 @@ pub mod date_parser;
 pub mod html;
 pub mod idempotency;
 pub mod job_queue;
+pub mod lenient_int;
 pub mod link_parser;
 pub mod name_index;
 pub mod node_paths;
