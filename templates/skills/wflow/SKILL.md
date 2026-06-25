@@ -417,6 +417,19 @@ Top level item
 
 Use `-` bullets only when outputting to the user in chat. Do not use `-` bullets or markdown headers in content sent to Workflowy.
 
+### Ordered lists must land in their intended order
+
+**Sequential content — numbered steps, ranked priorities, chronological entries, anything where position carries meaning — must read top-to-bottom in the intended order after the write.** This is not automatic. `insert_content`, `batch_create_nodes`, and any sequential `create_node` loop plant each new sibling at the *head* of the parent's children unless an explicit `priority` is set (Workflowy's `POST /nodes` defaults a node with no priority to position 0). The last item created therefore appears first, and an N-line ordered list arrives **fully reversed** — step 5 above step 1, the lowest priority above the highest, the narrative running backwards.
+
+The discipline whenever order matters:
+
+1. **Treat any list with numbering or narrative flow as order-bearing** — distillation sequences, priority briefings, procedure steps, timelines, ranked options. When in doubt, assume it matters.
+2. **Verify after the write, not just before.** Read the parent back (`list_children` / `get_node`) and confirm the sequence reads in the intended direction. Reversal is the default failure, not an edge case — check for it every time.
+3. **Repair with `reorder_nodes(parent_id, node_ids[])`** — pass the node IDs in the intended top-to-bottom order. The tool's reverse-priority-0 primitive (Bootstrap rule 8) lands them in exactly that sequence regardless of how they currently sit. This is the canonical fix; never hand-roll a forward-priority loop to correct order.
+4. **Prefer building the structure correctly in one pass** where the tool allows it — a single `insert_content` payload preserves the parent→child *hierarchy*, but sibling order within a level can still invert, so the read-back in step 2 is mandatory regardless of which tool wrote the list.
+
+The rule in one line: **an ordered list is not "inserted" until a read-back confirms it reads forwards.**
+
 ---
 
 ## End-of-session discipline
