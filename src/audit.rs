@@ -26,7 +26,12 @@
 //!
 //! - **BROKEN** — `mirror_of:<uuid>` does not resolve in the walked
 //!   scope **and** is not present in the supplied `external_canonicals`
-//!   map (UUID typo, target deleted from the entire graph).
+//!   map (UUID typo, target deleted from the entire graph). Resolution
+//!   accepts a full UUID, the 12-char URL-suffix short hash, or the
+//!   8-char doc-form prefix short hash (`id_match`, matching
+//!   `link_parser.rs`'s recognised short-hash shapes) — pre-2026-07-01
+//!   `id_match` only checked suffixes, so an 8-char prefix marker
+//!   never resolved even against an in-scope target.
 //! - **DRIFTED** — mirror name has diverged from the canonical's name
 //!   (substring-match in either direction; the canonical's name has
 //!   probably been edited and the mirror was missed).
@@ -175,9 +180,17 @@ pub fn audit_mirrors_with_external(
     nodes: &[WorkflowyNode],
     external_canonicals: &HashMap<String, ExternalCanonical>,
 ) -> Vec<MirrorFinding> {
+    // Matches a full UUID against either short-hash form the codebase
+    // recognises (link_parser.rs): the 12-char URL-suffix hash (trailing
+    // end of the UUID) and the 8-char doc-form prefix hash (leading end).
+    // Pre-fix this only checked suffixes, so a `mirror_of:<8-char-prefix>`
+    // marker never resolved even when its target was in scope.
+    const MIN_SHORT_HASH_LEN: usize = 8;
     let id_match = |a: &str, b: &str| -> bool {
         let (a, b) = (a.to_lowercase(), b.to_lowercase());
-        a == b || a.ends_with(&b) || b.ends_with(&a)
+        a == b
+            || (a.len() >= MIN_SHORT_HASH_LEN && (a.ends_with(&b) || a.starts_with(&b)))
+            || (b.len() >= MIN_SHORT_HASH_LEN && (b.ends_with(&a) || b.starts_with(&a)))
     };
     let mk = |status: &str, n: &WorkflowyNode, issue: String| MirrorFinding {
         status: status.into(),
@@ -457,6 +470,45 @@ mod tests {
         let findings = audit_mirrors(&nodes);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, "LONELY");
+    }
+
+    #[test]
+    fn mirror_of_8_char_doc_prefix_hash_resolves_in_scope() {
+        // link_parser.rs documents the 8-char doc-form prefix hash as a
+        // first-class short-hash shape alongside the 12-char URL-suffix
+        // form. Pre-fix `id_match` only checked suffixes (`ends_with`),
+        // so a `mirror_of:<8-char-prefix>` marker never resolved even
+        // when its target was in the walked scope.
+        let nodes = vec![
+            node("aaaabbbbccccdddd", "Title", Some("canonical_of:lead")),
+            node("eeee", "Title", Some("mirror_of:aaaabbbb")),
+        ];
+        let findings = audit_mirrors(&nodes);
+        assert!(
+            !findings.iter().any(|f| f.status == "BROKEN"),
+            "8-char doc-prefix mirror_of must resolve against an in-scope canonical: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn mirror_of_8_char_doc_prefix_hash_resolves_via_external_map() {
+        let nodes = vec![node("eeee", "Title", Some("mirror_of:aaaabbbb"))];
+        let mut external = HashMap::new();
+        external.insert(
+            "aaaabbbbccccdddd".to_string(),
+            ExternalCanonical {
+                id: "aaaabbbbccccdddd".to_string(),
+                name: "Title".to_string(),
+                has_canonical_marker: Some(true),
+            },
+        );
+        let findings = audit_mirrors_with_external(&nodes, &external);
+        assert!(
+            !findings.iter().any(|f| f.status == "BROKEN"),
+            "8-char doc-prefix mirror_of must resolve against an external canonical: {:?}",
+            findings
+        );
     }
 
     #[test]
