@@ -138,6 +138,19 @@ pub fn extract_marker(text: &str, prefix: &str) -> Option<String> {
     re.captures(text).map(|c| c[1].to_lowercase())
 }
 
+/// Strips one or more trailing `#tag` tokens from a node name before the
+/// DRIFTED name comparison. Mirror Discipline expects a mirror to carry
+/// pillar-appropriate tags that legitimately differ from the canonical's
+/// tags — mirroring a claim into six pillars means six different tag
+/// sets by design, not drift. Pre-fix the DRIFTED check compared the
+/// whole name (claim + tags) as one string, so a mirror with
+/// byte-identical claim text but different tags always failed the
+/// substring-containment check and false-flagged as DRIFTED.
+fn strip_trailing_tags(name: &str) -> String {
+    let re = regex::Regex::new(r"(?:\s*#[\w-]+)+\s*$").unwrap();
+    re.replace(name, "").trim_end().to_string()
+}
+
 /// A canonical resolved from outside the walked scope. The handler
 /// builds this map by consulting the persistent name index (and, for
 /// the MCP path, an optional live `get_node` fallback) for every
@@ -215,7 +228,10 @@ pub fn audit_mirrors_with_external(
             let canon = by_id.values().find(|c| id_match(&c.id, &target));
             match canon {
                 Some(canon) => {
-                    let (mn, cn) = (n.name.to_lowercase(), canon.name.to_lowercase());
+                    let (mn, cn) = (
+                        strip_trailing_tags(&n.name).to_lowercase(),
+                        strip_trailing_tags(&canon.name).to_lowercase(),
+                    );
                     if !mn.contains(&cn) && !cn.contains(&mn) {
                         findings.push(mk(
                             "DRIFTED",
@@ -252,7 +268,10 @@ pub fn audit_mirrors_with_external(
                             ),
                         )),
                         Some(ec) => {
-                            let (mn, cn) = (n.name.to_lowercase(), ec.name.to_lowercase());
+                            let (mn, cn) = (
+                                strip_trailing_tags(&n.name).to_lowercase(),
+                                strip_trailing_tags(&ec.name).to_lowercase(),
+                            );
                             if !mn.contains(&cn) && !cn.contains(&mn) {
                                 findings.push(mk(
                                     "DRIFTED",
@@ -509,6 +528,52 @@ mod tests {
             "8-char doc-prefix mirror_of must resolve against an external canonical: {:?}",
             findings
         );
+    }
+
+    #[test]
+    fn mirror_with_identical_claim_but_different_pillar_tags_does_not_drift() {
+        // Mirror Discipline expects a mirror to carry pillar-appropriate
+        // tags that differ from the canonical's — that's the point of
+        // mirroring the same claim into six pillars. Pre-fix the DRIFTED
+        // check compared the whole name (claim + tags), so this always
+        // false-flagged.
+        let nodes = vec![
+            node("aaa", "Same claim text #atomic #lead", Some("canonical_of:lead")),
+            node("bbb", "Same claim text #cybernetics #decide", Some("mirror_of:aaa")),
+        ];
+        let findings = audit_mirrors(&nodes);
+        assert!(
+            !findings.iter().any(|f| f.status == "DRIFTED"),
+            "identical claim text with different pillar tags must not classify DRIFTED: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn mirror_with_genuinely_different_claim_still_drifts_regardless_of_tags() {
+        let nodes = vec![
+            node("aaa", "Original claim text #atomic #lead", Some("canonical_of:lead")),
+            node(
+                "bbb",
+                "Completely different wording #cybernetics #decide",
+                Some("mirror_of:aaa"),
+            ),
+        ];
+        let findings = audit_mirrors(&nodes);
+        assert!(
+            findings.iter().any(|f| f.status == "DRIFTED" && f.node_id == "bbb"),
+            "genuinely divergent claim text must still classify DRIFTED even though tags also differ: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn strip_trailing_tags_removes_multiple_trailing_tags() {
+        assert_eq!(
+            strip_trailing_tags("Claim text here #foo #bar-baz #qux_1"),
+            "Claim text here"
+        );
+        assert_eq!(strip_trailing_tags("No tags here"), "No tags here");
     }
 
     #[test]
