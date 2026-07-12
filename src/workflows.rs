@@ -656,7 +656,7 @@ pub async fn insert_content_via_indented(
     // so the MCP surface can classify its proximate cause.
     let mut bailout_error: Option<String> = None;
 
-    for line in &parsed {
+    for (idx, line) in parsed.iter().enumerate() {
         // Pre-line cancel + deadline checks. A guard taken before the
         // rate limiter avoids burning a token on a doomed call.
         if ctx.is_cancelled() {
@@ -673,12 +673,28 @@ pub async fn insert_content_via_indented(
         let indent = line.indent.min(parent_stack.len().saturating_sub(1));
         let line_parent: Option<String> = parent_stack[indent].clone();
 
+        // Assign an explicit, monotonically-increasing priority per line in
+        // input order. WHY (2026-07-12 field report, issue 2a): pre-fix every
+        // create passed `priority=None`, so ordering was ceded entirely to
+        // Workflowy's placement of priority-less creates — which lands each new
+        // sibling at the head, reversing an ordered list. A strictly increasing
+        // priority maps input order onto ascending priority, and the read paths
+        // now sort ascending (see `WorkflowyClient::sort_children_by_priority`),
+        // so a page inserted top-to-bottom reads back top-to-bottom. Workflowy
+        // rescales priority server-side but preserves *relative* order (see the
+        // known-limitations note), so the absolute value is irrelevant — only
+        // the monotonic sequence matters. `idx` is bounded by
+        // `MAX_INSERT_CONTENT_LINES` (80) so it never approaches i32 range.
+        // This is best-effort: if the upstream declines to honour create-time
+        // priority, `reorder_nodes` remains the guaranteed ordering primitive.
+        let line_priority = Some(idx as i32);
+
         match client
             .create_node_cancellable(
                 &line.text,
                 None,
                 line_parent.as_deref(),
-                None,
+                line_priority,
                 ctx.cancel,
                 ctx.deadline,
             )
@@ -2671,6 +2687,58 @@ mod tests {
             }
             other => panic!("must surface as Partial error; got {other:?}"),
         }
+    }
+
+    /// 2026-07-12 issue 2a: insert_content must assign an explicit,
+    /// monotonically-increasing priority per line in input order so an
+    /// ordered page is not reversed by Workflowy's head-placement of
+    /// priority-less creates. Each POST /nodes must carry `priority = idx`.
+    /// The three mocks are keyed on (name, priority) pairs and each is
+    /// required to be hit exactly once, so a wrong or missing priority
+    /// fails verification.
+    #[tokio::test]
+    async fn insert_content_assigns_ascending_priorities_per_line() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        for (idx, (name, id)) in [
+            ("a", "00000000-0000-0000-0000-0000000000aa"),
+            ("b", "00000000-0000-0000-0000-0000000000bb"),
+            ("c", "00000000-0000-0000-0000-0000000000cc"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            Mock::given(method("POST"))
+                .and(path("/nodes"))
+                .and(body_partial_json(
+                    serde_json::json!({"name": name, "priority": idx as i64}),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"item_id": id})),
+                )
+                .expect(1)
+                .mount(&mock)
+                .await;
+        }
+
+        let client = WorkflowyClient::new(mock.uri(), "test-key".to_string())
+            .expect("client builds against mock");
+        let parsed = parse_indented_content("a\nb\nc");
+        let ctx = WorkflowContext::default();
+        let (outcome, _footprint) = insert_content_via_indented(&client, None, parsed, &ctx)
+            .await
+            .expect("insert succeeds");
+        match outcome {
+            InsertContentOutcome::Complete { created_count, .. } => {
+                assert_eq!(created_count, 3);
+            }
+            other => panic!("expected Complete; got {other:?}"),
+        }
+        // Mock `.expect(1)` verification runs on drop — every (name, priority)
+        // pair must have matched exactly once.
     }
 
     /// `BulkOp::parse` accepts the exact wire strings both surfaces

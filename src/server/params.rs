@@ -52,7 +52,7 @@ pub struct SearchNodesParams {
     /// skip the API walk entirely. Match is name-only (description
     /// content needs the live walk), and the index must be populated
     /// — call `build_name_index` first if it isn't.
-    #[schemars(description = "Serve the query from the persistent name index instead of walking the tree. O(1) lookups, no walk-budget timeouts. Match is name-only (description content needs the live walk). Defaults to false — a live walk; set true after `build_name_index` to bypass the 20 s subtree-fetch budget on huge subtrees.")]
+    #[schemars(description = "Serve the query from the persistent name index instead of walking the tree. O(1) lookups, no walk-budget timeouts. Token-AND match over node names AND descriptions (every whitespace-delimited query term must appear, in any order); descriptions of nodes not walked since the last index rebuild may be absent, so a live walk remains authoritative. Defaults to false — a live walk; set true after `build_name_index` to bypass the 20 s subtree-fetch budget on huge subtrees.")]
     pub use_index: Option<bool>,
 }
 

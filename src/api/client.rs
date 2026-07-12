@@ -523,11 +523,14 @@ impl WorkflowyClient {
         deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
         let response: serde_json::Value = self.request_cancellable("GET", "/nodes", None, cancel, deadline).await?;
-        let nodes: Vec<WorkflowyNode> = serde_json::from_value(
+        let mut nodes: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
         ).map_err(|e| WorkflowyError::ParseError {
             reason: format!("Failed to parse nodes: {}", e),
         })?;
+        // Same display-order sort as get_children_cancellable so the workspace
+        // root's top-level listing matches the Workflowy UI (2026-07-12 issue 3).
+        Self::sort_children_by_priority(&mut nodes);
         Ok(nodes)
     }
 
@@ -669,6 +672,24 @@ impl WorkflowyClient {
         self.get_children_cancellable(node_id, None, None).await
     }
 
+    /// Order a sibling set the way Workflowy displays it.
+    ///
+    /// WHY (2026-07-12 field report, issue 3): the `/nodes?parent_id=` endpoint
+    /// returns children in an internal/creation order, *not* the outline's
+    /// display order. Empirically (a live top-level read) the item Workflowy
+    /// renders at the top carries the *lowest* `priority` value — ascending
+    /// priority = top-of-list, consistent with `reorder_nodes`' proven
+    /// `priority=0`→head semantics. Sorting every children listing through this
+    /// one helper makes `list_children` and `get_subtree` agree (they both
+    /// funnel through `get_children_cancellable`) AND makes both reflect the UI,
+    /// so verify-after-write is reliable. Priority-less nodes (`None`) sort to
+    /// the head, matching Workflowy's documented placement of priority-less
+    /// creates. The sort is stable, so equal/`None` priorities keep the upstream
+    /// order rather than shuffling non-deterministically.
+    fn sort_children_by_priority(children: &mut [WorkflowyNode]) {
+        children.sort_by_key(|n| n.priority.unwrap_or(i64::MIN));
+    }
+
     pub async fn get_children_cancellable(
         &self,
         node_id: &str,
@@ -688,6 +709,7 @@ impl WorkflowyClient {
                 child.parent_id = Some(node_id.to_string());
             }
         }
+        Self::sort_children_by_priority(&mut children);
         Ok(children)
     }
 
@@ -1655,6 +1677,35 @@ mod tests {
     fn test_client() -> WorkflowyClient {
         WorkflowyClient::new("http://invalid.local".to_string(), "test".to_string())
             .expect("client builds")
+    }
+
+    fn node_with_priority(id: &str, priority: Option<i64>) -> WorkflowyNode {
+        WorkflowyNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sort_children_by_priority_ascending_none_first_stable() {
+        // Ascending priority = display order (lowest priority renders at the
+        // top of the outline; 2026-07-12 issue 3). Priority-less (None) sorts
+        // to the head, and equal priorities keep their upstream order (stable).
+        let mut children = vec![
+            node_with_priority("c", Some(6400)),
+            node_with_priority("a", Some(5700)),
+            node_with_priority("none1", None),
+            node_with_priority("b", Some(6100)),
+            node_with_priority("none2", None),
+            node_with_priority("dup1", Some(6100)),
+        ];
+        WorkflowyClient::sort_children_by_priority(&mut children);
+        let order: Vec<&str> = children.iter().map(|n| n.id.as_str()).collect();
+        // None entries first (head), preserving their relative upstream order;
+        // then ascending priority; ties (b, dup1 both 6100) keep upstream order.
+        assert_eq!(order, vec!["none1", "none2", "a", "b", "dup1", "c"]);
     }
 
     #[test]

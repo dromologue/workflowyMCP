@@ -1788,7 +1788,7 @@ impl WorkflowyMcpServer {
         Ok(fetch)
     }
 
-    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. PASS parent_id to scope the search; on large trees an unscoped (root-of-workspace) walk hits the 20 s subtree budget and times out before reaching most content. Two recovery paths: (a) `allow_root_scan=true` to accept the full walk; (b) `use_index=true` to serve the query from the persistent name index in O(1) without any walk — use after `build_name_index` populates the index. Index path is name-only (descriptions need a live walk). Use max_depth to control walk depth.")]
+    #[tool(description = "Search for nodes in Workflowy by text query. Returns matching nodes with their IDs, names, and paths. PASS parent_id to scope the search; on large trees an unscoped (root-of-workspace) walk hits the 20 s subtree budget and times out before reaching most content. Two recovery paths: (a) `allow_root_scan=true` to accept the full walk; (b) `use_index=true` to serve the query from the persistent name index in O(1) without any walk — use after `build_name_index` populates the index. The index path does a token-AND match over node names AND descriptions (every query term must appear, any order); a live walk stays authoritative for nodes not yet indexed. Use max_depth to control walk depth.")]
     async fn search_nodes(
         &self,
         Parameters(params): Parameters<SearchNodesParams>,
@@ -1824,7 +1824,12 @@ impl WorkflowyMcpServer {
                      and accept the live-walk path.",
                 ));
             }
-            let hits = self.name_index.lookup(&params.query, "contains");
+            // Token-AND match over name + description (2026-07-12 issues 5 & 6):
+            // every whitespace-delimited token must appear (in any order) in
+            // the entry's name-plus-description text, so distinctive multi-word
+            // queries work and description content is searchable — unlike the
+            // former `lookup(query, "contains")` single-substring name-only path.
+            let hits = self.name_index.search_tokens(&params.query);
             let hits: Vec<_> = if let Some(parent) = resolved_parent.as_deref() {
                 hits.into_iter()
                     .filter(|e| e.parent_id.as_deref() == Some(parent))
@@ -1839,9 +1844,11 @@ impl WorkflowyMcpServer {
             let body = if hits.is_empty() {
                 format!(
                     "No nodes found matching '{}' in the persistent name index \
-                     ({} entries). The index covers names only — content in node \
-                     descriptions requires a live walk (omit use_index and pass \
-                     parent_id or allow_root_scan=true).",
+                     ({} entries). The index matches on node names and descriptions \
+                     (every query token must appear, in any order); descriptions of \
+                     nodes not yet walked since the last index rebuild may be absent, \
+                     so for authoritative coverage omit use_index and pass parent_id \
+                     or allow_root_scan=true for a live walk.",
                     params.query,
                     self.name_index.size(),
                 )
@@ -1850,7 +1857,7 @@ impl WorkflowyMcpServer {
                     .map(|e| format!("- **{}** (id: `{}`)", e.name, e.node_id))
                     .collect();
                 format!(
-                    "Found {} node(s) matching '{}' (via name index — name match only, no description content):\n\n{}",
+                    "Found {} node(s) matching '{}' (via name index — token-AND match over names and descriptions):\n\n{}",
                     hits.len(),
                     params.query,
                     items.join("\n"),
@@ -8003,8 +8010,8 @@ mod tests {
             "non-matching index entry must not leak: {body}"
         );
         assert!(
-            body.contains("name index") && body.contains("name match"),
-            "response must signal the name-only / index-served path: {body}"
+            body.contains("name index") && body.contains("names and descriptions"),
+            "response must signal the index-served token-AND path: {body}"
         );
     }
 

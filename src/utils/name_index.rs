@@ -40,6 +40,12 @@ pub struct NameIndexEntry {
     pub node_id: String,
     pub name: String,
     pub parent_id: Option<String>,
+    /// The node's description/note text, if any. Stored so the
+    /// `search_nodes(use_index=true)` fast path can match content held in
+    /// descriptions, not just names (2026-07-12 field report, issue 5).
+    /// Available at every ingest site (walks return full `WorkflowyNode`s),
+    /// so populating it needs no extra API calls.
+    pub description: Option<String>,
 }
 
 #[derive(Debug)]
@@ -64,6 +70,11 @@ struct PersistedEntry {
     id: String,
     name: String,
     parent_id: Option<String>,
+    /// Persisted description text so a rehydrated index can serve
+    /// description-aware search without a fresh walk. `#[serde(default)]`
+    /// keeps the field optional on the wire; absent = `None`.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// On-disk snapshot of the entire name index. Schema-versioned so we
@@ -76,7 +87,11 @@ struct PersistedSnapshot {
     nodes: Vec<PersistedEntry>,
 }
 
-const PERSIST_SCHEMA_VERSION: u32 = 1;
+// Bumped 1 → 2 on 2026-07-12 when `description` was added to each entry.
+// `load_from_disk` rejects any snapshot whose version it doesn't recognise,
+// so a v1 cache is cleanly discarded (and rebuilt by the background walk)
+// rather than loaded with silently-missing descriptions.
+const PERSIST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Default)]
 pub struct NameIndex {
@@ -130,14 +145,26 @@ impl NameIndex {
         let mut by_short = self.by_short_hash.write();
         let mut by_prefix = self.by_prefix_hash.write();
         for node in nodes {
-            // Skip a redundant ingest: same id + same lowercased name
-            // means nothing in the maps would change. We still treat
-            // parent_id changes as a no-op here because moves are
-            // observed via the cache layer; the by_id key only stores
-            // the lowercased name.
+            // Skip a redundant ingest: same id + same lowercased name AND
+            // same description means nothing in the maps would change. We
+            // still treat parent_id changes as a no-op here because moves are
+            // observed via the cache layer; the by_id key only stores the
+            // lowercased name. Description is part of the equality check
+            // (2026-07-12 issue 5) so a description edit is picked up for
+            // description-aware search instead of being skipped — without it,
+            // re-observing the same node during a walk would keep the stale
+            // description. A genuinely-unchanged node still short-circuits, so
+            // the periodic saver is not woken by identical re-ingests.
             let key = node.name.to_lowercase();
             if by_id.get(&node.id).map(|n| n.as_str()) == Some(key.as_str()) {
-                continue;
+                let same_desc = by_name
+                    .get(&key)
+                    .and_then(|v| v.entries.iter().find(|e| e.node_id == node.id))
+                    .map(|e| e.description == node.description)
+                    .unwrap_or(false);
+                if same_desc {
+                    continue;
+                }
             }
             self.remove_locked(&mut by_name, &mut by_id, &mut by_short, &mut by_prefix, &node.id);
             changed = true;
@@ -145,6 +172,7 @@ impl NameIndex {
                 node_id: node.id.clone(),
                 name: node.name.clone(),
                 parent_id: node.parent_id.clone(),
+                description: node.description.clone(),
             };
             by_id.insert(node.id.clone(), key.clone());
             if let Some(short) = short_hash_of(&node.id) {
@@ -207,6 +235,48 @@ impl NameIndex {
                 }
             }
             _ => {}
+        }
+        out
+    }
+
+    /// Token-AND search over each entry's name **and** description, used by
+    /// the `search_nodes(use_index=true)` fast path.
+    ///
+    /// WHY (2026-07-12 field report, issues 5 & 6): the old fast path called
+    /// `lookup(query, "contains")`, which lowercases the *entire* query as one
+    /// needle and tests `name.contains(needle)` — a single contiguous substring
+    /// over the name only. Two failures fell out of that: (a) description
+    /// content was invisible (the index stored no description); (b) a
+    /// multi-token query like `"Annex III high-risk regime"` matched nothing
+    /// even when every token was present, because the interior words broke
+    /// contiguity. This method splits the query on whitespace and keeps an
+    /// entry iff *every* token is a case-insensitive substring of the entry's
+    /// `name + " " + description` haystack — order-independent, gap-tolerant,
+    /// and description-aware. An empty/whitespace-only query returns nothing
+    /// (an empty token set would otherwise match every node). `find_node`'s
+    /// `lookup` is deliberately left untouched so its `exact`/`starts_with`/
+    /// `contains` name-only semantics stay byte-compatible.
+    pub fn search_tokens(&self, query: &str) -> Vec<NameIndexEntry> {
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let by_name = self.by_name.read();
+        let mut out = Vec::new();
+        for value in by_name.values() {
+            for entry in &value.entries {
+                let mut hay = entry.name.to_lowercase();
+                if let Some(desc) = &entry.description {
+                    hay.push(' ');
+                    hay.push_str(&desc.to_lowercase());
+                }
+                if tokens.iter().all(|t| hay.contains(t)) {
+                    out.push(entry.clone());
+                }
+            }
         }
         out
     }
@@ -361,6 +431,7 @@ impl NameIndex {
                 id: e.id,
                 name: e.name,
                 parent_id: e.parent_id,
+                description: e.description,
                 ..Default::default()
             })
             .collect();
@@ -407,6 +478,7 @@ impl NameIndex {
                     id: entry.node_id.clone(),
                     name: entry.name.clone(),
                     parent_id: entry.parent_id.clone(),
+                    description: entry.description.clone(),
                 });
             }
         }
@@ -760,6 +832,96 @@ mod tests {
         idx.dirty.store(false, Ordering::Relaxed);
         idx.ingest(&[node("1", "A", None)]);
         assert!(!idx.is_dirty(), "redundant ingest must not mark dirty");
+    }
+
+    fn node_with_desc(id: &str, name: &str, desc: &str) -> WorkflowyNode {
+        WorkflowyNode {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_tokens_matches_multi_token_query_out_of_order() {
+        // 2026-07-12 issue 6: `lookup(_, "contains")` treated the whole query
+        // as one contiguous needle, so a distinctive multi-word query missed
+        // even when every token was present. Token-AND fixes it.
+        let idx = NameIndex::new();
+        idx.ingest(&[node("1", "Annex III — high-risk AI systems regime", None)]);
+        // Whole-phrase contiguous match still works.
+        assert_eq!(idx.search_tokens("Annex III").len(), 1);
+        // The former failure: interior words break contiguity; token-AND
+        // (any order, gaps allowed) now matches.
+        assert_eq!(idx.search_tokens("Annex III high-risk regime").len(), 1);
+        assert_eq!(idx.search_tokens("regime annex").len(), 1, "order-independent");
+        // A token absent from the node still excludes it.
+        assert_eq!(idx.search_tokens("Annex IV").len(), 0);
+    }
+
+    #[test]
+    fn search_tokens_matches_description_content() {
+        // 2026-07-12 issue 5: content living only in a node's description
+        // must be findable via the index fast path.
+        let idx = NameIndex::new();
+        idx.ingest(&[node_with_desc(
+            "1",
+            "GDPR obligations",
+            "records of processing activities under Article 30",
+        )]);
+        // Token present only in the description.
+        assert_eq!(idx.search_tokens("Article 30").len(), 1);
+        // Tokens spanning name + description both required.
+        assert_eq!(idx.search_tokens("GDPR Article").len(), 1);
+        assert_eq!(idx.search_tokens("GDPR Article 31").len(), 0);
+    }
+
+    #[test]
+    fn search_tokens_empty_query_returns_nothing() {
+        let idx = NameIndex::new();
+        idx.ingest(&[node("1", "A", None)]);
+        assert!(idx.search_tokens("").is_empty());
+        assert!(idx.search_tokens("   ").is_empty());
+    }
+
+    #[test]
+    fn description_edit_is_reingested_for_search() {
+        // The no-op guard must NOT skip a re-ingest when only the description
+        // changed, otherwise description-aware search would serve stale text.
+        let idx = NameIndex::new();
+        idx.ingest(&[node_with_desc("1", "Note", "old body")]);
+        assert_eq!(idx.search_tokens("old body").len(), 1);
+        idx.dirty.store(false, Ordering::Relaxed);
+        idx.ingest(&[node_with_desc("1", "Note", "new body")]);
+        assert!(idx.is_dirty(), "a description change must mark the index dirty");
+        assert!(idx.search_tokens("old body").is_empty(), "stale description gone");
+        assert_eq!(idx.search_tokens("new body").len(), 1);
+    }
+
+    #[test]
+    fn save_load_roundtrips_description() {
+        // Schema v2: descriptions survive a persist → rehydrate cycle so a
+        // fresh server start can serve description-aware search immediately.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+        let idx = NameIndex::new();
+        idx.set_save_path(path.clone());
+        idx.ingest(&[node_with_desc(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Policy",
+            "Article 30 records",
+        )]);
+        idx.save_to_disk().expect("save");
+
+        let idx2 = NameIndex::new();
+        idx2.set_save_path(path);
+        idx2.load_from_disk().expect("load");
+        assert_eq!(
+            idx2.search_tokens("Article 30").len(),
+            1,
+            "rehydrated index must still match on description content"
+        );
     }
 
     #[test]
