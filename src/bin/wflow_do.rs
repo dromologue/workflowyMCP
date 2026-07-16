@@ -474,14 +474,18 @@ enum Cmd {
         /// Maximum tree depth to walk under each root.
         #[arg(long, default_value_t = 10)]
         max_depth: usize,
-        /// Wall-clock budget per root in seconds. Defaults to the
-        /// resolution-walk timeout (300 s). Set to 0 for no time
-        /// budget — the walk runs until the node-count cap or until
-        /// the subtree is exhausted, whichever fires first. Use a
-        /// large value (e.g. 3600 for one hour per root) to reach
-        /// deep regions of large subtrees that timed out at the
-        /// default. The node-count cap (`RESOLVE_WALK_NODE_CAP`)
-        /// still applies regardless.
+        // The prose deliberately does not restate the default's value —
+        // clap renders it from the constant below. It read "300 s" for
+        // months after `RESOLVE_WALK_TIMEOUT_MS` dropped to 20 s, because
+        // a number written in two places drifts in one of them.
+        /// Wall-clock budget per root in seconds. The default (shown
+        /// below) is the resolution-walk timeout, which is tuned for an
+        /// interactive resolve rather than an indexing run — set this
+        /// explicitly for a real reindex. Set to 0 for no time budget:
+        /// the walk then runs until the node-count cap or until the
+        /// subtree is exhausted, whichever fires first. Use a large
+        /// value (e.g. 3600 for one hour per root) to reach deep regions
+        /// of large subtrees. The node-count cap still applies regardless.
         #[arg(long, default_value_t = (defaults::RESOLVE_WALK_TIMEOUT_MS / 1000) as u64)]
         timeout_secs: u64,
     },
@@ -2187,6 +2191,7 @@ async fn cmd_reindex(
     };
 
     let started_total = std::time::Instant::now();
+    let mut skipped_total: Vec<String> = Vec::new();
     if timeout_secs == 0 {
         println!(
             "reindex: per-root timeout disabled (walks bound only by node cap = {})",
@@ -2217,6 +2222,9 @@ async fn cmd_reindex(
             Ok(fetch) => {
                 let count = fetch.nodes.len();
                 index.ingest(&fetch.nodes);
+                // `complete` must mean "covered the subtree", not merely "did
+                // not time out" — a walk that dropped branches reports them
+                // here rather than claiming completion (2026-07-16).
                 let trunc = fetch
                     .truncation_reason
                     .map(|r| format!(", truncated: {}", r.as_str()))
@@ -2228,6 +2236,15 @@ async fn cmd_reindex(
                     start.elapsed().as_millis(),
                     trunc
                 );
+                if !fetch.skipped_branches.is_empty() {
+                    skipped_total.extend(fetch.skipped_branches.iter().cloned());
+                    eprintln!(
+                        "reindex: WARNING {} dropped {} branch(es) after retry — their subtrees are NOT indexed: {}",
+                        label,
+                        fetch.skipped_branches.len(),
+                        fetch.skipped_branches.join(", ")
+                    );
+                }
             }
             Err(e) => {
                 eprintln!("reindex: {} failed: {}", label, e);
@@ -2236,12 +2253,27 @@ async fn cmd_reindex(
     }
 
     if path.is_some() {
+        // Merges the on-disk file back in first, so entries written by a
+        // running MCP server since our load survive this save rather than
+        // being clobbered by it.
         index.save_to_disk()?;
         println!(
             "reindex: saved {} entries to {} (total elapsed {} ms)",
             index.size(),
             path.as_ref().unwrap().display(),
             started_total.elapsed().as_millis()
+        );
+    }
+
+    if !skipped_total.is_empty() {
+        skipped_total.sort();
+        skipped_total.dedup();
+        eprintln!(
+            "reindex: COVERAGE IS PARTIAL — {} branch(es) were dropped and their subtrees are absent from the index. \
+             Re-run once upstream rate-limit pressure clears; the merge-on-save means a re-run adds to the index rather than replacing it. \
+             Dropped branches: {}",
+            skipped_total.len(),
+            skipped_total.join(", ")
         );
     }
     Ok(())

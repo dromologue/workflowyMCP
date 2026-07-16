@@ -119,6 +119,20 @@ pub enum TruncationReason {
     Timeout,
     /// A [`CancelGuard`] reported cancellation mid-walk.
     Cancelled,
+    /// One or more branches were dropped because their child fetch errored
+    /// (typically a 429) and a bounded retry did not recover them. The walk
+    /// ran to its natural end, so it hit neither the node cap nor the
+    /// deadline — but it did NOT cover the subtree, and the nodes under the
+    /// dropped branches are absent from `nodes`.
+    ///
+    /// WHY this is a truncation reason rather than a log line: before
+    /// 2026-07-16 the child-fetch error arm logged `"Failed to fetch
+    /// children, skipping branch"` and carried on, and the walk still
+    /// returned `complete`. A `wflow-do reindex` that ate a burst of 429s
+    /// reported `complete` while silently omitting whole subtrees, so
+    /// `complete` meant "not timed out" rather than "covered the subtree"
+    /// and callers could not tell partial coverage from full.
+    SkippedBranches,
 }
 
 impl TruncationReason {
@@ -127,6 +141,7 @@ impl TruncationReason {
             TruncationReason::NodeLimit => "node_limit",
             TruncationReason::Timeout => "timeout",
             TruncationReason::Cancelled => "cancelled",
+            TruncationReason::SkippedBranches => "skipped_branches",
         }
     }
 }
@@ -138,6 +153,10 @@ impl TruncationReason {
 struct TruncationOutcome {
     reason: Option<TruncationReason>,
     truncated_at_node_id: Option<String>,
+    /// IDs of parents whose child fetch errored and was dropped after the
+    /// bounded retry. Non-empty means the walk did not cover the subtree
+    /// even when `reason` is a stopping reason like `Timeout`.
+    skipped_branches: Vec<String>,
 }
 
 impl TruncationOutcome {
@@ -149,7 +168,23 @@ impl TruncationOutcome {
         Self {
             reason: Some(reason),
             truncated_at_node_id: anchor,
+            skipped_branches: Vec::new(),
         }
+    }
+
+    /// Fold dropped branches into an outcome. A walk that stopped for
+    /// another reason keeps that reason (the stop is the more specific
+    /// fact); an otherwise-complete walk with dropped branches becomes
+    /// `SkippedBranches` so it can never report `complete`.
+    fn with_skipped(mut self, skipped: Vec<String>) -> Self {
+        if !skipped.is_empty() {
+            if self.reason.is_none() {
+                self.reason = Some(TruncationReason::SkippedBranches);
+                self.truncated_at_node_id = skipped.first().cloned();
+            }
+            self.skipped_branches = skipped;
+        }
+        self
     }
 }
 
@@ -182,6 +217,13 @@ pub struct SubtreeFetch {
     /// so the next call can re-scope intelligently. `None` when the walk
     /// completed or when truncation fired before any level was started.
     pub truncated_at_node_id: Option<String>,
+    /// Parent IDs whose child fetch errored and was dropped after the
+    /// walk's bounded retry. Empty on a walk that reached every branch it
+    /// attempted. Non-empty means `nodes` is missing whole subtrees, and
+    /// the walk reports `truncated: true` regardless of whether it also
+    /// hit the node cap or the deadline. Callers wanting full coverage can
+    /// re-walk these IDs directly once upstream pressure clears.
+    pub skipped_branches: Vec<String>,
 }
 
 /// Optional controls for a subtree walk: deadline budget and a cancellation
@@ -766,6 +808,8 @@ impl WorkflowyClient {
                 // anchor so the banner can still display a path even when no
                 // nodes were fetched.
                 truncated_at_node_id: root_id.map(str::to_string),
+                // Bailed before any branch was attempted.
+                skipped_branches: Vec::new(),
             });
         }
 
@@ -784,6 +828,7 @@ impl WorkflowyClient {
                             truncation_reason: Some(abort_reason(&e)),
                             elapsed_ms: started.elapsed().as_millis() as u64,
                             truncated_at_node_id: Some(id.to_string()),
+                            skipped_branches: Vec::new(),
                         });
                     }
                     Err(e) => return Err(e),
@@ -796,6 +841,7 @@ impl WorkflowyClient {
                         truncation_reason: Some(TruncationReason::NodeLimit),
                         elapsed_ms: started.elapsed().as_millis() as u64,
                         truncated_at_node_id: Some(id.to_string()),
+                        skipped_branches: Vec::new(),
                     });
                 }
                 if let Some(status) = controls.status() {
@@ -834,11 +880,15 @@ impl WorkflowyClient {
 
         Ok(SubtreeFetch {
             nodes: all_nodes,
-            truncated: outcome.reason.is_some(),
+            // Dropped branches make the walk partial even when it stopped for
+            // no other reason, so `truncated` keys off both facts rather than
+            // off the stopping reason alone.
+            truncated: outcome.reason.is_some() || !outcome.skipped_branches.is_empty(),
             limit: node_limit,
             truncation_reason: outcome.reason,
             elapsed_ms: started.elapsed().as_millis() as u64,
             truncated_at_node_id: outcome.truncated_at_node_id,
+            skipped_branches: outcome.skipped_branches,
         })
     }
 
@@ -868,6 +918,10 @@ impl WorkflowyClient {
         let mut depth = start_depth;
         let cancel_ref = controls.cancel.as_ref();
         let deadline = controls.deadline;
+        // Branches dropped across every level of this walk, after each
+        // level's bounded retry. Non-empty => the walk did not cover the
+        // subtree, whatever else it reports.
+        let mut skipped_branches: Vec<String> = Vec::new();
 
         while depth < max_depth && !current_level.is_empty() {
             // Accumulate this level before descending. If it blows the cap,
@@ -904,6 +958,10 @@ impl WorkflowyClient {
 
             let mut next_level: Vec<WorkflowyNode> = Vec::new();
             let mut stop: Option<TruncationReason> = None;
+            // Branches this level dropped on a non-abort error. Retried once
+            // below before we descend, so a transient 429 does not silently
+            // remove a subtree from the walk.
+            let mut level_skipped: Vec<String> = Vec::new();
             // Track which parents we have *not* yet drained, so when we stop
             // mid-level we can name the first unfinished branch.
             let mut pending_parents: std::collections::HashSet<String> =
@@ -918,7 +976,10 @@ impl WorkflowyClient {
                         last_unfinished = Some(id);
                         break;
                     }
-                    Err(e) => warn!(error = %e, node_id = %id, "Failed to fetch children, skipping branch"),
+                    Err(e) => {
+                        warn!(error = %e, node_id = %id, "Failed to fetch children, will retry branch");
+                        level_skipped.push(id);
+                    }
                 }
                 if out.len() + next_level.len() >= node_limit {
                     stop = Some(TruncationReason::NodeLimit);
@@ -940,7 +1001,19 @@ impl WorkflowyClient {
                 let truncated_at = last_unfinished
                     .or_else(|| pending_parents.into_iter().next())
                     .or_else(|| current_level.first().map(|n| n.id.clone()));
-                return Ok(TruncationOutcome::stopped(reason, truncated_at));
+                skipped_branches.extend(level_skipped);
+                return Ok(TruncationOutcome::stopped(reason, truncated_at)
+                    .with_skipped(skipped_branches));
+            }
+
+            // Recover branches this level dropped before descending: their
+            // children are the next level's input, so a dropped branch here
+            // removes its whole subtree from the walk.
+            if !level_skipped.is_empty() {
+                let (recovered, still_failed) =
+                    self.retry_skipped_branches(level_skipped, controls).await;
+                next_level.extend(recovered);
+                skipped_branches.extend(still_failed);
             }
 
             current_level = next_level;
@@ -955,12 +1028,92 @@ impl WorkflowyClient {
                 let anchor = current_level.get(remaining).and_then(|n| n.parent_id.clone());
                 out.extend(current_level.into_iter().take(remaining));
                 warn!(limit = node_limit, "Node cap reached on final level, subtree truncated");
-                return Ok(TruncationOutcome::stopped(TruncationReason::NodeLimit, anchor));
+                return Ok(TruncationOutcome::stopped(TruncationReason::NodeLimit, anchor)
+                    .with_skipped(skipped_branches));
             }
             out.extend(current_level);
         }
 
-        Ok(TruncationOutcome::complete())
+        if !skipped_branches.is_empty() {
+            warn!(
+                branches = skipped_branches.len(),
+                "subtree walk reached its end with branches dropped — coverage is partial"
+            );
+        }
+        Ok(TruncationOutcome::complete().with_skipped(skipped_branches))
+    }
+
+    /// Re-attempt child fetches for branches a level dropped on a non-abort
+    /// error. Returns `(recovered_children, still_failed_parent_ids)`.
+    ///
+    /// WHY the wait: the dominant cause of a dropped branch is a 429 burst,
+    /// and the client already knows the upstream's `retry_after` window, so
+    /// retrying immediately would only fail fast against the in-window
+    /// short-circuit in `request_cancellable`. Waiting the window out is the
+    /// difference between recovering the branch and dropping it.
+    ///
+    /// Both the wait and the retry respect the walk's deadline and cancel
+    /// guard. When the budget cannot cover the wait we skip the retry and
+    /// report the branches as skipped — which surfaces as
+    /// `TruncationReason::SkippedBranches`, never as a silent omission.
+    async fn retry_skipped_branches(
+        &self,
+        ids: Vec<String>,
+        controls: &FetchControls,
+    ) -> (Vec<WorkflowyNode>, Vec<String>) {
+        if controls.status().is_some() {
+            return (Vec::new(), ids);
+        }
+
+        if let Some(remaining_ms) = self.rate_limit_posture().retry_after_remaining_ms {
+            let wait = Duration::from_millis(
+                remaining_ms.saturating_add(defaults::RETRY_WINDOW_WAIT_SLACK_MS),
+            );
+            let fits_budget = controls
+                .deadline
+                .map(|d| Instant::now() + wait < d)
+                .unwrap_or(true);
+            if !fits_budget {
+                warn!(
+                    branches = ids.len(),
+                    remaining_ms,
+                    "rate-limit window outlasts the walk budget; branches dropped"
+                );
+                return (Vec::new(), ids);
+            }
+            info!(
+                branches = ids.len(),
+                wait_ms = wait.as_millis() as u64,
+                "waiting out rate-limit window before retrying dropped branches"
+            );
+            tokio::time::sleep(wait).await;
+            if controls.status().is_some() {
+                return (Vec::new(), ids);
+            }
+        }
+
+        let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+        let cancel_ref = controls.cancel.as_ref();
+        let deadline = controls.deadline;
+        let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
+            let res = self.get_children_cancellable(&id, cancel_ref, deadline).await;
+            (id, res)
+        }))
+        .buffer_unordered(concurrency);
+        tokio::pin!(fetches);
+
+        let mut recovered: Vec<WorkflowyNode> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        while let Some((id, res)) = fetches.next().await {
+            match res {
+                Ok(children) => recovered.extend(children),
+                Err(e) => {
+                    warn!(error = %e, node_id = %id, "Branch retry failed, skipping branch");
+                    failed.push(id);
+                }
+            }
+        }
+        (recovered, failed)
     }
 
     /// Pipelined batch creator. Submits `operations.len()` create calls
@@ -1778,6 +1931,7 @@ mod tests {
             truncation_reason: Some(TruncationReason::NodeLimit),
             elapsed_ms: 5,
             truncated_at_node_id: Some("anchor-123".to_string()),
+            skipped_branches: Vec::new(),
         };
         let cloned = fetch.clone();
         assert!(cloned.truncated);
@@ -2085,6 +2239,210 @@ mod tests {
         assert!(fetch.truncated);
         assert_eq!(fetch.truncation_reason, Some(TruncationReason::Cancelled));
         assert_eq!(fetch.truncated_at_node_id.as_deref(), Some("root-id"));
+    }
+
+    /// Coverage-honesty tests for the 2026-07-16 defect: a walk that ate a
+    /// 429 on a branch fetch logged a warning, dropped the branch, and still
+    /// reported `complete` — so `complete` meant "did not time out" rather
+    /// than "covered the subtree". A `wflow-do reindex` reported 1408 nodes
+    /// and `complete` while whole component menus were missing from the
+    /// index, and no field in the response distinguished that from a full
+    /// walk.
+    mod skipped_branch_coverage {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn no_retry() -> RetryConfig {
+            RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            }
+        }
+
+        fn fast_rate_limit() -> RateLimitConfig {
+            RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            }
+        }
+
+        async fn mock_client(mock: &MockServer) -> WorkflowyClient {
+            WorkflowyClient::new_with_configs(
+                mock.uri(),
+                "test-key".to_string(),
+                no_retry(),
+                fast_rate_limit(),
+            )
+            .expect("client must build against mock")
+        }
+
+        /// Root has two children. One child's child-fetch always 500s, so it
+        /// is dropped even after the retry. The walk must NOT report a
+        /// complete traversal.
+        #[tokio::test]
+        async fn walk_that_drops_a_branch_reports_skipped_branches_not_complete() {
+            let mock = MockServer::start().await;
+
+            // The scoped root itself.
+            Mock::given(method("GET"))
+                .and(path("/nodes/root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"id": "root", "name": "Root"}),
+                ))
+                .mount(&mock)
+                .await;
+            // Root's children: one healthy, one whose own fetch will fail.
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "ok-branch", "name": "Healthy"},
+                    {"id": "bad-branch", "name": "Rate limited"}
+                ]})))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "ok-branch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                .mount(&mock)
+                .await;
+            // The branch that never recovers.
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "bad-branch"))
+                .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            let fetch = client
+                .get_subtree_with_controls(Some("root"), 5, 10_000, FetchControls::default())
+                .await
+                .expect("a dropped branch is a partial walk, not an error");
+
+            assert!(
+                fetch.truncated,
+                "a walk missing whole subtrees must not report truncated=false"
+            );
+            assert_eq!(
+                fetch.truncation_reason,
+                Some(TruncationReason::SkippedBranches),
+                "the walk hit neither the node cap nor the deadline, so the reason \
+                 must name the dropped branches rather than reporting completion"
+            );
+            assert_eq!(
+                fetch.skipped_branches,
+                vec!["bad-branch".to_string()],
+                "the dropped branch must be named so the caller can re-walk it"
+            );
+        }
+
+        /// The healthy case must stay clean: no dropped branches, no
+        /// truncation, empty `skipped_branches`.
+        #[tokio::test]
+        async fn fully_walked_subtree_reports_complete_with_no_skipped_branches() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes/root"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"id": "root", "name": "Root"})),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "kid", "name": "Kid"}
+                ]})))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "kid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            let fetch = client
+                .get_subtree_with_controls(Some("root"), 5, 10_000, FetchControls::default())
+                .await
+                .expect("healthy walk");
+
+            assert!(!fetch.truncated, "healthy walk must not report truncation");
+            assert_eq!(fetch.truncation_reason, None);
+            assert!(fetch.skipped_branches.is_empty());
+            assert_eq!(fetch.nodes.len(), 2, "root + kid");
+        }
+
+        /// A branch whose first fetch fails but whose retry succeeds must be
+        /// recovered — children included, nothing reported as skipped. This
+        /// is the transient-429 case the retry exists for.
+        #[tokio::test]
+        async fn transient_branch_failure_is_recovered_by_the_retry() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes/root"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"id": "root", "name": "Root"})),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "flaky", "name": "Flaky"}
+                ]})))
+                .mount(&mock)
+                .await;
+            // First child-fetch for `flaky` fails; the retry then succeeds.
+            // `up_to_n_times` + mount order makes the first matching mock win.
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "flaky"))
+                .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+                .up_to_n_times(1)
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "flaky"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "rescued", "name": "Rescued"}
+                ]})))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "rescued"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            let fetch = client
+                .get_subtree_with_controls(Some("root"), 5, 10_000, FetchControls::default())
+                .await
+                .expect("walk");
+
+            assert!(
+                fetch.skipped_branches.is_empty(),
+                "the retry recovered the branch, so nothing should be reported skipped"
+            );
+            assert_eq!(fetch.truncation_reason, None);
+            assert!(
+                fetch.nodes.iter().any(|n| n.id == "rescued"),
+                "the recovered branch's children must appear in the walk: {:?}",
+                fetch.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Regression tests for the 2026-05-02 description field-loss bug.

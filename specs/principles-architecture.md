@@ -197,6 +197,88 @@ The following Rust patterns are actively enforced in this codebase:
   `with_truncation_envelope(payload, ...)` merges it into a `json!({...})`
   literal. Pinned by `every_walk_tool_emits_full_truncation_envelope_in_json`.
 
+### A walk reports coverage, not merely survival (`src/api/client.rs`)
+- **"Complete" means "covered the subtree", never "did not hit a budget".**
+  `fetch_descendants` drops a branch whose child fetch errors — the only
+  alternative would be to fail the whole walk over one transient 429 — and
+  before 2026-07-16 it dropped that branch with nothing but a `warn!` and
+  still returned `TruncationOutcome::complete()`. `wflow-do reindex` then
+  reported `1408 nodes ... complete` for a walk that had silently omitted
+  whole subtrees, and no field in the response distinguished it from a full
+  walk. Coverage was unpredictable rather than merely partial, which is
+  worse: consumers (the wflow skill's fast path, `use_index=true`) treat a
+  hit as authoritative and a miss as "not there".
+- Every dropped branch is counted and named. `SubtreeFetch.skipped_branches`
+  carries the parent IDs; a non-empty list forces `truncated: true` and, when
+  the walk stopped for no other reason, `truncation_reason:
+  "skipped_branches"`. A stopping reason (`NodeLimit` / `Timeout` /
+  `Cancelled`) is the more specific fact and keeps precedence, but
+  `skipped_branches` still reports alongside it — the two are independent
+  facts and a walk can be both cut short *and* incomplete within what it
+  reached. `TruncationOutcome::with_skipped` is the single fold point.
+- **Recover before reporting.** Each level retries its dropped branches once
+  before descending, since a dropped branch removes its entire subtree from
+  the walk, not just one node. The retry waits out an open `retry_after`
+  window (`RETRY_WINDOW_WAIT_SLACK_MS` of slack), because the dominant cause
+  is a 429 and `request_cancellable` fails fast inside that window — an
+  immediate retry would burn the branch's one attempt for nothing. The wait
+  and the retry both respect the walk's deadline and cancel guard; when the
+  budget cannot cover the wait, the branches report as skipped rather than
+  blowing the budget.
+- The recovery hint for this reason is reason-specific and **overrides any
+  tool-specific hint** (`SKIPPED_BRANCHES_RECOVERY_HINT`, applied inside
+  `truncation_envelope_with_hint`). Every other hint points at the persistent
+  name index, and the index is populated by these same walks — so it shares
+  the gap exactly. Pointing a caller there to recover from a partial walk
+  restates the defect instead of resolving it. "Narrow the scope" is equally
+  wrong: a narrower walk drops the same branches.
+- Pinned by `walk_that_drops_a_branch_reports_skipped_branches_not_complete`,
+  `fully_walked_subtree_reports_complete_with_no_skipped_branches`,
+  `transient_branch_failure_is_recovered_by_the_retry`, and
+  `skipped_branches_envelope_overrides_even_a_tool_specific_hint`.
+
+### The name index has two writers; saves merge, they do not clobber (`src/utils/name_index.rs`)
+- The persistent index is written by **two independent processes**: the
+  long-running MCP server (loads at startup, checkpoints every
+  `INDEX_SAVE_INTERVAL_SECS` when dirty) and `wflow-do reindex` (loads,
+  walks, saves once). Both used to serialise their whole in-memory map
+  straight over the file, so each silently discarded every entry the other
+  had added since its own load — a window of *hours* for the server. The
+  observed symptom was non-monotonic churn in the file: a subtree present at
+  15:20 was gone at 16:08, replaced by a different one, even though `ingest`
+  is purely additive and nothing prunes. Additive merge semantics cannot
+  explain entries disappearing; two last-writer-wins savers can.
+- `save_to_disk` is therefore a **read-merge-write under an exclusive
+  cross-process lock** (`SaveLock`, an `fs4` advisory lock on a `.lock`
+  sibling). The lock covers the whole critical section: without it two savers
+  can both read, both merge, and the later rename still drops the earlier's
+  additions — the same clobber on a shorter fuse. The lock sits on a sibling
+  file, not the index, because the save renames a temp file over the index
+  and would swap the very inode a lock was held against. Advisory locks
+  release when the handle closes (including on panic or kill), so a crashed
+  writer cannot wedge the index the way a `create_new` lock file would.
+- **Merge rule: memory wins for any ID this process knows** (it observed that
+  node itself, so it is at least as fresh); disk-only IDs are adopted (we
+  have no opinion, the other writer did observe them); **tombstoned IDs are
+  skipped**. The tombstone set exists because a naive union would resurrect
+  entries this process just deleted — the on-disk copy still carries them,
+  written by a process that never saw the delete. A merge that protects
+  additions must not silently undo deletions.
+- An unreadable or wrong-schema file is overwritten rather than propagated as
+  an error: refusing to save because another writer left a bad file would
+  strand this process's own work, and the save that follows replaces the bad
+  file with a good one.
+- **Residual, documented:** a writer that never observes a delete can still
+  re-add that node from its own memory on its next save. The index is a cache
+  whose miss semantics are "not there" and whose stale hit 404s on read, so
+  this is a lesser failure than the clobber and needs a shared write-ahead
+  log — not a bigger lock — to close properly.
+- Pinned by `concurrent_writers_additions_survive_each_others_saves`,
+  `merge_adopts_disk_only_entries_into_memory`,
+  `merge_does_not_overwrite_a_locally_renamed_node_with_the_stale_disk_name`,
+  `merge_does_not_resurrect_a_locally_deleted_node`, and
+  `save_overwrites_a_corrupt_file_rather_than_failing`.
+
 ### Pre-call cache invalidation for mutations
 - Every write handler invalidates cache + name-index entries for the
   affected nodes BEFORE calling the API, not in the success branch.

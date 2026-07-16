@@ -55,6 +55,12 @@ rmcp = { version = "1.7", features = [
 ] }
 schemars = "1.2"
 sha2 = "0.11"
+# Cross-process advisory file locking (flock/LockFileEx), used only to
+# guard the name index's read-merge-write in `save_to_disk`. The index has
+# two independent writers (the MCP server's periodic checkpoint and
+# `wflow-do reindex`); before 2026-07-16 they clobbered each other's
+# additions. Default `sync` feature only — no async runtime integration.
+fs4 = "1.1.0"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

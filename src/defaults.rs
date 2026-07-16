@@ -219,6 +219,14 @@ pub const BACKGROUND_INDEX_WALK_BUDGET_MS: u64 = 180_000;
 /// large tree can be exhaustively walked while still bounding worst
 /// case memory use.
 pub const RESOLVE_WALK_NODE_CAP: usize = 100_000;
+/// Slack added to an observed `retry_after` window before a subtree walk
+/// retries the branches it dropped on a 429. The window is measured from
+/// the 429's arrival, so retrying at exactly `retry_after` races the
+/// upstream's own clock; a small margin makes the retry land after the
+/// window rather than on its edge (where it would fail fast against
+/// `request_cancellable`'s in-window short-circuit and burn the branch's
+/// one retry for nothing).
+pub const RETRY_WINDOW_WAIT_SLACK_MS: u64 = 500;
 /// Environment variable that sets the on-disk path for the persistent
 /// name index. Unset or empty disables persistence — the index then
 /// lives only in memory for the lifetime of the process.

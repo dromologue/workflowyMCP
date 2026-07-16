@@ -768,6 +768,14 @@ fn truncation_banner_full(
             "⚠ subtree walk was cancelled; results below are partial.{}\n\n",
             suffix,
         ),
+        // Distinct from the node-cap branch below: the walk ran to its end
+        // and hit no budget, so telling the caller to narrow the scope would
+        // be exactly wrong advice — a narrower walk drops the same branches.
+        // The recovery is to re-walk once upstream pressure clears.
+        Some(TruncationReason::SkippedBranches) => format!(
+            "⚠ subtree walk completed but dropped one or more branches whose child fetch kept failing (typically upstream rate-limiting). Whole subtrees are missing from the results below — this is NOT a full walk. Retry once upstream pressure clears; the dropped branch IDs are reported alongside the results so they can be re-walked directly.{}\n\n",
+            suffix,
+        ),
         _ => format!(
             "⚠ subtree truncated at {} nodes — results below may be incomplete. Narrow parent_id or max_depth.{}{}\n\n",
             limit, suffix, INDEX_RECOVERY_HINT,
@@ -1297,6 +1305,7 @@ impl WorkflowyMcpServer {
             Some(crate::api::TruncationReason::Timeout) => "timeout",
             Some(crate::api::TruncationReason::NodeLimit) => "node_limit",
             Some(crate::api::TruncationReason::Cancelled) => "cancelled",
+            Some(crate::api::TruncationReason::SkippedBranches) => "skipped_branches",
             None => "none",
         };
         let tree_estimate = self
@@ -6918,6 +6927,7 @@ mod tests {
             truncation_reason: Some(TruncationReason::NodeLimit),
             elapsed_ms: 12,
             truncated_at_node_id: Some("c".into()),
+            skipped_branches: Vec::new(),
         };
         let banner = truncation_banner_from_fetch(&fetch);
         assert!(banner.contains("Walk stopped at:"), "banner: {banner}");
@@ -6936,6 +6946,7 @@ mod tests {
             truncation_reason: Some(TruncationReason::Timeout),
             elapsed_ms: 20_001,
             truncated_at_node_id: None,
+            skipped_branches: Vec::new(),
         };
         let banner = truncation_banner_from_fetch(&fetch);
         assert!(banner.contains("timed out"), "banner: {banner}");
@@ -6954,6 +6965,7 @@ mod tests {
             truncation_reason: None,
             elapsed_ms: 5,
             truncated_at_node_id: None,
+            skipped_branches: Vec::new(),
         };
         assert_eq!(truncation_banner_from_fetch(&fetch), "");
     }

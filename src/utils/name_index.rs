@@ -12,7 +12,7 @@
 use crate::types::WorkflowyNode;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,6 +122,17 @@ pub struct NameIndex {
     /// last successful save. Lets a debounced background saver coalesce
     /// many mutations into one write.
     dirty: AtomicBool,
+    /// Node IDs this process has explicitly invalidated (a delete, or a
+    /// `clear`) since its last successful save.
+    ///
+    /// WHY: [`save_to_disk`] merges the on-disk file back in before writing,
+    /// so a concurrent writer's additions survive. A naive union would also
+    /// resurrect entries this process just deleted — the on-disk copy still
+    /// has them, having been written by a process that never observed the
+    /// delete. The tombstone set makes the merge skip them, so a delete is
+    /// not undone by the very merge that protects additions. Cleared on a
+    /// successful save: the file we just wrote already excludes them.
+    tombstones: RwLock<HashSet<String>>,
 }
 
 impl NameIndex {
@@ -351,15 +362,26 @@ impl NameIndex {
             drop(by_short);
             drop(by_id);
             drop(by_name);
+            // Tombstone so the merge in `save_to_disk` cannot resurrect this
+            // node from a concurrent writer's copy of the file.
+            self.tombstones.write().insert(node_id.to_string());
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
     /// Drop every entry.
     pub fn clear(&self) {
-        let was_populated = !self.by_id.read().is_empty();
+        let mut by_id = self.by_id.write();
+        let was_populated = !by_id.is_empty();
+        if was_populated {
+            let mut tombstones = self.tombstones.write();
+            for id in by_id.keys() {
+                tombstones.insert(id.clone());
+            }
+        }
         self.by_name.write().clear();
-        self.by_id.write().clear();
+        by_id.clear();
+        drop(by_id);
         self.by_short_hash.write().clear();
         self.by_prefix_hash.write().clear();
         if was_populated {
@@ -442,10 +464,27 @@ impl NameIndex {
         Ok(count)
     }
 
-    /// Atomically write the current index to the configured save path.
-    /// No-op when no path is set. Writes through a `.tmp` sibling and
-    /// renames into place so a crashed save can never leave a half-
-    /// written JSON file behind. Clears the dirty flag on success.
+    /// Atomically write the current index to the configured save path,
+    /// merging in whatever another writer has added since this process last
+    /// read the file. No-op when no path is set. Writes through a `.tmp`
+    /// sibling and renames into place so a crashed save can never leave a
+    /// half-written JSON file behind. Clears the dirty flag on success.
+    ///
+    /// WHY the merge and the lock (2026-07-16): the index has two writers —
+    /// the long-running MCP server (loads at process start, checkpoints every
+    /// `INDEX_SAVE_INTERVAL_SECS`) and `wflow-do reindex` (loads, walks,
+    /// saves). Both used to serialise their whole in-memory map straight over
+    /// the file, so each silently discarded every entry the other had added
+    /// since its own load — a window of *hours* for the server. The observed
+    /// symptom was non-monotonic churn: a subtree present at 15:20 was gone
+    /// at 16:08, replaced by a different one, even though `ingest` is purely
+    /// additive and nothing prunes. Re-reading and merging under an exclusive
+    /// lock makes concurrent writers compose instead of clobber.
+    ///
+    /// Merge rule: **memory wins for any ID this process knows**, because it
+    /// observed that node itself; disk-only IDs are adopted, because we have
+    /// no opinion on them and the other writer did observe them. Tombstoned
+    /// IDs are skipped so the merge cannot undo a delete.
     pub fn save_to_disk(&self) -> std::io::Result<()> {
         let path = match self.save_path() {
             Some(p) => p,
@@ -454,6 +493,14 @@ impl NameIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Hold the lock across the whole read-merge-write. Without it two
+        // savers can both read, both merge, and the later rename still drops
+        // the earlier one's additions — the same clobber on a shorter fuse.
+        let _guard = SaveLock::acquire(&path)?;
+
+        self.merge_from_disk(&path)?;
+
         let snap = self.snapshot();
         let json = serde_json::to_vec_pretty(&snap)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -461,6 +508,63 @@ impl NameIndex {
         std::fs::write(&tmp, &json)?;
         std::fs::rename(&tmp, &path)?;
         self.dirty.store(false, Ordering::Relaxed);
+        // The file we just wrote already excludes these, so they no longer
+        // need suppressing on the next merge.
+        self.tombstones.write().clear();
+        Ok(())
+    }
+
+    /// Read `path` and adopt every entry this process has no opinion on.
+    /// Called by [`save_to_disk`] while holding the save lock.
+    ///
+    /// A missing file means nothing to merge. A malformed or wrong-schema
+    /// file is ignored rather than propagated: refusing to save because
+    /// someone else wrote a bad file would strand this process's own work,
+    /// and the save that follows replaces the bad file with a good one.
+    fn merge_from_disk(&self, path: &Path) -> std::io::Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let snap: PersistedSnapshot = match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "name index on disk is unreadable; overwriting it");
+                return Ok(());
+            }
+        };
+        if snap.version != PERSIST_SCHEMA_VERSION {
+            tracing::warn!(
+                found = snap.version,
+                expected = PERSIST_SCHEMA_VERSION,
+                "name index on disk has an unsupported schema version; overwriting it"
+            );
+            return Ok(());
+        }
+
+        let adopt: Vec<WorkflowyNode> = {
+            let by_id = self.by_id.read();
+            let tombstones = self.tombstones.read();
+            snap.nodes
+                .into_iter()
+                .filter(|e| !by_id.contains_key(&e.id) && !tombstones.contains(&e.id))
+                .map(|e| WorkflowyNode {
+                    id: e.id,
+                    name: e.name,
+                    parent_id: e.parent_id,
+                    description: e.description,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        if !adopt.is_empty() {
+            tracing::info!(
+                adopted = adopt.len(),
+                "merged entries written by another index writer"
+            );
+            self.ingest(&adopt);
+        }
         Ok(())
     }
 
@@ -531,6 +635,49 @@ impl NameIndex {
                 }
             }
         }
+    }
+}
+
+/// Cross-process exclusive lock guarding the read-merge-write in
+/// [`NameIndex::save_to_disk`], so the MCP server and a concurrent
+/// `wflow-do reindex` serialise their saves instead of racing.
+///
+/// The lock lives on a `.lock` sibling rather than on the index file
+/// itself: `save_to_disk` renames a temp file over the index, which would
+/// swap the very inode a lock on the index was held against. The advisory
+/// lock is released when the file handle drops — including on panic or a
+/// killed process — so a crashed writer cannot wedge the index permanently
+/// the way a `create_new`-style lock file would.
+struct SaveLock(std::fs::File);
+
+impl SaveLock {
+    fn acquire(index_path: &Path) -> std::io::Result<Self> {
+        use fs4::FileExt;
+        let mut s = index_path.as_os_str().to_owned();
+        s.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(PathBuf::from(s))?;
+        // Blocking exclusive lock (`FileExt::lock`). Saves are infrequent (a
+        // 30 s server checkpoint, a one-shot CLI run) and the critical
+        // section is a read plus a rename, so contention resolves in
+        // milliseconds. Waiting is strictly better than skipping the save
+        // and losing the work.
+        FileExt::lock(&file)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for SaveLock {
+    fn drop(&mut self) {
+        use fs4::FileExt;
+        // Best-effort and strictly redundant: closing the handle (which
+        // happens as this struct drops) releases the lock anyway. Explicit
+        // here so the guard's purpose is legible at the call site.
+        let _ = FileExt::unlock(&self.0);
     }
 }
 
@@ -820,6 +967,177 @@ mod tests {
             Some(id)
         );
         assert_eq!(idx2.lookup("tasks", "exact").len(), 1);
+    }
+
+    /// Multi-writer merge tests for the 2026-07-16 clobber defect.
+    ///
+    /// The index has two writers — the long-running MCP server and
+    /// `wflow-do reindex`. Both used to serialise their whole in-memory map
+    /// straight over the file, so each silently discarded everything the
+    /// other had added since its own load. The observed symptom was
+    /// non-monotonic churn: a subtree present in the file at 15:20 was gone
+    /// at 16:08, replaced by a different one, even though `ingest` is purely
+    /// additive and nothing prunes.
+    mod multi_writer_merge {
+        use super::*;
+
+        // Synthetic IDs. The defect was found against two real nodes in the
+        // author's workspace, but the repo ships no machine-specific IDs
+        // (constitution principle 8) — the merge logic is keyed on nothing
+        // but map membership, so the values carry no meaning beyond being
+        // distinct, well-formed UUIDs.
+        const A_ID: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+        const B_ID: &str = "bbbbbbbb-2222-4222-8222-222222222222";
+
+        /// The report's exact sequence: two writers each load the file, then
+        /// each ingests a different subtree and saves. Neither writer's work
+        /// may vanish.
+        #[test]
+        fn concurrent_writers_additions_survive_each_others_saves() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+
+            // Both writers start from the same (empty) file — this is the
+            // load-at-process-start that opens the clobber window.
+            let server = NameIndex::new();
+            server.set_save_path(path.clone());
+            server.load_from_disk().expect("load");
+
+            let cli = NameIndex::new();
+            cli.set_save_path(path.clone());
+            cli.load_from_disk().expect("load");
+
+            // The CLI reindex walks and saves one subtree.
+            cli.ingest(&[node(A_ID, "Walked by the CLI only", Some("parent-a"))]);
+            cli.save_to_disk().expect("cli save");
+
+            // Later the server's background refresher saves a different one.
+            // Pre-fix this write dropped A_ID, which the server had never
+            // seen, because it serialised its own stale map over the file.
+            server.ingest(&[node(B_ID, "Walked by the server only", Some("parent-b"))]);
+            server.save_to_disk().expect("server save");
+
+            let reader = NameIndex::new();
+            reader.set_save_path(path);
+            reader.load_from_disk().expect("load");
+
+            assert!(
+                reader.lookup_entry_by_id(A_ID).is_some(),
+                "the CLI's subtree was clobbered by the server's save"
+            );
+            assert!(
+                reader.lookup_entry_by_id(B_ID).is_some(),
+                "the server's own subtree is missing from its own save"
+            );
+        }
+
+        /// The merge adopts disk-only entries into memory, so a long-running
+        /// writer converges on the union rather than staying blind to the
+        /// other writer's work.
+        #[test]
+        fn merge_adopts_disk_only_entries_into_memory() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+
+            let cli = NameIndex::new();
+            cli.set_save_path(path.clone());
+            cli.ingest(&[node(A_ID, "From CLI", None)]);
+            cli.save_to_disk().expect("cli save");
+
+            let server = NameIndex::new();
+            server.set_save_path(path);
+            server.ingest(&[node(B_ID, "From server", None)]);
+            assert!(server.lookup_entry_by_id(A_ID).is_none(), "precondition");
+            server.save_to_disk().expect("server save");
+
+            assert!(
+                server.lookup_entry_by_id(A_ID).is_some(),
+                "save should merge the other writer's entries into memory"
+            );
+        }
+
+        /// Memory is at least as fresh as disk for any ID this process has
+        /// observed, so a rename must not be reverted by the merge.
+        #[test]
+        fn merge_does_not_overwrite_a_locally_renamed_node_with_the_stale_disk_name() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+
+            let first = NameIndex::new();
+            first.set_save_path(path.clone());
+            first.ingest(&[node(A_ID, "Old name", None)]);
+            first.save_to_disk().expect("save");
+
+            let second = NameIndex::new();
+            second.set_save_path(path);
+            second.ingest(&[node(A_ID, "New name", None)]);
+            second.save_to_disk().expect("save");
+
+            assert_eq!(
+                second.lookup("new name", "exact").len(),
+                1,
+                "the observed rename must win over the stale on-disk name"
+            );
+            assert_eq!(
+                second.lookup("old name", "exact").len(),
+                0,
+                "the merge resurrected the stale name"
+            );
+        }
+
+        /// The merge protects additions; it must not undo deletions. A node
+        /// this process invalidated is tombstoned, so the on-disk copy
+        /// written by a writer that never saw the delete cannot bring it back.
+        #[test]
+        fn merge_does_not_resurrect_a_locally_deleted_node() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+
+            // Another writer's file still carries the node.
+            let other = NameIndex::new();
+            other.set_save_path(path.clone());
+            other.ingest(&[node(A_ID, "Doomed", None)]);
+            other.save_to_disk().expect("save");
+
+            // This writer knows it, then observes the delete.
+            let server = NameIndex::new();
+            server.set_save_path(path.clone());
+            server.load_from_disk().expect("load");
+            assert!(server.lookup_entry_by_id(A_ID).is_some(), "precondition");
+            server.invalidate_node(A_ID);
+            server.save_to_disk().expect("save");
+
+            assert!(
+                server.lookup_entry_by_id(A_ID).is_none(),
+                "the merge resurrected a node this process deleted"
+            );
+            let reader = NameIndex::new();
+            reader.set_save_path(path);
+            reader.load_from_disk().expect("load");
+            assert!(
+                reader.lookup_entry_by_id(A_ID).is_none(),
+                "the deleted node came back through the saved file"
+            );
+        }
+
+        /// A save must not be abandoned because another writer left an
+        /// unreadable file — that would strand this process's own work.
+        #[test]
+        fn save_overwrites_a_corrupt_file_rather_than_failing() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+            std::fs::write(&path, "{ not json at all").expect("write corrupt");
+
+            let idx = NameIndex::new();
+            idx.set_save_path(path.clone());
+            idx.ingest(&[node(A_ID, "Survivor", None)]);
+            idx.save_to_disk().expect("save must not fail on a corrupt file");
+
+            let reader = NameIndex::new();
+            reader.set_save_path(path);
+            reader.load_from_disk().expect("load");
+            assert!(reader.lookup_entry_by_id(A_ID).is_some());
+        }
     }
 
     #[test]
