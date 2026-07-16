@@ -652,12 +652,25 @@ pinned by `template_skill_carries_required_discipline_phrases` in
    phrase `Fail loud when` `$SECONDBRAIN_DIR`. Pinned by `template_skill_carries_required_discipline_phrases`.
 
 4. **[C-disc-004] Synthesis workflows share three named patterns** — the
-   routing-plan gate (with novelty check), the MOC-batch-mirror
+   routing-plan gate (with novelty check), the head-batch-mirror
    sequence, and the Journal-scan + `Journal range covered:` stamp
    convention. The skill must name and describe all three so they
    become the prescribed defaults rather than implicit suggestions.
-   Pins: phrases `routing-plan gate`, `MOC-batch-mirror`,
+   Pins: phrases `routing-plan gate`, `head-batch-mirror`,
    `Journal range covered:`. Pinned by `template_skill_carries_required_discipline_phrases`.
+
+   *Renamed 2026-06-20 (`df69829`), spec caught up 2026-07-16.* The
+   sequence was `MOC-batch-mirror` until the claim-led distillation
+   standard retired "MOC" / "Map of Content" as reader-meaningless
+   jargon; the head of a source's cluster is now its **lead claim**, so
+   the sequence is `head-batch-mirror`. The discipline is unchanged —
+   only its first step's name is — so the contract stands rather than
+   being retired. The spec kept pinning the old phrase for four weeks,
+   which left `template_skill_carries_required_discipline_phrases`
+   red on main: it required the template to contain a term the
+   template's own Distillation Standard (point 2) explicitly bans.
+   When a term is retired, retire it at the source and let it flow
+   down to every pin that names it, in the same change.
 
 5. **[C-disc-005] Null discipline is definitive.** The skill must require an
    explicit UUID for every UUID-typed parameter, with no exceptions

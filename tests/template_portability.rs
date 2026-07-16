@@ -366,7 +366,13 @@ fn template_skill_carries_required_discipline_phrases() {
         ("Fail loud when", "C-disc-003 Bootstrap fail-loud on `$SECONDBRAIN_DIR`"),
         ("$SECONDBRAIN_DIR", "C-disc-003 Bootstrap fail-loud (env var named)"),
         ("routing-plan gate", "C-disc-004 Synthesis pattern: routing-plan gate"),
-        ("MOC-batch-mirror", "C-disc-004 Synthesis pattern: MOC-batch-mirror"),
+        // Renamed from `MOC-batch-mirror` on 2026-06-20 (df69829) when the
+        // claim-led distillation standard retired "MOC" as jargon. The pin
+        // followed the rename on 2026-07-16 — until then this test demanded
+        // a term the template's own Distillation Standard bans, and it sat
+        // red on main. The discipline is unchanged, so the pin moves rather
+        // than being dropped.
+        ("head-batch-mirror", "C-disc-004 Synthesis pattern: head-batch-mirror"),
         ("Journal range covered:", "C-disc-004 Synthesis pattern: Journal-scan + range stamp"),
         (
             "Every UUID-typed parameter gets an explicit UUID",
