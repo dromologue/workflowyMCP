@@ -237,6 +237,57 @@ The following Rust patterns are actively enforced in this codebase:
   `transient_branch_failure_is_recovered_by_the_retry`, and
   `skipped_branches_envelope_overrides_even_a_tool_specific_hint`.
 
+### Subtree exclusion is a persistence rule, enforced at the one serialisation site (`src/utils/name_index.rs`)
+- `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` names subtrees that must never be
+  **written to disk**. The rule is deliberately narrow: a walk may traverse
+  an excluded subtree and the in-memory index may hold it (a live session
+  resolving a hash under it still needs an answer, and that memory dies with
+  the process); the durable file must not carry it.
+- The filter therefore lives in `NameIndex::snapshot()` — the only place the
+  persisted form is built, and called only by `save_to_disk`. That is what
+  makes it total: the server's periodic checkpoint and an out-of-process
+  `wflow-do reindex` both pass through it, so no writer and no walk scope can
+  route around it. Pinned by `persisted_snapshot_is_the_only_serialisation_path`,
+  which fails the build if `PersistedSnapshot` is ever constructed elsewhere.
+- **Seed on `parent_id` as well as `id`.** The excluded root is normally
+  *absent* from the index — that is the filter working. A closure that seeds
+  only on `id` then finds nothing to walk down from and passes the entire
+  subtree through: it fails open, silently, and only for the subtree it
+  exists to protect. Observed against the live index on 2026-07-17, after a
+  purge had removed the root. Pinned by
+  `excludes_descendants_even_when_the_excluded_root_is_absent`, which was
+  driven red against that defect before the fix landed (constitution
+  principle 6: a control that cannot fail is not a control).
+- An exclusion token that parses as neither a UUID nor a 12-char short hash
+  is dropped **with a warning**, never kept as a never-matching filter — a
+  silently-ignored exclusion is a privacy leak, not a cosmetic bug.
+- **Residual, documented:** a node whose chain to an excluded root runs
+  through an intermediate that is also absent is unreachable from any seed
+  and will persist. Nothing in the entry links it to the token, so closing
+  it needs ancestry the index does not carry. Walks return whole levels, so
+  in practice a node's parent is present whenever the node is.
+
+### Walk patience: coverage for unattended walks, latency for interactive ones (`src/api/client.rs`)
+- `FetchControls::patient` (default `false`) is the single switch. Interactive
+  walks fail fast on rate-limit pressure because a caller is waiting and a
+  partial answer now beats a complete one in ten minutes; the scheduled
+  reindex has the opposite preference, because an index that silently omits
+  half the tree cannot tell you what it is missing.
+- **Why one retry wave cannot converge.** `request_cancellable` short-circuits
+  every request inside an open `retry_after` window, so a single 429 makes the
+  rest of the level fail in microseconds and `buffer_unordered` drains it
+  straight into the skipped pile. `retry_skipped_branches` waits the window
+  out, but re-fanning thousands of branches re-trips the limit and everything
+  queued behind the fresh 429 fails fast again. `recover_skipped_branches`
+  therefore loops waves under `patient`, stopping on a wave that recovers
+  nothing (a 404 will not heal by waiting), on cancel, or on the deadline.
+- Both fan-out sites read their width from `FetchControls::concurrency()` so a
+  patient walk cannot be patient in one and greedy in the other. Pinned by
+  `walk_fan_out_reads_concurrency_from_controls`.
+- `--patient` pairs with `--timeout-secs 0`. The retry declines to wait when
+  the wait would outlast the deadline, so a patient walk on a short budget
+  quietly stops being patient; the CLI warns rather than silently obliging.
+
 ### The name index has two writers; saves merge, they do not clobber (`src/utils/name_index.rs`)
 - The persistent index is written by **two independent processes**: the
   long-running MCP server (loads at startup, checkpoints every

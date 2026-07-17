@@ -1336,36 +1336,6 @@ impl WorkflowyMcpServer {
         Err(McpError::invalid_params(body, None))
     }
 
-    /// Walk the workspace root with the resolution budget and ingest
-    /// every visited node into the persistent name index. Used by the
-    /// background refresher in `run_server`. Returns
-    /// `(nodes_walked, truncated)` so the caller can log progress.
-    /// Distinct from [`Self::walk_for_short_hash`] in that it has no
-    /// early-termination — the goal is exhaustive coverage, not finding
-    /// one specific node.
-    pub async fn refresh_name_index(&self) -> crate::error::Result<(usize, bool)> {
-        use crate::api::client::FetchControls;
-        // The background refresher is unattended, so it uses the longer
-        // `BACKGROUND_INDEX_WALK_BUDGET_MS` rather than the 20 s on-demand
-        // `RESOLVE_WALK_TIMEOUT_MS` — more nodes ingested per cycle means
-        // the index converges in fewer 30-min iterations on large trees.
-        let controls = FetchControls::with_timeout(Duration::from_millis(
-            defaults::BACKGROUND_INDEX_WALK_BUDGET_MS,
-        ))
-        .and_cancel(self.cancel_registry.guard());
-        let fetch = self
-            .client
-            .get_subtree_with_controls(
-                None,
-                defaults::MAX_TREE_DEPTH,
-                defaults::RESOLVE_WALK_NODE_CAP,
-                controls,
-            )
-            .await?;
-        self.name_index.ingest(&fetch.nodes);
-        Ok((fetch.nodes.len(), fetch.truncated))
-    }
-
     /// Walk the workspace root with [`defaults::RESOLVE_WALK_TIMEOUT_MS`]
     /// and the resolution node cap, feeding every visited node into the
     /// name index. Returns a [`ResolveWalkSummary`] so the caller can
@@ -5272,42 +5242,23 @@ fn spawn_index_saver(name_index: Arc<NameIndex>) {
     });
 }
 
-/// Spawn a background task that periodically walks the workspace root
-/// to keep the persistent index in sync with newly added or renamed
-/// nodes. The first walk runs after a short startup delay so the
-/// initial set of user requests can take priority on the rate limiter.
-fn spawn_index_refresher(server: WorkflowyMcpServer) {
-    if server.name_index.save_path().is_none() {
-        return;
-    }
-    tokio::spawn(async move {
-        // Let the server warm up before kicking the first heavy walk —
-        // the user's first interactive request should not contend with
-        // a refresh on cold start.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        loop {
-            let started = Instant::now();
-            match server.refresh_name_index().await {
-                Ok(stats) => info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    nodes = stats.0,
-                    truncated = stats.1,
-                    "background name-index refresh completed"
-                ),
-                Err(e) => warn!(error = %e, "background name-index refresh failed"),
-            }
-            tokio::time::sleep(Duration::from_secs(
-                defaults::INDEX_REFRESH_INTERVAL_SECS,
-            ))
-            .await;
-        }
-    });
-}
 
 /// Build the server with name-index persistence and start its background
-/// index tasks (saver + 30-min refresher). Used by the stdio transport
+/// index task (the checkpoint saver). Used by the stdio transport
 /// (`run_server`); kept as a standalone constructor so server construction
 /// and the background name-index tasks live in one place.
+///
+/// WHY there is no periodic index refresher here: one used to walk the
+/// workspace root every 30 minutes. It was removed on 2026-07-17 because a
+/// root walk ingests *everything*, which defeated the walk-root exclusions
+/// the scheduled reindex is careful to apply — it silently re-added an
+/// excluded subtree to the index behind the operator's back. It also could
+/// not do its job: on a 250k-node tree a 3-minute budget covers a fraction
+/// of the tree, so it competed with foreground requests for rate-limit
+/// budget while delivering partial coverage. Index convergence is now the
+/// scheduled out-of-process `wflow-do reindex --patient` job's only, and
+/// the index still rehydrates on startup, ingests from every walk any tool
+/// performs, and checkpoints. Pinned by `no_periodic_root_walk_refresher`.
 pub(crate) fn build_and_spawn(client: Arc<WorkflowyClient>) -> WorkflowyMcpServer {
     let save_path = resolve_index_save_path();
     if let Some(p) = &save_path {
@@ -5323,7 +5274,6 @@ pub(crate) fn build_and_spawn(client: Arc<WorkflowyClient>) -> WorkflowyMcpServe
     );
 
     spawn_index_saver(Arc::clone(&server.name_index));
-    spawn_index_refresher(server.clone());
 
     server
 }
@@ -10868,19 +10818,49 @@ mod load_tests {
     /// converts the failure mode from "three minutes, then null" to
     /// "twenty seconds, then null" so callers can branch on the miss
     /// envelope and try a scoped retry instead of losing minutes per
-    /// attempt. The background refresher uses
-    /// `BACKGROUND_INDEX_WALK_BUDGET_MS` (still 180 s) so the on-demand
-    /// drop doesn't slow index convergence.
+    /// attempt.
+
+    /// No in-process task may periodically walk the workspace root. One did
+    /// (`spawn_index_refresher`, every 30 minutes) until 2026-07-17, and it
+    /// failed in the way unattended root walks always fail: it ingested the
+    /// whole tree, including the subtrees the scheduled reindex deliberately
+    /// excludes, so it silently re-added excluded material to the index that
+    /// the operator had purged. It was invisible precisely because a walk
+    /// that runs when you think it doesn't looks exactly like one that
+    /// doesn't run — nothing in the index says which writer added a node.
+    ///
+    /// Index convergence belongs to the scheduled out-of-process
+    /// `wflow-do reindex --patient` job, which walks named roots. If you are
+    /// reintroducing a periodic in-process walk, you are re-opening that
+    /// hole: don't. The persistence-time exclusion filter in `NameIndex`
+    /// would now catch the leak, but defence-in-depth is not licence to
+    /// restore the thing it defends against.
+    #[test]
+    fn no_periodic_root_walk_refresher() {
+        let src = include_str!("mod.rs");
+        // `concat!` keeps the needle out of this file as a contiguous
+        // literal, so the grep cannot match its own assertion text.
+        let refresher = concat!("fn ", "spawn_index_refresher");
+        let walker = concat!("fn ", "refresh_name_index");
+        assert!(
+            !src.contains(refresher),
+            "the periodic root-walk refresher was removed on 2026-07-17 because it \
+             defeated the index's subtree exclusions; index convergence is the \
+             scheduled reindex job's responsibility",
+        );
+        assert!(
+            !src.contains(walker),
+            "refresh_name_index existed only to serve the removed periodic refresher; \
+             a root-scoped unattended walk must not reappear in-process",
+        );
+    }
+
     #[test]
     fn resolve_walk_budget_aligns_with_subtree_fetch_budget() {
         assert_eq!(
             defaults::RESOLVE_WALK_TIMEOUT_MS,
             defaults::SUBTREE_FETCH_TIMEOUT_MS,
-            "on-demand resolve walks must share the standard 20 s subtree budget so a cold-cache `resolve_link` miss fails fast; if you need a longer walk, use the background refresher (`BACKGROUND_INDEX_WALK_BUDGET_MS`) which is unattended",
-        );
-        assert!(
-            defaults::BACKGROUND_INDEX_WALK_BUDGET_MS > defaults::RESOLVE_WALK_TIMEOUT_MS,
-            "background refresher must have a longer budget than the on-demand resolve walk so the persistent name index keeps converging on large trees even while on-demand calls fail fast",
+            "on-demand resolve walks must share the standard 20 s subtree budget so a cold-cache `resolve_link` miss fails fast; exhaustive coverage is the scheduled `wflow-do reindex --patient` job's business, not an interactive caller's",
         );
     }
 

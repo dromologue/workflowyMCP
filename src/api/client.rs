@@ -232,11 +232,23 @@ pub struct SubtreeFetch {
 pub struct FetchControls {
     pub deadline: Option<Instant>,
     pub cancel: Option<CancelGuard>,
+    /// Trade latency for coverage. An interactive walk must fail fast on
+    /// rate-limit pressure — a caller is waiting, and a partial answer now
+    /// beats a complete one in ten minutes. An unattended batch walk (the
+    /// scheduled reindex) has the opposite preference: nobody is waiting,
+    /// and a walk that silently omits half the tree is worse than useless
+    /// because the index it feeds cannot tell you what it is missing.
+    ///
+    /// Under `patient`, a walk waits out an open `retry_after` window and
+    /// re-attempts dropped branches until they stop yielding progress,
+    /// rather than dropping them on the first 429. Default `false` keeps
+    /// every interactive caller byte-identical.
+    pub patient: bool,
 }
 
 impl FetchControls {
     pub fn with_deadline(deadline: Instant) -> Self {
-        Self { deadline: Some(deadline), cancel: None }
+        Self { deadline: Some(deadline), cancel: None, patient: false }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
@@ -246,6 +258,24 @@ impl FetchControls {
     pub fn and_cancel(mut self, guard: CancelGuard) -> Self {
         self.cancel = Some(guard);
         self
+    }
+
+    /// Opt into coverage-over-latency. See [`FetchControls::patient`].
+    pub fn patient(mut self) -> Self {
+        self.patient = true;
+        self
+    }
+
+    /// Child-fetch fan-out width for this walk. The single source of the
+    /// figure: both the per-level fan-out and the branch-retry fan-out read
+    /// it here, so a patient walk cannot end up patient in one and greedy in
+    /// the other. Pinned by `walk_fan_out_reads_concurrency_from_controls`.
+    fn concurrency(&self) -> usize {
+        if self.patient {
+            defaults::PATIENT_SUBTREE_FETCH_CONCURRENCY.max(1)
+        } else {
+            defaults::SUBTREE_FETCH_CONCURRENCY.max(1)
+        }
     }
 
     fn status(&self) -> Option<TruncationReason> {
@@ -899,9 +929,10 @@ impl WorkflowyClient {
     }
 
     /// Fetch descendants level-by-level, parallelising per-level child fetches
-    /// up to [`defaults::SUBTREE_FETCH_CONCURRENCY`]. The rate-limiter serialises
-    /// each HTTP call internally, so this parallelism eliminates RTT stalls
-    /// without exceeding the sustained rate. Returns the truncation reason
+    /// up to [`FetchControls::concurrency`] (which picks the interactive or
+    /// the patient width). The rate-limiter serialises each HTTP call
+    /// internally, so this parallelism eliminates RTT stalls without
+    /// exceeding the sustained rate. Returns the truncation reason
     /// and, when truncation fired mid-level, the parent node ID whose
     /// children were not fully drained — callers can resolve that against
     /// `out` to display a path.
@@ -946,7 +977,7 @@ impl WorkflowyClient {
                 ));
             }
 
-            let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+            let concurrency = controls.concurrency();
             let ids: Vec<String> = current_level.iter().map(|n| n.id.clone()).collect();
             let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
                 let res = self.get_children_cancellable(&id, cancel_ref, deadline).await;
@@ -1011,7 +1042,7 @@ impl WorkflowyClient {
             // removes its whole subtree from the walk.
             if !level_skipped.is_empty() {
                 let (recovered, still_failed) =
-                    self.retry_skipped_branches(level_skipped, controls).await;
+                    self.recover_skipped_branches(level_skipped, controls).await;
                 next_level.extend(recovered);
                 skipped_branches.extend(still_failed);
             }
@@ -1041,6 +1072,65 @@ impl WorkflowyClient {
             );
         }
         Ok(TruncationOutcome::complete().with_skipped(skipped_branches))
+    }
+
+    /// Recover the branches a level dropped, honouring the walk's patience
+    /// setting. Returns `(recovered_children, still_failed_parent_ids)`.
+    ///
+    /// An impatient walk gets exactly one retry wave — a caller is waiting,
+    /// and the `skipped_branches` envelope tells them honestly what was
+    /// missed.
+    ///
+    /// A patient walk keeps going, and it has to: one wave cannot converge
+    /// under sustained rate-limit pressure. `retry_skipped_branches` waits
+    /// out the open window and then re-fans-out, but if any branch in that
+    /// wave draws a fresh 429 the window re-opens mid-flight and every
+    /// branch still queued behind it fails fast in microseconds — so one
+    /// wave typically recovers a slice and re-drops the rest. That is
+    /// exactly how a nightly reindex reported `complete` while omitting
+    /// thousands of branches (2026-07-17). Each wave pays one window wait
+    /// and recovers another slice, so the walk converges in wave-sized
+    /// steps: slow, but nobody is waiting on it.
+    async fn recover_skipped_branches(
+        &self,
+        ids: Vec<String>,
+        controls: &FetchControls,
+    ) -> (Vec<WorkflowyNode>, Vec<String>) {
+        let (mut recovered, mut failed) = self.retry_skipped_branches(ids, controls).await;
+        if !controls.patient {
+            return (recovered, failed);
+        }
+
+        let mut wave = 1u32;
+        while !failed.is_empty() && controls.status().is_none() {
+            let before = failed.len();
+            let (more, still) = self
+                .retry_skipped_branches(std::mem::take(&mut failed), controls)
+                .await;
+            recovered.extend(more);
+            failed = still;
+            wave += 1;
+            if failed.len() >= before {
+                // A wave that recovers nothing has told us the remaining
+                // branches are failing for a reason waiting cannot fix (a
+                // deleted node, a permission error). Another identical wave
+                // would fail identically; stop rather than spin.
+                warn!(
+                    branches = failed.len(),
+                    waves = wave,
+                    "patient walk stopped recovering branches — the remainder are not \
+                     rate-limit failures and will not resolve by waiting"
+                );
+                break;
+            }
+            info!(
+                recovered_so_far = recovered.len(),
+                remaining = failed.len(),
+                wave,
+                "patient walk recovering dropped branches"
+            );
+        }
+        (recovered, failed)
     }
 
     /// Re-attempt child fetches for branches a level dropped on a non-abort
@@ -1092,7 +1182,7 @@ impl WorkflowyClient {
             }
         }
 
-        let concurrency = defaults::SUBTREE_FETCH_CONCURRENCY.max(1);
+        let concurrency = controls.concurrency();
         let cancel_ref = controls.cancel.as_ref();
         let deadline = controls.deadline;
         let fetches = futures::stream::iter(ids.into_iter().map(|id| async move {
@@ -2441,6 +2531,195 @@ mod tests {
                 fetch.nodes.iter().any(|n| n.id == "rescued"),
                 "the recovered branch's children must appear in the walk: {:?}",
                 fetch.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+        }
+
+        /// The interactive contract: a caller is waiting, so a walk must not
+        /// silently become patient. If this flips, every `resolve_link` miss
+        /// starts waiting out 50-second rate-limit windows instead of
+        /// returning its miss envelope in 20 seconds.
+        #[test]
+        fn fetch_controls_are_impatient_by_default() {
+            assert!(!FetchControls::default().patient);
+            assert!(!FetchControls::with_timeout(Duration::from_secs(1)).patient);
+            assert!(FetchControls::default().patient().patient);
+        }
+
+        /// The walk's two fan-out sites must both read their width from
+        /// `FetchControls::concurrency()`. Reading the interactive constant
+        /// directly at either site would make a patient walk fan out five
+        /// wide — re-tripping the very rate limit patience exists to avoid,
+        /// and doing it in the retry path where the damage compounds.
+        #[test]
+        fn walk_fan_out_reads_concurrency_from_controls() {
+            let src = include_str!("client.rs");
+            let start = src
+                .find(concat!("fn ", "fetch_descendants"))
+                .expect("fetch_descendants must exist");
+            // Bound at the next item's doc comment, not its `fn` line:
+            // `batch_create_nodes` is not a walk and names the interactive
+            // constant in its own docs quite legitimately.
+            let end = src[start..]
+                .find("/// Pipelined batch creator")
+                .map(|o| start + o)
+                .expect("batch_create_nodes doc marks the end of the walk functions");
+            let walk = &src[start..end];
+            assert!(
+                !walk.contains(concat!("defaults::", "SUBTREE_FETCH_CONCURRENCY")),
+                "the walk must take its fan-out width from controls.concurrency(), not the \
+                 interactive constant — otherwise a patient walk fans out five wide and \
+                 re-trips the rate limit it is meant to tiptoe around",
+            );
+            assert_eq!(
+                walk.matches("controls.concurrency()").count(),
+                2,
+                "both the per-level fan-out and the branch-retry fan-out must read the \
+                 width from controls",
+            );
+        }
+
+        /// A patient walk keeps re-attempting until branches stop recovering.
+        /// Here a branch fails its first two fetches (the initial attempt and
+        /// the first retry wave) and succeeds on the third — which an
+        /// impatient walk, having exactly one retry wave, drops.
+        #[tokio::test]
+        async fn patient_walk_recovers_a_branch_a_single_retry_wave_would_drop() {
+            async fn build(mock: &MockServer) {
+                Mock::given(method("GET"))
+                    .and(path("/nodes/root"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({"id": "root", "name": "Root"})),
+                    )
+                    .mount(mock)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/nodes"))
+                    .and(query_param("parent_id", "root"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                        {"id": "stubborn", "name": "Stubborn"}
+                    ]})))
+                    .mount(mock)
+                    .await;
+                // Two failures: enough to exhaust the single retry wave.
+                Mock::given(method("GET"))
+                    .and(path("/nodes"))
+                    .and(query_param("parent_id", "stubborn"))
+                    .respond_with(
+                        ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})),
+                    )
+                    .up_to_n_times(2)
+                    .mount(mock)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/nodes"))
+                    .and(query_param("parent_id", "stubborn"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                        {"id": "deep", "name": "Deep"}
+                    ]})))
+                    .mount(mock)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/nodes"))
+                    .and(query_param("parent_id", "deep"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                    .mount(mock)
+                    .await;
+            }
+
+            let patient_mock = MockServer::start().await;
+            build(&patient_mock).await;
+            let fetch = mock_client(&patient_mock)
+                .await
+                .get_subtree_with_controls(
+                    Some("root"),
+                    5,
+                    10_000,
+                    FetchControls::default().patient(),
+                )
+                .await
+                .expect("walk");
+            assert!(
+                fetch.skipped_branches.is_empty(),
+                "a patient walk must keep retrying until the branch recovers, got {:?}",
+                fetch.skipped_branches
+            );
+            assert!(
+                fetch.nodes.iter().any(|n| n.id == "deep"),
+                "the recovered subtree must be present"
+            );
+            assert_eq!(fetch.truncation_reason, None);
+
+            // The same tree, impatiently: one retry wave is not enough, so
+            // the branch is dropped — and reported, never silently omitted.
+            let impatient_mock = MockServer::start().await;
+            build(&impatient_mock).await;
+            let fetch = mock_client(&impatient_mock)
+                .await
+                .get_subtree_with_controls(Some("root"), 5, 10_000, FetchControls::default())
+                .await
+                .expect("walk");
+            assert_eq!(
+                fetch.skipped_branches,
+                vec!["stubborn".to_string()],
+                "an impatient walk drops the branch after its single retry wave"
+            );
+            assert_eq!(
+                fetch.truncation_reason,
+                Some(TruncationReason::SkippedBranches),
+                "and says so — a dropped branch must never read as complete"
+            );
+        }
+
+        /// Patience must not mean spinning. A branch failing for a reason
+        /// waiting cannot fix (a 404, say) has to stop the loop, not retry
+        /// until the deadline.
+        #[tokio::test]
+        async fn patient_walk_stops_when_a_wave_recovers_nothing() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes/root"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"id": "root", "name": "Root"})),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "root"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "gone", "name": "Gone"}
+                ]})))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "gone"))
+                .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "always"})))
+                .mount(&mock)
+                .await;
+
+            let started = Instant::now();
+            let fetch = mock_client(&mock)
+                .await
+                .get_subtree_with_controls(
+                    Some("root"),
+                    5,
+                    10_000,
+                    FetchControls::default().patient(),
+                )
+                .await
+                .expect("walk");
+
+            assert_eq!(
+                fetch.skipped_branches,
+                vec!["gone".to_string()],
+                "a permanently-failing branch must be reported, not retried forever"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the no-progress guard must stop the loop promptly; took {:?}",
+                started.elapsed()
             );
         }
     }

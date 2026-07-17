@@ -159,6 +159,13 @@ pub const SUBTREE_FETCH_TIMEOUT_MS: u64 = 20_000;
 /// Concurrency for parallel child fetches inside a subtree walk. Kept close
 /// to the rate-limit burst so the limiter, not this cap, shapes throughput.
 pub const SUBTREE_FETCH_CONCURRENCY: usize = 5;
+/// Concurrency for a walk running under `FetchControls::patient`. Lower than
+/// the interactive figure on purpose: the fastest walk is the one that never
+/// trips the upstream limit. A 429 costs a ~50 s window during which every
+/// in-flight child fetch fails, so five-wide bursts buy throughput measured
+/// in milliseconds and pay for it in minutes. An unattended walk optimises
+/// for finishing, not for finishing quickly.
+pub const PATIENT_SUBTREE_FETCH_CONCURRENCY: usize = 2;
 /// Wall-clock budget for health checks (milliseconds). Must stay sub-second
 /// on any tree size so the tool is usable when the API is degraded.
 pub const HEALTH_CHECK_TIMEOUT_MS: u64 = 5_000;
@@ -183,14 +190,6 @@ pub const HTTP_TIMEOUT_SECS: u64 = 30;
 /// the rename-on-success protocol means a crash mid-save never produces
 /// a half-written file.
 pub const INDEX_SAVE_INTERVAL_SECS: u64 = 30;
-/// How often the background refresher walks the workspace root to keep
-/// the index in sync with newly added/renamed nodes. The walk inherits
-/// the resolution timeout and node cap, so a single pass on a huge
-/// (250k+) tree only covers ~12k nodes — the convergence story is
-/// many short walks stitched together over time rather than one long
-/// one. 30 minutes leaves enough rate-limit headroom for foreground
-/// requests while still building up coverage within a working day.
-pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 /// Wall-clock budget for an on-demand resolution walk triggered by a
 /// short-hash miss in `resolve_link` / `resolve_node_ref`. Aligned with
 /// `SUBTREE_FETCH_TIMEOUT_MS` so the worst-case wait a caller pays for
@@ -206,15 +205,6 @@ pub const INDEX_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 /// the miss envelope and try a scoped retry instead of losing minutes
 /// per attempt. Pinned by `resolve_walk_budget_leaves_mcp_transport_margin`.
 pub const RESOLVE_WALK_TIMEOUT_MS: u64 = SUBTREE_FETCH_TIMEOUT_MS;
-/// Wall-clock budget for the **background** name-index refresher (every
-/// `INDEX_REFRESH_INTERVAL_SECS`). Distinct from `RESOLVE_WALK_TIMEOUT_MS`
-/// because the background walk is unattended — no caller is waiting on
-/// it — so a longer budget is the right trade-off (more nodes ingested
-/// per cycle, faster index convergence on large trees). Capped at 180 s
-/// so it still sits 60 s below the MCP transport hard timeout; the
-/// background walk doesn't have a transport caller, but the same margin
-/// rule keeps the budget visibly bounded.
-pub const BACKGROUND_INDEX_WALK_BUDGET_MS: u64 = 180_000;
 /// Node cap for the resolution walk. Set generously so a moderately
 /// large tree can be exhaustively walked while still bounding worst
 /// case memory use.
@@ -401,6 +391,70 @@ pub fn default_review_root() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Subtree roots whose nodes must never be written to the persistent name
+/// index. Reads `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` — a comma-separated list
+/// of full UUIDs and/or 12-char Workflowy URL short hashes. Unset or empty
+/// means exclude nothing.
+///
+/// WHY this is a *persistence* filter and not an ingest filter: a walk may
+/// legitimately traverse an excluded subtree (a live session resolving a
+/// short hash under it still needs an answer, and the in-memory index is
+/// scoped to that process's lifetime), but the on-disk index is a durable
+/// artefact that outlives the session and is read by other tools. The rule
+/// is "may enter memory, may never reach disk", so the filter belongs at
+/// the serialisation boundary. See [`crate::utils::name_index::NameIndex`].
+///
+/// WHY env-driven: constitution principle 8 — no machine-specific IDs in
+/// the repo. Which subtrees are sensitive is the operator's fact, not this
+/// project's.
+///
+/// A token that is neither a 36-char UUID nor a 12-char short hash is
+/// almost certainly a typo. Since a silently-ignored exclusion token is a
+/// privacy leak rather than a cosmetic bug, such tokens are dropped with a
+/// warning rather than passed through as a never-matching filter.
+pub fn index_excluded_subtrees() -> Vec<String> {
+    let raw = match std::env::var("WORKFLOWY_INDEX_EXCLUDE_SUBTREES") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    raw.split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            let ok = is_full_uuid(t) || is_short_hash(t);
+            if !ok {
+                tracing::warn!(
+                    token = %t,
+                    "WORKFLOWY_INDEX_EXCLUDE_SUBTREES entry is neither a 36-char UUID nor a \
+                     12-char short hash; ignoring it — the subtree it was meant to exclude \
+                     WILL be persisted"
+                );
+            }
+            ok
+        })
+        .collect()
+}
+
+/// Serialises tests that mutate process-global environment variables.
+/// `cargo test` runs tests as threads in one process, so two tests touching
+/// the same var race and each sees the other's value. Poisoning is ignored:
+/// a panic in one env test must not cascade into unrelated failures.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A 36-char hyphenated UUID, lowercase-normalised by the caller.
+fn is_full_uuid(t: &str) -> bool {
+    t.len() == 36
+        && t.chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+        && t.matches('-').count() == 4
+}
+
+/// The 12-char trailing hex Workflowy uses in `/#/<hash>` URLs.
+fn is_short_hash(t: &str) -> bool {
+    t.len() == 12 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +601,55 @@ mod tests {
         assert_eq!(got, root);
 
         let _ = std::fs::remove_dir_all(&root);
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn index_excluded_subtrees_parses_uuids_and_short_hashes_and_drops_junk() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "WORKFLOWY_INDEX_EXCLUDE_SUBTREES";
+        let prev = std::env::var(key).ok();
+
+        // Unset → exclude nothing, so the shipped behaviour is unchanged for
+        // anyone who never sets the var.
+        std::env::remove_var(key);
+        assert!(index_excluded_subtrees().is_empty());
+
+        // Empty / whitespace-only → nothing, not a single empty token (which
+        // would match every id by `ends_with` and blank the whole index).
+        std::env::set_var(key, "   ,  ,");
+        assert!(
+            index_excluded_subtrees().is_empty(),
+            "empty tokens must be dropped, never treated as a match-all"
+        );
+
+        // Synthetic IDs: the repo ships no machine-specific IDs
+        // (constitution principle 8), and an exclusion list is precisely
+        // where a real one would be a privacy leak in its own right — the
+        // whole point of the entry is that the subtree is sensitive.
+        //
+        // Both accepted id shapes, whitespace tolerated, case normalised.
+        std::env::set_var(key, " AAAAAAAA-1111-4111-8111-111111111111 , 222222222222 ");
+        assert_eq!(
+            index_excluded_subtrees(),
+            vec![
+                "aaaaaaaa-1111-4111-8111-111111111111".to_string(),
+                "222222222222".to_string()
+            ]
+        );
+
+        // A typo'd token is dropped rather than kept as a never-matching
+        // filter — a silently-ignored exclusion is a privacy leak.
+        std::env::set_var(key, "Some/Path, aaaaaaaa-1111-4111-8111-111111111111");
+        assert_eq!(
+            index_excluded_subtrees(),
+            vec!["aaaaaaaa-1111-4111-8111-111111111111".to_string()],
+            "unrecognised tokens must be dropped, valid ones kept"
+        );
+
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),

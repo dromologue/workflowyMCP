@@ -77,6 +77,76 @@ struct PersistedEntry {
     description: Option<String>,
 }
 
+/// Ids that must not be persisted: every node matching an excluded-subtree
+/// token, plus every descendant of one.
+///
+/// Matching accepts the two id shapes `WORKFLOWY_INDEX_EXCLUDE_SUBTREES`
+/// documents — a full UUID (exact) or a 12-char short hash (trailing match,
+/// the form Workflowy puts in `/#/<hash>` URLs).
+///
+/// Seeds are nodes matching a token **or** naming one as their `parent_id`;
+/// the walk then descends from there.
+///
+/// WHY seed on the parent too, rather than only on the node itself: the
+/// excluded root is frequently *not* in the index — the whole point of the
+/// filter is to keep it out, so once it has been purged once it never comes
+/// back. Seeding only on `id` would then find nothing to start from and every
+/// child of the excluded root would sail through, which is the exact opposite
+/// of what this function is for. It fails open, silently, and only for the
+/// subtree that matters. (Observed 2026-07-17, against a purged root.)
+///
+/// Residual, documented: a node whose chain to an excluded root runs through
+/// an intermediate that is *also* absent is not reachable from any seed and
+/// will persist. Nothing in the entry links it to the token in that case, so
+/// closing it needs the ancestry the index does not have. In practice walks
+/// return whole levels, so a node's parent is present whenever the node is.
+fn excluded_ids(nodes: &[PersistedEntry], tokens: &[String]) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    if tokens.is_empty() {
+        return out;
+    }
+
+    // A token matches an id exactly (full UUID) or as its 12-char trailing
+    // short hash. Compared without allocating: ids are ASCII, so the byte
+    // slice is safe.
+    let is_match = |id: &str| -> bool {
+        tokens.iter().any(|t| {
+            id.eq_ignore_ascii_case(t)
+                || (t.len() == SHORT_HASH_LEN_URL
+                    && id.len() >= SHORT_HASH_LEN_URL
+                    && id[id.len() - SHORT_HASH_LEN_URL..].eq_ignore_ascii_case(t))
+        })
+    };
+
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut stack: Vec<&str> = Vec::new();
+    for n in nodes {
+        if let Some(p) = n.parent_id.as_deref() {
+            children.entry(p).or_default().push(n.id.as_str());
+            // Seed on the parent as well: the excluded root is usually
+            // absent from the index precisely because this filter works.
+            if is_match(p) {
+                stack.push(n.id.as_str());
+            }
+        }
+        if is_match(&n.id) {
+            stack.push(n.id.as_str());
+        }
+    }
+
+    while let Some(id) = stack.pop() {
+        // `insert` returning false means we have already queued this id —
+        // which doubles as the cycle guard for a malformed parent loop.
+        if !out.insert(id.to_string()) {
+            continue;
+        }
+        if let Some(kids) = children.get(id) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    out
+}
+
 /// On-disk snapshot of the entire name index. Schema-versioned so we
 /// can evolve the format without breaking older caches; readers ignore
 /// snapshots whose `version` is unfamiliar rather than panicking.
@@ -573,6 +643,13 @@ impl NameIndex {
     /// node_id), so successive saves of an unchanged index produce
     /// byte-identical JSON — useful when the index file is itself
     /// version-controlled.
+    ///
+    /// This is the ONLY place the persisted form is built (`save_to_disk`
+    /// is its sole caller), which is why the excluded-subtree filter lives
+    /// here: every writer — the server's periodic checkpoint and an
+    /// out-of-process `wflow-do reindex` alike — must pass through it, so
+    /// an excluded subtree cannot reach disk by any route. Pinned by
+    /// `persisted_snapshot_is_the_only_serialisation_path`.
     fn snapshot(&self) -> PersistedSnapshot {
         let by_name = self.by_name.read();
         let mut nodes: Vec<PersistedEntry> = Vec::with_capacity(by_name.values().map(|v| v.entries.len()).sum());
@@ -586,6 +663,17 @@ impl NameIndex {
                 });
             }
         }
+
+        let excluded = excluded_ids(&nodes, &crate::defaults::index_excluded_subtrees());
+        if !excluded.is_empty() {
+            let before = nodes.len();
+            nodes.retain(|n| !excluded.contains(&n.id));
+            tracing::debug!(
+                dropped = before - nodes.len(),
+                "excluded subtrees withheld from the persisted name index"
+            );
+        }
+
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         let updated_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -967,6 +1055,178 @@ mod tests {
             Some(id)
         );
         assert_eq!(idx2.lookup("tasks", "exact").len(), 1);
+    }
+
+    /// Persistence-time exclusion tests (2026-07-17).
+    ///
+    /// The rule is "may enter memory, may never reach disk": a walk is free
+    /// to traverse an excluded subtree (a live session resolving a hash under
+    /// it still needs an answer), but the durable file must never carry it.
+    /// The filter therefore sits at the serialisation boundary, not at
+    /// `ingest`, and these tests assert both halves of that.
+    mod excluded_subtrees {
+        use super::*;
+
+        const EXCL_ROOT: &str = "e0000000-0000-4000-8000-000000000000";
+        const CHILD: &str = "c0000000-0000-4000-8000-000000000001";
+        const GRANDCHILD: &str = "c0000000-0000-4000-8000-000000000002";
+        const KEEP: &str = "k0000000-0000-4000-8000-000000000003";
+
+        fn entry(id: &str, parent: Option<&str>) -> PersistedEntry {
+            PersistedEntry {
+                id: id.to_string(),
+                name: format!("node-{id}"),
+                parent_id: parent.map(str::to_string),
+                description: None,
+            }
+        }
+
+        fn tree() -> Vec<PersistedEntry> {
+            vec![
+                entry(EXCL_ROOT, None),
+                entry(CHILD, Some(EXCL_ROOT)),
+                entry(GRANDCHILD, Some(CHILD)),
+                entry(KEEP, None),
+            ]
+        }
+
+        #[test]
+        fn excludes_the_root_and_every_descendant_transitively() {
+            let out = excluded_ids(&tree(), &[EXCL_ROOT.to_string()]);
+            assert!(out.contains(EXCL_ROOT), "the named root itself must go");
+            assert!(out.contains(CHILD));
+            assert!(
+                out.contains(GRANDCHILD),
+                "exclusion must be transitive, not just direct children"
+            );
+            assert!(!out.contains(KEEP), "unrelated nodes must survive");
+        }
+
+        #[test]
+        fn matches_a_twelve_char_short_hash_as_well_as_a_full_uuid() {
+            let short = &EXCL_ROOT[EXCL_ROOT.len() - SHORT_HASH_LEN_URL..];
+            let out = excluded_ids(&tree(), &[short.to_string()]);
+            assert!(
+                out.contains(EXCL_ROOT) && out.contains(GRANDCHILD),
+                "a URL short hash must exclude the same subtree a full UUID does"
+            );
+        }
+
+        #[test]
+        fn no_tokens_excludes_nothing() {
+            assert!(excluded_ids(&tree(), &[]).is_empty());
+        }
+
+        /// The regression that matters most. Once the excluded root has been
+        /// purged it is no longer in the index, so a filter that seeds only
+        /// on `id` finds nothing to walk from and passes the entire subtree
+        /// through — failing open exactly where it must not, and only for the
+        /// subtree it exists to protect. Observed against the live index on
+        /// 2026-07-17.
+        #[test]
+        fn excludes_descendants_even_when_the_excluded_root_is_absent() {
+            let orphaned: Vec<PersistedEntry> = tree()
+                .into_iter()
+                .filter(|n| n.id != EXCL_ROOT)
+                .collect();
+            assert!(
+                !orphaned.iter().any(|n| n.id == EXCL_ROOT),
+                "precondition: the root is not in the index"
+            );
+
+            let out = excluded_ids(&orphaned, &[EXCL_ROOT.to_string()]);
+            assert!(
+                out.contains(CHILD),
+                "a child naming the excluded root as its parent must be excluded even \
+                 though the root itself is not indexed"
+            );
+            assert!(
+                out.contains(GRANDCHILD),
+                "and the exclusion must still descend from that child"
+            );
+            assert!(!out.contains(KEEP));
+        }
+
+        #[test]
+        fn a_parent_cycle_terminates() {
+            // A malformed pair pointing at each other must not spin forever.
+            let nodes = vec![entry(EXCL_ROOT, Some(CHILD)), entry(CHILD, Some(EXCL_ROOT))];
+            let out = excluded_ids(&nodes, &[EXCL_ROOT.to_string()]);
+            assert_eq!(out.len(), 2);
+        }
+
+        #[test]
+        fn excluded_subtree_is_withheld_from_disk_but_kept_in_memory() {
+            let _guard = crate::defaults::ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let key = "WORKFLOWY_INDEX_EXCLUDE_SUBTREES";
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, EXCL_ROOT);
+
+            let dir = std::env::temp_dir().join(format!("wf-excl-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("name_index.json");
+            let _ = std::fs::remove_file(&path);
+
+            let idx = NameIndex::default();
+            idx.set_save_path(path.clone());
+            idx.ingest(&[
+                node(EXCL_ROOT, "secret-root", None),
+                node(CHILD, "secret-child", Some(EXCL_ROOT)),
+                node(KEEP, "public", None),
+            ]);
+
+            // In memory the excluded node is present: a live session may
+            // still resolve it.
+            assert!(
+                idx.lookup_entry_by_id(CHILD).is_some(),
+                "exclusion is a persistence rule, not an ingest rule"
+            );
+
+            idx.save_to_disk().unwrap();
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !on_disk.contains(EXCL_ROOT) && !on_disk.contains(CHILD),
+                "excluded subtree must not reach disk"
+            );
+            assert!(on_disk.contains(KEEP), "everything else must still persist");
+
+            let _ = std::fs::remove_file(&path);
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        /// `snapshot()` is where the exclusion filter lives, so it must stay
+        /// the only place the persisted form is built. A future edit that
+        /// serialises the index anywhere else would bypass the filter and
+        /// leak the excluded subtree to disk — silently, since nothing in
+        /// the file records which writer produced it.
+        #[test]
+        fn persisted_snapshot_is_the_only_serialisation_path() {
+            let src = include_str!("name_index.rs");
+            // `concat!` keeps these needles out of this file as contiguous
+            // literals, so the grep cannot match its own assertion text.
+            let ctor = concat!("PersistedSnapshot", " {");
+            let def = concat!("struct ", "PersistedSnapshot", " {");
+            // The type also appears as `snapshot()`'s return signature; the
+            // brace there opens the function, not a struct literal.
+            let sig = concat!("-> ", "PersistedSnapshot", " {");
+            let sites =
+                src.matches(ctor).count() - src.matches(def).count() - src.matches(sig).count();
+            assert_eq!(
+                sites, 1,
+                "PersistedSnapshot must be constructed in exactly one place — snapshot(), \
+                 which applies the excluded-subtree filter. Another construction site \
+                 would write the index to disk unfiltered; found {sites}",
+            );
+            assert!(
+                src.contains(concat!("let snap = ", "self.snapshot();")),
+                "save_to_disk must serialise via self.snapshot(), never a hand-built snapshot",
+            );
+        }
     }
 
     /// Multi-writer merge tests for the 2026-07-16 clobber defect.

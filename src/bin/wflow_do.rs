@@ -488,6 +488,17 @@ enum Cmd {
         /// of large subtrees. The node-count cap still applies regardless.
         #[arg(long, default_value_t = (defaults::RESOLVE_WALK_TIMEOUT_MS / 1000) as u64)]
         timeout_secs: u64,
+        /// Trade time for coverage: wait out rate-limit windows and keep
+        /// re-attempting dropped branches until they stop recovering,
+        /// rather than dropping them on the first 429. Without this a walk
+        /// under rate-limit pressure silently omits whole subtrees — one
+        /// 429 opens a ~50 s window in which every remaining child fetch
+        /// fails instantly, so entire levels get dropped in milliseconds.
+        /// Use for any scheduled/unattended reindex, and pair it with
+        /// `--timeout-secs 0`: a deadline that cannot cover a rate-limit
+        /// wait makes the walk skip the wait and drop the branches anyway.
+        #[arg(long)]
+        patient: bool,
     },
 }
 
@@ -1865,6 +1876,9 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 None,
                 *max_depth,
                 (defaults::RESOLVE_WALK_TIMEOUT_MS / 1000) as u64,
+                // Impatient: this mirrors the MCP tool, whose caller is
+                // waiting. Patience belongs to the scheduled reindex.
+                false,
             ).await?;
         }
         Cmd::RecentTools { limit } => {
@@ -2129,13 +2143,14 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             std::fs::write(target, &body)?;
             println!("index: wrote {} entries to {}", entries.len(), target);
         }
-        Cmd::Reindex { roots, index_path, max_depth, timeout_secs } => {
+        Cmd::Reindex { roots, index_path, max_depth, timeout_secs, patient } => {
             cmd_reindex(
                 client,
                 roots.as_slice(),
                 index_path.as_deref(),
                 *max_depth,
                 *timeout_secs,
+                *patient,
             )
             .await?;
         }
@@ -2154,6 +2169,7 @@ async fn cmd_reindex(
     index_path_override: Option<&str>,
     max_depth: usize,
     timeout_secs: u64,
+    patient: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use workflowy_mcp_server::utils::NameIndex;
 
@@ -2200,6 +2216,22 @@ async fn cmd_reindex(
     } else {
         println!("reindex: per-root timeout = {} s", timeout_secs);
     }
+    if patient {
+        println!(
+            "reindex: patient mode — waiting out rate-limit windows and re-attempting \
+             dropped branches until they stop recovering"
+        );
+        if timeout_secs != 0 {
+            // Not fatal, but it undercuts the flag: the retry declines to
+            // wait when the wait would outlast the deadline, and then the
+            // branches are dropped exactly as they would be without it.
+            eprintln!(
+                "reindex: WARNING --patient with --timeout-secs {timeout_secs} — a rate-limit \
+                 window that outlasts the remaining budget makes the walk skip the wait and \
+                 drop the branches anyway. Use --timeout-secs 0 for a complete walk."
+            );
+        }
+    }
     for target in walk_targets {
         let label = target.unwrap_or("<workspace_root>");
         let start = std::time::Instant::now();
@@ -2210,6 +2242,7 @@ async fn cmd_reindex(
         } else {
             FetchControls::with_timeout(std::time::Duration::from_secs(timeout_secs))
         };
+        let controls = if patient { controls.patient() } else { controls };
         let result = client
             .get_subtree_with_controls(
                 target,
