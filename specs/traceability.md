@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 43 contracts, 34 unique pinning tests.
+**Coverage:** 46 contracts, 37 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -68,4 +68,7 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-wf-012` | Indented content parser handles 2-space-per-level indentation, drops empty lines, trims whitespace | `parse_indented_content_handles_indents_and_blanks` | `src/workflows.rs` |
 | `C-wf-013` | `create_mirror_dry_run` rejects self-mirror with `InvalidInput` before any API call | `create_mirror_dry_run_rejects_self_mirror_without_api_call` | `src/workflows.rs` |
 | `C-wf-014` | `scope_resolved_label` is the single renderer for the diagnostic `scope_resolved` token; format is `"workspace_root"` for None and `"scoped:<uuid>"` for Some | `scope_resolved_label_two_branches_render_stable_format` | `src/workflows.rs` |
+| `C-wf-015` | `create_mirror_via_convention` performs the full "create a node, then mirror it elsewhere" write sequence: reads the canonical's current name, creates a new node under `target_parent_id` carrying that name and a `mirror_of: <canonical_id>` note, and â when a `pillar` is given and the canonical carries no existing `canonical_of:` marker â annotates the canonical in a second write | `create_mirror_via_convention_creates_mirror_and_annotates_canonical` | `src/workflows.rs` |
+| `C-wf-016` | An already-marked canonical is never re-annotated, even when the caller supplies a different pillar â the documented "existing markers are never overwritten" rule | `create_mirror_via_convention_does_not_reannotate_marked_canonical` | `src/workflows.rs` |
+| `C-wf-017` | With no pillar supplied and no existing `canonical_of:` marker, the mirror is still created but `audit_status` reports `ORPHAN_canonical_lacks_marker` rather than silently skipping the annotation | `create_mirror_via_convention_without_pillar_reports_orphan` | `src/workflows.rs` |
 

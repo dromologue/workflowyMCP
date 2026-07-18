@@ -47,7 +47,7 @@
 | API Expansion | since | Implemented (single get_node + timestamp comparison) |
 | API Expansion | find_by_tag_and_path | Implemented (tag ∩ hierarchical path filter) |
 | API Expansion | export_subtree | Implemented (OPML / Markdown / JSON) |
-| API Expansion | create_mirror | **Stub** — returns explanatory error; Workflowy's REST API does not expose mirror creation |
+| API Expansion | create_mirror | Implemented (convention-based, replacing the original stub — see "create_mirror" below) |
 | Graph Hygiene | audit_mirrors | Implemented (T-164) — walks subtree, reports BROKEN / DRIFTED / ORPHAN / LONELY against the canonical_of:/mirror_of: convention |
 | Graph Hygiene | review | Implemented (T-164) — four buckets: revisit-due, multi-pillar (≥3 signal), stale cross-pillar (>days_stale), source-MOC re-cited |
 
@@ -86,13 +86,26 @@ plus the typed payload (`findings` array or `buckets` object). The
 audit/review surfaces are read-only and idempotent — safe to schedule
 weekly.
 
-### Not Implemented
+### create_mirror (convention-based, not native)
 
-True native mirrors require upstream Workflowy API support that does
-not exist as of 2026-04. The `create_mirror` tool is a stub that
-returns an informative error so callers don't silently fall back to
-the `mirror_of: <uuid>` note convention. Tracked in
-`tasks/reliability-and-ergonomics.md` (T-157).
+True native mirrors — a live-synced clone where an edit to one side
+propagates to the other — require upstream Workflowy API support that
+does not exist as of 2026-07. `create_mirror` was a stub returning an
+explanatory error through T-157 (2026-04); the 2026-05-04
+failure-report follow-up replaced the stub with a real
+convention-based implementation and it has shipped ever since. Calling
+it duplicates the canonical's name into a new node under
+`target_parent_id` and writes `mirror_of: <canonical_uuid>` to the new
+node's description; an optional `pillar` argument additionally writes
+`canonical_of: <pillar>` onto the canonical, if it doesn't already
+carry a marker. **The two nodes are not kept in sync** — editing the
+canonical afterwards does not update the mirror, and vice versa; the
+link is structural and human-curated. `audit_mirrors` is the
+consistency check for the convention (BROKEN / DRIFTED / ORPHAN /
+LONELY findings). `dry_run=true` previews the write without executing
+it. See the `create_mirror_via_convention` workflow contracts
+(C-wf-001, C-wf-013, C-wf-015 through C-wf-017) and C-server-010 for
+the pinned behaviour.
 
 ---
 
@@ -551,6 +564,9 @@ The 2026-05-09 lifts were a duplication-audit follow-up to the failure-report fi
 - **[C-wf-012]** Indented content parser handles 2-space-per-level indentation, drops empty lines, trims whitespace. Pinned by `parse_indented_content_handles_indents_and_blanks`.
 - **[C-wf-013]** `create_mirror_dry_run` rejects self-mirror with `InvalidInput` before any API call. The dry-run preview must catch the same constraints as the production call so the caller's resolution check is authoritative. Pinned by `create_mirror_dry_run_rejects_self_mirror_without_api_call`.
 - **[C-wf-014]** `scope_resolved_label` is the single renderer for the diagnostic `scope_resolved` token; format is `"workspace_root"` for None and `"scoped:<uuid>"` for Some. Both the MCP tool family and the `wflow-do --dry-run` paths call it. Pinned by `scope_resolved_label_two_branches_render_stable_format`.
+- **[C-wf-015]** `create_mirror_via_convention` performs the full "create a node, then mirror it elsewhere" write sequence: reads the canonical's current name, creates a new node under `target_parent_id` carrying that name and a `mirror_of: <canonical_id>` note, and — when a `pillar` is given and the canonical carries no existing `canonical_of:` marker — annotates the canonical in a second write. Exercised end-to-end against a mock API; prior coverage stopped at the self-mirror validation guard (C-wf-001) and never proved the writes themselves. Pinned by `create_mirror_via_convention_creates_mirror_and_annotates_canonical`.
+- **[C-wf-016]** An already-marked canonical is never re-annotated, even when the caller supplies a different pillar — the documented "existing markers are never overwritten" rule. Pinned by `create_mirror_via_convention_does_not_reannotate_marked_canonical` (mounts no edit-endpoint mock; a regression that tried to write a second marker would fail via wiremock's unmatched-request panic).
+- **[C-wf-017]** With no pillar supplied and no existing `canonical_of:` marker, the mirror is still created but `audit_status` reports `ORPHAN_canonical_lacks_marker` rather than silently skipping the annotation. Pinned by `create_mirror_via_convention_without_pillar_reports_orphan`.
 
 ### MCP-CLI parity properties
 

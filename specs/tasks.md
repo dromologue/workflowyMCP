@@ -243,6 +243,11 @@
     public Workflowy REST API does not expose mirror creation, so
     delivering this tool would silently lie. Stub keeps the MCP
     surface honest and gives callers a clear next-step pointer.
+  - **Superseded 2026-05-04**: the stub was replaced with a real
+    convention-based implementation (`create_mirror_via_convention` —
+    duplicate + `mirror_of:`/`canonical_of:` notes, still not a native
+    live-synced mirror). See `specs/specification.md` "create_mirror
+    (convention-based, not native)" and contracts C-wf-001/013/015-017.
   - `path_of` walks parent_id chain via repeated get_node; bounded by
     max_depth (default 50) to defend against malformed cycles.
     Returns ordered segments root→leaf and a printable `A > B > C`

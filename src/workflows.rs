@@ -2421,6 +2421,228 @@ mod tests {
         );
     }
 
+    /// [C-wf-015] The core "create a node, then mirror it elsewhere"
+    /// workflow, exercised end-to-end against a mock API. Prior coverage
+    /// of `create_mirror_via_convention` stopped at the self-mirror
+    /// validation guard; nothing proved the happy path actually reads
+    /// the canonical, writes the mirror with a `mirror_of:` note, and
+    /// annotates the canonical with `canonical_of:` when a pillar is
+    /// given and none exists yet. Pins the exact wire shape of all three
+    /// calls (GET canonical, POST mirror, POST canonical annotation).
+    #[tokio::test]
+    async fn create_mirror_via_convention_creates_mirror_and_annotates_canonical() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let canonical_id = "550e8400-e29b-41d4-a716-446655440001";
+        let target_parent_id = "660e8400-e29b-41d4-a716-446655440002";
+        let mirror_id = "770e8400-e29b-41d4-a716-446655440003";
+
+        // 1. Read the canonical so the mirror's name is a verbatim copy.
+        Mock::given(method("GET"))
+            .and(path(format!("/nodes/{canonical_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node": {"id": canonical_id, "name": "Q3 Roadmap"}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // 2. Create the mirror under target_parent carrying the mirror_of: note.
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(serde_json::json!({
+                "name": "Q3 Roadmap",
+                "note": format!("mirror_of: {canonical_id}"),
+                "parent_id": target_parent_id,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"item_id": mirror_id})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // 3. Annotate the canonical: it carries no marker and a pillar was given.
+        Mock::given(method("POST"))
+            .and(path(format!("/nodes/{canonical_id}")))
+            .and(body_partial_json(serde_json::json!({"note": "canonical_of: lead"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client = WorkflowyClient::new_with_configs(
+            mock.uri(),
+            "test-key".to_string(),
+            crate::config::RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 10,
+                max_delay_ms: 20,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            },
+            crate::config::RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            },
+        )
+        .expect("client builds against mock");
+
+        let ctx = WorkflowContext::default();
+        let (result, footprint) = create_mirror_via_convention(
+            &client,
+            canonical_id,
+            Some(target_parent_id),
+            None,
+            Some("lead"),
+            &ctx,
+        )
+        .await
+        .expect("mirror creation must succeed against the mock");
+
+        assert_eq!(result.mirror_id, mirror_id);
+        assert_eq!(result.canonical_id, canonical_id);
+        assert_eq!(result.target_parent_id.as_deref(), Some(target_parent_id));
+        assert_eq!(result.name, "Q3 Roadmap");
+        assert_eq!(result.audit_status, "OK");
+        assert!(
+            result.annotated_canonical,
+            "canonical must be annotated when unmarked and a pillar is given"
+        );
+        assert!(
+            footprint.invalidated_nodes.iter().any(|id| id == canonical_id),
+            "the canonical must be declared for cache invalidation: {:?}",
+            footprint.invalidated_nodes
+        );
+    }
+
+    /// [C-wf-016] An already-marked canonical is never re-annotated, even
+    /// when the caller supplies a (different) pillar — "existing markers
+    /// are never overwritten" is documented behaviour on
+    /// `create_mirror_via_convention` but was untested. No edit-endpoint
+    /// mock is mounted with `.expect(0)`: if the workflow regressed and
+    /// tried to write a second `canonical_of:` marker anyway, wiremock's
+    /// verification-on-drop fails the test.
+    #[tokio::test]
+    async fn create_mirror_via_convention_does_not_reannotate_marked_canonical() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let canonical_id = "550e8400-e29b-41d4-a716-446655440011";
+        let mirror_id = "770e8400-e29b-41d4-a716-446655440013";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/nodes/{canonical_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node": {"id": canonical_id, "name": "Distillation Practice", "note": "canonical_of: transform"}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(serde_json::json!({"name": "Distillation Practice"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"item_id": mirror_id})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // No mock mounted for POST /nodes/{canonical_id} — a re-annotation
+        // attempt would go unmatched and fail the test via wiremock's
+        // built-in unexpected-request panic.
+
+        let client = WorkflowyClient::new_with_configs(
+            mock.uri(),
+            "test-key".to_string(),
+            crate::config::RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 10,
+                max_delay_ms: 20,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            },
+            crate::config::RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            },
+        )
+        .expect("client builds against mock");
+
+        let ctx = WorkflowContext::default();
+        let (result, _footprint) =
+            create_mirror_via_convention(&client, canonical_id, None, None, Some("lead"), &ctx)
+                .await
+                .expect("mirror creation must succeed against the mock");
+
+        assert_eq!(result.audit_status, "OK", "already-marked canonical stays OK");
+        assert!(
+            !result.annotated_canonical,
+            "an existing canonical_of: marker must never be overwritten"
+        );
+    }
+
+    /// [C-wf-017] With no pillar supplied and no existing marker, the
+    /// mirror is still created but `audit_status` reports
+    /// `ORPHAN_canonical_lacks_marker` — the caller gets an honest signal
+    /// that `audit_mirrors` will flag this pair later rather than the
+    /// annotation silently being skipped.
+    #[tokio::test]
+    async fn create_mirror_via_convention_without_pillar_reports_orphan() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let canonical_id = "550e8400-e29b-41d4-a716-446655440021";
+        let mirror_id = "770e8400-e29b-41d4-a716-446655440023";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/nodes/{canonical_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node": {"id": canonical_id, "name": "Reading Queue"}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"item_id": mirror_id})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client = WorkflowyClient::new_with_configs(
+            mock.uri(),
+            "test-key".to_string(),
+            crate::config::RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 10,
+                max_delay_ms: 20,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            },
+            crate::config::RateLimitConfig {
+                requests_per_second: 200,
+                burst_size: 100,
+            },
+        )
+        .expect("client builds against mock");
+
+        let ctx = WorkflowContext::default();
+        let (result, _footprint) =
+            create_mirror_via_convention(&client, canonical_id, None, None, None, &ctx)
+                .await
+                .expect("mirror creation must succeed against the mock");
+
+        assert_eq!(result.audit_status, "ORPHAN_canonical_lacks_marker");
+        assert!(!result.annotated_canonical);
+    }
+
     /// [C-wf-014] `scope_resolved_label` produces the stable two-form
     /// label every MCP tool emits: `workspace_root` for None,
     /// `scoped:<uuid>` for Some. Pinned because a future contributor

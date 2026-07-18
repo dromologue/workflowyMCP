@@ -5146,7 +5146,10 @@ Content creation & editing:
 - create_from_template: Copy template with {{variable}} substitution
 - convert_markdown: Convert markdown to Workflowy format
 - export_subtree: Export as OPML | Markdown | JSON
-- create_mirror: STUB — Workflowy's REST API does not expose mirror creation; returns an explanatory error
+- create_mirror: Create a convention-based mirror (duplicate node + `mirror_of:` note; does not live-sync — Workflowy's REST API exposes no native mirror primitive). Supports `dry_run=true` for a no-write preview.
+
+Mirror discipline:
+- audit_mirrors: Walk a subtree and report BROKEN / DRIFTED / ORPHAN / LONELY mirror_of:/canonical_of: findings
 
 Todos & scheduling:
 - daily_review: Overdue + upcoming + recent + pending in one call
