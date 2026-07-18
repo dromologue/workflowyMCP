@@ -41,7 +41,7 @@
 |-----------|--------|-----------|
 | Language | Rust (2021 edition) | Memory safety, performance, no runtime |
 | Async Runtime | Tokio | Industry standard for async Rust |
-| MCP SDK | rmcp 0.16 | Rust MCP framework with proc macros |
+| MCP SDK | rmcp 2.2 | Rust MCP framework with proc macros |
 | HTTP Client | reqwest 0.12 | Async HTTP with JSON support |
 | Serialization | serde + serde_json | Type-safe (de)serialization |
 | Schema | schemars 1.0 | JSON Schema generation for tool params |

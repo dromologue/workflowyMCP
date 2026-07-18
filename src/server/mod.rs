@@ -1842,7 +1842,7 @@ impl WorkflowyMcpServer {
                     items.join("\n"),
                 )
             };
-            return Ok(CallToolResult::success(vec![Content::text(format!("{}{}", prefix, body))]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}{}", prefix, body))]));
         }
 
         // Refuse unscoped walks by default, mirroring find_node. Brief
@@ -1910,7 +1910,7 @@ impl WorkflowyMcpServer {
 
                 let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 let result_text = format!("scope_resolved: {}\n\n{}{}", scope_resolved, banner, body);
-                Ok(CallToolResult::success(vec![Content::text(result_text)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
             }
             Err(e) => {
                 error!(error = %e, "Failed to search nodes");
@@ -1983,7 +1983,7 @@ impl WorkflowyMcpServer {
         let json = serde_json::to_string_pretty(&payload).map_err(|e| {
             tool_error("get_node", Some(&resolved), format!("Serialization error: {}", e))
         })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
         })
     }
 
@@ -2027,7 +2027,7 @@ impl WorkflowyMcpServer {
                      before assuming a single write.)",
                     key, age_s, hit.name, hit.item_id, placement
                 );
-                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
             }
         }
 
@@ -2089,7 +2089,7 @@ impl WorkflowyMcpServer {
                         crate::utils::idempotency::now_unix_ms(),
                     );
                 }
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
             }
             Err(e) => Err(tool_error("create_node", resolved_parent.as_deref(), e)),
         }
@@ -2125,7 +2125,7 @@ impl WorkflowyMcpServer {
             .await
         {
             Ok(_) => {
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "scope_resolved: {}\n\nUpdated node `{}`",
                     scope_resolved_label(Some(&resolved)),
                     resolved
@@ -2176,7 +2176,7 @@ impl WorkflowyMcpServer {
 
         match self.client.delete_node_with_propagation_retry(&resolved).await {
             Ok(_) => {
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "scope_resolved: {}\n\nDeleted node `{}`",
                     scope_resolved_label(Some(&resolved)),
                     resolved
@@ -2207,7 +2207,7 @@ impl WorkflowyMcpServer {
         {
             Ok(_) => {
                 let verb = if target_state { "Completed" } else { "Uncompleted" };
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "scope_resolved: {}\n\n{} node `{}`",
                     scope_resolved_label(Some(&resolved)),
                     verb, resolved
@@ -2257,7 +2257,7 @@ impl WorkflowyMcpServer {
             Ok(_) => {
                 // Both `node_id` and `new_parent_id` are host-coercion-
                 // vulnerable, so name both resolved scopes for audit.
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "scope_resolved: node={}; new_parent={}\n\nMoved node `{}` under `{}`",
                     scope_resolved_label(Some(&resolved_node)),
                     scope_resolved_label(Some(&resolved_parent)),
@@ -2304,7 +2304,7 @@ impl WorkflowyMcpServer {
         match fetch_result {
             Ok(children) => {
                 if children.is_empty() {
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}`{}` has no children",
                         prefix, scope_label
                     ))]))
@@ -2313,7 +2313,7 @@ impl WorkflowyMcpServer {
                         .iter()
                         .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
                         .collect();
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}{} children of `{}`:\n\n{}",
                         prefix,
                         children.len(),
@@ -2351,7 +2351,7 @@ impl WorkflowyMcpServer {
 
                 results.truncate(max_results);
                 if results.is_empty() {
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}No nodes found with tag '{}'",
                         banner, params.tag
                     ))]))
@@ -2360,7 +2360,7 @@ impl WorkflowyMcpServer {
                         .iter()
                         .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
                         .collect();
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}Found {} node(s) with tag '{}':\n\n{}",
                         banner,
                         results.len(),
@@ -2407,7 +2407,7 @@ impl WorkflowyMcpServer {
 
         let parsed = crate::workflows::parse_indented_content(&params.content);
         if parsed.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No content to insert (all lines empty)".to_string(),
             )]));
         }
@@ -2452,7 +2452,7 @@ impl WorkflowyMcpServer {
                     "scope_resolved: {}\n\nInserted {} node(s) under `{}`",
                     scope_resolved, created_count, parent_label
                 );
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
             }
             crate::workflows::InsertContentOutcome::Partial {
                 parent_id,
@@ -2501,9 +2501,9 @@ impl WorkflowyMcpServer {
                     obj.insert("retry_after_secs".into(), json!(c.retry_after_secs));
                     obj.insert("hint".into(), json!(c.hint));
                     obj.insert("error".into(), json!(err_str));
-                    return Ok(CallToolResult::error(vec![Content::text(payload.to_string())]));
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(payload.to_string())]));
                 }
-                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
             }
         }
         })
@@ -2522,7 +2522,7 @@ impl WorkflowyMcpServer {
         match self.walk_subtree(Some(&resolved), max_depth).await {
             Ok(fetch) => {
                 if fetch.nodes.is_empty() {
-                    return Ok(CallToolResult::success(vec![Content::text(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
                         format!("Node `{}` not found or has no descendants", params.node_id)
                     )]));
                 }
@@ -2532,7 +2532,7 @@ impl WorkflowyMcpServer {
                 let json = serde_json::to_string_pretty(&fetch.nodes).map_err(|e| {
                     tool_error("get_subtree", Some(&resolved), format!("Serialization error: {}", e))
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "{}Subtree for '{}' ({} nodes):\n\n{}",
                     banner, root_name, total, json
                 ))]))
@@ -2624,7 +2624,7 @@ impl WorkflowyMcpServer {
                     if truncated {
                         result["hint"] = json!("Results are partial — narrow parent_id or max_depth, or retry with use_index after build_name_index populates.");
                     }
-                    Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
                 } else if matches.len() == 1 || params.selection.is_some() {
                     let idx = params.selection.unwrap_or(1);
                     if idx < 1 || idx > matches.len() {
@@ -2647,7 +2647,7 @@ impl WorkflowyMcpServer {
                         "message": format!("Found '{}'", node.name)
                     });
                     let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
-                    Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
                 } else {
                     let options: Vec<serde_json::Value> = matches.iter().enumerate().map(|(i, n)| {
                         let path = build_node_path_with_map(&n.id, &node_map);
@@ -2672,7 +2672,7 @@ impl WorkflowyMcpServer {
                         "message": format!("Found {} matches for '{}'. Use selection parameter to choose.", matches.len(), params.name)
                     });
                     let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
-                    Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
                 }
             }
             Err(e) => Err(tool_error("find_node", resolved_parent.as_deref(), e)),
@@ -2694,12 +2694,12 @@ impl WorkflowyMcpServer {
                 "index_served": true,
                 "message": format!("No nodes matching '{}' in name index (mode: {}). Retry without use_index for a live walk, or run build_name_index to populate.", params.name, match_mode)
             });
-            return CallToolResult::success(vec![Content::text(result.to_string())]);
+            return CallToolResult::success(vec![ContentBlock::text(result.to_string())]);
         }
         if hits.len() == 1 || params.selection.is_some() {
             let idx = params.selection.unwrap_or(1);
             if idx < 1 || idx > hits.len() {
-                return CallToolResult::success(vec![Content::text(
+                return CallToolResult::success(vec![ContentBlock::text(
                     json!({
                         "error": format!("Selection {} out of range (1-{})", idx, hits.len())
                     })
@@ -2716,7 +2716,7 @@ impl WorkflowyMcpServer {
                 "parent_id": hit.parent_id,
                 "message": format!("Found '{}' via name index", hit.name)
             });
-            return CallToolResult::success(vec![Content::text(result.to_string())]);
+            return CallToolResult::success(vec![ContentBlock::text(result.to_string())]);
         }
         let options: Vec<serde_json::Value> = hits
             .iter()
@@ -2739,7 +2739,7 @@ impl WorkflowyMcpServer {
             "options": options,
             "message": format!("Found {} matches for '{}' via name index. Use selection to choose.", hits.len(), params.name)
         });
-        CallToolResult::success(vec![Content::text(result.to_string())])
+        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
     }
 
     #[tool(description = "Search for a target node and insert content under it. Combines search and insert into one tool. If multiple matches, returns options for selection.")]
@@ -2789,7 +2789,7 @@ impl WorkflowyMcpServer {
                         "message": format!("Found {} matches. Use selection parameter to choose.", matches.len())
                     });
                     let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
-                    return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]));
                 }
 
                 let idx = params.selection.unwrap_or(1);
@@ -2839,7 +2839,7 @@ impl WorkflowyMcpServer {
                     "message": format!("Inserted {} node(s) under '{}'", created_count, target_name)
                 });
                 let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("smart_insert", None, e)),
         }
@@ -2889,7 +2889,7 @@ impl WorkflowyMcpServer {
                 if let Some(obj) = result.as_object_mut() {
                     obj.extend(truncation_envelope(truncated, limit, truncation_reason));
                 }
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("daily_review", resolved_root.as_deref(), e)),
         }
@@ -2933,7 +2933,7 @@ impl WorkflowyMcpServer {
                     "changes": items
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("get_recent_changes", resolved_root.as_deref(), e)),
         }
@@ -2969,7 +2969,7 @@ impl WorkflowyMcpServer {
                     "overdue": items
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_overdue", resolved_root.as_deref(), e)),
         }
@@ -3039,7 +3039,7 @@ impl WorkflowyMcpServer {
                     "upcoming": items
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_upcoming", resolved_root.as_deref(), e)),
         }
@@ -3079,7 +3079,7 @@ impl WorkflowyMcpServer {
                 if let Some(obj) = result.as_object_mut() {
                     obj.extend(truncation_envelope(truncated, node_limit, truncation_reason));
                 }
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("get_project_summary", Some(&resolved), e)),
         }
@@ -3152,7 +3152,7 @@ impl WorkflowyMcpServer {
                     "backlinks": backlinks
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("find_backlinks", Some(&resolved), e)),
         }
@@ -3193,7 +3193,7 @@ impl WorkflowyMcpServer {
                     "todos": todos,
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("list_todos", resolved_parent.as_deref(), e)),
         }
@@ -3237,7 +3237,7 @@ impl WorkflowyMcpServer {
             "new_root_id": outcome.new_root_id,
             "nodes_created": outcome.nodes_created,
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3277,7 +3277,7 @@ impl WorkflowyMcpServer {
             "nodes_created": outcome.nodes_created,
             "variables_applied": outcome.variables_applied,
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3374,7 +3374,7 @@ impl WorkflowyMcpServer {
                         "nodes_matched": items
                     });
                     let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                    return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]));
                 }
 
                 // Execute via the shared workflow. The apply step is
@@ -3415,7 +3415,7 @@ impl WorkflowyMcpServer {
                     "nodes_affected": affected_nodes
                 });
                 let result = with_truncation_envelope(payload, truncated, node_limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("bulk_update", resolved_root.as_deref(), e)),
         }
@@ -3561,7 +3561,7 @@ impl WorkflowyMcpServer {
 
         if analyze_only {
             let result = json!({ "analyze_only": true, "node_count": node_count, "stats": stats });
-            return Ok(CallToolResult::success(vec![Content::text(result.to_string())]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]));
         }
 
         let result = json!({
@@ -3571,7 +3571,7 @@ impl WorkflowyMcpServer {
             "stats": stats,
             "usage_hint": "Pass the 'content' field to insert_content to add to Workflowy"
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3625,7 +3625,7 @@ impl WorkflowyMcpServer {
             "cancel_generation": self.cancel_registry.generation(),
             "error": outcome.error,
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3770,7 +3770,7 @@ impl WorkflowyMcpServer {
             "cancel_generation": self.cancel_registry.generation(),
             "error": error,
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3786,7 +3786,7 @@ impl WorkflowyMcpServer {
             "generation": new_gen,
             "message": "In-flight walks have been signalled to return partial results; new calls start fresh."
         });
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -3820,7 +3820,7 @@ impl WorkflowyMcpServer {
                     "elapsed_ms": elapsed_ms,
                 });
                 let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
-                Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
             }
             Err(e) => Err(tool_error("build_name_index", resolved_root.as_deref(), e)),
         }
@@ -3940,7 +3940,7 @@ impl WorkflowyMcpServer {
             "failed": failed,
             "results": entries,
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4083,7 +4083,7 @@ impl WorkflowyMcpServer {
                 "failed": failed,
                 "results": entries,
             });
-            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4150,7 +4150,7 @@ impl WorkflowyMcpServer {
                     format!("failed to serialise outcome: {e}"),
                 )
             })?;
-            let content = vec![Content::text(payload.to_string())];
+            let content = vec![ContentBlock::text(payload.to_string())];
             // A rolled-back transaction completed its rollback path but
             // durably committed nothing. Flag is_error:true so (a) MCP
             // clients see the operation as unsuccessful while still
@@ -4213,7 +4213,7 @@ impl WorkflowyMcpServer {
                 "depth": chain.segments.len(),
                 "truncated": chain.truncated,
             });
-            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4311,7 +4311,7 @@ impl WorkflowyMcpServer {
             "failed": failed,
             "results": entries,
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4389,7 +4389,7 @@ impl WorkflowyMcpServer {
                     "results": results,
                 }),
             };
-            Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4412,7 +4412,7 @@ impl WorkflowyMcpServer {
             "threshold_unix_ms": params.timestamp_unix_ms,
             "changed_since": changed,
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4462,7 +4462,7 @@ impl WorkflowyMcpServer {
                     "hits": hits,
                 });
                 let result_text = format!("{}{}", banner, body);
-                Ok(CallToolResult::success(vec![Content::text(result_text)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
             }
             Err(e) => Err(tool_error("find_by_tag_and_path", scope.as_deref(), e)),
         }
@@ -4556,7 +4556,7 @@ impl WorkflowyMcpServer {
         }
         payload.insert("findings".into(), serde_json::to_value(&findings).unwrap());
         let json_str = serde_json::Value::Object(payload).to_string();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
         })
     }
 
@@ -4650,7 +4650,7 @@ impl WorkflowyMcpServer {
                     "days_stale": days_stale,
                     "buckets": report,
                 });
-                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
             }
             Err(e) => Err(tool_error("review", Some(&root), e)),
         }
@@ -4750,7 +4750,7 @@ impl WorkflowyMcpServer {
             "api_calls": params.path.len(),
             "nodes_indexed": visited_nodes.len(),
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -4788,7 +4788,7 @@ impl WorkflowyMcpServer {
                         &node,
                         "full_uuid_passthrough",
                     );
-                    Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
                 }
                 Err(e) => Err(tool_error("resolve_link", Some(&canonical), e)),
             };
@@ -4899,7 +4899,7 @@ impl WorkflowyMcpServer {
             resolved_via,
             Some(self.name_index.size()),
         );
-        Ok(CallToolResult::success(vec![Content::text(result.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
         })
     }
 
@@ -4921,7 +4921,7 @@ impl WorkflowyMcpServer {
                     &node,
                     resolved_via,
                 );
-                Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
             }
             Err(e) => Err(tool_error("resolve_link", Some(full_uuid), e)),
         }
@@ -4969,7 +4969,7 @@ impl WorkflowyMcpServer {
                     "opml" => render_subtree_opml(&fetch.nodes, &resolved),
                     _ => unreachable!("format validated above"),
                 };
-                Ok(CallToolResult::success(vec![Content::text(format!("{}{}", banner, body))]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}{}", banner, body))]))
             }
             Err(e) => Err(tool_error("export_subtree", Some(&resolved), e)),
         }
@@ -5031,7 +5031,7 @@ impl WorkflowyMcpServer {
                     preview.would_annotate_canonical,
                 ),
             });
-            return Ok(CallToolResult::success(vec![Content::text(payload.to_string())]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]));
         }
 
         // The workflow declares its mutation footprint; the wrapper
@@ -5071,7 +5071,7 @@ impl WorkflowyMcpServer {
                 result.audit_status,
             ),
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
     }
 
@@ -5094,7 +5094,7 @@ impl WorkflowyMcpServer {
             "returned": entries.len(),
             "entries": entries,
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
     }
 }
 

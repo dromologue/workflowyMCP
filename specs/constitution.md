@@ -45,7 +45,7 @@ Rust's type system is the first line of defence — used to its full potential a
 
 - `NodeId` newtype rejects malformed IDs (including the literal strings `"null"` / `"undefined"` / whitespace-only) at the parameter boundary, not deep in the API layer.
 - `WorkflowyError` distinguishes `InvalidInput` (caller's fault) from operational variants so wrappers translate each to the correct envelope without inspecting strings.
-- `Parameters<T>` wrapper enforces schema generation at compile time; the literal identifier name is load-bearing for `rmcp-macros 0.16` and pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
+- `Parameters<T>` wrapper enforces schema generation at compile time; the literal identifier name is load-bearing for `rmcp-macros 2.2` and pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
 - `#[serde(deny_unknown_fields)]` on every parameter struct so a typo'd field name fails fast with a recorded error rather than silently defaulting.
 - No `.unwrap()` / `.expect()` outside test code or genuinely-unreachable post-conditions; no dropped `Result` values.
 

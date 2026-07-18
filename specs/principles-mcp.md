@@ -62,7 +62,7 @@ Use elicitation to fill missing parameters or confirm risky actions. Gate with c
 - Never use elicitation to harvest sensitive data
 - Fall back gracefully if host doesn't support elicitation
 
-**Status**: ⚠️ Partial. Elicitation primitive not yet implemented (rmcp 0.16 doesn't expose it). `dry_run` adopted on the highest-impact mutation tools:
+**Status**: ⚠️ Partial. Elicitation primitive not yet implemented (rmcp 2.2 doesn't expose it). `dry_run` adopted on the highest-impact mutation tools:
 - `create_mirror` honours `dry_run=true` via the shared `create_mirror_dry_run` workflow — returns the would-be canonical / target / pillar resolution without writing.
 - `bulk_update` honours `dry_run=true` — returns the matched node set without applying the operation.
 

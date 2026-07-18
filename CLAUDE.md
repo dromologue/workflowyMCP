@@ -85,11 +85,11 @@ Never ask the user to "remember to re-bundle" — the hook removes that obligati
 
 ## Architecture
 
-Rust MCP server for Workflowy content management. Uses `rmcp` 0.16 over stdio transport for Claude Desktop integration.
+Rust MCP server for Workflowy content management. Uses `rmcp` 2.2 over stdio transport for Claude Desktop integration.
 
 ### Module Structure
 
-- **`src/server/`** — MCP tool_router split across `mod.rs` (server struct, helpers, tool_handler!, all 40+ #[tool] handlers, tests) and `params.rs` (parameter struct definitions, ~40 of them). The 2026-05-03 architecture-review file split moved the param struct slab out of mod.rs to make the handler-side navigable. `#[tool]` proc macros register tools; serde + schemars validate inputs via `Parameters<T>` wrapper. Uses `NodeId` newtype for all node ID parameters. Every parameter struct carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded error instead of silently defaulting to `None`. **The wrapper struct must keep its name `Parameters`**: `rmcp-macros 0.16` discovers a tool's parameter type by matching the literal identifier `Parameters` on the last path segment of the function-arg type (`rmcp-macros/src/common.rs:64`). A wrapper named anything else makes the macro fall back to a hardcoded `{"type": "object", "properties": {}}` schema for every parameter-bearing tool — silently strips arguments at the wire. Pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
+- **`src/server/`** — MCP tool_router split across `mod.rs` (server struct, helpers, tool_handler!, all 40+ #[tool] handlers, tests) and `params.rs` (parameter struct definitions, ~40 of them). The 2026-05-03 architecture-review file split moved the param struct slab out of mod.rs to make the handler-side navigable. `#[tool]` proc macros register tools; serde + schemars validate inputs via `Parameters<T>` wrapper. Uses `NodeId` newtype for all node ID parameters. Every parameter struct carries `#[serde(deny_unknown_fields)]` so a typo'd field name fails fast with a recorded error instead of silently defaulting to `None`. **The wrapper struct must keep its name `Parameters`**: `rmcp-macros 2.2` discovers a tool's parameter type by matching the literal identifier `Parameters` on the last path segment of the function-arg type (`rmcp-macros/src/common.rs:64`). A wrapper named anything else makes the macro fall back to a hardcoded `{"type": "object", "properties": {}}` schema for every parameter-bearing tool — silently strips arguments at the wire. Pinned by `parameter_bearing_tools_publish_non_empty_input_schema_properties`.
 
   **Helper inventory** (all in `server/mod.rs`):
   - `tool_handler!(self, name, kind, params, body)` — the standard wrapper for every non-diagnostic handler. Combines op-log recording + cancel-registry observation + kind-keyed wall-clock budget.
@@ -329,7 +329,7 @@ User-specific data (cached node IDs, drafts, session logs, briefs) lives in what
 
 | Crate | Purpose |
 |-------|---------|
-| rmcp 0.16 | MCP server framework (proc macros, stdio transport) |
+| rmcp 2.2 | MCP server framework (proc macros, stdio transport) |
 | tokio | Async runtime |
 | reqwest | HTTP client |
 | serde + serde_json | Serialization |

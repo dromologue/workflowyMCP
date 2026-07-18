@@ -49,7 +49,7 @@ clap = { version = "4.6", features = ["derive"] }
 futures = "0.3"
 lazy_static = "1.5"
 rand = "0.10"
-rmcp = { version = "1.7", features = [
+rmcp = { version = "2.2", features = [
     "server",
     "transport-io",
 ] }
