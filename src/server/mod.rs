@@ -1324,7 +1324,7 @@ impl WorkflowyMcpServer {
         let index_size = self.name_index.size();
         let body = if summary.truncated {
             format!(
-                "Short-hash '{}' was not found in the {} nodes the walk reached in {} ms before truncating ({}).{} The walk did NOT cover the full workspace, so the hash may exist in an unwalked region. The persistent index now contains {} entries; coverage extends with each walk and via the 30-min background refresher. Recovery: (a) call build_name_index repeatedly with parent_id scoped to a likely region (e.g. Projects, Areas); (b) pass the full UUID directly; (c) call find_node(name=..., use_index=true) — the index already covers the names you've walked through this session.",
+                "Short-hash '{}' was not found in the {} nodes the walk reached in {} ms before truncating ({}).{} The walk did NOT cover the full workspace, so the hash may exist in an unwalked region. The persistent index now contains {} entries; coverage extends with each walk and via the scheduled `wflow-do reindex --patient` job. Recovery: (a) call build_name_index repeatedly with parent_id scoped to a likely region (e.g. Projects, Areas); (b) pass the full UUID directly; (c) call find_node(name=..., use_index=true) — the index already covers the names you've walked through this session.",
                 raw, summary.nodes_walked, summary.elapsed_ms, reason_str, scale_hint, index_size,
             )
         } else {
