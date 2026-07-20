@@ -149,6 +149,23 @@ enum Cmd {
         node_id: String,
         #[arg(long, default_value_t = 5)]
         depth: usize,
+        /// Wall-clock budget in seconds. Defaults to the interactive
+        /// subtree timeout. Set to 0 for no time budget: the walk then
+        /// runs until the node-count cap or until the subtree is
+        /// exhausted, so it returns the COMPLETE subtree rather than a
+        /// depth-3-in-20-seconds partial. Pair with `--patient` for a
+        /// walk that also survives rate-limit windows. Used by
+        /// dromologue-site's canonical drift check, which needs the true
+        /// subtree max, not a partial one.
+        #[arg(long, default_value_t = defaults::SUBTREE_FETCH_TIMEOUT_MS / 1000)]
+        timeout_secs: u64,
+        /// Trade time for coverage: wait out rate-limit windows and keep
+        /// re-attempting dropped branches until they stop recovering,
+        /// rather than dropping them on the first 429. Pair with
+        /// `--timeout-secs 0` — a deadline that cannot cover a rate-limit
+        /// wait makes the walk skip the wait and drop branches anyway.
+        #[arg(long)]
+        patient: bool,
     },
     /// Find every node containing a Workflowy link to the given node.
     /// Mirrors MCP `find_backlinks`.
@@ -941,10 +958,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
-        Cmd::Subtree { node_id, depth } => {
-            let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
-                defaults::SUBTREE_FETCH_TIMEOUT_MS,
-            ));
+        Cmd::Subtree { node_id, depth, timeout_secs, patient } => {
+            // A 0 budget means "no deadline" — the walk is bound only by the
+            // node cap, so it returns the complete subtree rather than a
+            // partial. `--patient` additionally waits out rate-limit windows.
+            let controls = if *timeout_secs == 0 {
+                FetchControls::default()
+            } else {
+                FetchControls::with_timeout(std::time::Duration::from_secs(*timeout_secs))
+            };
+            let controls = if *patient { controls.patient() } else { controls };
             let fetch = client
                 .get_subtree_with_controls(Some(node_id), *depth, defaults::MAX_SUBTREE_NODES, controls)
                 .await?;
@@ -954,6 +977,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 "count": fetch.nodes.len(),
                 "truncated": fetch.truncated,
                 "truncation_reason": fetch.truncation_reason.map(|r| r.as_str()),
+                "skipped_branches": fetch.skipped_branches,
                 "nodes": fetch.nodes,
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
