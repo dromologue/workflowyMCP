@@ -11442,6 +11442,24 @@ mod load_tests {
         );
     }
 
+    /// A multi-hour reindex must not hold all its work for one final
+    /// save (2026-07-21 incident: a patient run dying on a late root
+    /// would have lost everything). The per-root checkpoint composes via
+    /// merge-on-save, so an interrupted run keeps every completed root.
+    #[test]
+    fn reindex_checkpoints_after_every_root() {
+        let src = include_str!("../bin/wflow_do.rs");
+        let loop_body = src
+            .split("for target in walk_targets")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("reindex walk loop present");
+        assert!(
+            loop_body.contains("save_to_disk"),
+            "cmd_reindex must checkpoint the index after each root walk",
+        );
+    }
+
     /// Every observed 429 must drain the local token bucket. Burst
     /// headroom held through a rate-limit window fires up to burst_size
     /// requests back-to-back the moment the window clears, re-tripping

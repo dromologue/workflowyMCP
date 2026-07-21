@@ -30,5 +30,10 @@
   // language tag.
   "MD040": false,
   // Table pipes are not column-aligned; content width varies too much.
-  "MD060": false
+  "MD060": false,
+  // Angle-bracket placeholders in prose (<field>, <reason>) are wire-shape
+  // documentation, not HTML.
+  "MD033": false,
+  // Both _underscore_ and *asterisk* emphasis appear in long-lived docs.
+  "MD049": false
 }

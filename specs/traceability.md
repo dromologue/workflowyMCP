@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 57 contracts, 54 unique pinning tests.
+**Coverage:** 58 contracts, 57 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -60,6 +60,7 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-server-019` | The rate limiter is AIMD | `drain_halves_rate_and_reward_recovers_to_ceiling` | `src/utils/rate_limiter.rs` |
 | `C-server-020` | The persisted index records `last_modified` (schema v3) and serves local incremental queries | `last_modified_roundtrips_and_changed_since_filters` | `src/utils/name_index.rs` |
 | `C-server-021` | `insert_content` creates lines strictly sequentially | `insert_content_remains_sequential_by_design` | `src/server/mod.rs` |
+| `C-server-022` | Index schema changes migrate forward and never downgrade (2026-07-21 incident) | `older_schema_snapshot_migrates_forward_instead_of_discarding`<br>`reindex_checkpoints_after_every_root`<br>`save_refuses_to_downgrade_a_newer_schema_file` | `src/utils/name_index.rs`<br>`src/server/mod.rs`<br>`src/utils/name_index.rs` |
 
 ## Workflow orchestration (`C-wf-*`)
 

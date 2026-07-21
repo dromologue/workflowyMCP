@@ -2557,6 +2557,23 @@ async fn cmd_reindex(
                     start.elapsed().as_millis(),
                     trunc
                 );
+                // Checkpoint after EVERY root, not once at the end
+                // (2026-07-21): a multi-hour patient run that dies on root
+                // 9 of 13 must keep roots 1-8. save_to_disk merges under
+                // the cross-process lock, so incremental saves compose
+                // exactly like the final one; a failed checkpoint is
+                // reported but does not abort the walk (the final save
+                // retries it with everything accumulated).
+                if index.save_path().is_some() {
+                    match index.save_to_disk() {
+                        Ok(()) => println!(
+                            "reindex: checkpointed {} entries after {}",
+                            index.size(),
+                            label
+                        ),
+                        Err(e) => eprintln!("reindex: checkpoint after {} failed: {}", label, e),
+                    }
+                }
                 if !fetch.skipped_branches.is_empty() {
                     skipped_total.extend(fetch.skipped_branches.iter().cloned());
                     eprintln!(

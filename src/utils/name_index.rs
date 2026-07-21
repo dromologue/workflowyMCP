@@ -608,14 +608,32 @@ impl NameIndex {
         let text = std::fs::read_to_string(&path)?;
         let snap: PersistedSnapshot = serde_json::from_str(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if snap.version != PERSIST_SCHEMA_VERSION {
+        // OLDER schemas migrate forward, they are not discarded
+        // (2026-07-21). Every bump so far has been additive
+        // (v1→v2 description, v2→v3 last_modified), and the persisted
+        // fields carry `#[serde(default)]`, so an old snapshot parses
+        // with the new fields absent — throwing away hours of walk
+        // coverage over a field addition was the defect, not the schema
+        // change. Only a snapshot from the FUTURE (version > ours) is
+        // refused: we cannot know what its fields mean, and a save over
+        // it would destroy a newer writer's work (see save_to_disk's
+        // downgrade refusal).
+        if snap.version > PERSIST_SCHEMA_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "name index schema version {} is not supported (expected {})",
+                    "name index schema version {} is newer than this binary supports ({}) — \
+                     refusing to load; upgrade the binary or move the file aside",
                     snap.version, PERSIST_SCHEMA_VERSION
                 ),
             ));
+        }
+        if snap.version < PERSIST_SCHEMA_VERSION {
+            tracing::info!(
+                from = snap.version,
+                to = PERSIST_SCHEMA_VERSION,
+                "migrating older name-index snapshot forward (absent fields default to None)"
+            );
         }
         let count = snap.nodes.len();
         // Reuse the public ingest path so all derived maps stay
@@ -755,13 +773,29 @@ impl NameIndex {
                 return Ok(());
             }
         };
-        if snap.version != PERSIST_SCHEMA_VERSION {
-            tracing::warn!(
-                found = snap.version,
-                expected = PERSIST_SCHEMA_VERSION,
-                "name index on disk has an unsupported schema version; overwriting it"
+        // A NEWER on-disk schema must never be merged-then-overwritten by
+        // this older binary — that is exactly the stale-process clobber
+        // that reverted a freshly-rebuilt v3 file to v2 on 2026-07-21
+        // (long-lived MCP servers keep running old code after a rebuild).
+        // The save path refuses before calling us, but refuse here too so
+        // no future caller can reach the destructive path. An OLDER
+        // schema merges fine: absent fields default to None.
+        if snap.version > PERSIST_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "name index on disk is schema v{} but this binary writes v{} — \
+                     refusing to merge/overwrite a newer writer's file",
+                    snap.version, PERSIST_SCHEMA_VERSION
+                ),
+            ));
+        }
+        if snap.version < PERSIST_SCHEMA_VERSION {
+            tracing::info!(
+                from = snap.version,
+                to = PERSIST_SCHEMA_VERSION,
+                "merging older-schema snapshot forward"
             );
-            return Ok(());
         }
 
         let adopt: Vec<WorkflowyNode> = {
@@ -1755,6 +1789,60 @@ mod tests {
         idx.set_save_path(path);
         let err = idx.load_from_disk().expect_err("bad version must error");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Reliability fixes after the 2026-07-21 rebuild incident: an OLDER
+    /// snapshot migrates forward instead of being discarded (a field
+    /// addition must never cost hours of walk coverage), and an older
+    /// binary must never merge-then-overwrite a NEWER file (the
+    /// stale-process clobber that reverted a fresh v3 rebuild to v2).
+    #[test]
+    fn older_schema_snapshot_migrates_forward_instead_of_discarding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+        // A v2-shaped file: no last_modified fields anywhere.
+        std::fs::write(
+            &path,
+            r#"{"version": 2, "updated_at": 0, "nodes": [
+                {"id": "aaaaaaaa-1111-4111-8111-111111111111", "name": "Kept", "parent_id": null, "description": "still here"}
+            ]}"#,
+        )
+        .expect("write");
+        let idx = NameIndex::new();
+        idx.set_save_path(path.clone());
+        let loaded = idx.load_from_disk().expect("older schema must load");
+        assert_eq!(loaded, 1, "the v2 entry must be adopted, not discarded");
+        let entry = idx
+            .lookup_entry_by_id("aaaaaaaa-1111-4111-8111-111111111111")
+            .expect("migrated entry present");
+        assert_eq!(entry.description.as_deref(), Some("still here"));
+        assert_eq!(entry.last_modified, None, "absent v3 field defaults to None");
+        // The next save writes the CURRENT schema.
+        idx.save_to_disk().expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(v["version"], PERSIST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn save_refuses_to_downgrade_a_newer_schema_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+        let future = r#"{"version": 999, "updated_at": 0, "nodes": []}"#;
+        std::fs::write(&path, future).expect("write");
+        let idx = NameIndex::new();
+        idx.set_save_path(path.clone());
+        idx.ingest(&[node("bbbbbbbb-2222-4222-8222-222222222222", "Mine", None)]);
+        let err = idx
+            .save_to_disk()
+            .expect_err("an older binary must refuse to overwrite a newer file");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            future,
+            "the newer writer's file must be untouched"
+        );
+        assert!(idx.is_dirty(), "refused work stays dirty for a later retry");
     }
 
     #[test]
