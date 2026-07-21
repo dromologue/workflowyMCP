@@ -23,21 +23,35 @@ pub struct RateLimiter {
     tokens: Arc<Mutex<TokenBucket>>,
 }
 
+/// Multiplicative-decrease factor applied to the refill rate on every
+/// observed 429, and the additive per-success recovery step back toward
+/// the configured ceiling. Classic AIMD: back off hard when the upstream
+/// says stop, creep back while it stays quiet. The floor keeps the
+/// limiter serviceable even under a hostile upstream.
+const AIMD_DECREASE_FACTOR: f64 = 0.5;
+const AIMD_RECOVERY_STEP: f64 = 0.1;
+const AIMD_MIN_RATE: f64 = 1.0;
+
 struct TokenBucket {
     tokens: f64,
     capacity: f64,
     refill_rate: f64,
+    /// The configured ceiling `refill_rate` recovers toward. Never
+    /// exceeded — AIMD adapts downward from here, not upward past it.
+    configured_rate: f64,
     last_refill: Instant,
 }
 
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         let capacity = config.burst_size as f64;
+        let rate = config.requests_per_second as f64;
 
         let bucket = TokenBucket {
             tokens: capacity,
             capacity,
-            refill_rate: config.requests_per_second as f64,
+            refill_rate: rate,
+            configured_rate: rate,
             last_refill: Instant::now(),
         };
 
@@ -82,6 +96,39 @@ impl RateLimiter {
     /// Try to acquire a token without blocking; returns true on success.
     pub fn try_acquire(&self) -> bool {
         self.try_consume_or_wait().is_ok()
+    }
+
+    /// Empty the bucket AND multiplicatively cut the refill rate. Called
+    /// when the upstream returns a 429: the accumulated burst headroom is
+    /// exactly what re-trips the upstream the moment its retry window
+    /// clears — up to `burst_size` queued callers fire back-to-back into a
+    /// freshly-reset quota. Draining makes the post-window resume start
+    /// from zero tokens; the rate cut (AIMD decrease, floored at
+    /// [`AIMD_MIN_RATE`]) makes it resume *slower* than the pace that
+    /// tripped the limit, recovering via [`Self::reward`] as successes
+    /// accumulate.
+    pub fn drain(&self) {
+        let mut bucket = self.tokens.lock();
+        bucket.tokens = 0.0;
+        bucket.last_refill = Instant::now();
+        bucket.refill_rate = (bucket.refill_rate * AIMD_DECREASE_FACTOR).max(AIMD_MIN_RATE);
+        debug!(rate = bucket.refill_rate, "Token bucket drained + rate cut after upstream rate-limit signal");
+    }
+
+    /// Additive recovery toward the configured ceiling, called on every
+    /// successful upstream response. A sustained quiet run walks the rate
+    /// back up (0.1 req/s per success); a fresh 429 halves it again.
+    pub fn reward(&self) {
+        let mut bucket = self.tokens.lock();
+        if bucket.refill_rate < bucket.configured_rate {
+            bucket.refill_rate =
+                (bucket.refill_rate + AIMD_RECOVERY_STEP).min(bucket.configured_rate);
+        }
+    }
+
+    /// Current adaptive refill rate (req/s). Diagnostic accessor.
+    pub fn current_rate(&self) -> f64 {
+        self.tokens.lock().refill_rate
     }
 
     /// Single locked critical section: refill, attempt consume, and if we
@@ -206,6 +253,46 @@ mod tests {
         let guard = registry.guard();
 
         assert!(limiter.acquire_cancellable(&guard).await);
+    }
+
+    #[tokio::test]
+    async fn drain_empties_burst_and_resumes_at_sustained_rate() {
+        let config = RateLimitConfig { requests_per_second: 10, burst_size: 5 };
+        let limiter = RateLimiter::new(config);
+        // Full bucket: burst headroom available.
+        assert!(limiter.try_acquire());
+        limiter.drain();
+        // Post-drain, no token is immediately available — the burst that
+        // would re-trip an upstream 429 is gone.
+        assert!(!limiter.try_acquire());
+        // Refill resumes at the (AIMD-halved: 10 → 5/s) sustained rate —
+        // one token within ~200 ms, and no burst.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire(), "only sustained-rate tokens, no burst");
+    }
+
+    /// AIMD contract: each 429 halves the refill rate (floored), and
+    /// successes recover it additively, never past the configured ceiling.
+    #[tokio::test]
+    async fn drain_halves_rate_and_reward_recovers_to_ceiling() {
+        let config = RateLimitConfig { requests_per_second: 8, burst_size: 8 };
+        let limiter = RateLimiter::new(config);
+        assert_eq!(limiter.current_rate(), 8.0);
+        limiter.drain();
+        assert_eq!(limiter.current_rate(), 4.0, "429 must halve the rate");
+        limiter.drain();
+        limiter.drain();
+        limiter.drain();
+        assert_eq!(limiter.current_rate(), 1.0, "rate floors at 1 req/s");
+        for _ in 0..200 {
+            limiter.reward();
+        }
+        assert_eq!(
+            limiter.current_rate(),
+            8.0,
+            "sustained success recovers to the configured ceiling, never past it"
+        );
     }
 
     #[tokio::test]

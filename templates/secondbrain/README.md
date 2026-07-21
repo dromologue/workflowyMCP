@@ -37,7 +37,7 @@ Declares any MCP services beyond Workflowy (ink capture, reading queues, task sy
 
 ### `memory/name_index.json`
 
-The MCP server's persistent short-hash → full-UUID cache. Auto-managed: rehydrated from disk on server startup, checkpointed every 30 seconds when dirty, refreshed by a background walk every 6 hours. Do not edit by hand.
+The MCP server's persistent short-hash → full-UUID cache. Auto-managed: rehydrated from disk on server startup, checkpointed every 30 seconds when dirty, and grown by every walk any tool performs plus explicit `wflow-do reindex` passes (there is no in-process background refresher). Do not edit by hand.
 
 ### `drafts/`
 

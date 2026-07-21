@@ -330,6 +330,60 @@ The following Rust patterns are actively enforced in this codebase:
   `merge_does_not_resurrect_a_locally_deleted_node`, and
   `save_overwrites_a_corrupt_file_rather_than_failing`.
 
+### Read-path economy under the rate limit (2026-07-21 second-brain pass)
+
+Seven invariants landed together, all with the same aim: many large,
+frequent queries and updates must fit inside Workflowy's 429/timeout
+regime without re-paying API cost for state local knowledge can serve.
+Spec contracts `C-server-011` … `C-server-017` carry the full statements;
+the structural rules for contributors are:
+
+- **Children listings are cached and invalidated at single funnels.**
+  Consult/populate ONLY in `get_children_cancellable` /
+  `get_top_level_nodes_cancellable`; invalidate ONLY in
+  `request_cancellable`'s non-GET pre-send hook (plus the server-side
+  `invalidate_for_mutation`, which converges on the same `NodeCache`
+  instance). `get_node` is never cache-served — verify-after-write stays
+  live. A new read path that lists children MUST route through the
+  funnel, not around it.
+- **A 429 drains the token bucket** (`stamp_rate_limited` →
+  `RateLimiter::drain()`). Never reintroduce burst carry-over across a
+  retry window.
+- **Blocking maintenance runs on blocking threads.** The index
+  checkpoint (and any future fs-heavy background task) wraps in
+  `spawn_blocking`; snapshots serialise compact.
+- **Local state answers before the network walks.** The short-hash miss
+  path merges the disk index (mtime-guarded
+  `refresh_from_disk_if_changed`) before walking; workflows record
+  `created_nodes` in the `MutationFootprint` so `apply_footprint` seeds
+  the index at create time; `wflow-do resolve-link` hydrates from and
+  contributes back to the persisted index. A new workflow that creates
+  nodes MUST call `footprint.record_created(...)`.
+- **Index-backed read paths share the walk paths' predicates**
+  (`C-server-018`). `find_backlinks`/`tag_search` `use_index` scans and
+  the `prefer_index` fallback mode on `find_node`/`search_nodes` route
+  through `node_links_to` / `node_has_tag` / the index matchers — never
+  a private reimplementation, so fast and authoritative paths cannot
+  fork. Subtree scoping over the index goes through
+  `NameIndex::is_descendant_of` (never a direct-parent-equality
+  shortcut), and nothing lock-reacquiring runs inside a
+  `for_each_entry` closure.
+- **The limiter is AIMD** (`C-server-019`): 429 → drain + halve rate
+  (floor 1 req/s); success → +0.1 req/s toward the configured ceiling.
+- **Incremental sync is a local diff** (`C-server-020`): the index
+  records `last_modified` (schema v3) and `wflow-do changed-since`
+  serves change windows with zero API calls.
+- **Deliberately rejected:** serving `bulk_tag`'s pre-read from the name
+  index. The fetched name is the *base for the mutation* — a stale
+  index name would clobber a rename, and a stale already-tagged name
+  would silently skip a live untagged node. Correctness outranks the
+  saved round-trip (constitution hierarchy rule 1).
+- **Deliberately rejected:** parallel sibling creates in
+  `insert_content` (`C-server-021`). The resume cursor assumes prefix
+  completion; concurrency would make the documented resume double-write
+  after a mid-run failure. `batch_create_nodes` is the sanctioned
+  concurrent create path.
+
 ### Pre-call cache invalidation for mutations
 - Every write handler invalidates cache + name-index entries for the
   affected nodes BEFORE calling the API, not in the success branch.

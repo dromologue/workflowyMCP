@@ -1,0 +1,34 @@
+// Markdownlint tuning for this repo's documentation style.
+//
+// The specs, CLAUDE.md, and templates deliberately use formatting the
+// default rules misread as defects: ordered lists whose numbering
+// continues across prose sections (the numbered-contract style in
+// specs/), tight heading→list spacing, unaligned table pipes, code
+// fences nested inside list items, spaced code spans quoting literal
+// output, and multi-paragraph blockquotes. Disabling these specific
+// rules stops the recurring false-positive warnings without loosening
+// anything that catches real mistakes (broken links, bad fences,
+// duplicate headings all still fire).
+{
+  // Mixed bullet markers appear in long-lived docs; not a defect.
+  "MD004": false,
+  // Long lines are the norm in spec prose and tables.
+  "MD013": false,
+  // Headings and lists sit tight against each other by house style.
+  "MD022": false,
+  "MD032": false,
+  // Multi-paragraph blockquotes (doc preambles) are intentional.
+  "MD028": false,
+  // Contract lists number 1..N across intervening headings/prose;
+  // markdownlint expects each block to restart at 1.
+  "MD029": false,
+  // Code fences sit tight inside list items and tables by design.
+  "MD031": false,
+  // Code spans quoting literal output keep their inner spaces.
+  "MD038": false,
+  // Plain-output fences (shell transcripts, tree diagrams) carry no
+  // language tag.
+  "MD040": false,
+  // Table pipes are not column-aligned; content width varies too much.
+  "MD060": false
+}

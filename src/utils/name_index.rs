@@ -46,6 +46,10 @@ pub struct NameIndexEntry {
     /// Available at every ingest site (walks return full `WorkflowyNode`s),
     /// so populating it needs no extra API calls.
     pub description: Option<String>,
+    /// Upstream `modifiedAt` (epoch ms) as of the last ingest. Feeds
+    /// `entries_modified_since` / `wflow-do changed-since` so incremental
+    /// sync is a local index diff, not a repeated live walk.
+    pub last_modified: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -75,6 +79,12 @@ struct PersistedEntry {
     /// keeps the field optional on the wire; absent = `None`.
     #[serde(default)]
     description: Option<String>,
+    /// The node's upstream `modifiedAt` (epoch ms) as of the last ingest
+    /// (2026-07-21, schema v3). Enables local incremental queries —
+    /// `wflow-do changed-since` diffs the index instead of re-walking a
+    /// large subtree on every sync poll.
+    #[serde(default)]
+    last_modified: Option<i64>,
 }
 
 /// Ids that must not be persisted: every node matching an excluded-subtree
@@ -157,11 +167,14 @@ struct PersistedSnapshot {
     nodes: Vec<PersistedEntry>,
 }
 
-// Bumped 1 → 2 on 2026-07-12 when `description` was added to each entry.
-// `load_from_disk` rejects any snapshot whose version it doesn't recognise,
-// so a v1 cache is cleanly discarded (and rebuilt by the background walk)
-// rather than loaded with silently-missing descriptions.
-const PERSIST_SCHEMA_VERSION: u32 = 2;
+// Bumped 1 → 2 on 2026-07-12 when `description` was added to each entry;
+// 2 → 3 on 2026-07-21 when `last_modified` was added (feeds
+// `wflow-do changed-since`). `load_from_disk` rejects any snapshot whose
+// version it doesn't recognise, so an old cache is cleanly discarded (and
+// rebuilt by walks / the scheduled reindex) rather than loaded with
+// silently-missing fields. Plan a full `wflow-do reindex --timeout-secs 0
+// --patient` after upgrading across a version bump.
+const PERSIST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Default)]
 pub struct NameIndex {
@@ -203,6 +216,11 @@ pub struct NameIndex {
     /// not undone by the very merge that protects additions. Cleared on a
     /// successful save: the file we just wrote already excludes them.
     tombstones: RwLock<HashSet<String>>,
+    /// mtime of the on-disk snapshot as of this process's last read or
+    /// write of it. Guards [`refresh_from_disk_if_changed`] so a burst of
+    /// short-hash misses re-reads the (multi-MB) file at most once per
+    /// actual change by another writer.
+    last_disk_refresh_mtime: RwLock<Option<std::time::SystemTime>>,
 }
 
 impl NameIndex {
@@ -238,12 +256,21 @@ impl NameIndex {
             // the periodic saver is not woken by identical re-ingests.
             let key = node.name.to_lowercase();
             if by_id.get(&node.id).map(|n| n.as_str()) == Some(key.as_str()) {
-                let same_desc = by_name
+                let same_content = by_name
                     .get(&key)
                     .and_then(|v| v.entries.iter().find(|e| e.node_id == node.id))
-                    .map(|e| e.description == node.description)
+                    // last_modified joins the equality check (2026-07-21):
+                    // a timestamp-only change must be re-ingested or
+                    // `changed-since` serves stale windows. `None` on the
+                    // incoming node (create-time seeds carry no timestamp)
+                    // does not force churn against a stored Some.
+                    .map(|e| {
+                        e.description == node.description
+                            && (node.last_modified.is_none()
+                                || e.last_modified == node.last_modified)
+                    })
                     .unwrap_or(false);
-                if same_desc {
+                if same_content {
                     continue;
                 }
             }
@@ -254,6 +281,7 @@ impl NameIndex {
                 name: node.name.clone(),
                 parent_id: node.parent_id.clone(),
                 description: node.description.clone(),
+                last_modified: node.last_modified,
             };
             by_id.insert(node.id.clone(), key.clone());
             if let Some(short) = short_hash_of(&node.id) {
@@ -360,6 +388,83 @@ impl NameIndex {
             }
         }
         out
+    }
+
+    /// Visit every indexed entry under one read-lock acquisition. Used by
+    /// index-backed scans (`find_backlinks`/`tag_search` `use_index`
+    /// paths) that need an arbitrary predicate over name + description
+    /// without cloning the whole index. Keep `f` cheap — it runs with the
+    /// read lock held.
+    pub fn for_each_entry(&self, mut f: impl FnMut(&NameIndexEntry)) {
+        let by_name = self.by_name.read();
+        for value in by_name.values() {
+            for entry in &value.entries {
+                f(entry);
+            }
+        }
+    }
+
+    /// Build the root→node display path for an indexed node by following
+    /// `parent_id` links inside the index. Segments outside the index are
+    /// simply absent (the path starts at the highest indexed ancestor);
+    /// a depth cap doubles as the cycle guard.
+    pub fn path_of(&self, node_id: &str) -> Vec<String> {
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = self.lookup_entry_by_id(node_id);
+        let mut hops = 0;
+        while let Some(entry) = current {
+            segments.push(entry.name.clone());
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
+            current = entry
+                .parent_id
+                .as_deref()
+                .and_then(|pid| self.lookup_entry_by_id(pid));
+        }
+        segments.reverse();
+        segments
+    }
+
+    /// Entries whose recorded upstream `modifiedAt` is at or after
+    /// `since_ms` (2026-07-21). The local half of incremental sync:
+    /// `wflow-do changed-since` diffs the index instead of re-walking a
+    /// large subtree on every poll. Entries with no recorded timestamp are
+    /// excluded — absence means "not observed", not "unchanged", and the
+    /// caller's recovery for suspected gaps is a fresh reindex.
+    pub fn entries_modified_since(&self, since_ms: i64) -> Vec<NameIndexEntry> {
+        let mut out = Vec::new();
+        self.for_each_entry(|e| {
+            if e.last_modified.map(|m| m >= since_ms).unwrap_or(false) {
+                out.push(e.clone());
+            }
+        });
+        out
+    }
+
+    /// True when `node_id`'s parent chain inside the index reaches
+    /// `ancestor_id`. Chain segments missing from the index end the walk
+    /// (absence is "unknown", reported as false); the hop cap doubles as
+    /// the cycle guard. NOT safe to call from inside a `for_each_entry`
+    /// closure — it re-acquires the read lock per hop.
+    pub fn is_descendant_of(&self, node_id: &str, ancestor_id: &str) -> bool {
+        let mut current = self.lookup_entry_by_id(node_id);
+        let mut hops = 0;
+        while let Some(entry) = current {
+            match entry.parent_id.as_deref() {
+                Some(pid) if pid == ancestor_id => return true,
+                Some(pid) => {
+                    hops += 1;
+                    if hops > 32 {
+                        return false;
+                    }
+                    current = self.lookup_entry_by_id(pid);
+                }
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Look up the entry for a specific node by its full UUID. Used by
@@ -524,6 +629,7 @@ impl NameIndex {
                 name: e.name,
                 parent_id: e.parent_id,
                 description: e.description,
+                last_modified: e.last_modified,
                 ..Default::default()
             })
             .collect();
@@ -572,16 +678,61 @@ impl NameIndex {
         self.merge_from_disk(&path)?;
 
         let snap = self.snapshot();
-        let json = serde_json::to_vec_pretty(&snap)
+        // Compact, not pretty: the file is a machine cache nobody reads by
+        // hand, and pretty-printing a ~55k-entry production index roughly
+        // doubles both the serialisation CPU and the bytes written every
+        // 30 s checkpoint.
+        let json = serde_json::to_vec(&snap)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp = with_tmp_suffix(&path);
         std::fs::write(&tmp, &json)?;
         std::fs::rename(&tmp, &path)?;
+        // Stamp the freshly-written file's mtime so the next
+        // `refresh_from_disk_if_changed` doesn't re-read our own save.
+        if let Ok(m) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+            *self.last_disk_refresh_mtime.write() = Some(m);
+        }
         self.dirty.store(false, Ordering::Relaxed);
         // The file we just wrote already excludes these, so they no longer
         // need suppressing on the next merge.
         self.tombstones.write().clear();
         Ok(())
+    }
+
+    /// Adopt entries another writer persisted since this process last read
+    /// or wrote the index file, without walking anything (2026-07-21).
+    ///
+    /// WHY: a long-running MCP server loads the index once at startup. A
+    /// nightly `wflow-do reindex --patient` (or another surface) that runs
+    /// afterwards extends the on-disk file, but the server only re-read it
+    /// as a side effect of its own dirty-save merge — so an idle server
+    /// could sit for hours not knowing nodes the disk already covers, and
+    /// a "copy internal link" short hash would fire a 20 s API walk when a
+    /// millisecond local file read had the answer. Callers invoke this on
+    /// a short-hash miss BEFORE walking. The mtime guard makes repeated
+    /// misses effectively free; the merge itself reuses the same
+    /// memory-wins/tombstone-respecting adoption the save path uses. A
+    /// lock-free read is safe because savers rename a complete temp file
+    /// into place — we see either the old or the new file, never a torn one.
+    ///
+    /// Returns `Ok(true)` when a changed file was merged, `Ok(false)` when
+    /// there was nothing new to read.
+    pub fn refresh_from_disk_if_changed(&self) -> std::io::Result<bool> {
+        let path = match self.save_path() {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if *self.last_disk_refresh_mtime.read() == Some(mtime) {
+            return Ok(false);
+        }
+        self.merge_from_disk(&path)?;
+        *self.last_disk_refresh_mtime.write() = Some(mtime);
+        Ok(true)
     }
 
     /// Read `path` and adopt every entry this process has no opinion on.
@@ -624,6 +775,7 @@ impl NameIndex {
                     name: e.name,
                     parent_id: e.parent_id,
                     description: e.description,
+                    last_modified: e.last_modified,
                     ..Default::default()
                 })
                 .collect()
@@ -660,6 +812,7 @@ impl NameIndex {
                     name: entry.name.clone(),
                     parent_id: entry.parent_id.clone(),
                     description: entry.description.clone(),
+                    last_modified: entry.last_modified,
                 });
             }
         }
@@ -818,6 +971,41 @@ mod tests {
         let idx = NameIndex::new();
         assert!(idx.lookup("anything", "exact").is_empty());
         assert!(!idx.is_populated());
+    }
+
+    /// Schema v3 (2026-07-21): `last_modified` survives the disk
+    /// roundtrip, `entries_modified_since` filters on it, and entries
+    /// with no recorded timestamp are excluded from the window (absence
+    /// means "not observed", not "unchanged").
+    #[test]
+    fn last_modified_roundtrips_and_changed_since_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("name_index.json");
+
+        let idx = NameIndex::new();
+        idx.set_save_path(path.clone());
+        let mut old = node("aaaaaaaa-1111-4111-8111-111111111111", "Old note", None);
+        old.last_modified = Some(1_000);
+        let mut fresh = node("bbbbbbbb-2222-4222-8222-222222222222", "Fresh note", None);
+        fresh.last_modified = Some(5_000);
+        let unknown = node("cccccccc-3333-4333-8333-333333333333", "Never stamped", None);
+        idx.ingest(&[old, fresh, unknown]);
+        idx.save_to_disk().expect("save");
+
+        let rehydrated = NameIndex::new();
+        rehydrated.set_save_path(path);
+        rehydrated.load_from_disk().expect("load");
+        assert_eq!(
+            rehydrated
+                .lookup_entry_by_id("aaaaaaaa-1111-4111-8111-111111111111")
+                .and_then(|e| e.last_modified),
+            Some(1_000),
+            "last_modified must survive the disk roundtrip"
+        );
+
+        let hits = rehydrated.entries_modified_since(2_000);
+        assert_eq!(hits.len(), 1, "only the fresh entry falls in the window");
+        assert_eq!(hits[0].name, "Fresh note");
     }
 
     #[test]
@@ -1078,6 +1266,7 @@ mod tests {
                 name: format!("node-{id}"),
                 parent_id: parent.map(str::to_string),
                 description: None,
+                last_modified: None,
             }
         }
 
@@ -1313,6 +1502,48 @@ mod tests {
             assert!(
                 server.lookup_entry_by_id(A_ID).is_some(),
                 "save should merge the other writer's entries into memory"
+            );
+        }
+
+        /// A short-hash miss must be answerable from another writer's
+        /// persisted work without a walk (2026-07-21): the on-miss
+        /// disk refresh adopts entries the nightly reindex wrote after
+        /// this process loaded, and the mtime guard makes a repeat call
+        /// a no-op.
+        #[test]
+        fn refresh_from_disk_adopts_other_writers_entries_and_is_mtime_guarded() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("name_index.json");
+
+            // Long-running server loads an empty file.
+            let server = NameIndex::new();
+            server.set_save_path(path.clone());
+            server.load_from_disk().ok();
+
+            // A reindex runs afterwards and persists a node.
+            let reindex = NameIndex::new();
+            reindex.set_save_path(path.clone());
+            reindex.ingest(&[node(A_ID, "Covered by nightly reindex", None)]);
+            reindex.save_to_disk().expect("reindex save");
+
+            // Server misses the short hash, refreshes from disk, resolves.
+            assert!(server.lookup_entry_by_id(A_ID).is_none(), "precondition: miss");
+            let merged = server
+                .refresh_from_disk_if_changed()
+                .expect("refresh reads the file");
+            assert!(merged, "a changed file must be merged");
+            let short = A_ID.replace('-', "");
+            let short = &short[short.len() - 12..];
+            assert_eq!(
+                server.resolve_short_hash(short).as_deref(),
+                Some(A_ID),
+                "the adopted entry must resolve the short hash without a walk"
+            );
+
+            // Unchanged file → guarded no-op.
+            assert!(
+                !server.refresh_from_disk_if_changed().expect("second refresh"),
+                "an unchanged file must not be re-read"
             );
         }
 

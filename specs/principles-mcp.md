@@ -176,13 +176,20 @@ Don't inline megabytes into a single tool result.
 - Return handles/URIs instead of full content for large trees
 - Advertise total counts where feasible
 
-**Status**: ❌ get_subtree and search could return unbounded payloads.
+**Status**: ⚠️ partially addressed. Walks are bounded by node-count
+(10 000) and wall-clock (20 s) caps surfaced via the four-field
+truncation envelope, and since 2026-07-21 `WorkflowyNode` serialises
+sparse — absent optionals and empty `children` are omitted
+(`C-server-017`), which removed the literal-null bulk of large walk
+payloads. `read_batch` dispatches with bounded concurrency and stable
+input-order results (`C-server-016`). No byte-size cap or cursor
+pagination exists (the upstream API has no server-side child paging to
+hang one on).
 
-**Action items**:
-- **Hard cap**: All text responses limited to ~50KB, truncated with "... (truncated, N more items)"
-- get_subtree: enforce max_depth default (e.g. 3), paginate beyond that
-- search_nodes: enforce max_results hard cap (e.g. 100)
-- Return `total_count` alongside paginated results
+**Remaining action items**:
+- Consider a `fields=summary` control on `get_subtree`/`read_batch`
+  (id/name/parent/completed only) for agent callers that only navigate
+- Return `total_count` alongside capped results where feasible
 
 ---
 

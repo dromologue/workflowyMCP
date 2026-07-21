@@ -144,8 +144,12 @@ pub const INSERT_CONTENT_TIMEOUT_MS: u64 = 180_000;
 pub const MCP_TRANSPORT_HARD_TIMEOUT_MS: u64 = 240_000;
 
 // --- Tree Traversal ---
-/// Default max_depth for search operations
-pub const DEFAULT_SEARCH_DEPTH: usize = 3;
+/// Default max_depth for search operations. Raised 3 → 5 on 2026-07-21:
+/// second-brain content (pillar → bucket → note → atom) routinely sits
+/// 4-6 levels deep, and a depth-3 default returned silent zero-hit
+/// searches with no depth-truncation signal. The walk caps
+/// (`MAX_SUBTREE_NODES`, `SUBTREE_FETCH_TIMEOUT_MS`) bound the extra cost.
+pub const DEFAULT_SEARCH_DEPTH: usize = 5;
 /// Default max_depth for review/todo operations
 pub const DEFAULT_REVIEW_DEPTH: usize = 5;
 /// Maximum recursion depth for subtree fetching
@@ -166,6 +170,11 @@ pub const SUBTREE_FETCH_CONCURRENCY: usize = 5;
 /// in milliseconds and pay for it in minutes. An unattended walk optimises
 /// for finishing, not for finishing quickly.
 pub const PATIENT_SUBTREE_FETCH_CONCURRENCY: usize = 2;
+/// Cap on the number of complete children listings the node cache holds
+/// (see `NodeCache::insert_children_listing`). 4096 listings comfortably
+/// covers a large walk's working set while bounding memory; overflow purges
+/// expired entries first and clears as a last resort.
+pub const MAX_CACHED_LISTINGS: usize = 4_096;
 /// Wall-clock budget for health checks (milliseconds). Must stay sub-second
 /// on any tree size so the tool is usable when the API is degraded.
 pub const HEALTH_CHECK_TIMEOUT_MS: u64 = 5_000;
@@ -304,6 +313,13 @@ pub fn secondbrain_dir_checked() -> Result<Option<std::path::PathBuf>, String> {
 
 /// Valid `op` kinds for `read_batch` (MCP) / `wflow-do read-batch` (CLI).
 pub const READ_BATCH_VALID_OPS: &[&str] = &["get_node", "list_children", "get_subtree"];
+/// In-flight fan-out for `read_batch` operation dispatch (2026-07-21).
+/// The ops are independent reads; overlapping them collapses RTT stalls
+/// (a 20-op sweep at ~200 ms each was ~4 s strictly serial). Kept below
+/// `SUBTREE_FETCH_CONCURRENCY` because a batched `get_subtree` op fans
+/// out internally on top of this; the shared rate limiter caps real
+/// throughput either way.
+pub const READ_BATCH_CONCURRENCY: usize = 4;
 
 /// Valid `operation` kinds for `bulk_update` (MCP) / `wflow-do bulk-update` (CLI).
 pub const BULK_UPDATE_VALID_OPS: &[&str] =

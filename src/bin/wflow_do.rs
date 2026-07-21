@@ -116,6 +116,11 @@ enum Cmd {
         depth: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Serve from the persisted name index at $WORKFLOWY_INDEX_PATH
+        /// (token-AND over names + descriptions) instead of a live walk.
+        /// No API calls; misses nodes not yet walked/reindexed.
+        #[arg(long)]
+        use_index: bool,
     },
     /// Search by tag (`#tag` or `@person`). Walks a subtree (or workspace) and
     /// returns nodes carrying the tag in name or note. Mirrors MCP `tag_search`.
@@ -127,6 +132,10 @@ enum Cmd {
         depth: usize,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Serve from the persisted name index at $WORKFLOWY_INDEX_PATH
+        /// instead of a live walk. Whole-tag match, no API calls.
+        #[arg(long)]
+        use_index: bool,
     },
     /// Find a node by exact / contains / starts-with name match. Mirrors MCP
     /// `find_node`. Refuses unscoped root walks unless `--allow-root-scan`.
@@ -142,6 +151,10 @@ enum Cmd {
         allow_root_scan: bool,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Serve from the persisted name index at $WORKFLOWY_INDEX_PATH
+        /// (name-only match) instead of a live walk. No API calls.
+        #[arg(long)]
+        use_index: bool,
     },
     /// Get the full subtree under a node, bounded by `--depth` and the
     /// 10 000-node walk cap. Mirrors MCP `get_subtree`.
@@ -175,6 +188,10 @@ enum Cmd {
         parent: Option<String>,
         #[arg(long, default_value_t = 8)]
         depth: usize,
+        /// Scan the persisted name index at $WORKFLOWY_INDEX_PATH instead
+        /// of walking. Covers everything ever indexed, no walk budget.
+        #[arg(long)]
+        use_index: bool,
     },
     /// Tag intersected with hierarchical path prefix. Mirrors MCP
     /// `find_by_tag_and_path`.
@@ -517,6 +534,21 @@ enum Cmd {
         #[arg(long)]
         patient: bool,
     },
+    /// List nodes modified since a given time, served entirely from the
+    /// persisted name index at $WORKFLOWY_INDEX_PATH — zero API calls.
+    /// The local half of incremental sync: the scheduled reindex records
+    /// each node's upstream modifiedAt (index schema v3); this diffs it.
+    /// Entries with no recorded timestamp are excluded (absence means
+    /// "not observed"); for suspected gaps, re-run the reindex.
+    ChangedSince {
+        /// Cutoff: epoch milliseconds, or a YYYY-MM-DD date (midnight UTC).
+        since: String,
+        /// Restrict to descendants of this node (full UUID as stored).
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -610,6 +642,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Review { .. } => "review",
         Cmd::Index { .. } => "index",
         Cmd::Reindex { .. } => "reindex",
+        Cmd::ChangedSince { .. } => "changed-since",
     }
 }
 
@@ -690,10 +723,37 @@ fn dry_run_line(cmd: &Cmd) -> Option<String> {
     }
 }
 
+/// Hydrate the persisted name index for a `--use-index` read. Fails loud
+/// when the env var is unset or the file is empty — an index-backed query
+/// against nothing would masquerade as "no results".
+fn load_persistent_index(
+) -> Result<workflowy_mcp_server::utils::NameIndex, Box<dyn std::error::Error>> {
+    use workflowy_mcp_server::utils::NameIndex;
+    let path = std::env::var(defaults::INDEX_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("--use-index requires $WORKFLOWY_INDEX_PATH to point at the persisted name index")?;
+    let index = NameIndex::new();
+    index.set_save_path(std::path::PathBuf::from(&path));
+    let loaded = index.load_from_disk()?;
+    if loaded == 0 {
+        return Err(format!(
+            "the persisted name index at {} is empty; run `wflow-do reindex --timeout-secs 0 --patient --root <UUID>` first",
+            path
+        )
+        .into());
+    }
+    Ok(index)
+}
+
 fn build_client() -> Result<Arc<WorkflowyClient>, Box<dyn std::error::Error>> {
     let config = validate_config().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    // The listing cache pays off within a single CLI run too: chunked
+    // audit walks and duplicate/template deep-copies revisit shared
+    // branches, and writes invalidate through the same request funnel.
     let client = WorkflowyClient::new(config.workflowy_base_url, config.workflowy_api_key)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+        .with_node_cache(workflowy_mcp_server::utils::cache::get_cache());
     Ok(Arc::new(client))
 }
 
@@ -859,7 +919,34 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 println!("{} {}", verb, node_id);
             }
         }
-        Cmd::Search { query, parent, depth, limit } => {
+        Cmd::Search { query, parent, depth, limit, use_index } => {
+            if *use_index {
+                // Serve from the persisted index: token-AND over names +
+                // descriptions, subtree-scoped via parent-chain links —
+                // the same semantics the MCP `search_nodes(use_index)`
+                // path has, with zero API calls.
+                let index = load_persistent_index()?;
+                let mut hits = index.search_tokens(query);
+                if let Some(p) = parent.as_deref() {
+                    hits.retain(|e| index.is_descendant_of(&e.node_id, p));
+                }
+                hits.truncate(*limit);
+                let payload = json!({
+                    "query": query,
+                    "scope": parent,
+                    "served_from": "name_index",
+                    "name_index_size": index.size(),
+                    "count": hits.len(),
+                    "matches": hits.iter().map(|e| json!({
+                        "id": e.node_id,
+                        "name": e.name,
+                        "description": e.description,
+                        "parent_id": e.parent_id,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             // Walk the subtree under `parent` (or the workspace root) up to
             // `depth` levels and filter on substring match in name or note.
             // No new client method is needed — reuses get_subtree_with_controls.
@@ -893,8 +980,44 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
-        Cmd::TagSearch { tag, parent, depth, limit } => {
+        Cmd::TagSearch { tag, parent, depth, limit, use_index } => {
             use workflowy_mcp_server::utils::tag_parser::node_has_tag;
+            if *use_index {
+                let index = load_persistent_index()?;
+                let bare = tag.trim_start_matches('#').trim_start_matches('@');
+                let as_tag = format!("#{}", bare);
+                let as_assignee = format!("@{}", bare);
+                let mut matches: Vec<workflowy_mcp_server::utils::name_index::NameIndexEntry> =
+                    Vec::new();
+                index.for_each_entry(|e| {
+                    let probe = workflowy_mcp_server::types::WorkflowyNode {
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        ..Default::default()
+                    };
+                    if node_has_tag(&probe, &as_tag) || node_has_tag(&probe, &as_assignee) {
+                        matches.push(e.clone());
+                    }
+                });
+                if let Some(p) = parent.as_deref() {
+                    matches.retain(|e| index.is_descendant_of(&e.node_id, p));
+                }
+                matches.truncate(*limit);
+                let payload = json!({
+                    "tag": tag,
+                    "scope": parent,
+                    "served_from": "name_index",
+                    "name_index_size": index.size(),
+                    "count": matches.len(),
+                    "matches": matches.iter().map(|e| json!({
+                        "id": e.node_id,
+                        "name": e.name,
+                        "parent_id": e.parent_id,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             // Whole-tag match via the shared `node_has_tag` predicate so
             // the CLI cannot drift from MCP `tag_search`. We check both a
             // `#tag` and an `@assignee` interpretation of the needle so a
@@ -924,7 +1047,30 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
-        Cmd::Find { name, parent, match_mode, depth, allow_root_scan, limit } => {
+        Cmd::Find { name, parent, match_mode, depth, allow_root_scan, limit, use_index } => {
+            if *use_index {
+                let index = load_persistent_index()?;
+                let mut hits = index.lookup(name, match_mode);
+                if let Some(p) = parent.as_deref() {
+                    hits.retain(|e| index.is_descendant_of(&e.node_id, p));
+                }
+                hits.truncate(*limit);
+                let payload = json!({
+                    "name": name,
+                    "match_mode": match_mode,
+                    "scope": parent,
+                    "served_from": "name_index",
+                    "name_index_size": index.size(),
+                    "count": hits.len(),
+                    "matches": hits.iter().map(|e| json!({
+                        "id": e.node_id,
+                        "name": e.name,
+                        "parent_id": e.parent_id,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             if parent.is_none() && !*allow_root_scan {
                 return Err("find refuses unscoped root walks; pass --parent or --allow-root-scan".into());
             }
@@ -982,7 +1128,43 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
-        Cmd::Backlinks { node_id, parent, depth } => {
+        Cmd::Backlinks { node_id, parent, depth, use_index } => {
+            if *use_index {
+                use workflowy_mcp_server::utils::link_parser::node_links_to;
+                let index = load_persistent_index()?;
+                let mut matches: Vec<workflowy_mcp_server::utils::name_index::NameIndexEntry> =
+                    Vec::new();
+                index.for_each_entry(|e| {
+                    if e.node_id == *node_id {
+                        return;
+                    }
+                    let probe = workflowy_mcp_server::types::WorkflowyNode {
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        ..Default::default()
+                    };
+                    if node_links_to(&probe, node_id) {
+                        matches.push(e.clone());
+                    }
+                });
+                if let Some(p) = parent.as_deref() {
+                    matches.retain(|e| index.is_descendant_of(&e.node_id, p));
+                }
+                let payload = json!({
+                    "target": node_id,
+                    "scope": parent,
+                    "served_from": "name_index",
+                    "name_index_size": index.size(),
+                    "count": matches.len(),
+                    "backlinks": matches.iter().map(|e| json!({
+                        "id": e.node_id,
+                        "name": e.name,
+                        "path": index.path_of(&e.node_id).join(" > "),
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
             let controls = FetchControls::with_timeout(std::time::Duration::from_millis(
                 defaults::SUBTREE_FETCH_TIMEOUT_MS,
             ));
@@ -1098,12 +1280,16 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             // Facade over the lifted `crate::workflows::resolve_link_*`
             // helpers — see the doc comment block at the top of the
             // resolve_link section in src/workflows.rs for the design.
-            // The CLI omits server-only concerns (preflight name-index
-            // lookup, single-flight scope marker, name-index ingestion)
-            // because it has no persistent name index and no concurrent
-            // caller; everything else — URL parsing, walk-and-scan,
+            // The CLI omits the single-flight scope marker (no concurrent
+            // caller), but since 2026-07-21 it DOES use the persistent
+            // name index at `$WORKFLOWY_INDEX_PATH` when configured:
+            // an O(1) preflight answers without any walk, and a
+            // miss-walk's nodes are merged back into the file so every
+            // walk permanently extends coverage instead of being thrown
+            // away. Everything else — URL parsing, walk-and-scan,
             // hit/miss payload construction — routes through the same
             // workflow functions the MCP handler calls.
+            use workflowy_mcp_server::utils::NameIndex;
             use workflowy_mcp_server::workflows::{
                 build_resolve_link_hit_payload, build_resolve_link_miss_payload,
                 resolve_link_via_walk_and_scan,
@@ -1129,6 +1315,31 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                         return Ok(());
                     }
                     Err(e) => return Err(format!("get_node({}) failed: {}", candidate, e).into()),
+                }
+            }
+
+            // Persistent-index preflight (2026-07-21): hydrate from
+            // `$WORKFLOWY_INDEX_PATH` and try the short hash before any
+            // walk. A hit costs one `get_node` (which also verifies the
+            // entry isn't stale — a 404 falls through to the walk).
+            let index = NameIndex::new();
+            let index_path = std::env::var(defaults::INDEX_PATH_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(std::path::PathBuf::from);
+            if let Some(p) = &index_path {
+                index.set_save_path(p.clone());
+                let _ = index.load_from_disk();
+                if let Some(full) = index.resolve_short_hash(&candidate) {
+                    if let Ok(node) = client.get_node(&full).await {
+                        let payload = build_resolve_link_hit_payload(&node, "cache_hit");
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        return Ok(());
+                    }
+                    eprintln!(
+                        "resolve-link: index entry for {} is stale (get_node failed); walking",
+                        candidate
+                    );
                 }
             }
 
@@ -1170,8 +1381,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 Ok(w) => w,
                 Err(e) => {
                     // Walk-error miss envelope — symmetric with the MCP
-                    // handler's `walk_error` branch. The CLI has no
-                    // persistent name index, so `name_index_size: None`.
+                    // handler's `walk_error` branch.
                     let payload = build_resolve_link_miss_payload(
                         &candidate,
                         &scope_str,
@@ -1180,12 +1390,27 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                         true,
                         None,
                         "walk_error",
-                        None,
+                        index_path.as_ref().map(|_| index.size()),
                     );
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                     return Err(format!("resolve_link walk failed: {}", e).into());
                 }
             };
+
+            // Contribute the walk to the persistent index (merge-on-save,
+            // so concurrent writers compose). Pre-2026-07-21 the CLI threw
+            // this coverage away, and the next miss re-walked the same
+            // region — the "requires walking the tree again" complaint.
+            if index_path.is_some() && !walk.nodes.is_empty() {
+                index.ingest(&walk.nodes);
+                match index.save_to_disk() {
+                    Ok(()) => eprintln!(
+                        "resolve-link: contributed {} walked nodes to the persistent index",
+                        walk.nodes.len()
+                    ),
+                    Err(e) => eprintln!("resolve-link: could not persist walked nodes: {}", e),
+                }
+            }
 
             match walk.found {
                 Some(node) => {
@@ -1197,10 +1422,10 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 }
                 None => {
                     // Miss envelope — same builder the MCP handler
-                    // calls. `name_index_size: None` because the CLI
-                    // has no persistent index; the lifted hint
-                    // adjusts to omit the "persistent index has N
-                    // entries" sentence accordingly.
+                    // calls. `name_index_size` reflects the hydrated
+                    // persistent index when `$WORKFLOWY_INDEX_PATH` is
+                    // configured; the lifted hint adjusts its wording
+                    // when it is not.
                     let payload = build_resolve_link_miss_payload(
                         &candidate,
                         &scope_str,
@@ -1209,7 +1434,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                         walk.truncated,
                         walk.truncation_reason,
                         "primary_walk",
-                        None,
+                        index_path.as_ref().map(|_| index.size()),
                     );
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                     // Surface the miss to the caller via a non-zero
@@ -2177,6 +2402,45 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 *patient,
             )
             .await?;
+        }
+        Cmd::ChangedSince { since, root, limit } => {
+            let since_ms: i64 = if let Ok(ms) = since.parse::<i64>() {
+                ms
+            } else {
+                let date = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d").map_err(|_| {
+                    format!(
+                        "--since must be epoch milliseconds or YYYY-MM-DD, got {:?}",
+                        since
+                    )
+                })?;
+                date.and_hms_opt(0, 0, 0)
+                    .expect("midnight is always valid")
+                    .and_utc()
+                    .timestamp_millis()
+            };
+            let index = load_persistent_index()?;
+            let mut hits = index.entries_modified_since(since_ms);
+            if let Some(r) = root.as_deref() {
+                hits.retain(|e| index.is_descendant_of(&e.node_id, r));
+            }
+            hits.sort_by_key(|e| std::cmp::Reverse(e.last_modified));
+            let total = hits.len();
+            hits.truncate(*limit);
+            let payload = json!({
+                "since_ms": since_ms,
+                "root": root,
+                "served_from": "name_index",
+                "name_index_size": index.size(),
+                "total_matches": total,
+                "count": hits.len(),
+                "nodes": hits.iter().map(|e| json!({
+                    "id": e.node_id,
+                    "name": e.name,
+                    "parent_id": e.parent_id,
+                    "last_modified": e.last_modified,
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
         }
     }
     Ok(())

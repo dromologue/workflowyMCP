@@ -140,22 +140,35 @@ pub struct WorkflowyNode {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    // Absent-`None` fields and the empty `children` list are skipped on
+    // serialisation (2026-07-21): a 10 000-node `get_subtree` used to emit
+    // `"color": null, "tags": null, …` for every node — the bulk of a large
+    // walk payload was literal nulls, paid for in tokens and transport on
+    // every big read. Absent-vs-null is semantically identical to every
+    // known consumer, and the read path is unaffected (`Option` + `default`
+    // deserialise absent fields fine).
     /// Maps from API field "note"
-    #[serde(alias = "note")]
+    #[serde(alias = "note", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     /// Maps from API field "modifiedAt"
-    #[serde(alias = "modifiedAt")]
+    #[serde(alias = "modifiedAt", skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified_user_id: Option<String>,
     /// Maps from API field "completedAt"
-    #[serde(alias = "completedAt")]
+    #[serde(alias = "completedAt", skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub layout_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<String>,
     #[serde(default)]
     pub shared: bool,
@@ -163,13 +176,13 @@ pub struct WorkflowyNode {
     #[serde(default)]
     pub completed: bool,
     /// Maps from API field "createdAt"
-    #[serde(default, alias = "createdAt")]
+    #[serde(default, alias = "createdAt", skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
     /// Nested data object from API (contains layoutMode etc.)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<NodeData>,
     /// Maps from API field "priority"
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i64>,
 }
 
@@ -444,5 +457,48 @@ mod tests {
         let node: WorkflowyNode = serde_json::from_value(api_json).unwrap();
         assert!(node.completed);
         assert_eq!(node.completed_at, Some(1700000000));
+    }
+
+    /// Serialised nodes omit absent optionals and the empty children list
+    /// (2026-07-21): on a 10k-node walk the nulls were the bulk of the
+    /// payload. Present values must still serialise, and a trimmed
+    /// payload must round-trip losslessly.
+    #[test]
+    fn serialised_node_omits_none_fields_and_empty_children() {
+        let sparse = WorkflowyNode {
+            id: "n1".to_string(),
+            name: "Sparse".to_string(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&sparse).unwrap();
+        let obj = v.as_object().unwrap();
+        for absent in [
+            "description", "parent_id", "last_modified", "last_modified_user_id",
+            "completed_at", "layout_mode", "color", "tags", "assignee",
+            "children", "created_at", "data", "priority",
+        ] {
+            assert!(!obj.contains_key(absent), "{} must be omitted when absent", absent);
+        }
+        assert_eq!(obj["id"], "n1");
+
+        let full = WorkflowyNode {
+            id: "n2".to_string(),
+            name: "Full".to_string(),
+            description: Some("note".to_string()),
+            parent_id: Some("p".to_string()),
+            priority: Some(3),
+            children: vec!["c1".to_string()],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["description"], "note");
+        assert_eq!(v["parent_id"], "p");
+        assert_eq!(v["priority"], 3);
+        assert_eq!(v["children"][0], "c1");
+
+        let back: WorkflowyNode = serde_json::from_value(serde_json::to_value(&sparse).unwrap()).unwrap();
+        assert_eq!(back.id, sparse.id);
+        assert_eq!(back.description, None);
+        assert!(back.children.is_empty());
     }
 }

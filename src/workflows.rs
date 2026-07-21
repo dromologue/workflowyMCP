@@ -149,6 +149,15 @@ pub struct MutationFootprint {
     /// the moved/renamed/deleted node — the index is name-keyed, so
     /// its parent's cache entry isn't affected.
     pub invalidated_name_index: Vec<String>,
+    /// Nodes this workflow created, with the id/name/parent known at
+    /// create time (2026-07-21). The MCP wrapper ingests these into the
+    /// persistent name index so a "copy internal link" short hash of a
+    /// just-created node resolves O(1) instead of firing a 20 s walk —
+    /// pre-fix only the bare `create_node` / `batch_create_nodes`
+    /// handlers seeded the index, so bulk-created content (the common
+    /// capture path) was invisible until the next walk. The CLI discards
+    /// this along with the rest of the footprint.
+    pub created_nodes: Vec<WorkflowyNode>,
 }
 
 impl MutationFootprint {
@@ -171,12 +180,31 @@ impl MutationFootprint {
         self.invalidated_nodes.push(id.into());
     }
 
+    /// Record a node this workflow created so the MCP wrapper can seed
+    /// the name index with it (short-hash resolution without a walk).
+    pub fn record_created(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        description: Option<String>,
+        parent_id: Option<String>,
+    ) {
+        self.created_nodes.push(WorkflowyNode {
+            id: id.into(),
+            name: name.into(),
+            description,
+            parent_id,
+            ..Default::default()
+        });
+    }
+
     /// Merge another footprint's IDs into self. Used when a workflow
     /// composes sub-workflows.
     pub fn extend(&mut self, other: MutationFootprint) {
         self.invalidated_nodes.extend(other.invalidated_nodes);
         self.invalidated_name_index
             .extend(other.invalidated_name_index);
+        self.created_nodes.extend(other.created_nodes);
     }
 }
 
@@ -443,6 +471,12 @@ pub async fn create_mirror_via_convention(
     if let Some(pid) = target_parent_id {
         footprint.invalidate_cache_only(pid);
     }
+    footprint.record_created(
+        created.id.clone(),
+        canonical.name.clone(),
+        Some(mirror_note.clone()),
+        target_parent_id.map(str::to_string),
+    );
 
     // 4. Optionally annotate the canonical with a `canonical_of:`
     //    marker. Best-effort: if the edit fails, the mirror itself
@@ -703,6 +737,12 @@ pub async fn insert_content_via_indented(
             Ok(created) => {
                 created_count += 1;
                 last_inserted_id = Some(created.id.clone());
+                footprint.record_created(
+                    created.id.clone(),
+                    line.text.clone(),
+                    None,
+                    line_parent.clone(),
+                );
                 let next_level = indent + 1;
                 if next_level < parent_stack.len() {
                     parent_stack[next_level] = Some(created.id);
@@ -1009,6 +1049,12 @@ async fn apply_txn_step(
             if let Some(pid) = op.parent_id.as_deref() {
                 footprint.invalidate_cache_only(pid);
             }
+            footprint.record_created(
+                created.id.clone(),
+                created.name.clone(),
+                op.description.clone(),
+                op.parent_id.clone(),
+            );
             let summary = json!({
                 "op": "create",
                 "id": created.id.clone(),
@@ -1787,6 +1833,12 @@ where
     let created_root = client
         .create_node(&root_name, root_desc.as_deref(), Some(target_parent_id), None)
         .await?;
+    footprint.record_created(
+        created_root.id.clone(),
+        root_name.clone(),
+        root_desc.clone(),
+        Some(target_parent_id.to_string()),
+    );
     let new_root_id = created_root.id.clone();
     let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     id_map.insert(root.id.clone(), created_root.id);
@@ -1842,6 +1894,12 @@ where
         let created = client
             .create_node(&name, desc.as_deref(), Some(&new_parent), None)
             .await?;
+        footprint.record_created(
+            created.id.clone(),
+            name.clone(),
+            desc.clone(),
+            Some(new_parent.clone()),
+        );
         id_map.insert(node.id.clone(), created.id);
         created_count += 1;
         if let Some(children) = children_of.get(node.id.as_str()) {

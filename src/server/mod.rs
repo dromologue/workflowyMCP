@@ -1274,6 +1274,12 @@ impl WorkflowyMcpServer {
         for id in &footprint.invalidated_name_index {
             self.name_index.invalidate_node(id);
         }
+        // Seed the index with nodes the workflow created, so a "copy
+        // internal link" short hash of just-created content resolves O(1)
+        // instead of firing a walk (2026-07-21).
+        if !footprint.created_nodes.is_empty() {
+            self.name_index.ingest(&footprint.created_nodes);
+        }
     }
 
     async fn resolve_node_ref(&self, raw: &str) -> Result<String, McpError> {
@@ -1282,6 +1288,23 @@ impl WorkflowyMcpServer {
         }
         if let Some(full) = self.name_index.resolve_short_hash(raw) {
             return Ok(full);
+        }
+        // Before burning a 20 s API walk, adopt anything another index
+        // writer (nightly `wflow-do reindex`, another surface) persisted
+        // since this process last read the file — a millisecond-scale local
+        // read that resolves the common "the nightly job already covered
+        // this node but the long-running server predates it" miss.
+        // spawn_blocking: multi-MB read + parse must not stall the runtime.
+        let idx = Arc::clone(&self.name_index);
+        let refreshed = tokio::task::spawn_blocking(move || idx.refresh_from_disk_if_changed())
+            .await
+            .unwrap_or(Ok(false))
+            .unwrap_or(false);
+        if refreshed {
+            if let Some(full) = self.name_index.resolve_short_hash(raw) {
+                info!(short_hash = raw, "resolved from freshly-merged disk index without a walk");
+                return Ok(full);
+            }
         }
         // Cache miss — walk the workspace with the extended budget.
         info!(short_hash = raw, "resolve_node_ref: cache miss, walking workspace");
@@ -1792,17 +1815,26 @@ impl WorkflowyMcpServer {
         // mode — Distillations grew past the 10 000-node walk cap, so
         // every search under it timed out — and `use_index` is the
         // recovery path the truncation banner now points at.
-        if use_index {
+        // `prefer_index` (2026-07-21) is index-first-with-live-fallback:
+        // serve from the index when it answers; fall through to the normal
+        // scoped walk when the index is empty or has no hits. Collapses the
+        // former two-step (`use_index=true`, get nothing, re-issue without
+        // it) into one call for warm-index deployments.
+        let prefer_index = params.prefer_index.unwrap_or(false);
+        if use_index || prefer_index {
             if !self.name_index.is_populated() {
-                return Err(tool_invalid_params(
-                    "search_nodes",
-                    None,
-                    "search_nodes use_index=true requires the persistent name \
-                     index to be populated. Call `build_name_index(parent_id=...)` \
-                     first to walk a subtree into the index, or omit use_index \
-                     and accept the live-walk path.",
-                ));
-            }
+                if use_index {
+                    return Err(tool_invalid_params(
+                        "search_nodes",
+                        None,
+                        "search_nodes use_index=true requires the persistent name \
+                         index to be populated. Call `build_name_index(parent_id=...)` \
+                         first to walk a subtree into the index, or omit use_index \
+                         and accept the live-walk path.",
+                    ));
+                }
+                // prefer_index on an empty index: fall through to the walk.
+            } else {
             // Token-AND match over name + description (2026-07-12 issues 5 & 6):
             // every whitespace-delimited token must appear (in any order) in
             // the entry's name-plus-description text, so distinctive multi-word
@@ -1818,6 +1850,9 @@ impl WorkflowyMcpServer {
             };
             let mut hits = hits;
             hits.truncate(max_results);
+            if hits.is_empty() && prefer_index && !use_index {
+                // Index answered nothing — fall through to the live walk.
+            } else {
             let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
             let prefix = format!("scope_resolved: {}\n\n", scope_resolved);
             let body = if hits.is_empty() {
@@ -1843,6 +1878,8 @@ impl WorkflowyMcpServer {
                 )
             };
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}{}", prefix, body))]));
+            }
+            }
         }
 
         // Refuse unscoped walks by default, mirroring find_node. Brief
@@ -2335,7 +2372,61 @@ impl WorkflowyMcpServer {
         tool_handler!(self, "tag_search", ToolKind::Walk, params, {
         let max_results = params.max_results.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
-        info!(tag = %params.tag, max_depth, "Tag search");
+        info!(tag = %params.tag, max_depth, use_index = params.use_index.unwrap_or(false), "Tag search");
+
+        // Index path (2026-07-21): tags live in node names, which the
+        // persistent index already holds — so a warm index answers a tag
+        // sweep with zero walk budget. Whole-tag semantics via the same
+        // shared `node_has_tag` predicate the walk path uses.
+        if params.use_index.unwrap_or(false) {
+            if !self.name_index.is_populated() {
+                return Err(tool_invalid_params(
+                    "tag_search",
+                    None,
+                    "tag_search use_index=true requires the persistent name \
+                     index to be populated. Run `build_name_index(parent_id=...)` \
+                     (or the scheduled `wflow-do reindex`) first, or omit \
+                     use_index for a live walk.",
+                ));
+            }
+            let mut matches: Vec<crate::utils::name_index::NameIndexEntry> = Vec::new();
+            self.name_index.for_each_entry(|e| {
+                let probe = WorkflowyNode {
+                    name: e.name.clone(),
+                    description: e.description.clone(),
+                    ..WorkflowyNode::default()
+                };
+                if node_has_tag(&probe, &params.tag) {
+                    matches.push(e.clone());
+                }
+            });
+            if let Some(scope) = params.parent_id.as_deref() {
+                let scope = self.validate_and_resolve(scope).await?;
+                matches.retain(|e| self.name_index.is_descendant_of(&e.node_id, &scope));
+            }
+            matches.truncate(max_results);
+            let body = if matches.is_empty() {
+                format!(
+                    "No nodes found with tag '{}' in the persistent name index \
+                     ({} entries). Nodes not yet walked/reindexed are absent from \
+                     the index — omit use_index for an authoritative live walk.",
+                    params.tag,
+                    self.name_index.size(),
+                )
+            } else {
+                let items: Vec<String> = matches
+                    .iter()
+                    .map(|e| format!("- **{}** (id: `{}`)", e.name, e.node_id))
+                    .collect();
+                format!(
+                    "Found {} node(s) with tag '{}' (via name index):\n\n{}",
+                    matches.len(),
+                    params.tag,
+                    items.join("\n")
+                )
+            };
+            return Ok(CallToolResult::success(vec![ContentBlock::text(body)]));
+        }
 
         match self.walk_subtree(params.parent_id.as_deref(), max_depth).await {
             Ok(fetch) => {
@@ -2560,9 +2651,11 @@ impl WorkflowyMcpServer {
         };
         info!(name = %params.name, match_mode, max_depth, use_index, allow_root_scan, "Finding node");
 
+        let prefer_index = params.prefer_index.unwrap_or(false);
         // Refuse unscoped walks by default so a caller that forgot `parent_id`
         // cannot blow the client timeout on a 250k-node tree. Index-backed
-        // lookups are exempt because they don't touch the API.
+        // lookups are exempt because they don't touch the API; `prefer_index`
+        // is NOT exempt — its fallback is a walk, so it needs a walkable scope.
         if resolved_parent.is_none() && !allow_root_scan && !use_index {
             return Err(tool_invalid_params(
                 "find_node",
@@ -2573,8 +2666,10 @@ impl WorkflowyMcpServer {
 
         // Index fast path. We still require either a scoped parent_id (so we
         // can filter hits) or an explicit allow_root_scan to return unscoped
-        // results, to preserve the contract above.
-        if use_index && self.name_index.is_populated() {
+        // results, to preserve the contract above. `prefer_index` (2026-07-21)
+        // reuses this path but falls through to the live walk when the index
+        // has no hits, instead of returning an index-shaped empty result.
+        if (use_index || prefer_index) && self.name_index.is_populated() {
             let hits = self.name_index.lookup(&params.name, match_mode);
             let hits: Vec<_> = if let Some(parent) = resolved_parent.as_deref() {
                 hits.into_iter()
@@ -2583,7 +2678,9 @@ impl WorkflowyMcpServer {
             } else {
                 hits
             };
-            if !hits.is_empty() || !allow_root_scan {
+            if prefer_index && !use_index && hits.is_empty() {
+                // Index answered nothing — fall through to the live walk.
+            } else if !hits.is_empty() || !allow_root_scan {
                 let scope_resolved = scope_resolved_label(resolved_parent.as_deref());
                 return Ok(self.render_find_node_index_result(&params, match_mode, hits, &scope_resolved));
             }
@@ -3088,7 +3185,7 @@ impl WorkflowyMcpServer {
 
     // --- Remaining planned tools ---
 
-    #[tool(description = "Find all nodes that contain a Workflowy link to the given node.")]
+    #[tool(description = "Find all nodes that contain a Workflowy link to the given node. Pass parent_id to scope the walk (a root walk truncates on large trees and silently misses backlinks), or set use_index=true to scan the persistent name index — no walk budget, covers everything ever indexed.")]
     async fn find_backlinks(
         &self,
         Parameters(params): Parameters<FindBacklinksParams>,
@@ -3097,9 +3194,97 @@ impl WorkflowyMcpServer {
         let resolved = self.validate_and_resolve(&params.node_id).await?;
         let limit = params.limit.unwrap_or(50);
         let max_depth = params.max_depth.unwrap_or(3);
-        info!(node_id = %resolved, max_depth, "Finding backlinks");
+        let resolved_parent = match &params.parent_id {
+            Some(pid) => Some(self.validate_and_resolve(pid).await?),
+            None => None,
+        };
+        info!(node_id = %resolved, max_depth, use_index = params.use_index.unwrap_or(false), "Finding backlinks");
 
-        match self.walk_subtree(None, max_depth).await {
+        // Index path (2026-07-21): a root walk on a large tree truncates at
+        // 10k nodes / 20 s and silently misses backlinks — the worst
+        // failure mode for the link/mirror discipline this tool audits.
+        // The persistent index holds exactly the fields the backlink
+        // predicate reads (name + description), so a warm index answers
+        // completely for everything ever walked, with zero walk budget.
+        if params.use_index.unwrap_or(false) {
+            if !self.name_index.is_populated() {
+                return Err(tool_invalid_params(
+                    "find_backlinks",
+                    Some(&resolved),
+                    "find_backlinks use_index=true requires the persistent name \
+                     index to be populated. Run `build_name_index(parent_id=...)` \
+                     (or the scheduled `wflow-do reindex`) first, or omit \
+                     use_index for a live walk.",
+                ));
+            }
+            // Collect link matches under one lock pass; ancestry-filter and
+            // path-build AFTER — `for_each_entry` holds the index read lock
+            // and `is_descendant_of`/`path_of` re-acquire it per hop, so
+            // they must not run inside the closure. Backlink matches are
+            // naturally few, so the post-filter is cheap.
+            let mut matches: Vec<crate::utils::name_index::NameIndexEntry> = Vec::new();
+            self.name_index.for_each_entry(|e| {
+                if e.node_id == resolved {
+                    return;
+                }
+                let probe = WorkflowyNode {
+                    name: e.name.clone(),
+                    description: e.description.clone(),
+                    ..WorkflowyNode::default()
+                };
+                if crate::utils::link_parser::node_links_to(&probe, &resolved) {
+                    matches.push(e.clone());
+                }
+            });
+            if let Some(scope) = resolved_parent.as_deref() {
+                matches.retain(|e| self.name_index.is_descendant_of(&e.node_id, scope));
+            }
+            matches.truncate(limit);
+            let target_name = self
+                .name_index
+                .lookup_entry_by_id(&resolved)
+                .map(|e| e.name)
+                .unwrap_or_else(|| "unknown".to_string());
+            let backlinks: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|e| {
+                    let name_probe = WorkflowyNode {
+                        name: e.name.clone(),
+                        ..WorkflowyNode::default()
+                    };
+                    let desc_probe = WorkflowyNode {
+                        description: e.description.clone(),
+                        ..WorkflowyNode::default()
+                    };
+                    let in_name =
+                        crate::utils::link_parser::node_links_to(&name_probe, &resolved);
+                    let in_desc =
+                        crate::utils::link_parser::node_links_to(&desc_probe, &resolved);
+                    let link_in = match (in_name, in_desc) {
+                        (true, true) => "both",
+                        (true, false) => "name",
+                        _ => "note",
+                    };
+                    json!({
+                        "id": e.node_id,
+                        "name": e.name,
+                        "path": self.name_index.path_of(&e.node_id).join(" > "),
+                        "link_in": link_in,
+                    })
+                })
+                .collect();
+            let payload = json!({
+                "target": { "id": resolved, "name": target_name },
+                "count": backlinks.len(),
+                "backlinks": backlinks,
+                "served_from": "name_index",
+                "name_index_size": self.name_index.size(),
+            });
+            let result = with_truncation_envelope(payload, false, limit, None);
+            return Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]));
+        }
+
+        match self.walk_subtree(resolved_parent.as_deref(), max_depth).await {
             Ok(SubtreeFetch { nodes, truncated, limit: node_limit, truncation_reason, .. }) => {
                 let node_map = build_node_map(&nodes);
                 let target = node_map.get(resolved.as_str());
@@ -3944,7 +4129,7 @@ impl WorkflowyMcpServer {
         })
     }
 
-    #[tool(description = "Run many reads in one call (get_node / list_children / get_subtree). Operations dispatch sequentially in input order and results carry per-operation status. Use this when one or more sweep-shaped reads need to land reliably under hosts that strip bare-string node_id parameters: the operations-array wrapper inherits the same host-encoding resilience that batch_create_nodes already gives writes. The 2026-05-25 \"sweeping a freshly-created node\" failure surfaced this gap — list_children / get_subtree with bare-string IDs were silently misrouted to workspace root on roughly every second call, leaving the sweep with no clean read path.")]
+    #[tool(description = "Run many reads in one call (get_node / list_children / get_subtree). Operations dispatch with bounded concurrency (the shared rate limiter still caps real throughput) and results are returned in input order with per-operation status. Use this when one or more sweep-shaped reads need to land reliably under hosts that strip bare-string node_id parameters: the operations-array wrapper inherits the same host-encoding resilience that batch_create_nodes already gives writes. The 2026-05-25 \"sweeping a freshly-created node\" failure surfaced this gap — list_children / get_subtree with bare-string IDs were silently misrouted to workspace root on roughly every second call, leaving the sweep with no clean read path.")]
     async fn read_batch(
         &self,
         Parameters(params): Parameters<ReadBatchParams>,
@@ -3994,64 +4179,33 @@ impl WorkflowyMcpServer {
                 resolved_ops.push((op.op.clone(), resolved_id, op.max_depth));
             }
 
+            // Bounded-concurrency dispatch (2026-07-21): the ops are
+            // independent reads, so overlapping them collapses RTT stalls —
+            // a 20-op sweep at ~200 ms each was ~4 s serial. The shared
+            // rate limiter still caps real throughput; this cap only bounds
+            // in-flight fan-out. Results re-emit in input order below.
+            use futures::StreamExt as _;
+            let op_futures = resolved_ops.into_iter().enumerate().map(
+                |(idx, (op_kind, id, max_depth))| async move {
+                    let result = self.run_read_batch_op(&op_kind, id.as_deref(), max_depth).await;
+                    (idx, op_kind, id, result)
+                },
+            );
+            let mut collected: Vec<(
+                usize,
+                String,
+                Option<String>,
+                std::result::Result<serde_json::Value, String>,
+            )> = futures::stream::iter(op_futures)
+                .buffer_unordered(defaults::READ_BATCH_CONCURRENCY)
+                .collect()
+                .await;
+            collected.sort_by_key(|(idx, ..)| *idx);
+
             let mut succeeded = 0usize;
             let mut failed = 0usize;
-            let mut entries: Vec<serde_json::Value> = Vec::with_capacity(resolved_ops.len());
-            for (idx, (op_kind, id, max_depth)) in resolved_ops.into_iter().enumerate() {
-                let result: std::result::Result<serde_json::Value, String> = match op_kind.as_str() {
-                    "get_node" => {
-                        let id_ref = id.as_deref().expect("validated above");
-                        let node_fut = self.client.get_node_with_propagation_retry(id_ref);
-                        let children_fut = self.client.get_children_with_propagation_retry(id_ref);
-                        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
-                        match node_res {
-                            Ok(n) => {
-                                let children: Vec<WorkflowyNode> = children_res.unwrap_or_default();
-                                if !children.is_empty() {
-                                    self.name_index.ingest(&children);
-                                }
-                                self.name_index.ingest(std::slice::from_ref(&n));
-                                Ok(json!({"node": n, "children": children}))
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                    "list_children" => {
-                        let res = match id.as_deref() {
-                            Some(i) => self.client.get_children_with_propagation_retry(i).await,
-                            None => self.client.get_top_level_nodes().await,
-                        };
-                        match res {
-                            Ok(children) => {
-                                if !children.is_empty() {
-                                    self.name_index.ingest(&children);
-                                }
-                                Ok(json!({
-                                    "scope_resolved": scope_resolved_label(id.as_deref()),
-                                    "children": children,
-                                }))
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                    "get_subtree" => {
-                        let id_ref = id.as_deref().expect("validated above");
-                        let depth = max_depth.unwrap_or(5);
-                        match self.walk_subtree(Some(id_ref), depth).await {
-                            Ok(fetch) => {
-                                let payload = json!({"nodes": fetch.nodes});
-                                Ok(with_truncation_envelope(
-                                    payload,
-                                    fetch.truncated,
-                                    fetch.limit,
-                                    fetch.truncation_reason,
-                                ))
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                    _ => unreachable!("validated above"),
-                };
+            let mut entries: Vec<serde_json::Value> = Vec::with_capacity(collected.len());
+            for (idx, op_kind, id, result) in collected {
                 let entry = match result {
                     Ok(data) => {
                         succeeded += 1;
@@ -4085,6 +4239,70 @@ impl WorkflowyMcpServer {
             });
             Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]))
         })
+    }
+
+    /// One `read_batch` operation, dispatched by kind. Extracted from the
+    /// handler body so the bounded-concurrency stream stays readable.
+    async fn run_read_batch_op(
+        &self,
+        op_kind: &str,
+        id: Option<&str>,
+        max_depth: Option<usize>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        match op_kind {
+                    "get_node" => {
+                        let id_ref = id.expect("validated above");
+                        let node_fut = self.client.get_node_with_propagation_retry(id_ref);
+                        let children_fut = self.client.get_children_with_propagation_retry(id_ref);
+                        let (node_res, children_res) = tokio::join!(node_fut, children_fut);
+                        match node_res {
+                            Ok(n) => {
+                                let children: Vec<WorkflowyNode> = children_res.unwrap_or_default();
+                                if !children.is_empty() {
+                                    self.name_index.ingest(&children);
+                                }
+                                self.name_index.ingest(std::slice::from_ref(&n));
+                                Ok(json!({"node": n, "children": children}))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "list_children" => {
+                        let res = match id {
+                            Some(i) => self.client.get_children_with_propagation_retry(i).await,
+                            None => self.client.get_top_level_nodes().await,
+                        };
+                        match res {
+                            Ok(children) => {
+                                if !children.is_empty() {
+                                    self.name_index.ingest(&children);
+                                }
+                                Ok(json!({
+                                    "scope_resolved": scope_resolved_label(id),
+                                    "children": children,
+                                }))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    "get_subtree" => {
+                        let id_ref = id.expect("validated above");
+                        let depth = max_depth.unwrap_or(5);
+                        match self.walk_subtree(Some(id_ref), depth).await {
+                            Ok(fetch) => {
+                                let payload = json!({"nodes": fetch.nodes});
+                                Ok(with_truncation_envelope(
+                                    payload,
+                                    fetch.truncated,
+                                    fetch.limit,
+                                    fetch.truncation_reason,
+                                ))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    _ => unreachable!("validated above"),
+        }
     }
 
     #[tool(description = "Apply a sequence of create/edit/delete/move operations with best-effort atomicity. Operations run sequentially so dependencies resolve in order; on first failure the server replays inverse operations to roll back what already succeeded. Rollback is best-effort — not all operations are perfectly invertible (a deleted node's children cannot be perfectly recreated). True atomicity needs upstream transaction support which Workflowy does not expose; this wrapper is the closest you get without that. Orchestration runs through `crate::workflows::run_transaction`, the same code path the `wflow-do transaction` CLI uses.")]
@@ -5235,10 +5453,22 @@ fn spawn_index_saver(name_index: Arc<NameIndex>) {
         loop {
             interval.tick().await;
             if name_index.is_dirty() {
-                if let Err(e) = name_index.save_to_disk() {
-                    warn!(error = %e, "name index save failed");
-                } else {
-                    info!(size = name_index.size(), "name index checkpointed");
+                // spawn_blocking: `save_to_disk` is synchronous fs I/O plus a
+                // cross-process file lock plus a full-index serialise — on a
+                // ~55k-entry index that is real blocking work, and running it
+                // on a runtime worker stalls request handling on small
+                // worker pools (cf. the 2026-06-28 single-vCPU connector
+                // starvation incident).
+                let idx = Arc::clone(&name_index);
+                match tokio::task::spawn_blocking(move || {
+                    let r = idx.save_to_disk();
+                    (r, idx.size())
+                })
+                .await
+                {
+                    Ok((Ok(()), size)) => info!(size, "name index checkpointed"),
+                    Ok((Err(e), _)) => warn!(error = %e, "name index save failed"),
+                    Err(e) => warn!(error = %e, "name index save task panicked"),
                 }
             }
         }
@@ -5993,8 +6223,14 @@ mod tests {
         assert_eq!(resolved, full);
     }
 
+    /// Serialises the tests that mutate the process-global
+    /// `WORKFLOWY_INDEX_PATH` env var — without it they race under the
+    /// parallel test runner and fail spuriously (observed 2026-07-21).
+    static INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_index_save_path_uses_env_override_when_set() {
+        let _env = INDEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Save and restore the env var so the test is repeatable. We
         // avoid `std::env::set_var` in async context (it's not
         // thread-safe across tests) by using a serialised wrapper here.
@@ -6012,6 +6248,7 @@ mod tests {
 
     #[test]
     fn resolve_index_save_path_treats_empty_env_as_disabled() {
+        let _env = INDEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = defaults::INDEX_PATH_ENV;
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "");
@@ -6031,6 +6268,7 @@ mod tests {
     /// var and the recommended host-config fix.
     #[test]
     fn name_index_persistence_envelope_warns_when_env_unset() {
+        let _env = INDEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = defaults::INDEX_PATH_ENV;
         let prev = std::env::var(key).ok();
         std::env::remove_var(key);
@@ -6058,6 +6296,7 @@ mod tests {
     /// configured nor the unconfigured shape can drift silently.
     #[test]
     fn name_index_persistence_envelope_reports_path_when_env_set() {
+        let _env = INDEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = defaults::INDEX_PATH_ENV;
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "/tmp/wflow-persist-test/idx.json");
@@ -6076,6 +6315,7 @@ mod tests {
 
     #[test]
     fn resolve_index_save_path_returns_none_when_env_unset() {
+        let _env = INDEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Pin the no-fallback contract: the repo carries no
         // machine-specific default, so an unset env var must yield
         // None rather than guessing a HOME-relative path.
@@ -7026,6 +7266,7 @@ mod tests {
     async fn find_node_refuses_root_scan_by_default() {
         let server = new_test_server();
         let params = FindNodeParams {
+            prefer_index: None,
             name: "Tasks".to_string(),
             match_mode: None,
             selection: None,
@@ -7046,6 +7287,7 @@ mod tests {
     async fn find_node_rejects_invalid_parent_id() {
         let server = new_test_server();
         let params = FindNodeParams {
+            prefer_index: None,
             name: "Tasks".to_string(),
             match_mode: None,
             selection: None,
@@ -7071,6 +7313,7 @@ mod tests {
             ..Default::default()
         }]);
         let params = FindNodeParams {
+            prefer_index: None,
             name: "Tasks".to_string(),
             match_mode: Some("exact".to_string()),
             selection: None,
@@ -7091,6 +7334,131 @@ mod tests {
             .unwrap_or_default();
         assert!(body.contains("\"index_served\":true"), "body: {body}");
         assert!(body.contains(valid_id()), "body: {body}");
+    }
+
+    /// `prefer_index` serves index hits with no walk (2026-07-21): the
+    /// client is unreachable, so any walk attempt would error — a passing
+    /// result proves the index answered.
+    #[tokio::test]
+    async fn find_node_prefer_index_serves_hits_without_walk() {
+        let server = new_test_server();
+        server.name_index.ingest(&[WorkflowyNode {
+            id: valid_id().to_string(),
+            name: "Tasks".to_string(),
+            parent_id: None,
+            ..Default::default()
+        }]);
+        let params = FindNodeParams {
+            name: "Tasks".to_string(),
+            match_mode: Some("exact".to_string()),
+            selection: None,
+            parent_id: None,
+            max_depth: None,
+            allow_root_scan: Some(true),
+            use_index: None,
+            prefer_index: Some(true),
+        };
+        let result = server
+            .find_node(Parameters(params))
+            .await
+            .expect("prefer_index with a hit must serve from the index");
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(body.contains(valid_id()), "body: {body}");
+    }
+
+    /// `find_backlinks(use_index=true)` scans the index with the shared
+    /// `node_links_to` predicate — no walk, unreachable client, and the
+    /// four-field truncation envelope reports an untruncated result.
+    #[tokio::test]
+    async fn find_backlinks_use_index_serves_from_index_without_walk() {
+        let server = new_test_server();
+        let target = valid_id().to_string();
+        let short = {
+            let compact = target.replace('-', "");
+            compact[compact.len() - 12..].to_string()
+        };
+        server.name_index.ingest(&[
+            WorkflowyNode {
+                id: target.clone(),
+                name: "Canonical claim".to_string(),
+                ..Default::default()
+            },
+            WorkflowyNode {
+                id: "bbbbbbbb-2222-4222-8222-222222222222".to_string(),
+                name: "Mirror".to_string(),
+                description: Some(format!("mirror_of: {}", short)),
+                ..Default::default()
+            },
+            WorkflowyNode {
+                id: "cccccccc-3333-4333-8333-333333333333".to_string(),
+                name: "Unrelated".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let result = server
+            .find_backlinks(Parameters(FindBacklinksParams {
+                node_id: NodeId::from(target.as_str()),
+                limit: None,
+                max_depth: None,
+                parent_id: None,
+                use_index: Some(true),
+            }))
+            .await
+            .expect("index path must succeed");
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(v["served_from"], "name_index");
+        assert_eq!(v["count"], 1, "only the linking node matches: {body}");
+        assert_eq!(v["backlinks"][0]["name"], "Mirror");
+        assert_eq!(v["truncated"], false);
+        assert!(v.get("truncation_recovery_hint").is_some(), "envelope: {body}");
+    }
+
+    /// `tag_search(use_index=true)` is whole-tag from the index: `#lead`
+    /// must not match `#leadership` (same predicate as the walk path).
+    #[tokio::test]
+    async fn tag_search_use_index_matches_whole_tag_from_index() {
+        let server = new_test_server();
+        server.name_index.ingest(&[
+            WorkflowyNode {
+                id: "bbbbbbbb-2222-4222-8222-222222222222".to_string(),
+                name: "Pipeline review #lead".to_string(),
+                ..Default::default()
+            },
+            WorkflowyNode {
+                id: "cccccccc-3333-4333-8333-333333333333".to_string(),
+                name: "Reading on #leadership".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let result = server
+            .tag_search(Parameters(TagSearchParams {
+                tag: "#lead".to_string(),
+                max_results: None,
+                parent_id: None,
+                max_depth: None,
+                use_index: Some(true),
+            }))
+            .await
+            .expect("index path must succeed");
+        let body = result
+            .content
+            .into_iter()
+            .next()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        assert!(body.contains("Pipeline review"), "body: {body}");
+        assert!(!body.contains("Reading on"), "whole-tag must exclude #leadership: {body}");
     }
 
     #[tokio::test]
@@ -7899,6 +8267,7 @@ mod tests {
     async fn search_nodes_refuses_root_scan_by_default() {
         let server = new_test_server();
         let params = SearchNodesParams {
+            prefer_index: None,
             query: "Tasks".to_string(),
             max_results: None,
             parent_id: None,
@@ -7949,6 +8318,7 @@ mod tests {
             },
         ]);
         let params = SearchNodesParams {
+            prefer_index: None,
             query: "cynefin".to_string(),
             max_results: None,
             parent_id: None,
@@ -7989,6 +8359,7 @@ mod tests {
         let server = new_test_server();
         // No ingest — name index is empty.
         let params = SearchNodesParams {
+            prefer_index: None,
             query: "anything".to_string(),
             max_results: None,
             parent_id: None,
@@ -8981,6 +9352,168 @@ mod load_tests {
             .next()
             .and_then(|c| c.as_text().map(|t| t.text.clone()))
             .unwrap_or_default()
+    }
+
+    /// Bulk-created nodes must be resolvable by short hash immediately
+    /// (2026-07-21): `insert_content`'s workflow records every created
+    /// node in the `MutationFootprint`, and `apply_footprint` ingests
+    /// them into the name index — so a "copy internal link" of content
+    /// captured moments ago resolves O(1) instead of firing a 20 s walk.
+    #[tokio::test]
+    async fn insert_content_seeds_name_index_with_created_nodes() {
+        let mock = MockServer::start().await;
+        let id_a = "00000000-0000-0000-0000-0000000000aa";
+        let id_b = "00000000-0000-0000-0000-0000000000bb";
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "alpha"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"item_id": id_a})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/nodes"))
+            .and(body_partial_json(json!({"name": "beta"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"item_id": id_b})))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        server
+            .insert_content(Parameters(InsertContentParams {
+                parent_id: NodeId::from(""),
+                content: "alpha\nbeta".to_string(),
+            }))
+            .await
+            .expect("insert succeeds");
+
+        for full in [id_a, id_b] {
+            let compact = full.replace('-', "");
+            let short = &compact[compact.len() - 12..];
+            assert_eq!(
+                server.name_index.resolve_short_hash(short).as_deref(),
+                Some(full),
+                "a just-created node's short hash must resolve without a walk",
+            );
+        }
+    }
+
+    /// `prefer_index` is index-first with LIVE FALLBACK (2026-07-21): a
+    /// populated index that has no hits for the query must fall through
+    /// to the scoped walk instead of returning an index-shaped empty
+    /// result — collapsing the old two-step (use_index, get nothing,
+    /// re-issue without it) into one call.
+    #[tokio::test]
+    async fn search_nodes_prefer_index_falls_back_to_walk_on_index_miss() {
+        let mock = MockServer::start().await;
+        let parent = "00000000-0000-0000-0000-0000000000dd";
+        let child = "00000000-0000-0000-0000-0000000000ee";
+        Mock::given(method("GET"))
+            .and(path(format!("/nodes/{}", parent)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"node": {"id": parent, "name": "Projects"}}),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .and(query_param("parent_id", parent))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                {"id": child, "name": "Quarterly plan"}
+            ]})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nodes"))
+            .and(query_param("parent_id", child))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+            .mount(&mock)
+            .await;
+
+        let server = server_against(&mock).await;
+        // Populated index with NO hit for the query — prefer_index must
+        // fall through to the live walk rather than reporting nothing.
+        server.name_index.ingest(&[crate::types::WorkflowyNode {
+            id: "00000000-0000-0000-0000-0000000000ff".to_string(),
+            name: "Unrelated".to_string(),
+            ..Default::default()
+        }]);
+        let result = server
+            .search_nodes(Parameters(SearchNodesParams {
+                query: "quarterly".to_string(),
+                max_results: None,
+                parent_id: Some(NodeId::from(parent)),
+                max_depth: None,
+                allow_root_scan: None,
+                use_index: None,
+                prefer_index: Some(true),
+            }))
+            .await
+            .expect("fallback walk must serve the result");
+        let body = body_text(&result);
+        assert!(
+            body.contains("Quarterly plan"),
+            "index miss must fall back to the live walk: {body}"
+        );
+    }
+
+    /// `read_batch` dispatches with bounded concurrency (2026-07-21), but
+    /// the response contract is unchanged: results arrive in input order,
+    /// each carrying its input `index`. The first op is given the SLOWEST
+    /// mock response so completion order inverts input order — sorting by
+    /// index must restore it.
+    #[tokio::test]
+    async fn read_batch_concurrent_dispatch_preserves_input_order() {
+        let mock = MockServer::start().await;
+        let ids = [
+            "00000000-0000-0000-0000-0000000000aa",
+            "00000000-0000-0000-0000-0000000000bb",
+            "00000000-0000-0000-0000-0000000000cc",
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            let delay_ms = [60u64, 10, 1][i];
+            Mock::given(method("GET"))
+                .and(path(format!("/nodes/{}", id)))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"node": {"id": id, "name": format!("n{}", i)}}))
+                        .set_delay(Duration::from_millis(delay_ms)),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", *id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                .mount(&mock)
+                .await;
+        }
+
+        let server = server_against(&mock).await;
+        let result = server
+            .read_batch(Parameters(ReadBatchParams {
+                operations: ids
+                    .iter()
+                    .map(|id| ReadBatchOpParams {
+                        op: "get_node".to_string(),
+                        node_id: Some(NodeId::from(*id)),
+                        max_depth: None,
+                    })
+                    .collect(),
+            }))
+            .await
+            .expect("batch must succeed");
+
+        let v: serde_json::Value = serde_json::from_str(&body_text(&result)).expect("JSON body");
+        assert_eq!(v["succeeded"], 3);
+        let results = v["results"].as_array().expect("results array");
+        for (i, entry) in results.iter().enumerate() {
+            assert_eq!(entry["index"], i, "results must be emitted in input order");
+            assert_eq!(
+                entry["node_id"], ids[i],
+                "result {} must correspond to input op {}",
+                i, i,
+            );
+        }
     }
 
     /// Write-path report Recommendation D (2026-06-17): a hard mid-batch
@@ -10855,6 +11388,78 @@ mod load_tests {
             !src.contains(walker),
             "refresh_name_index existed only to serve the removed periodic refresher; \
              a root-scoped unattended walk must not reappear in-process",
+        );
+    }
+
+    /// The 30 s index checkpoint must not run its synchronous fs-I/O +
+    /// full-index serialise on a tokio runtime worker: on small worker
+    /// pools (the 2026-06-28 single-vCPU connector incident) a multi-MB
+    /// save stalls every in-flight request for its duration. And the file
+    /// is a machine cache — pretty-printing it doubles the serialise cost
+    /// for nothing.
+    #[test]
+    fn index_checkpoint_runs_on_blocking_thread_with_compact_json() {
+        let src = include_str!("mod.rs");
+        let saver_body = src
+            .split("fn spawn_index_saver")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("spawn_index_saver present");
+        assert!(
+            saver_body.contains("spawn_blocking"),
+            "spawn_index_saver must route save_to_disk through tokio::task::spawn_blocking",
+        );
+        let idx_src = include_str!("../utils/name_index.rs");
+        let pretty = concat!("to_vec", "_pretty");
+        assert!(
+            !idx_src.contains(pretty),
+            "the persisted name index is a machine cache; serialise it compact",
+        );
+    }
+
+    /// `insert_content` stays STRICTLY SEQUENTIAL by design (2026-07-21
+    /// decision, revisited and re-affirmed): its resume contract —
+    /// "re-run the remaining lines under `last_inserted_id`" — assumes
+    /// prefix completion, i.e. lines 0..created_count committed and
+    /// nothing beyond. Parallel sibling creates break that: a mid-run
+    /// failure leaves committed lines BEYOND the failure point, and the
+    /// documented resume then double-writes them. `batch_create_nodes`
+    /// (per-op status, already concurrent) is the sanctioned parallel
+    /// path for flat sibling batches.
+    #[test]
+    fn insert_content_remains_sequential_by_design() {
+        let src = include_str!("../workflows.rs");
+        let body = src
+            .split("fn insert_content_via_indented")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub ").next())
+            .expect("insert_content_via_indented present");
+        assert!(
+            !body.contains("buffer_unordered") && !body.contains("join_all"),
+            "insert_content must not create lines concurrently — the \
+             committed-count resume cursor assumes prefix completion; use \
+             batch_create_nodes for parallel flat creates",
+        );
+    }
+
+    /// Every observed 429 must drain the local token bucket. Burst
+    /// headroom held through a rate-limit window fires up to burst_size
+    /// requests back-to-back the moment the window clears, re-tripping
+    /// the upstream — the 429-storm oscillation. `stamp_rate_limited` is
+    /// the single site every 429 observation routes through, so the
+    /// drain lives there.
+    #[test]
+    fn a_429_observation_drains_the_local_token_bucket() {
+        let src = include_str!("../api/client.rs");
+        let body = src
+            .split("fn stamp_rate_limited")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("stamp_rate_limited present");
+        assert!(
+            body.contains("rate_limiter.drain()"),
+            "stamp_rate_limited must drain the token bucket so the post-window \
+             resume paces at the sustained rate instead of firing the burst",
         );
     }
 

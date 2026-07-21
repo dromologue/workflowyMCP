@@ -89,7 +89,7 @@ Every discipline section that follows (Read-path, Multi-write batch, synthesis p
 
 ## Read-path discipline for freshly-created nodes (the sweep trap)
 
-The read-side compound of UUID Parameter Discipline. For established material the persistent name index at `$WORKFLOWY_INDEX_PATH` is the clean second channel; for material created within the last ~30 minutes the index can still be empty for that subtree, and the live-read channel is exposed to the encoding hazard described above.
+The read-side compound of UUID Parameter Discipline. For established material the persistent name index at `$WORKFLOWY_INDEX_PATH` is the clean second channel; for recently created material the index can still be empty for that subtree (it only learns nodes through walks and explicit reindex passes), and the live-read channel is exposed to the encoding hazard described above.
 
 **The discipline, in order:**
 
@@ -97,7 +97,7 @@ The read-side compound of UUID Parameter Discipline. For established material th
 
 2. **Index fresh → reconstruct from local JSON.** Walk `parent_id` links from the target downward. No walk budget, no host encoding, no rate limiter. Always prefer for established material.
 
-3. **Node newer than index → scoped reindex first.** `build_name_index(parent_id=<UUID>)` from the same session that created the node, or `wflow-do reindex --root <UUID>` from the shell. The 30-minute background refresher is a backstop, not the primary refresh path.
+3. **Node newer than index → scoped reindex first.** `build_name_index(parent_id=<UUID>)` from the same session that created the node, or `wflow-do reindex --root <UUID>` from the shell. There is no in-process background refresher — the scoped reindex (or a scheduled `wflow-do reindex --timeout-secs 0 --patient` job) is the only refresh path.
 
 4. **End-of-capture reflex.** Fire the scoped reindex immediately after writes settle on any workflow that may want to read the new content same-session. Sub-second cost; keeps the read path open.
 
@@ -262,16 +262,16 @@ This rule prevents the failure mode where a half-configured environment makes th
 
 #### Persistent name index + path-based discovery
 
-The MCP server keeps a disk-persisted name index at `$WORKFLOWY_INDEX_PATH` (conventionally `$SECONDBRAIN_DIR/memory/name_index.json`; unset disables persistence). It survives restarts; a 30-minute background task refreshes it; mutations checkpoint every 30 seconds.
+The MCP server keeps a disk-persisted name index at `$WORKFLOWY_INDEX_PATH` (conventionally `$SECONDBRAIN_DIR/memory/name_index.json`; unset disables persistence). It survives restarts; mutations checkpoint every 30 seconds; coverage grows from every walk any tool performs and converges via explicit reindex passes — there is no in-process background refresher.
 
 **The fast retrieval surface to reach for first:**
 
 - `node_at_path(path=["Top", "Sub", "Target"])` — walks a hierarchical path of node names. ONE `list_children` call per segment, so resolution is O(depth), not O(tree). Use this whenever you know where a node lives but not its UUID; visited nodes also feed the persistent index, accelerating future short-hash lookups under that branch.
 - `resolve_link(link="...", search_parent_path=[...])` — built for the "I have a Workflowy URL, give me the node info" workflow. Pass the URL or short hash via `link`; pass an optional parent-name path via `search_parent_path` to scope the walk to a single subtree. Returns full node info on success.
 
-**Short-hash auto-walk (fallback):** every `node_id` parameter accepts the 12-char URL-suffix or 8-char doc-prefix forms. On a cache miss the resolver runs a 5-minute walk. For trees over ~50 k nodes the fallback is unreliable — **prefer `node_at_path` or `resolve_link` with a parent path** rather than relying on the auto-walk.
+**Short-hash auto-walk (fallback):** every `node_id` parameter accepts the 12-char URL-suffix or 8-char doc-prefix forms. On a cache miss the resolver runs a 20-second walk (the interactive budget; exhaustive coverage belongs to the scheduled reindex). For trees over ~50 k nodes the fallback is unreliable — **prefer `node_at_path` or `resolve_link` with a parent path** rather than relying on the auto-walk.
 
-**Building coverage explicitly:** `build_name_index(parent_id=...)` walks a single subtree deeply; the persistent index makes the work cumulative across sessions. For a one-shot deep index pass from the shell (independent of any running MCP), run `wflow-do reindex --root <UUID> [--root <UUID> ...]` — walks each root with the resolution budget, merges results into the same persistent file, and reports per-root coverage. Useful for fresh installs or recovery from sparse coverage.
+**Building coverage explicitly:** `build_name_index(parent_id=...)` walks a single subtree deeply; the persistent index makes the work cumulative across sessions. For a one-shot deep index pass from the shell (independent of any running MCP), run `wflow-do reindex --timeout-secs 0 --patient --root <UUID> [--root <UUID> ...]` — the two flags make the pass coverage-complete (patient retry of rate-limited branches, no per-root deadline); without them each root gets only the interactive 20-second budget. Merges results into the same persistent file and reports per-root coverage. Useful for fresh installs, recovery from sparse coverage, and as a scheduled nightly job.
 
 #### Direct local index access (fastest possible lookup)
 
@@ -338,33 +338,33 @@ For each name the user provides, call `find_node(name="<name>", parent_id=<works
 
 ## Workflow categories (skeletons — flesh out per user)
 
-The detailed implementation of each workflow lives in the user's customised copy of this file at `~/.claude/skills/wflow/SKILL.md`. The category list below is the framework; the prompts and tool sequences are user-specific.
+The detailed implementation of each workflow lives in the user's customised copy of this file at `~/.claude/skills/wflow/SKILL.md`. The category list below is the framework; the prompts and tool sequences are user-specific. **The numbers are load-bearing:** cross-references elsewhere in this file (and in the memory-file schemas) cite workflows as "Workflow 6", "Workflows 9–14", etc. — they refer to the numbering below.
 
 ### Operate (day-to-day)
 
-- **Daily prioritisation** — surface today's todos, overdue items, and recently-modified projects via `daily_review`. Suggest a focus block for the morning.
-- **Weekly prioritisation** — review last week's completions and unmoved items. Identify what to drop, what to escalate.
-- **Monthly prioritisation** — set themes; promote/demote pillar work.
-- **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo. **When capture is incidental** (an action item surfaces mid-chat rather than being the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under `<inferred-domain>` — confirm?", (2) on user yes, the actual write. When the user's *primary* intent is capture ("capture: X"), the offer collapses to a domain confirmation in the first response and the create lands on yes.
-- **Project status** — for a named project, return current state (todos open, recent activity, blockers tagged).
-- **Inbox triage** — walk Inbox children, route each to the right subtree (or delete).
-- **Reading list management** — surface WIP reading, recent additions, items tagged for distillation.
-- **Journal check-in** — append a dated entry under the Journal node.
+1. **Daily prioritisation** — surface today's todos, overdue items, and recently-modified projects via `daily_review`. Suggest a focus block for the morning.
+2. **Weekly prioritisation** — review last week's completions and unmoved items. Identify what to drop, what to escalate.
+3. **Monthly prioritisation** — set themes; promote/demote pillar work.
+4. **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo. **When capture is incidental** (an action item surfaces mid-chat rather than being the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under `<inferred-domain>` — confirm?", (2) on user yes, the actual write. When the user's *primary* intent is capture ("capture: X"), the offer collapses to a domain confirmation in the first response and the create lands on yes.
+5. **Project status** — for a named project, return current state (todos open, recent activity, blockers tagged).
+6. **Inbox triage** — walk Inbox children, route each to the right subtree (or delete).
+7. **Reading list management** — surface WIP reading, recent additions, items tagged for distillation.
+8. **Journal check-in** — append a dated entry under the Journal node.
 
 ### Synthesise (slower, compounding)
 
-- **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes via `create_mirror(canonical_node_id, target_parent_id, pillar?)` — the mirror's name is copied from the canonical and its description gets `mirror_of: <canonical_uuid>` so `audit_mirrors` can surface drift later. Pass `pillar` when the canonical lacks a `canonical_of:` marker; existing markers are never overwritten.
-- **Sweep an existing node into the second brain** — take an already-in-Workflowy node (reference document, transcript, discussion thread) and distil its subtree into the canonical pillars/themes:
+9. **Distil single source** — turn a paper / article / chat into atomic notes. Place each note under the right pillar/theme. Mirror cross-cutting notes via `create_mirror(canonical_node_id, target_parent_id, pillar?)` — the mirror's name is copied from the canonical and its description gets `mirror_of: <canonical_uuid>` so `audit_mirrors` can surface drift later. Pass `pillar` when the canonical lacks a `canonical_of:` marker; existing markers are never overwritten.
+10. **Sweep an existing node into the second brain** — take an already-in-Workflowy node (reference document, transcript, discussion thread) and distil its subtree into the canonical pillars/themes:
   1. **Resolve precisely.** `resolve_link` with a scope hint (`search_parent_id` / `search_parent_path`), never an unscoped walk — unscoped on a large workspace times out at the 20 s subtree budget before finding anything.
   2. **Establish a clean read path** per Read-path discipline above — freshness check, reconstruct or reindex, `read_batch` for live reads, export as last resort.
   3. **Apply the routing-plan gate (pattern 1) and the novelty check** before writing. A sweep is the highest-risk place to silently duplicate a canonical that already covers the source.
   4. **Route per `distillation_taxonomy.md`** — pillar / theme / cross-pillar classification reads from the taxonomy, not from the sweep content. The taxonomy is canonical on borderline cases.
   5. **Write via the head-batch-mirror sequence (pattern 2).** Single cluster-head create, batched atomic notes, selective mirrors, session-log entry.
-- **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
-- **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
-- **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.
-- **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
-- **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
+11. **Distil reading list (batch)** — process the reading queue in one pass, producing a session log entry.
+12. **Cross-system research** — query Workflowy for everything related to a topic. If `services.md` exists and any of its entries have `participates_in: retrieval`, query those services too and merge the results. Surface as a synthesis with citations back to source nodes.
+13. **Extract from additional services** *(only if `services.md` declares any with `participates_in: extraction`)* — route the service's outputs (marginalia, highlights, annotations) into Distillations. The exact extraction call lives in the service's MCP namespace; consult `services.md` for the namespace and the relevant tools.
+14. **Synthesis capture** — convert a chat-produced framework or comparison into an atomic note in Workflowy.
+15. **Review surface** — surface notes tagged `#revisit` (or similar), prompt for spaced-repetition action.
 
 #### Three patterns every synthesis workflow shares
 

@@ -373,6 +373,11 @@ pub struct WorkflowyClient {
     /// 429 body has no hint we still stamp `last_429_unix_ms` but leave
     /// this at 0 — callers fall back to their normal cadence.
     last_retry_after_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Optional shared node cache. When attached (production wiring), the
+    /// children-listing funnels serve TTL-bounded cache hits and the write
+    /// funnel invalidates affected listings pre-send. `None` (default)
+    /// preserves fully-live behaviour for tests and one-shot callers.
+    node_cache: Option<Arc<crate::utils::cache::NodeCache>>,
 }
 
 impl WorkflowyClient {
@@ -416,7 +421,38 @@ impl WorkflowyClient {
             rate_limit_reset_unix: Arc::new(AtomicI64::new(-1)),
             last_429_unix_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_retry_after_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            node_cache: None,
         })
+    }
+
+    /// Attach a node cache so children listings served by
+    /// `get_children_cancellable` / `get_top_level_nodes_cancellable` are
+    /// cached (TTL-bounded) and every write funnelled through
+    /// `request_cancellable` invalidates the affected listings pre-send.
+    /// Off by default: tests and short-lived callers get byte-identical
+    /// live behaviour unless the wiring site opts in. The production server
+    /// passes the SAME `Arc` it uses for `invalidate_for_mutation`, so the
+    /// two invalidation layers converge on one cache.
+    pub fn with_node_cache(mut self, cache: Arc<crate::utils::cache::NodeCache>) -> Self {
+        self.node_cache = Some(cache);
+        self
+    }
+
+    /// Drop the children listings a mutation can affect, from the single
+    /// write funnel. `/nodes` (create) → the target parent's listing (root
+    /// when absent); `/nodes/{id}` (edit/complete/delete/move) → the node's
+    /// own listing, the listing displaying it, and — for a move — the new
+    /// parent's listing from the body.
+    fn invalidate_listings_for_write(&self, endpoint: &str, body: Option<&serde_json::Value>) {
+        let Some(cache) = &self.node_cache else { return };
+        if let Some(id) = endpoint.strip_prefix("/nodes/") {
+            cache.invalidate_node(id);
+        }
+        match body.and_then(|b| b.get("parent_id")).and_then(|v| v.as_str()) {
+            Some(pid) => cache.invalidate_listing(pid),
+            None if endpoint == "/nodes" => cache.invalidate_listing(""),
+            None => {}
+        }
     }
 
     /// Last successful request's wall-clock duration in ms. `0` until the
@@ -515,6 +551,12 @@ impl WorkflowyClient {
         self.last_429_unix_ms.store(now_unix_ms(), Ordering::Relaxed);
         self.last_retry_after_ms
             .store(retry_after_ms.unwrap_or(0), Ordering::Relaxed);
+        // Drain the local bucket: keeping up to burst_size tokens through a
+        // 429 means the instant the window clears, queued callers fire
+        // back-to-back into a fresh quota and re-trip it — the observed
+        // 429-storm oscillation. Post-window traffic resumes at the
+        // sustained rate instead.
+        self.rate_limiter.drain();
     }
 
     #[cfg(test)]
@@ -594,6 +636,15 @@ impl WorkflowyClient {
         cancel: Option<&CancelGuard>,
         deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
+        // Cache key "" = workspace root, matching the root sentinel the
+        // handlers use. The diagnostic probe does NOT route here (it calls
+        // try_request_cancellable directly), so probes stay live.
+        if let Some(cache) = &self.node_cache {
+            if let Some(hit) = cache.children_listing("") {
+                debug!("top-level listing served from cache");
+                return Ok(hit);
+            }
+        }
         let response: serde_json::Value = self.request_cancellable("GET", "/nodes", None, cancel, deadline).await?;
         let mut nodes: Vec<WorkflowyNode> = serde_json::from_value(
             response.get("nodes").cloned().unwrap_or(json!([]))
@@ -603,6 +654,9 @@ impl WorkflowyClient {
         // Same display-order sort as get_children_cancellable so the workspace
         // root's top-level listing matches the Workflowy UI (2026-07-12 issue 3).
         Self::sort_children_by_priority(&mut nodes);
+        if let Some(cache) = &self.node_cache {
+            cache.insert_children_listing("", &nodes);
+        }
         Ok(nodes)
     }
 
@@ -768,6 +822,17 @@ impl WorkflowyClient {
         cancel: Option<&CancelGuard>,
         deadline: Option<Instant>,
     ) -> Result<Vec<WorkflowyNode>> {
+        // Cache-first: this is the single children-listing funnel (every
+        // list_children call and every walk level routes here), so a hit
+        // collapses repeated/overlapping reads within the TTL to zero API
+        // calls. Writes invalidate pre-send via the request funnel, so a
+        // hit can never predate an in-process mutation.
+        if let Some(cache) = &self.node_cache {
+            if let Some(hit) = cache.children_listing(node_id) {
+                debug!(parent_id = %node_id, "children listing served from cache");
+                return Ok(hit);
+            }
+        }
         let endpoint = format!("/nodes?parent_id={}", node_id);
         let response: serde_json::Value = self.request_cancellable("GET", &endpoint, None, cancel, deadline).await?;
         let mut children: Vec<WorkflowyNode> = serde_json::from_value(
@@ -782,6 +847,9 @@ impl WorkflowyClient {
             }
         }
         Self::sort_children_by_priority(&mut children);
+        if let Some(cache) = &self.node_cache {
+            cache.insert_children_listing(node_id, &children);
+        }
         Ok(children)
     }
 
@@ -1617,6 +1685,15 @@ impl WorkflowyClient {
         cancel: Option<&CancelGuard>,
         deadline: Option<Instant>,
     ) -> Result<T> {
+        // Pre-write listing invalidation: every mutation routes through this
+        // funnel, so dropping the affected children listings HERE — before
+        // the HTTP send — means no future write path can forget it, and a
+        // timeout/cancel mid-flight can never strand a stale listing
+        // (constitution: invalidate before the mutation lands, not after).
+        if method != "GET" {
+            self.invalidate_listings_for_write(endpoint, body.as_ref());
+        }
+
         // Fail-fast inside an open retry_after window. Pre-2026-06-01 a
         // call (read or write) issued while the upstream's 429 window was
         // still open queued behind the rate limiter and held for the full
@@ -1791,6 +1868,9 @@ impl WorkflowyClient {
             // liveness issue.
             self.last_success_unix_ms
                 .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+            // AIMD additive recovery: each quiet success walks a 429-cut
+            // refill rate back toward the configured ceiling.
+            self.rate_limiter.reward();
             response
                 .json::<T>()
                 .await
@@ -2338,6 +2418,121 @@ mod tests {
     /// and `complete` while whole component menus were missing from the
     /// index, and no field in the response distinguished that from a full
     /// walk.
+    /// The children-listing cache (2026-07-21): `get_children_cancellable`
+    /// is the single funnel every `list_children` call and every walk level
+    /// routes through, so a TTL-bounded cache there collapses repeated and
+    /// overlapping reads to one upstream call — the dominant avoidable load
+    /// in a many-large-frequent-queries second-brain session. Writes
+    /// invalidate pre-send via the `request_cancellable` funnel, so a hit
+    /// can never predate an in-process mutation. Caching is opt-in via
+    /// `with_node_cache`; a bare client stays fully live.
+    mod children_listing_cache {
+        use super::*;
+        use crate::utils::cache::NodeCache;
+        use serde_json::json;
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn quick_configs() -> (RetryConfig, RateLimitConfig) {
+            (
+                RetryConfig {
+                    max_attempts: 1,
+                    base_delay_ms: 1,
+                    max_delay_ms: 2,
+                    retryable_statuses: defaults::RETRY_STATUSES,
+                },
+                RateLimitConfig { requests_per_second: 200, burst_size: 100 },
+            )
+        }
+
+        fn cached_client(mock: &MockServer) -> WorkflowyClient {
+            let (retry, rate) = quick_configs();
+            WorkflowyClient::new_with_configs(mock.uri(), "test-key".to_string(), retry, rate)
+                .expect("client must build against mock")
+                .with_node_cache(Arc::new(NodeCache::new(100)))
+        }
+
+        #[tokio::test]
+        async fn repeat_children_reads_within_ttl_hit_upstream_once() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "p"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "a", "name": "A", "priority": 1},
+                    {"id": "b", "name": "B", "priority": 2}
+                ]})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = cached_client(&mock);
+            let first = client.get_children("p").await.expect("live read");
+            let second = client.get_children("p").await.expect("cached read");
+            assert_eq!(first.len(), 2);
+            assert_eq!(
+                first.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+                second.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+                "cached listing must serve the same display order as the live read",
+            );
+            // MockServer verifies expect(1) on drop: the second read must
+            // not have reached the upstream.
+        }
+
+        #[tokio::test]
+        async fn write_through_funnel_invalidates_listing_so_next_read_is_live() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "p"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "a", "name": "A"}
+                ]})))
+                .expect(2)
+                .mount(&mock)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/nodes"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"item_id": "new-child"})),
+                )
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = cached_client(&mock);
+            client.get_children("p").await.expect("first live read");
+            client
+                .create_node("New", None, Some("p"), None)
+                .await
+                .expect("create under p");
+            client.get_children("p").await.expect("post-write read");
+            // expect(2) on the GET proves the post-write read went live —
+            // the create invalidated the cached listing before its POST.
+        }
+
+        #[tokio::test]
+        async fn client_without_cache_stays_fully_live() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes"))
+                .and(query_param("parent_id", "p"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
+                .expect(2)
+                .mount(&mock)
+                .await;
+
+            let (retry, rate) = quick_configs();
+            let client =
+                WorkflowyClient::new_with_configs(mock.uri(), "test-key".to_string(), retry, rate)
+                    .expect("client must build against mock");
+            client.get_children("p").await.expect("read 1");
+            client.get_children("p").await.expect("read 2");
+            // expect(2): no cache attached, both reads reach the upstream.
+        }
+    }
+
     mod skipped_branch_coverage {
         use super::*;
         use serde_json::json;

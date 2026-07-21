@@ -23,6 +23,13 @@ The contract:
 If the user wants only the bare MCP server (no second-brain workflow), stop
 after Step 2. Otherwise run the full sequence.
 
+**The 10-minute path.** Steps 1–4 are the minimal viable second brain:
+build, wire the host, seed the directory, cache the structural node IDs.
+Step 5 (skill install) takes over the first real session; Step 6 (index
+pre-warm) matters for trees over ~12 k nodes and multi-surface setups.
+If the user's tree is small and they run a single Claude surface, do
+Steps 1–5 and skip Step 6 — the lazy walk covers the rest.
+
 ---
 
 ## Step 0 — Confirm prerequisites
@@ -36,7 +43,7 @@ Ask the user:
   or several. The bootstrap differs slightly per surface (Step 4).
 
 If the user wants only the MCP server, run Steps 1 and 2 then stop. Otherwise
-continue through Step 6.
+continue through Step 7.
 
 ---
 
@@ -59,6 +66,18 @@ tests pass.
 ---
 
 ## Step 2 — Wire up the MCP host
+
+**Read this before wiring anything.** The env vars in this step must be set
+in the **MCP host's config** (`env` block), not only in the user's shell
+profile. The MCP server process inherits its environment from the host's
+launch, not from the interactive shell — a var exported only in `.zshrc`
+is invisible to the server, and the failure is silent: the persistent
+index quietly runs in-memory-only and every short-hash resolve pays
+cold-start latency. Set the vars in **both** places (host config for the
+server, shell profile for the `wflow-do` CLI) in the same session, and
+verify with `workflowy_status` — its `name_index.persistence` block
+reports `configured: true` plus the resolved path when the server can
+see the var.
 
 Ask the user for their Workflowy API key. Then write `.env` in the repo root:
 
@@ -83,6 +102,14 @@ with Step 3:
   "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json"
 }
 ```
+
+Two further optional vars belong in the same block when the user wants
+them: `WORKFLOWY_REVIEW_ROOT` (default root for the `review` and
+`audit_mirrors` tools — picked in Step 4) and
+`WORKFLOWY_INDEX_EXCLUDE_SUBTREES` (comma-separated UUIDs or 12-char
+short hashes of subtrees that must never be written to the on-disk
+index — set this if any subtree holds material the user does not want
+in a durable local file).
 
 Verify with `claude mcp list` — the `workflowy` entry should report
 `✓ Connected`.
@@ -188,6 +215,13 @@ For each, use `find_node` (with `parent_id` scoped to the workspace root) or
 **Important:** every value in this file is the user's specific data. Never
 copy any of it back into the repo or share it publicly.
 
+While the user is choosing structural nodes, also ask: **which node is
+their review anchor** — the subtree the `review` and `audit_mirrors`
+tools should default to (typically Distillations or the root of their
+knowledge area). Set it as `WORKFLOWY_REVIEW_ROOT` in the MCP host's
+`env` block (Step 2). Without it, those two tools require an explicit
+`root_id` on every call and will error on first casual use.
+
 **Check before continuing:** the file has at least Tasks, Inbox, and Journal
 filled in, with verified UUIDs.
 
@@ -249,22 +283,38 @@ surface. Future sessions will reference it on first interaction.
 ## Step 6 — Optional: pre-warm the persistent index for large trees
 
 For workspaces with more than ~12 k nodes, the lazy short-hash resolver
-can't cover the full tree on a single 5-minute walk. Pre-warming the index
+can't cover the full tree on a single 20-second walk (its budget,
+`RESOLVE_WALK_TIMEOUT_MS`, is deliberately short — exhaustive coverage
+belongs to this step, not to interactive calls). Pre-warming the index
 makes every URL the user pastes resolve O(1) thereafter.
+
+Run the pre-warm **patient and unbudgeted** — this is the
+coverage-complete mode; the flags matter:
 
 ```bash
 ~/code/workflowy-mcp-server/target/release/wflow-do reindex \
+  --timeout-secs 0 --patient \
   --root <Tasks-UUID> \
   --root <Inbox-UUID> \
   --root <Reading-List-UUID> \
   --root <Distillations-UUID>
 ```
 
-Each root walk is bounded by `RESOLVE_WALK_TIMEOUT_MS` (5 minutes by
-default). The CLI writes back to whatever `$WORKFLOWY_INDEX_PATH` points
+`--patient` retries rate-limited branches in waves instead of dropping
+them, and `--timeout-secs 0` removes the per-root deadline so patience
+can actually complete (a patient walk on a budget quietly stops being
+patient; the CLI warns about the combination). Without these flags the
+walk uses the interactive 20-second default and a large tree gets a
+silently partial index. A full pass over a large workspace can take
+minutes per root — that is the point. Re-run the same command any time
+to extend coverage; the index merges on save, so the work is cumulative.
+
+The CLI writes back to whatever `$WORKFLOWY_INDEX_PATH` points
 at (typically `$SECONDBRAIN_DIR/memory/name_index.json`); the running
 MCP server picks the file up automatically as long as both processes
-read the same env var.
+read the same env var. Consider scheduling this same command nightly
+(cron / launchd) — the server has no in-process background refresher,
+so the scheduled reindex is what keeps coverage converged.
 
 For trees under 5 k nodes, skip this step — the lazy walk handles
 everything in the first session.
@@ -272,6 +322,27 @@ everything in the first session.
 **Check before continuing:** the file at `$WORKFLOWY_INDEX_PATH`
 exists, is non-empty, and reports a node count comparable to the user's
 expected workspace size.
+
+---
+
+## Step 7 — Verify the whole chain
+
+Before declaring the bootstrap done, prove one representative call of
+each kind works end-to-end on the user's primary surface:
+
+1. `workflowy_status` → `status: "ok"`, and `name_index.persistence`
+   reports `configured: true` with the expected path.
+2. `node_at_path` (or `find_node`) against one of the structural nodes
+   cached in Step 4 → returns the UUID recorded in
+   `workflowy_node_links.md`.
+3. Paste one Workflowy URL from the user's tree → `resolve_link`
+   returns the node (after Step 6, without a walk).
+4. One trivial write-and-verify: `create_node` under Inbox, `get_node`
+   it back, `delete_node` it (pass `expect_name`).
+
+If any of the four fails, fix it now using the troubleshooting section
+below — a bootstrap that ends on a broken chain costs the user their
+first real session.
 
 ---
 

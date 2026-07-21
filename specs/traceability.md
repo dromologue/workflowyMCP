@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 46 contracts, 37 unique pinning tests.
+**Coverage:** 57 contracts, 54 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -49,6 +49,17 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-server-008` | `INSERT_CONTENT_TIMEOUT_MS` leaves â¥ 60 s margin under `MCP_TRANSPORT_HARD_TIMEOUT_MS` | `bulk_budget_leaves_mcp_transport_margin` | `src/defaults.rs` |
 | `C-server-009` | Subtree renderers + `scope_resolved_label` live in shared modules, never duplicated in the surface binaries | `no_duplicated_renderer_or_scope_label_definitions_outside_canonical_modules` | `src/server/mod.rs` |
 | `C-server-010` | `create_mirror` supports `dry_run=true` for read-only resolution preview | `create_mirror_dry_run_rejects_self_mirror_without_api_call` | `src/workflows.rs` |
+| `C-server-011` | Children listings are cached in the single children funnel and invalidated pre-send in the single write funnel | `client_without_cache_stays_fully_live`<br>`repeat_children_reads_within_ttl_hit_upstream_once`<br>`write_through_funnel_invalidates_listing_so_next_read_is_live` | `src/api/client.rs`<br>`src/api/client.rs`<br>`src/api/client.rs` |
+| `C-server-012` | An observed 429 drains the local token bucket | `a_429_observation_drains_the_local_token_bucket`<br>`drain_empties_burst_and_resumes_at_sustained_rate` | `src/server/mod.rs`<br>`src/utils/rate_limiter.rs` |
+| `C-server-013` | The index checkpoint runs on a blocking thread and serialises compact | `index_checkpoint_runs_on_blocking_thread_with_compact_json` | `src/server/mod.rs` |
+| `C-server-014` | A short-hash miss consults the disk index before walking | `refresh_from_disk_adopts_other_writers_entries_and_is_mtime_guarded` | `src/utils/name_index.rs` |
+| `C-server-015` | Workflow-created nodes seed the name index at create time | `insert_content_seeds_name_index_with_created_nodes` | `src/server/mod.rs` |
+| `C-server-016` | `read_batch` dispatches with bounded concurrency and emits results in input order | `read_batch_concurrent_dispatch_preserves_input_order` | `src/server/mod.rs` |
+| `C-server-017` | `WorkflowyNode` serialises sparse | `serialised_node_omits_none_fields_and_empty_children` | `src/types.rs` |
+| `C-server-018` | Index-backed read paths serve without a walk and share the walk paths' predicates | `find_backlinks_use_index_serves_from_index_without_walk`<br>`find_node_prefer_index_serves_hits_without_walk`<br>`search_nodes_prefer_index_falls_back_to_walk_on_index_miss`<br>`tag_search_use_index_matches_whole_tag_from_index` | `src/server/mod.rs`<br>`src/server/mod.rs`<br>`src/server/mod.rs`<br>`src/server/mod.rs` |
+| `C-server-019` | The rate limiter is AIMD | `drain_halves_rate_and_reward_recovers_to_ceiling` | `src/utils/rate_limiter.rs` |
+| `C-server-020` | The persisted index records `last_modified` (schema v3) and serves local incremental queries | `last_modified_roundtrips_and_changed_since_filters` | `src/utils/name_index.rs` |
+| `C-server-021` | `insert_content` creates lines strictly sequentially | `insert_content_remains_sequential_by_design` | `src/server/mod.rs` |
 
 ## Workflow orchestration (`C-wf-*`)
 

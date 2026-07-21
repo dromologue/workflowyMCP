@@ -1,30 +1,75 @@
 # Workflowy MCP Server
 
-A Rust MCP server that gives Claude (Code or Desktop) read/write access
-to your Workflowy graph, plus a generic template for turning that raw access
-into a working second brain.
+**Give Claude a second brain, built on the outliner you already trust.**
 
-There are two ways to use it:
+This is a Rust MCP server that connects Claude — Desktop, Code, or claude.ai —
+to your Workflowy workspace, plus a complete, opinionated method for turning
+that connection into a working second brain: capture, triage, retrieval,
+distillation, and review, all driven by conversation.
 
-1. **Bare MCP server.** Wire the binary into your MCP host and call the 41
+Say *"capture this as a task under Projects"* mid-conversation and it lands in
+the right place, tagged and dated. Ask *"what do I have on organisational
+design?"* and get an answer assembled from your own notes in about a second,
+without walking your tree. Paste any Workflowy link and Claude knows exactly
+which node you mean. Run a morning review — overdue items, due-soon, what
+changed yesterday — as a single question.
+
+Two ways in:
+
+1. **Bare MCP server.** Wire the binary into your MCP host and use the 45
    tools directly. No templates, no opinions.
-2. **Second brain.** Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The
-   assistant follows the script: builds the binary, wires the host, sets up
-   your secondBrain directory at whatever path you choose (exposed to the
-   server via `$SECONDBRAIN_DIR`), and installs the wflow skill that
-   drives every subsequent session.
+2. **Second brain.** Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude and let it
+   run the install: build, wire the host, seed your private data directory,
+   cache your structural node IDs, install the wflow skill that drives every
+   later session. Steps 1–4 are a ten-minute job.
 
-The methodology in option 2 is opinionated; the server itself is not. The
-repo only ships generic templates — your node IDs, drafts, and session logs
-live wherever `$SECONDBRAIN_DIR` points, never in this repo.
+Your data stays yours: the repo ships only generic templates, and everything
+personal — node IDs, drafts, session logs, the search index — lives at a path
+you choose, outside the repo, on your machine.
 
 ---
 
-## Quick install
+## Why this one
 
-You need: Rust 1.75+ (`rustup install stable`), a Workflowy account with an
-API key (Settings → API in Workflowy), and an MCP host (Claude Code
-or Claude Desktop).
+Most Workflowy integrations are demos. This one has been hardened in daily
+production use against a 250,000-node workspace, and every hard-won lesson is
+encoded in the code and pinned by a test — over 500 of them, including a
+suite of build-time invariant tests that make the design rules unbreakable by
+future contributors.
+
+Concretely, that means the problems you would otherwise hit in week two have
+already been hit, diagnosed, and engineered away:
+
+- **Rate limits don't ruin your session.** The client fails fast inside a
+  429 window instead of hanging for four minutes, adapts its request rate
+  when the API pushes back (halve on 429, creep back on success), and never
+  fires a burst into a freshly-reset quota. Bulk writes that stop early
+  always tell you exactly what landed and how to resume.
+- **Big trees don't time out your questions.** A persistent name index turns
+  names, tags, backlinks, and Workflowy URLs into answers in O(1) from a
+  local file — no tree walk, no API calls. Searches fall back to live,
+  scoped walks only when the index can't answer, and every truncated result
+  says so honestly, with a recovery hint.
+- **Nothing fails silently.** Every walk reports its coverage, every error
+  carries a typed cause (`rate_limited`, `timeout`, `auth`, …) with a
+  retry-ability flag, every write is auditable in an operation log, and
+  deletes support a name-echo guard so a coerced ID can't take out the wrong
+  node.
+- **Repeat reads are nearly free.** Complete children listings are cached
+  with write-through invalidation, node payloads serialise sparse, and
+  overlapping queries collapse to single API calls.
+
+The same logic serves two surfaces: the MCP server for conversation, and a
+`wflow-do` CLI with full parity for scripts, cron jobs, and the terminal —
+enforced at build time, so the two can never drift apart.
+
+---
+
+## Quick install (five minutes)
+
+You need Rust 1.75+ (`rustup install stable`), a Workflowy API key
+(Workflowy → Settings → API), and an MCP host (Claude Code or Claude
+Desktop).
 
 ```bash
 git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
@@ -33,14 +78,7 @@ cargo build --release
 echo "WORKFLOWY_API_KEY=<your-token>" > .env
 ```
 
-The binary reads `.env` from the directory it's launched from. The
-clone path above (`~/code/workflowy-mcp-server`) is the working
-directory for the host's MCP launch — the host runs the binary from
-there, so `.env` resolves correctly. **Recommended alternative:** put
-the same key in your MCP host's `env` block (see the next section), so
-the binary works regardless of where it's launched from.
-
-Wire the resulting `target/release/workflowy-mcp-server` into your MCP host:
+Wire `target/release/workflowy-mcp-server` into your host:
 
 - **Claude Code:** `claude mcp add workflowy -- $(pwd)/target/release/workflowy-mcp-server`
 - **Claude Desktop:** edit
@@ -48,18 +86,38 @@ Wire the resulting `target/release/workflowy-mcp-server` into your MCP host:
   or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). See
   [BOOTSTRAP.md](BOOTSTRAP.md) for the JSON shape.
 
-Verify by calling the `workflowy_status` tool — the host should return
-`status: "ok"`, `api_reachable: true`, `authenticated: true`. If
-`authenticated: false`, your API key is wrong or not reaching the
-binary; check the env-var section below.
+Verify by asking Claude to call `workflowy_status` — you want
+`status: "ok"`, `api_reachable: true`, `authenticated: true`. Then try it:
 
-That's it for plain MCP usage.
+> "List the children of my workspace root."
+> "Create a node called *Read later* under my Inbox."
+> "What did I change in the last two days?"
+
+That's the bare server working. The `.env` file covers a binary launched from
+the repo directory; putting the same key in the host's `env` block (next
+section) works from anywhere and is the recommended form.
+
+## Make it a second brain (recommended)
+
+Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. It walks the seven steps:
+build, wire the host, seed your private `$SECONDBRAIN_DIR`, cache your
+structural node IDs (Inbox, Tasks, Journal…), install the wflow skill,
+pre-warm the search index for large trees, and verify the whole chain
+end-to-end. After that, every session opens with your workflows available
+conversationally: daily and weekly reviews, task capture, inbox triage,
+reading-list management, distillation of sources into atomic notes, mirror
+discipline with drift auditing, and cross-note research.
+
+The long-form walkthrough (multi-surface setups, large-tree convergence,
+troubleshooting) is in [`docs/SETUP.md`](docs/SETUP.md). Running behind a
+remote connector for claude.ai web/mobile is covered in
+[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md).
 
 ---
 
 ## Environment variables
 
-The server reads four env vars at runtime. The repository ships no
+The server reads five env vars at runtime. The repository ships no
 machine-specific defaults: a path or node ID you don't set is a feature you
 don't use. Set them in the `env` block of your MCP host config (Claude Code:
 `~/.claude.json`; Claude Desktop: `claude_desktop_config.json`) and,
@@ -72,6 +130,7 @@ profile (`~/.zshrc` or `~/.bashrc`).
 | `SECONDBRAIN_DIR` | Optional | Absolute path to your operational secondBrain directory (drafts, session logs, briefs, memory). When set, the `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip). |
 | `WORKFLOWY_INDEX_PATH` | Optional | Absolute path to the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Unset or empty disables persistence — the index then lives only in memory for the lifetime of each process. |
 | `WORKFLOWY_REVIEW_ROOT` | Optional | Default root node for the `review` and `audit_mirrors` tools when `root_id` is omitted (your review-anchor / "Distillations" node). No hardcoded fallback — if unset, those two tools require an explicit `root_id`. |
+| `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` | Optional | Comma-separated full UUIDs and/or 12-char short hashes whose subtrees must never be **written to the persistent index file**. Walks may still traverse them in memory (a live session still needs answers), but the on-disk index — a durable artefact other tools read — never carries them. Exclusion is transitive (root + all descendants); malformed tokens are dropped with a warning. Set this for any subtree holding material you don't want in a local file. |
 
 Example MCP host `env` block (Claude Code or Desktop):
 
@@ -91,327 +150,154 @@ export SECONDBRAIN_DIR="/absolute/path/to/secondBrain"
 export WORKFLOWY_INDEX_PATH="$SECONDBRAIN_DIR/memory/name_index.json"
 ```
 
-Neither path needs to be inside the user's home directory — a Dropbox /
-iCloud / Google Drive folder works as long as the host process can
-read and write it. Paths with spaces are fine in the MCP `env` block
-(JSON quoting handles it) and in the shell profile (the export line
-quotes the value).
+Neither path needs to be inside your home directory — a Dropbox / iCloud /
+Google Drive folder works as long as the host process can read and write it.
+**Set the vars in the host config, not only your shell profile** — the server
+process inherits its environment from the host's launch, and a var visible
+only to your interactive shell silently disables the features it drives.
 
 ---
 
-## Set up the second brain (recommended)
+## The tool surface
 
-Hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. The assistant runs through
-six steps: build, wire the host, bootstrap your secondBrain directory at
-the path you set in `$SECONDBRAIN_DIR`, populate your structural node IDs,
-install the wflow skill, and (optionally) pre-warm the persistent name
-index. After bootstrap, the assistant follows
-[`templates/skills/wflow/SKILL.md`](templates/skills/wflow/SKILL.md) as the
-operating manual.
-
-The detailed long-form walkthrough — large-tree convergence,
-troubleshooting — lives in [`docs/SETUP.md`](docs/SETUP.md).
-
----
-
-## User-specific files (what you create)
-
-The repo is generic. Everything specific to your Workflowy tree, your
-intellectual frameworks, and your in-progress work lives outside it. These
-are the files you populate (or accept the bundled defaults from the wflow
-skill, then customise):
-
-| File | Lives at | What it holds | Why it's external |
-|------|----------|---------------|-------------------|
-| `workflowy_node_links.md` | `$SECONDBRAIN_DIR/memory/` (canonical) and `~/.claude/skills/wflow/` (bundled fallback for surfaces that can't read `$SECONDBRAIN_DIR`) | Cached UUIDs for your structural Workflowy nodes (Inbox, Tasks, Reading List, Distillations, Themes, etc.) plus a **Triage Sources** table that defines which nodes Workflow 6 sweeps. Editing this list is how you add a new triage target — capture sub-node, Slack-saved-items mirror — without changing the skill. | The skill is portable; your tree isn't. The skill references this file so different users can have entirely different Workflowy structures. |
-| `distillation_taxonomy.md` | `$SECONDBRAIN_DIR/memory/` (canonical) and `~/.claude/skills/wflow/` (bundled fallback) | Your distillation pillars (the top-level conceptual buckets you organise atomic notes into), themes (cross-cutting tags), inbound routing rules (which topic goes to which pillar), and the named frameworks you work with. | The skill describes the synthesis workflow generically and reads your actual taxonomy from this file. Pillars and frameworks are deeply personal; embedding one user's into the skill would force everyone else to inherit them. |
-| `name_index.json` | `$WORKFLOWY_INDEX_PATH` (typically `$SECONDBRAIN_DIR/memory/name_index.json`) | Auto-managed by the MCP server. Persistent name index that turns Workflowy URL fragments and short-hashes into full UUIDs in O(1). Survives restarts; checkpoints every 30 s; refreshes via background walks every 30 minutes. | You don't write this file directly — the server maintains it. But it lives in your secondBrain so it's portable across your machines (e.g. via Google Drive / Dropbox / iCloud). |
-| `drafts/`, `session-logs/`, `briefs/` | `$SECONDBRAIN_DIR/` | Your in-flight distillation work (`drafts/`), per-session audit trails (`session-logs/`), and external-facing handoff documents (`briefs/`). | The skill's end-of-session discipline writes to these locations. They're per-user by definition. |
-| `tasks/todo.local.md` | inside this repo (gitignored) | Cross-session engineering follow-ups for the workflowy-mcp-server itself — issues you noticed, ideas to revisit, items the previous habit would have filed as Workflowy "system tasks." | Engineering todos belong with the code, not in your Workflowy outline; gitignored so each contributor's local list stays out of the tracked tree. |
-
-**Precedence rule.** When the skill needs data from the two memory files,
-it prefers the canonical at `$SECONDBRAIN_DIR/memory/<file>.md`. If that
-path isn't readable (e.g. a host with no filesystem access), it
-falls back to the bundled copy at `~/.claude/skills/wflow/<file>.md`. The
-bundled copy is overwritten on each skill ZIP rebuild, so canonical edits
-need to be re-bundled before they reach surfaces that depend on the
-fallback.
-
----
-
-## What ships in this repo
-
-```
-workflowyMCP/
-├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
-├── README.md                 ← this file
-├── docs/SETUP.md             ← long-form bootstrap notes
-├── specs/specification.md    ← authoritative behavioural spec
-├── templates/
-│   ├── secondbrain/          ← skeleton copied to $SECONDBRAIN_DIR
-│   │   ├── README.md
-│   │   ├── memory/workflowy_node_links.md     (template; user fills in)
-│   │   ├── memory/distillation_taxonomy.md    (template; user fills in)
-│   │   ├── drafts/  session-logs/  briefs/
-│   └── skills/wflow/SKILL.md ← the operating manual the assistant follows
-└── src/                       ← Rust MCP server source
-```
-
-User-specific data (node IDs, drafts, session logs, briefs) belongs at
-whatever path you set via `$SECONDBRAIN_DIR`. The repo content stays
-generic so the next person who clones it gets a clean starting point.
-
----
-
-## Tool reference
-
-The server exposes 41 tools. `node_id` accepts any of: full UUID (with or
-without hyphens), 12-char URL-suffix short hash, or 8-char prefix.
-`parent_id` (and any other parent-scoped argument) accepts `null` or
-omission as "workspace root" across the whole tool surface — `create_node`,
-`batch_create_nodes`, `insert_content`, `list_children`, and the rest
-behave the same way.
+45 tools. `node_id` accepts a full UUID (with or without hyphens), the
+12-char short hash from any Workflowy URL, or the 8-char doc prefix — paste
+whatever you have.
 
 | Category | Tools |
 |----------|-------|
 | Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`, `read_batch` |
 | Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `reorder_nodes`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
-| Mirror discipline | `create_mirror` (convention-based: duplicates the canonical's name into a new parent and writes `mirror_of:` to the new node's note), `audit_mirrors` |
+| Mirror discipline | `create_mirror` (convention-based `mirror_of:` linking), `audit_mirrors` (finds broken and drifted mirrors) |
 | Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
 | Project management | `get_project_summary`, `get_recent_changes` |
 | Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `review`, `get_recent_tool_calls` |
 
-**Native task completion.** `complete_node(node_id)` toggles the
-Workflowy `completed` boolean — the legacy `#done` tag-as-completion
-workaround is deprecated for tasks. `bulk_update(operation: "complete"|"uncomplete", filter: …)`
-toggles a filtered set in one call; `transaction` accepts the same ops
-with rollback. Wire payload is `POST /nodes/{id}` with
-`{"completed": true|false}`.
+Highlights worth knowing before you need them:
 
-**Reordering siblings (`reorder_nodes`).** Workflowy's `move_node`
-priority is *position-relative-to-siblings* and renormalises after every
-call, so a naive forward `priority=0,1,2,…` loop fights itself when you
-try to batch-reorder a set. `reorder_nodes(parent_id, node_ids[])`
-takes the desired head-first order and walks it in **reverse**, issuing
-`move_node` with `priority=0` per id — every move plants its node at
-position 0, the previously-planted nodes shift one step right, and after
-N moves the head of the parent's children is the requested sequence.
-Side effect: ids not currently under `parent_id` are reparented as part
-of the reorder (the primitive is built on `move_node`, not a sibling-
-only assertion). Capped at 200 ids per call. Returns `Complete` or
-`Partial { reason: cancelled | timeout }` with per-id `ok / error /
-skipped` entries; partial outcomes are safe to re-issue with the full
-list because each reverse-priority-0 move is idempotent. The
-orchestration lives once in `crate::workflows::reorder_nodes_via_priority`
-and is shared with `wflow-do reorder --parent <id> --node <id> --node <id>`.
+- **Index-first retrieval.** `search_nodes` and `find_node` take
+  `prefer_index=true` — answer from the local index when it can, fall back
+  to a live scoped walk when it can't, one call either way. `tag_search`
+  and `find_backlinks` take `use_index=true` for zero-API-call sweeps.
+  The index matches names *and* descriptions, token-AND, any order.
+- **Reads that survive awkward hosts.** `read_batch` runs many reads in one
+  call with bounded concurrency and per-operation status — the reliable
+  shape on hosts that mangle single-ID parameters.
+- **Writes that can't land in the wrong place.** The write tools require an
+  explicit `parent_id` (empty string means workspace root), every scoped
+  response echoes `scope_resolved` so you can verify the target, and
+  `delete_node` accepts an `expect_name` guard that refuses a delete when
+  the resolved node's name doesn't match.
+- **Batches that resume.** `insert_content` reports a committed-count
+  cursor on *every* failure, so a rate-limited batch resumes exactly where
+  it stopped, with no double-writes. `transaction` rolls back on failure.
+- **Ordering that matches the app.** Listings sort into Workflowy display
+  order; `insert_content` writes explicit ascending priorities;
+  `reorder_nodes` is the deterministic reorder primitive.
 
-**Mirror creation (convention).** Workflowy's REST API does not expose
-native mirror creation, so `create_mirror(canonical_node_id, target_parent_id)`
-implements the documented `mirror_of:` / `canonical_of:` note convention
-that `audit_mirrors` already understands: a new node is created under
-the target parent with the same name as the canonical, and its
-description carries `mirror_of: <canonical_uuid>`. Edits to the
-canonical do **not** propagate to the mirror — the link is structural
-and human-curated, not live. Pass an optional `pillar` to write a
-`canonical_of: <pillar>` marker to the canonical when it lacks one;
-existing markers are never overwritten. Pass `dry_run=true` to preview
-the resolved canonical, target_parent, and mirror name (verbatim copy of
-the canonical's name) without writing — useful when batching multiple
-mirror passes across a synthesis. The mirror's create + the optional
-canonical edit (and the dry-run preview) run through the shared
-[`crate::workflows`](src/workflows.rs) module, the same code path the
-`wflow-do create-mirror [--dry-run]` CLI calls.
-
-**`scope_resolved` diagnostic field.** Every tool that accepts an
-`Option<NodeId>` for parent_id (`create_node`, `batch_create_nodes`,
-`insert_content`, `create_mirror`, `list_children`, `find_node`,
-`search_nodes`) returns a `scope_resolved` field naming what the server
-actually targeted: `workspace_root` when the resolved scope was None
-(caller passed null or omitted), or `scoped:<full-uuid>` otherwise.
-Read this field after every call where parent_id was null/omitted to
-verify the server resolved to where you intended — pre-2026-05-09
-callers had no way to audit this without inspecting the wire payload.
-
-**`insert_content` payload cap.** The hard cap is 80 lines per call,
-lowered from 200 on 2026-05-04 after the failure-report 2026-05-03
-session observed ≥80-line payloads failing at the MCP transport layer
-with no diagnostic. Above the cap, the call returns a typed error with
-a chunking instruction; chunk to ≤80 lines and pass the previous
-batch's `last_inserted_id` as the next call's `parent_id` to keep the
-hierarchy stitched together.
-
-**Truncation envelope.** Every walk-shaped tool that emits JSON includes
-the same four fields when its 20 s walk budget fires:
-
-```json
-{
-  "truncated": true,
-  "truncation_limit": 10000,
-  "truncation_reason": "timeout",
-  "truncation_recovery_hint": "Call build_name_index(parent_id=...) … then re-issue with use_index=true …"
-}
-```
-
-Read `truncation_reason` and `truncation_recovery_hint` on every walk
-response. For name-based queries (`search_nodes`, `find_node`),
-`use_index=true` answers in O(1) from the persistent name index without
-burning the walk budget — populate it first with
-`build_name_index(parent_id=<scope>)`. Index path is name-only;
-description-content matching still needs a live walk.
-
-For large workspaces, prefer `node_at_path` (path of names → UUID, ~1 second
-on any tree size) and `resolve_link` (Workflowy URL + optional parent path
-→ full node info) over `search_nodes`. They cost O(depth) API calls instead
-of O(tree).
-
-Conventions parsed from node text:
-
-- Tags: `#inbox`, `#review`, `#urgent`
-- Assignees: `@alice`, `@bob`
-- Due dates: `due:2026-03-15`, `#due-2026-03-15`, or bare `2026-03-15`
-  (priority order)
+Conventions parsed from node text: tags (`#project`), assignees (`@alice`),
+due dates (`due:2026-03-15`, `#due-2026-03-15`, or a bare date).
 
 ---
 
-## Reliability properties
+## Reliability, in numbers
 
-Every API-touching handler runs inside a uniform `run_handler` wrapper
-that observes the server-wide cancel registry and applies a
-kind-appropriate wall-clock deadline:
+Every API-touching handler runs inside a uniform wrapper with a
+kind-appropriate wall-clock budget, cancellation support, and an op-log
+entry — a call can time out, but it cannot vanish:
 
 | Tool kind | Budget | Examples |
 |-----------|--------|----------|
 | Read | 30 s | `get_node`, `list_children` |
 | Write | 15 s | `create_node`, `delete_node`, `edit_node` |
-| Bulk | 180 s | `insert_content`, `transaction`, `bulk_update`, `path_of`, `node_at_path` |
+| Bulk | 180 s | `insert_content`, `transaction`, `bulk_update` |
 | Walk | 20 s (internal) | `search_nodes`, `get_subtree`, `find_node` |
 
-`cancel_all` interrupts any in-flight tool within ~50 ms. On budget
-expiry, bulk operations return a structured partial-success payload
-(`status: "partial"`, `created_count`, `last_inserted_id`, etc.) so the
-caller can resume — no "no result received" without diagnostic. The
-180 s bulk budget leaves 60 s of margin under the MCP transport's
-4-min hard timeout (Claude Desktop) so the
-partial-success envelope is reachable on every surface — lowered from
-210 s on 2026-05-09 after a sub-cap `insert_content` payload was
-observed hanging the full 4 minutes with no diagnostic.
-
-**Typed write failures (2026-06-17).** Every error response carries a
-structured envelope — `{operation, node_id, proximate_cause, retryable,
-retry_after_secs, hint, error}` — so a caller never sees a bare "tool
-failed" it can't reason about. A rate-limit (429) classifies as
-`proximate_cause: "rate_limited"` with `retryable: true` and a typed
-`retry_after_secs`, distinct from an opaque `unknown`, so the right move
-(wait `retry_after_secs`, then retry) is explicit. And `insert_content`
-reports the committed-count cursor (`created_count` + `last_inserted_id`)
-on **every** failure — a hard mid-batch error, not just a timeout — so
-you learn exactly what landed without a separate read and resume from the
-cursor. Workflowy exposes no client-supplied ID or idempotency header, so
-`create_node` takes an optional best-effort `idempotency_key` — a repeated
-key replays the original node (with a reportable `idempotent_replay:`
-message) instead of double-writing, covering retry-after-success and
-retry-before-write but NOT an ambiguous post-write timeout (read back to
-confirm there). For batches the resume cursor — not a key — is the
-double-write-safe retry path. Replay the original failure sequence with
-[`scripts/repro-write-path-429.sh`](scripts/repro-write-path-429.sh).
-
-For the full list (transport-timeout retry, `authenticated`/`api_reachable`
-decoupling, `null` parameter handling and the `scope_resolved` audit
-field, the 2026-05-04 `move_node` unification that collapsed the
-previous wrapper-vs-bare divergence, etc.) see
-[`specs/specification.md`](specs/specification.md). 331 lib + 12 CLI
-tests pin the 43 contracts, including 21 wiremock-driven failure-mode
-tests that run in under 2 seconds, plus build-time invariant tests:
-
-- `parameter_bearing_tools_publish_non_empty_input_schema_properties`
-  fails the build if a tool's published schema has empty `properties`
-  (the rmcp `Parameters<T>` wrapper rename trap).
-- `every_walk_tool_emits_full_truncation_envelope_in_json` fails the
-  build if a walk-shaped tool emits `truncation_limit` without the
-  reason + recovery_hint companions.
-- `cli_covers_every_non_diagnostic_mcp_tool` fails the build if a new
-  MCP tool ships without its matching `wflow-do` subcommand.
-- `cancel_all_preempts_inflight_create_node_via_run_handler` and the
-  `path_of` companion pin the cancel-registry safety net.
-- `move_node_embeds_propagation_retry_loop` pins the 2026-05-04
-  unification: the move retry now lives inside `client.move_node`
-  itself, so every caller (handler, transaction, CLI) gets identical
-  resilience without having to remember which wrapper to call.
-- `every_scoped_tool_emits_scope_resolved_in_response` and
-  `bulk_budget_leaves_mcp_transport_margin` (2026-05-09) pin the
-  diagnostic surface: every parent-scoped tool surfaces
-  `scope_resolved`, and the bulk budget is held below the MCP transport
-  cap so partial-success envelopes are always reachable.
-- `no_duplicated_renderer_or_scope_label_definitions_outside_canonical_modules`
-  pins the duplication-audit contract: the subtree renderers
-  (`render_subtree_markdown`, `render_subtree_opml`) and the
-  `scope_resolved_label` renderer live once each, with both surfaces
-  re-exporting from `utils::subtree::*` / `workflows::*`.
+`cancel_all` interrupts anything in flight within ~50 ms. Every walk-shaped
+response carries a four-field truncation envelope (`truncated`,
+`truncation_limit`, `truncation_reason`, `truncation_recovery_hint`) so a
+partial answer is never mistaken for a complete one. Every error carries a
+typed envelope — `proximate_cause`, `retryable`, `retry_after_secs`, a
+hint — so the right recovery is explicit rather than guessed. The full
+behavioural contract, including 21 wiremock-driven failure-mode tests and
+the build-time invariant suite, lives in
+[`specs/specification.md`](specs/specification.md) with a machine-checked
+[traceability matrix](specs/traceability.md) mapping every contract to the
+test that pins it.
 
 ---
 
-## CLI: `wflow-do`
+## The CLI: `wflow-do`
 
-A second binary exposes the same operations as a plain shell command.
-**Full surface parity** with the MCP server — every non-diagnostic tool
-has a matching subcommand, enforced at build time. Useful as a fallback
-when the MCP transport drops or when you want a Bash-driven workflow.
-
-The CLI and the MCP server share more than the API client: workflow
-orchestration that used to be duplicated (`create_mirror`,
-`insert_content`, `transaction`, `bulk_update`, `smart_insert`, plus
-the renderers used by `export_subtree`, plus the dry-run preview and
-`scope_resolved` label added on 2026-05-09) lives in
-[`src/workflows.rs`](src/workflows.rs) and
-[`src/utils/subtree.rs`](src/utils/subtree.rs). Both surfaces call the
-same shared function and wrap the typed result in their own envelope
-(structured `tool_error` for the MCP handler, stdout/JSON for the
-CLI). A build-time test grep-audits the source so any future
-contributor reintroducing a parallel implementation in either binary
-fails the build.
+Everything the MCP server does, as a shell command — full surface parity,
+enforced at build time. Use it for scheduled jobs, shell pipelines, and as a
+fallback when you'd rather not open a chat window.
 
 ```bash
-target/release/wflow-do status                              # liveness
-target/release/wflow-do search --query "concept maps"       # substring filter
-target/release/wflow-do find "Tasks" --use-index            # O(1) index lookup
-target/release/wflow-do complete <uuid>                     # mark task done
-target/release/wflow-do bulk-update complete --tag urgent   # bulk-toggle by filter
-target/release/wflow-do --dry-run delete <uuid>             # preview
-target/release/wflow-do reindex --root <UUID> --root <UUID> # pre-warm index
+wflow-do status                                      # liveness
+wflow-do search --query "concept maps" --use-index   # zero-API-call search
+wflow-do find "Tasks" --use-index                    # O(1) name lookup
+wflow-do backlinks <uuid> --use-index                # who links here?
+wflow-do changed-since 2026-07-14 --root <uuid>      # local incremental diff
+wflow-do complete <uuid>                             # mark done
+wflow-do bulk-update complete --tag urgent           # bulk-toggle by filter
+wflow-do --dry-run delete <uuid>                     # preview first
+wflow-do reindex --timeout-secs 0 --patient --root <uuid>   # coverage-complete index build
 ```
 
-Forty-one subcommands grouped: read & navigate (`status`, `health-check`,
-`get`, `children`, `subtree`, `find`, `search`, `tag-search`,
-`backlinks`, `find-by-tag-and-path`, `node-at-path`, `path-of`,
-`resolve-link`, `since`); todos & scheduling (`todos`, `overdue`,
-`upcoming`, `daily-review`, `recent-changes`, `project-summary`);
-single-node writes (`create`, `move`, `delete`, `edit`, `complete`);
-bulk writes (`insert`, `smart-insert`, `duplicate`, `template`,
-`bulk-update`, `bulk-tag`, `batch-create`, `transaction`, `export`);
-graph hygiene (`audit-mirrors`, `create-mirror`, `review`, `index`,
-`reindex`, `build-name-index`); diagnostics (`cancel-all`,
-`recent-tools`).
+Forty-two subcommands, `--json` for raw output, `--dry-run` on write verbs.
+The nightly `reindex --patient` job is the convergence mechanism for the
+search index: it waits out rate-limit windows instead of dropping branches,
+and its work is cumulative — every walk any tool performs extends the same
+persistent file.
 
-Use `--json` for raw output, `--dry-run` (write verbs only) to preview
-without calling the API.
+---
+
+## What ships in this repo
+
+```text
+workflowyMCP/
+├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
+├── README.md                 ← this file
+├── docs/SETUP.md             ← long-form setup walkthrough
+├── docs/REMOTE-CONNECTOR.md  ← claude.ai custom-connector notes
+├── specs/                    ← behavioural spec, principles, traceability
+├── templates/
+│   ├── secondbrain/          ← skeleton copied to $SECONDBRAIN_DIR
+│   └── skills/wflow/SKILL.md ← the operating manual the assistant follows
+├── dist/wflow.skill.zip      ← ready-to-upload skill bundle for claude.ai
+└── src/                      ← Rust MCP server + wflow-do CLI
+```
+
+Everything specific to you — cached node IDs, your pillars and routing
+rules, drafts, session logs, the name index — lives at `$SECONDBRAIN_DIR`
+and `$WORKFLOWY_INDEX_PATH`, never in the repo. Clone it and you get a clean
+starting point; so does the next person.
+
+| File you'll create | Lives at | What it holds |
+|------|----------|---------------|
+| `workflowy_node_links.md` | `$SECONDBRAIN_DIR/memory/` | Cached UUIDs for your structural nodes (Inbox, Tasks, Reading List…) plus the triage-sources table. |
+| `distillation_taxonomy.md` | `$SECONDBRAIN_DIR/memory/` | Your pillars, themes, and routing rules for the synthesis workflows. |
+| `name_index.json` | `$WORKFLOWY_INDEX_PATH` | Auto-managed persistent search index. Survives restarts; checkpoints every 30 s; grows with every walk and converges via the scheduled `reindex --patient` job. |
+| `drafts/`, `session-logs/`, `briefs/` | `$SECONDBRAIN_DIR/` | In-flight work, per-session audit trails, handoff documents. |
 
 ---
 
 ## Development
 
 ```bash
-cargo build              # debug
-cargo build --release    # optimised
-cargo test --lib         # 331 unit tests
-cargo test               # full suite (lib + portability + traceability + eval coverage)
-cargo check              # type-check only
+cargo build --release    # optimised build (server + CLI)
+cargo test --lib         # 500+ unit tests, no live API calls
+cargo test               # full suite: lib + portability + traceability + eval coverage
 ```
 
-Architectural overview: [CLAUDE.md](CLAUDE.md). Behavioural spec:
-[specs/specification.md](specs/specification.md).
+The architecture guide is [CLAUDE.md](CLAUDE.md); the law of the project —
+eight core principles, a definition of done, and a conflict-resolution
+hierarchy — is [`specs/constitution.md`](specs/constitution.md). Every
+consistency rule worth stating is pinned by a test that fails the build when
+violated. Contributions are held to the same standard, which is precisely
+why you can build on this without reading the whole source first.
 
----
-
-## License
+## Licence
 
 MIT

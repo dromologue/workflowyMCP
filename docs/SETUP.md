@@ -46,6 +46,8 @@ repo ships no fallback paths):
 |----------|----------------------|---------|
 | `SECONDBRAIN_DIR` | The `review` tool's bucket-d session-log scan and the `wflow-do index` default output are disabled (graceful skip). | Absolute path to the user's secondBrain directory. |
 | `WORKFLOWY_INDEX_PATH` | The persistent name index is disabled — index lives only in memory for the lifetime of each process. | Disk path for the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. |
+| `WORKFLOWY_REVIEW_ROOT` | The `review` and `audit_mirrors` tools require an explicit `root_id` on every call. | Default root node for `review` / `audit_mirrors` — the user's review-anchor node (typically Distillations). |
+| `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` | Nothing is excluded from the persisted index. | Comma-separated full UUIDs and/or 12-char short hashes whose subtrees must never be written to the on-disk index (privacy control; transitive; walks may still traverse them in memory). |
 | `RUST_LOG` | `info` level. | Tracing filter (e.g. `debug`, `workflowy_mcp_server=trace`). |
 
 Wire the binary into the user's MCP-host config (Claude Desktop, the IDE extension, etc.). The exact path varies by host — for Claude Desktop on macOS it is `~/Library/Application Support/Claude/claude_desktop_config.json`. The relevant block:
@@ -64,6 +66,17 @@ Wire the binary into the user's MCP-host config (Claude Desktop, the IDE extensi
   }
 }
 ```
+
+**The dual-config hazard, stated up front:** the MCP server process
+inherits its environment from the host's launch, **not** from the
+user's interactive shell. A var exported only in `.zshrc` is invisible
+to the server, and the failure is silent — the persistent index runs
+in-memory-only and every short-hash resolve pays cold-start latency.
+Always set the paths in the host's `env` block; the shell profile copy
+below exists only so the `wflow-do` CLI agrees with the server. Verify
+with `workflowy_status`: its `name_index.persistence` block reports
+`configured: true` and the resolved path when the server can see the
+var, `configured: false` plus a warning when it cannot.
 
 If the user also runs the `wflow-do` CLI from a shell, mirror the same
 two paths into `~/.zshrc` (or `~/.bashrc`):
@@ -155,6 +168,7 @@ First, identify the user's top-level subtree UUIDs (already cached in `$SECONDBR
 
 ```bash
 ~/code/workflowy-mcp-server/target/release/wflow-do reindex \
+  --timeout-secs 0 --patient \
   --root <Tasks-UUID> \
   --root <Inbox-UUID> \
   --root <Reading-List-UUID> \
@@ -162,7 +176,7 @@ First, identify the user's top-level subtree UUIDs (already cached in `$SECONDBR
   --root <any-other-major-subtree-UUIDs>
 ```
 
-Each root walk is bounded by the resolution timeout (`RESOLVE_WALK_TIMEOUT_MS`, 5 minutes by default), so the full pass for a half-dozen roots runs in 5-25 minutes depending on tree shape. The CLI hydrates from the existing index file at `$WORKFLOWY_INDEX_PATH`, walks each root, and saves the merged index back. Re-run the same command later to extend coverage; the persistent index makes the work cumulative.
+The two flags are what make this pass coverage-complete: `--patient` retries rate-limited branches in waves instead of dropping them, and `--timeout-secs 0` removes the per-root deadline so the patience can complete (the default is the interactive 20-second budget — `RESOLVE_WALK_TIMEOUT_MS` — which on a large tree produces a silently partial index; a patient walk on a budget quietly stops being patient, and the CLI warns about the combination). A full pass for a half-dozen large roots can take several minutes per root; that is the intended trade. The CLI hydrates from the existing index file at `$WORKFLOWY_INDEX_PATH`, walks each root, and saves the merged index back. Re-run the same command later to extend coverage; the persistent index makes the work cumulative. **Schedule this same command nightly (cron / launchd)** — the server has no in-process background refresher, so the scheduled reindex is the convergence mechanism.
 
 For smaller trees (≤ 5 k nodes) you can also ask the MCP-driven assistant to run `build_name_index allow_root_scan=true` once — equivalent in effect, just routed through MCP rather than the CLI.
 
@@ -227,6 +241,6 @@ Anything user-specific must never be committed back into this repo.
 
 - **"Short-hash X is not in the name index" on a fresh install.** The auto-walk should fire automatically; if it does not, confirm `$WORKFLOWY_INDEX_PATH` is set to a writable path and the MCP host has permission to read/write the directory it lives in.
 - **Server hangs on `tag_search`.** The deadline-honouring fix landed in commit `d378f56`. Confirm the binary is built from that commit or later.
-- **`build_name_index` reports `truncation_reason: "timeout"`.** The tree is larger than a single 5-minute walk can cover; subsequent passes converge. The background refresher (every 30 minutes) accumulates coverage. For trees ≥ 50 k nodes, scope `build_name_index` to a specific subtree (`parent_id` = Projects, Areas, etc.) — indexing one subtree deeply is faster than indexing the whole root shallowly. Once a subtree is indexed, every short hash inside it resolves O(1) and survives restarts.
+- **`build_name_index` reports `truncation_reason: "timeout"`.** The tree is larger than a single 20-second walk can cover; subsequent passes converge because the index merges on save. For trees ≥ 50 k nodes, scope `build_name_index` to a specific subtree (`parent_id` = Projects, Areas, etc.) — indexing one subtree deeply is faster than indexing the whole root shallowly — or run `wflow-do reindex --timeout-secs 0 --patient` from the shell for a coverage-complete pass. Once a subtree is indexed, every short hash inside it resolves O(1) and survives restarts.
 
-- **A short-hash lookup returns "did NOT cover" with low coverage percentage.** Your tree is much larger than the resolver's 5-minute budget. Workarounds, in order of effort: (a) call `build_name_index` with `parent_id` set to a region likely to contain the target — often Projects or whatever subtree the URL came from; (b) get the full UUID from the Workflowy app's URL bar and pass that instead of the short hash; (c) leave the server running — the 30-minute background refresher accumulates coverage over hours.
+- **A short-hash lookup returns "did NOT cover" with low coverage percentage.** Your tree is much larger than the resolver's 20-second interactive budget. Workarounds, in order of effort: (a) call `build_name_index` with `parent_id` set to a region likely to contain the target — often Projects or whatever subtree the URL came from; (b) get the full UUID from the Workflowy app's URL bar and pass that instead of the short hash; (c) run (or schedule) `wflow-do reindex --timeout-secs 0 --patient --root <UUID>` — there is no in-process background refresher, so coverage converges only through walks and explicit reindex passes.

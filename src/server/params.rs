@@ -54,6 +54,8 @@ pub struct SearchNodesParams {
     /// — call `build_name_index` first if it isn't.
     #[schemars(description = "Serve the query from the persistent name index instead of walking the tree. O(1) lookups, no walk-budget timeouts. Token-AND match over node names AND descriptions (every whitespace-delimited query term must appear, in any order); descriptions of nodes not walked since the last index rebuild may be absent, so a live walk remains authoritative. Defaults to false — a live walk; set true after `build_name_index` to bypass the 20 s subtree-fetch budget on huge subtrees.")]
     pub use_index: Option<bool>,
+    #[schemars(description = "Index-first with live fallback: serve from the persistent name index when it answers, transparently fall through to the normal (scoped) walk when it has no hits or is empty. The recommended mode for warm-index deployments. Default: false")]
+    pub prefer_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -185,6 +187,8 @@ pub struct TagSearchParams {
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
     #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
+    #[schemars(description = "Match tags against the persistent name index (names + descriptions) instead of walking the tree. No walk budget; misses nodes not yet indexed. Default: false")]
+    pub use_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -243,6 +247,8 @@ pub struct FindNodeParams {
     pub allow_root_scan: Option<bool>,
     #[schemars(description = "Serve results from the opportunistic name index when it has data instead of walking the tree. Safe for stable names; will miss recently-created nodes not yet indexed. Default: false")]
     pub use_index: Option<bool>,
+    #[schemars(description = "Index-first with live fallback: serve from the persistent name index when it answers, transparently fall through to the normal (scoped) walk when it has no hits or is empty. The recommended mode for warm-index deployments. Default: false")]
+    pub prefer_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
@@ -365,6 +371,10 @@ pub struct FindBacklinksParams {
     #[schemars(description = "Maximum tree depth to search (default: 3)")]
     #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub max_depth: Option<usize>,
+    #[schemars(description = "Parent node ID to scope the walk under. Without it the walk starts at the workspace root, which truncates on large trees and silently misses backlinks — scope it, or set use_index=true.")]
+    pub parent_id: Option<NodeId>,
+    #[schemars(description = "Scan the persistent name index (names + descriptions) instead of walking the tree. No walk budget, covers everything ever indexed; misses nodes not yet walked/reindexed. Default: false")]
+    pub use_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, serde::Serialize)]
