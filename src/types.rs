@@ -165,11 +165,36 @@ impl schemars::JsonSchema for NodeId {
     }
 }
 
+/// Serialize a node-text string as its clean display form (HTML markup the
+/// API added on write is rendered back to text). See [`WorkflowyNode::name`].
+fn serialize_rendered_str<S: serde::Serializer>(s: &str, ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&crate::utils::html::render_display(s))
+}
+
+/// `Option` companion to [`serialize_rendered_str`]. Only invoked for `Some`
+/// (the field carries `skip_serializing_if = "Option::is_none"`); the `None`
+/// arm is defensive.
+fn serialize_rendered_opt_str<S: serde::Serializer>(
+    v: &Option<String>,
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(s) => ser.serialize_str(&crate::utils::html::render_display(s)),
+        None => ser.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowyNode {
     #[serde(default)]
     pub id: String,
-    #[serde(default)]
+    // Rendered to clean display text on serialisation (2026.01 reconciliation):
+    // since the API parses markdown on write, stored names carry <b>/<a>/<time>
+    // markup. The wire form is the human-readable text; internal Rust logic
+    // (cache, name-index ingest, mirror/name comparisons) reads the raw `.name`
+    // field, which is untouched — serialisation is output-only (nodes are held
+    // in the cache as structs and never JSON-round-tripped internally).
+    #[serde(default, serialize_with = "serialize_rendered_str")]
     pub name: String,
     // Absent-`None` fields and the empty `children` list are skipped on
     // serialisation (2026-07-21): a 10 000-node `get_subtree` used to emit
@@ -179,7 +204,11 @@ pub struct WorkflowyNode {
     // known consumer, and the read path is unaffected (`Option` + `default`
     // deserialise absent fields fine).
     /// Maps from API field "note"
-    #[serde(alias = "note", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "note",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_rendered_opt_str"
+    )]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,

@@ -245,6 +245,25 @@ pub const RESOLVE_WALK_NODE_CAP: usize = 100_000;
 /// `request_cancellable`'s in-window short-circuit and burn the branch's
 /// one retry for nothing).
 pub const RETRY_WINDOW_WAIT_SLACK_MS: u64 = 500;
+/// The node `layoutMode` values the Workflowy API accepts (2025.19 / 2026.01).
+/// A create/edit may set one directly instead of relying on a markdown prefix
+/// (`# ` -> h1, `- [ ]` -> todo, etc.). `bullets` is the default when unset.
+pub const LAYOUT_MODES: &[&str] = &[
+    "bullets",
+    "todo",
+    "h1",
+    "h2",
+    "h3",
+    "code-block",
+    "quote-block",
+];
+
+/// True if `mode` is one of the accepted [`LAYOUT_MODES`] (case-sensitive —
+/// the API's own values are lowercase-hyphenated).
+pub fn is_valid_layout_mode(mode: &str) -> bool {
+    LAYOUT_MODES.contains(&mode)
+}
+
 /// Environment variable that sets the on-disk path for the persistent
 /// name index. Unset or empty disables persistence — the index then
 /// lives only in memory for the lifetime of the process.
@@ -860,6 +879,18 @@ mod tests {
             Some(v) => std::env::set_var(file_key, v),
             None => std::env::remove_var(file_key),
         }
+    }
+
+    #[test]
+    fn layout_mode_validation_accepts_api_values_only() {
+        for m in ["bullets", "todo", "h1", "h2", "h3", "code-block", "quote-block"] {
+            assert!(is_valid_layout_mode(m), "{m} must be accepted");
+        }
+        // Case-sensitive (the API's values are lowercase) and no aliases.
+        assert!(!is_valid_layout_mode("Todo"));
+        assert!(!is_valid_layout_mode("heading"));
+        assert!(!is_valid_layout_mode("code"));
+        assert!(!is_valid_layout_mode(""));
     }
 
     #[test]

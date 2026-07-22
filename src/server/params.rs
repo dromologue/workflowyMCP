@@ -87,6 +87,12 @@ pub struct CreateNodeParams {
     #[schemars(description = "Priority (position) among siblings. Lower = higher position")]
     #[serde(default, deserialize_with = "de_opt_string_or_int")]
     pub priority: Option<i32>,
+    /// Node type, set directly rather than via a markdown prefix in `name`.
+    /// The API also infers this from a `name` prefix (`# ` -> h1, `- [ ]` ->
+    /// todo, ` ``` ` -> code-block, `> ` -> quote-block); this parameter is
+    /// the explicit form. Invalid values are rejected at the handler.
+    #[schemars(description = "Optional node type: bullets | todo | h1 | h2 | h3 | code-block | quote-block. Omit for the default (bullets). The API also infers this from a markdown prefix in the name.")]
+    pub layout: Option<String>,
     /// Optional best-effort idempotency key. Supply a stable, caller-generated
     /// token (e.g. a UUID) to make a retry of THIS create safe: if the same
     /// key was already used for a successful create within the server's

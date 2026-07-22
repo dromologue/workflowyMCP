@@ -692,7 +692,7 @@ struct ProbeOutcome {
 // implementation — pre-2026-06-16 `resolve_link` had a char-scanner copy
 // that diverged on an unterminated `<`. Re-exported under the local name
 // so the existing call sites read unchanged.
-use crate::utils::html::strip_html;
+use crate::utils::html::{render_display, strip_html};
 
 /// Result of an on-demand short-hash resolution walk. Carries enough
 /// signal for the resolver to distinguish "walked the whole tree, the
@@ -1868,7 +1868,7 @@ impl WorkflowyMcpServer {
                 )
             } else {
                 let items: Vec<String> = hits.iter()
-                    .map(|e| format!("- **{}** (id: `{}`)", e.name, e.node_id))
+                    .map(|e| format!("- **{}** (id: `{}`)", render_display(&e.name), e.node_id))
                     .collect();
                 format!(
                     "Found {} node(s) matching '{}' (via name index — token-AND match over names and descriptions):\n\n{}",
@@ -2078,6 +2078,23 @@ impl WorkflowyMcpServer {
         // plan before issuing follow-up writes.
         let degraded_warning = self.degraded_warning_if_recent_failure(30_000);
 
+        // Validate the optional layout mode BEFORE any cache invalidation or
+        // write — a bad param must leave no side effect (same discipline as the
+        // expect_name precondition).
+        if let Some(lm) = params.layout.as_deref() {
+            if !crate::defaults::is_valid_layout_mode(lm) {
+                return Err(tool_invalid_params(
+                    "create_node",
+                    resolved_parent.as_deref(),
+                    &format!(
+                        "invalid layout '{}'; expected one of: {}",
+                        lm,
+                        crate::defaults::LAYOUT_MODES.join(", ")
+                    ),
+                ));
+            }
+        }
+
         // Pre-call invalidation: the parent's children listing must be
         // refreshed whether the create succeeds or the wrapper fires
         // its timeout/cancel arm mid-flight. Cost on a failed create is
@@ -2088,7 +2105,15 @@ impl WorkflowyMcpServer {
 
         match self
             .client
-            .create_node(&params.name, params.description.as_deref(), resolved_parent.as_deref(), params.priority)
+            .create_node_cancellable(
+                &params.name,
+                params.description.as_deref(),
+                resolved_parent.as_deref(),
+                params.priority,
+                params.layout.as_deref(),
+                None,
+                None,
+            )
             .await
         {
             Ok(created) => {
@@ -2348,7 +2373,7 @@ impl WorkflowyMcpServer {
                 } else {
                     let items: Vec<String> = children
                         .iter()
-                        .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
+                        .map(|n| format!("- **{}** (id: `{}`)", render_display(&n.name), n.id))
                         .collect();
                     Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}{} children of `{}`:\n\n{}",
@@ -2416,7 +2441,7 @@ impl WorkflowyMcpServer {
             } else {
                 let items: Vec<String> = matches
                     .iter()
-                    .map(|e| format!("- **{}** (id: `{}`)", e.name, e.node_id))
+                    .map(|e| format!("- **{}** (id: `{}`)", render_display(&e.name), e.node_id))
                     .collect();
                 format!(
                     "Found {} node(s) with tag '{}' (via name index):\n\n{}",
@@ -2449,7 +2474,7 @@ impl WorkflowyMcpServer {
                 } else {
                     let items: Vec<String> = results
                         .iter()
-                        .map(|n| format!("- **{}** (id: `{}`)", n.name, n.id))
+                        .map(|n| format!("- **{}** (id: `{}`)", render_display(&n.name), n.id))
                         .collect();
                     Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "{}Found {} node(s) with tag '{}':\n\n{}",
@@ -2738,10 +2763,10 @@ impl WorkflowyMcpServer {
                         "scope_resolved": scope_resolved,
                         "truncated_at_path": truncated_at_path,
                         "node_id": node.id,
-                        "name": node.name,
+                        "name": render_display(&node.name),
                         "path": path,
-                        "note": node.description,
-                        "message": format!("Found '{}'", node.name)
+                        "note": node.description.as_deref().map(render_display),
+                        "message": format!("Found '{}'", render_display(&node.name))
                     });
                     let result = with_truncation_envelope(payload, truncated, limit, truncation_reason);
                     Ok(CallToolResult::success(vec![ContentBlock::text(result.to_string())]))
@@ -2753,7 +2778,7 @@ impl WorkflowyMcpServer {
                         });
                         json!({
                             "option": i + 1,
-                            "name": n.name,
+                            "name": render_display(&n.name),
                             "id": n.id,
                             "path": path,
                             "note_preview": note_preview
@@ -2809,9 +2834,9 @@ impl WorkflowyMcpServer {
                 "scope_resolved": scope_resolved,
                 "index_served": true,
                 "node_id": hit.node_id,
-                "name": hit.name,
+                "name": render_display(&hit.name),
                 "parent_id": hit.parent_id,
-                "message": format!("Found '{}' via name index", hit.name)
+                "message": format!("Found '{}' via name index", render_display(&hit.name))
             });
             return CallToolResult::success(vec![ContentBlock::text(result.to_string())]);
         }
@@ -2821,7 +2846,7 @@ impl WorkflowyMcpServer {
             .map(|(i, h)| {
                 json!({
                     "option": i + 1,
-                    "name": h.name,
+                    "name": render_display(&h.name),
                     "id": h.node_id,
                     "parent_id": h.parent_id
                 })
@@ -2877,7 +2902,7 @@ impl WorkflowyMcpServer {
                     let node_map = build_node_map(&nodes);
                     let options: Vec<serde_json::Value> = matches.iter().enumerate().map(|(i, n)| {
                         let path = build_node_path_with_map(&n.id, &node_map);
-                        json!({ "option": i + 1, "name": n.name, "id": n.id, "path": path })
+                        json!({ "option": i + 1, "name": render_display(&n.name), "id": n.id, "path": path })
                     }).collect();
                     let payload = json!({
                         "multiple_matches": true,
@@ -3124,7 +3149,7 @@ impl WorkflowyMcpServer {
                         }
                         let path = build_node_path_with_map(&n.id, &node_map);
                         items.push(json!({
-                            "id": n.id, "name": n.name, "path": path,
+                            "id": n.id, "name": render_display(&n.name), "path": path,
                             "due_date": null, "days_until_due": null, "overdue": false
                         }));
                     }
@@ -3267,7 +3292,7 @@ impl WorkflowyMcpServer {
                     };
                     json!({
                         "id": e.node_id,
-                        "name": e.name,
+                        "name": render_display(&e.name),
                         "path": self.name_index.path_of(&e.node_id).join(" > "),
                         "link_in": link_in,
                     })
@@ -3325,7 +3350,7 @@ impl WorkflowyMcpServer {
                             _ => "note",
                         };
                         backlinks.push(json!({
-                            "id": node.id, "name": node.name, "path": path, "link_in": link_in
+                            "id": node.id, "name": render_display(&node.name), "path": path, "link_in": link_in
                         }));
                         if backlinks.len() >= limit { break; }
                     }
@@ -3550,7 +3575,7 @@ impl WorkflowyMcpServer {
                 if dry_run {
                     let items: Vec<serde_json::Value> = matched.iter().map(|n| {
                         let path = build_node_path_with_map(&n.id, &node_map);
-                        json!({ "id": n.id, "name": n.name, "path": path })
+                        json!({ "id": n.id, "name": render_display(&n.name), "path": path })
                     }).collect();
                     let payload = json!({
                         "dry_run": true,
@@ -3587,7 +3612,7 @@ impl WorkflowyMcpServer {
                     .filter_map(|id| {
                         matched_owned.iter().find(|n| n.id == *id).map(|n| {
                             let path = build_node_path_with_map(&n.id, &node_map);
-                            json!({ "id": n.id, "name": n.name, "path": path })
+                            json!({ "id": n.id, "name": render_display(&n.name), "path": path })
                         })
                     })
                     .collect();
@@ -4627,7 +4652,7 @@ impl WorkflowyMcpServer {
         let changed = last_modified >= params.timestamp_unix_ms;
         let payload = json!({
             "node_id": resolved,
-            "name": node.name,
+            "name": render_display(&node.name),
             "last_modified_unix_ms": last_modified,
             "threshold_unix_ms": params.timestamp_unix_ms,
             "changed_since": changed,
@@ -4669,7 +4694,7 @@ impl WorkflowyMcpServer {
 
                     hits.push(json!({
                         "id": node.id,
-                        "name": node.name,
+                        "name": render_display(&node.name),
                         "path": path,
                     }));
                     if hits.len() >= limit { break; }
@@ -7099,6 +7124,7 @@ mod tests {
                 description: None,
                 parent_id: NodeId::from("ffffffffffff"),
                 priority: None,
+                layout: None,
                 idempotency_key: None,
             }))
             .await
@@ -9735,6 +9761,7 @@ mod load_tests {
             description: None,
             parent_id: NodeId::from(""),
             priority: None,
+            layout: None,
             idempotency_key: Some(key.to_string()),
         };
 
@@ -10645,7 +10672,7 @@ mod load_tests {
         let started = Instant::now();
         let deadline = Instant::now() + Duration::from_millis(300);
         let result = client
-            .create_node_cancellable("hello", None, None, None, None, Some(deadline))
+            .create_node_cancellable("hello", None, None, None, None, None, Some(deadline))
             .await;
         let elapsed = started.elapsed();
 
@@ -10776,6 +10803,7 @@ mod load_tests {
                     description: None,
                     parent_id: NodeId::from(""),
                     priority: None,
+                    layout: None,
                     idempotency_key: None,
                 }))
                 .await

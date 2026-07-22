@@ -200,6 +200,13 @@ Highlights worth knowing before you need them:
 - **Ordering that matches the app.** Listings sort into Workflowy display
   order; `insert_content` writes explicit ascending priorities;
   `reorder_nodes` is the deterministic reorder primitive.
+- **Clean text in, rich nodes out.** Since the 2026.01 API parses markdown
+  in a node's name on write (so stored names carry `<b>`/`<a>`/`<time>`
+  markup), reads render back to clean display text — links keep their URL,
+  dates unwrap to their label — and search matches the visible text, not the
+  tags. `create_node` also takes an explicit `layout` (`todo`/`h1`/`h2`/`h3`/
+  `code-block`/`quote-block`) so you can build headers and checklists
+  directly.
 
 Conventions parsed from node text: tags (`#project`), assignees (`@alice`),
 due dates (`due:2026-03-15`, `#due-2026-03-15`, or a bare date).

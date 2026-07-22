@@ -380,10 +380,15 @@ impl NameIndex {
         let mut out = Vec::new();
         for value in by_name.values() {
             for entry in &value.entries {
-                let mut hay = entry.name.to_lowercase();
+                // Since 2026.01 the API stores names as HTML (markdown parsed
+                // on write), so match against the rendered plain text — a query
+                // "Distribution Patterns" must find "<b>Distribution
+                // Patterns:</b>". render_display fast-paths plain text, so the
+                // 97% of entries with no markup cost nothing extra.
+                let mut hay = crate::utils::html::render_display(&entry.name).to_lowercase();
                 if let Some(desc) = &entry.description {
                     hay.push(' ');
-                    hay.push_str(&desc.to_lowercase());
+                    hay.push_str(&crate::utils::html::render_display(desc).to_lowercase());
                 }
                 if tokens.iter().all(|t| hay.contains(t)) {
                     out.push(entry.clone());
@@ -1726,6 +1731,24 @@ mod tests {
         // Tokens spanning name + description both required.
         assert_eq!(idx.search_tokens("GDPR Article").len(), 1);
         assert_eq!(idx.search_tokens("GDPR Article 31").len(), 0);
+    }
+
+    #[test]
+    fn search_tokens_matches_across_api_html() {
+        // Since 2026.01 the API stores names as HTML (markdown parsed on
+        // write). A query for the visible text must match through the tags,
+        // and a link's URL must be searchable because the target is content.
+        let idx = NameIndex::new();
+        idx.ingest(&[
+            node("1", "<b>Distribution Patterns:</b> remote facade", None),
+            node("2", r#"See <a href="https://martinfowler.com/eaaCatalog">catalog</a>"#, None),
+        ]);
+        // Visible text found through the <b> tags.
+        assert_eq!(idx.search_tokens("Distribution Patterns").len(), 1);
+        // The link's URL is matchable (render keeps it).
+        assert_eq!(idx.search_tokens("martinfowler.com").len(), 1);
+        // And the link's visible label.
+        assert_eq!(idx.search_tokens("catalog").len(), 1);
     }
 
     #[test]

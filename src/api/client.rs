@@ -1450,7 +1450,7 @@ impl WorkflowyClient {
         parent_id: Option<&str>,
         priority: Option<i32>,
     ) -> Result<CreatedNode> {
-        self.create_node_cancellable(name, description, parent_id, priority, None, None)
+        self.create_node_cancellable(name, description, parent_id, priority, None, None, None)
             .await
     }
 
@@ -1458,12 +1458,14 @@ impl WorkflowyClient {
     /// explicit cancel guard and deadline. Callers that drive bulk
     /// inserts (`insert_content`) pass a per-operation deadline so an
     /// individual create can't burn the whole budget.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_node_cancellable(
         &self,
         name: &str,
         description: Option<&str>,
         parent_id: Option<&str>,
         priority: Option<i32>,
+        layout: Option<&str>,
         cancel: Option<&CancelGuard>,
         deadline: Option<Instant>,
     ) -> Result<CreatedNode> {
@@ -1479,6 +1481,11 @@ impl WorkflowyClient {
         }
         if let Some(pri) = priority {
             body["priority"] = json!(pri);
+        }
+        if let Some(lm) = layout {
+            // Wire field is `layoutMode` (2025.19 API). Sets the node type
+            // (todo/h1/code-block/…) directly instead of via a markdown prefix.
+            body["layoutMode"] = json!(lm);
         }
         let effective_deadline = deadline.or_else(|| {
             Some(Instant::now() + Duration::from_millis(defaults::WRITE_NODE_TIMEOUT_MS))
@@ -3107,6 +3114,30 @@ mod tests {
                 .create_node("n", Some("d"), None, None)
                 .await
                 .expect("create must reach mock — if this fails, the wire field name regressed");
+        }
+
+        #[tokio::test]
+        async fn create_node_sends_layout_as_layout_mode() {
+            // 2026.01 adoption: a layout maps to the wire field `layoutMode`
+            // (camelCase, the API's own name). Assert it reaches the wire so a
+            // future rename of the field can't silently drop the node type.
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/nodes"))
+                .and(body_partial_json(json!({ "name": "task", "layoutMode": "todo" })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"item_id": "00000000-0000-0000-0000-000000000002"})),
+                )
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let client = mock_client(&mock).await;
+            client
+                .create_node_cancellable("task", None, None, None, Some("todo"), None, None)
+                .await
+                .expect("create-with-layout must reach the mock with layoutMode on the wire");
         }
 
         #[tokio::test]

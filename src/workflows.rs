@@ -729,6 +729,7 @@ pub async fn insert_content_via_indented(
                 None,
                 line_parent.as_deref(),
                 line_priority,
+                None,
                 ctx.cancel,
                 ctx.deadline,
             )
@@ -899,7 +900,14 @@ pub struct TxnOp {
 /// wire-level `NodeId` null-rejection cannot catch that, but a name mismatch
 /// against the caller's echo can — and a delete is irreversible.
 pub fn destructive_echo_matches(current_name: &str, echoed_name: &str) -> bool {
-    current_name.trim() == echoed_name.trim()
+    let echoed = echoed_name.trim();
+    // Accept either the raw stored name OR its rendered display form. Since
+    // 2026.01 the API stores names as HTML (markdown parsed on write), and the
+    // caller echoes what they SAW — which is the rendered text. Matching both
+    // keeps the guard working whether the caller pasted the clean display name
+    // or (for back-compat) the raw stored form.
+    current_name.trim() == echoed
+        || crate::utils::html::render_display(current_name).trim() == echoed
 }
 
 /// Inverse of a successful transaction step. Applied in LIFO order
@@ -1058,7 +1066,7 @@ async fn apply_txn_step(
             let summary = json!({
                 "op": "create",
                 "id": created.id.clone(),
-                "name": created.name.clone(),
+                "name": crate::utils::html::render_display(&created.name),
             });
             let inverse = TxnInverse::DeleteCreated {
                 node_id: created.id,
@@ -2130,7 +2138,7 @@ pub async fn audit_mirrors_walk(
         }
         chunks.push(json!({
             "id": child.id,
-            "name": child.name,
+            "name": crate::utils::html::render_display(&child.name),
             "scanned": scanned,
             "truncated": truncated,
             "truncation_reason": reason,
@@ -2318,8 +2326,8 @@ pub fn build_resolve_link_hit_payload(
     json!({
         "resolved_via": resolved_via,
         "id": node.id,
-        "name": crate::utils::html::strip_html(&node.name),
-        "description": node.description,
+        "name": crate::utils::html::render_display(&node.name),
+        "description": node.description.as_deref().map(crate::utils::html::render_display),
         "parent_id": node.parent_id,
     })
 }

@@ -57,6 +57,9 @@ enum Cmd {
         parent: Option<String>,
         #[arg(long)]
         priority: Option<i32>,
+        /// Node type: bullets | todo | h1 | h2 | h3 | code-block | quote-block.
+        #[arg(long)]
+        layout: Option<String>,
     },
     /// Move a node to a new parent.
     Move {
@@ -683,7 +686,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
 /// for read-only verbs (which are unaffected by `--dry-run`).
 fn dry_run_line(cmd: &Cmd) -> Option<String> {
     match cmd {
-        Cmd::Create { name, description, parent, priority } => Some(format!(
+        Cmd::Create { name, description, parent, priority, .. } => Some(format!(
             "DRY-RUN create name={:?} parent={:?} priority={:?} description_len={}",
             name,
             parent,
@@ -830,9 +833,27 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             let children = client.get_children_with_propagation_retry(node_id).await?;
             println!("{}", serde_json::to_string_pretty(&children)?);
         }
-        Cmd::Create { name, description, parent, priority } => {
+        Cmd::Create { name, description, parent, priority, layout } => {
+            if let Some(lm) = layout.as_deref() {
+                if !workflowy_mcp_server::defaults::is_valid_layout_mode(lm) {
+                    return Err(format!(
+                        "invalid --layout '{}'; expected one of: {}",
+                        lm,
+                        workflowy_mcp_server::defaults::LAYOUT_MODES.join(", ")
+                    )
+                    .into());
+                }
+            }
             let created = client
-                .create_node(name, description.as_deref(), parent.as_deref(), *priority)
+                .create_node_cancellable(
+                    name,
+                    description.as_deref(),
+                    parent.as_deref(),
+                    *priority,
+                    layout.as_deref(),
+                    None,
+                    None,
+                )
                 .await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&created)?);
