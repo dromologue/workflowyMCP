@@ -55,3 +55,30 @@ or misroutes), on roughly every second call.
   deployment should provision its own `WORKFLOWY_INDEX_PATH` on durable
   storage and schedule `wflow-do reindex --timeout-secs 0 --patient` for
   convergence, exactly as a local install does.
+
+## Two surfaces onto one tree: routing guidance
+
+Running both a local stdio server and a remote connector against the **same
+Workflowy account** is a supported topology — the connector is a nightly
+follower of the local canonical index, so either can serve reads. But they
+share one upstream account and therefore **one API rate limit**: two live
+clients issuing requests double the load against that single budget, and it is
+easy to lose track of which surface actually answered a call.
+
+The recommended policy is to route by which surface can reach the local server,
+not to spread traffic across both:
+
+- **Where the local stdio server is reachable (a desktop/laptop running Claude
+  Desktop or Claude Code), use it.** It is lower-latency, needs no network
+  round-trip to a hosted shim, and keeps the connector's quota free.
+- **Use the remote connector only for surfaces that cannot reach the local
+  server** — claude.ai web and mobile. That is the connector's reason to exist.
+- Treat a fall-through from local to connector as an incident signal, not a
+  default: if the local server is unresponsive on a host that should use it,
+  restart that host rather than silently sending its traffic through the
+  connector. `pgrep`-ing the server binary plus a `workflowy_status` /
+  `health_check` probe tells you which surface is live.
+
+This is an operational deployment policy, not server behaviour — the binary
+cannot know which device called it, so it is enforced by convention and by the
+operator's health monitoring, not by a code path in this repo.
