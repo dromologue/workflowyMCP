@@ -533,6 +533,18 @@ enum Cmd {
         /// wait makes the walk skip the wait and drop the branches anyway.
         #[arg(long)]
         patient: bool,
+        /// Rebuild the WHOLE index from a single bulk `GET /nodes-export`
+        /// instead of walking roots level-by-level. One request returns
+        /// every node (flat, with parent_id) in ~30 s, replacing the
+        /// patient-walk machinery — no truncation, no dropped branches, no
+        /// 429 storm. `--root`, `--max-depth`, `--timeout-secs` and
+        /// `--patient` are IGNORED (an export covers the entire tree); the
+        /// `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` filter still applies at the
+        /// save boundary, so excluded subtrees never reach disk. Workflowy
+        /// throttles this endpoint hard — do not loop it faster than the
+        /// ~65 s floor. This is the recommended path for the nightly job.
+        #[arg(long = "full-export")]
+        full_export: bool,
     },
     /// List nodes modified since a given time, served entirely from the
     /// persisted name index at $WORKFLOWY_INDEX_PATH — zero API calls.
@@ -541,13 +553,33 @@ enum Cmd {
     /// Entries with no recorded timestamp are excluded (absence means
     /// "not observed"); for suspected gaps, re-run the reindex.
     ChangedSince {
-        /// Cutoff: epoch milliseconds, or a YYYY-MM-DD date (midnight UTC).
+        /// Cutoff: epoch seconds (the index's native unit), epoch
+        /// milliseconds (auto-detected and divided down), or a YYYY-MM-DD
+        /// date (midnight UTC).
         since: String,
         /// Restrict to descendants of this node (full UUID as stored).
         #[arg(long)]
         root: Option<String>,
         #[arg(long, default_value_t = 500)]
         limit: usize,
+    },
+    /// Create a NATIVE Workflowy mirror via the beta API (a real mirror
+    /// whose shared content stays in sync with its origin), as opposed to
+    /// the convention-based `create-mirror` (which duplicates a node and
+    /// writes a `mirror_of:` note). CLI-only and experimental: native
+    /// mirrors are BETA-ONLY — on the production account the created node
+    /// renders with an empty name and no mirror metadata until Workflowy
+    /// ships mirrors to production. Distinct mechanism from `audit-mirrors`
+    /// (which tracks the note convention).
+    NativeMirrorCreate {
+        /// UUID or short hash of the canonical (origin) node to mirror.
+        canonical_node_id: String,
+        /// UUID or short hash of the parent under which the mirror appears.
+        #[arg(long = "to")]
+        target_parent_id: String,
+        /// Position among siblings: "top" (default) or "bottom".
+        #[arg(long, default_value = "top")]
+        position: String,
     },
 }
 
@@ -643,6 +675,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Index { .. } => "index",
         Cmd::Reindex { .. } => "reindex",
         Cmd::ChangedSince { .. } => "changed-since",
+        Cmd::NativeMirrorCreate { .. } => "native-mirror-create",
     }
 }
 
@@ -2128,6 +2161,9 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 // Impatient: this mirrors the MCP tool, whose caller is
                 // waiting. Patience belongs to the scheduled reindex.
                 false,
+                // Scoped walk, not a full export: build_name_index targets a
+                // single root by design.
+                false,
             ).await?;
         }
         Cmd::RecentTools { limit } => {
@@ -2392,7 +2428,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             std::fs::write(target, &body)?;
             println!("index: wrote {} entries to {}", entries.len(), target);
         }
-        Cmd::Reindex { roots, index_path, max_depth, timeout_secs, patient } => {
+        Cmd::Reindex { roots, index_path, max_depth, timeout_secs, patient, full_export } => {
             cmd_reindex(
                 client,
                 roots.as_slice(),
@@ -2400,26 +2436,18 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                 *max_depth,
                 *timeout_secs,
                 *patient,
+                *full_export,
             )
             .await?;
         }
         Cmd::ChangedSince { since, root, limit } => {
-            let since_ms: i64 = if let Ok(ms) = since.parse::<i64>() {
-                ms
-            } else {
-                let date = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d").map_err(|_| {
-                    format!(
-                        "--since must be epoch milliseconds or YYYY-MM-DD, got {:?}",
-                        since
-                    )
-                })?;
-                date.and_hms_opt(0, 0, 0)
-                    .expect("midnight is always valid")
-                    .and_utc()
-                    .timestamp_millis()
-            };
+            // Normalise to epoch SECONDS — the unit the index stores
+            // `last_modified` in. Comparing a ms cutoff against second-scale
+            // stored values matched nothing (fixed 2026-07-22).
+            let since_secs: i64 =
+                workflowy_mcp_server::utils::date_parser::epoch_input_to_secs(since)?;
             let index = load_persistent_index()?;
-            let mut hits = index.entries_modified_since(since_ms);
+            let mut hits = index.entries_modified_since(since_secs);
             if let Some(r) = root.as_deref() {
                 hits.retain(|e| index.is_descendant_of(&e.node_id, r));
             }
@@ -2427,7 +2455,7 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
             let total = hits.len();
             hits.truncate(*limit);
             let payload = json!({
-                "since_ms": since_ms,
+                "since_secs": since_secs,
                 "root": root,
                 "served_from": "name_index",
                 "name_index_size": index.size(),
@@ -2439,6 +2467,23 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
                     "parent_id": e.parent_id,
                     "last_modified": e.last_modified,
                 })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        Cmd::NativeMirrorCreate { canonical_node_id, target_parent_id, position } => {
+            let resp = client
+                .create_native_mirror(canonical_node_id, target_parent_id, position)
+                .await?;
+            let payload = json!({
+                "mode": "native",
+                "item_id": resp.item_id,
+                "origin_id": resp.origin_id,
+                "position": position,
+                "caveat": "Native mirror created on the BETA API. On the production \
+                           account it renders as an empty-named node with no mirror \
+                           metadata until Workflowy ships mirrors to production. This is \
+                           a distinct mechanism from the `create-mirror` note convention \
+                           that `audit-mirrors` tracks.",
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         }
@@ -2458,6 +2503,7 @@ async fn cmd_reindex(
     max_depth: usize,
     timeout_secs: u64,
     patient: bool,
+    full_export: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use workflowy_mcp_server::utils::NameIndex;
 
@@ -2485,6 +2531,46 @@ async fn cmd_reindex(
         }
     } else {
         println!("reindex: persistence disabled (no save path)");
+    }
+
+    // Fast path: one bulk `GET /nodes-export` covers the entire tree, so it
+    // replaces the whole root-walk loop below — no truncation, no dropped
+    // branches, no per-root checkpointing. The exclusion filter still runs
+    // at the save boundary (`snapshot()`), so ingesting the whole tree in
+    // memory and then saving yields a disk index that omits the excluded
+    // subtrees exactly as the scoped walk did. `--root`/`--max-depth`/
+    // `--timeout-secs`/`--patient` are meaningless here and ignored.
+    if full_export {
+        if !roots.is_empty() || patient {
+            eprintln!(
+                "reindex: --full-export covers the whole tree; ignoring --root/--patient/--timeout-secs"
+            );
+        }
+        let started = std::time::Instant::now();
+        println!("reindex: full export via GET /nodes-export (one call for the whole tree)…");
+        let nodes = client.export_all().await.map_err(|e| {
+            format!("full export failed: {e} (Workflowy throttles /nodes-export; wait ~65 s and retry)")
+        })?;
+        let fetched = nodes.len();
+        index.ingest(&nodes);
+        println!(
+            "reindex: exported {} nodes in {} ms; index holds {} entries (pre-exclusion, in memory)",
+            fetched,
+            started.elapsed().as_millis(),
+            index.size()
+        );
+        if path.is_some() {
+            index.save_to_disk()?;
+            println!(
+                "reindex: saved to {} (excluded subtrees filtered at save; total elapsed {} ms)",
+                path.as_ref().unwrap().display(),
+                started.elapsed().as_millis()
+            );
+        }
+        if fetched == 0 {
+            eprintln!("reindex: WARNING export returned 0 nodes — index left unchanged on disk");
+        }
+        return Ok(());
     }
 
     // Walk each root in turn. Empty roots = walk from workspace root.

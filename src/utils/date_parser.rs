@@ -52,6 +52,33 @@ pub fn parse_due_date_from_node(node: &WorkflowyNode) -> Option<NaiveDate> {
     None
 }
 
+/// Normalise a `--since` string into **epoch seconds**, the unit the name
+/// index stores `last_modified` in (a verbatim passthrough of the API's
+/// `modifiedAt`). Accepts:
+///   - `YYYY-MM-DD` → that date's UTC midnight, in seconds;
+///   - a bare integer → interpreted as seconds when it is second-scale, or
+///     milliseconds (divided by 1000) when it is millisecond-scale. The
+///     boundary is `1e11`: any epoch after ~1973 in *seconds* is below it,
+///     while any realistic epoch in *milliseconds* is far above it, so the
+///     magnitude alone disambiguates the two without a unit flag.
+///
+/// Pre-2026-07-22 the caller compared a millisecond cutoff against second-
+/// scale stored timestamps, so a date-based `changed-since` silently matched
+/// nothing; this helper is the single normalisation point that fixes it.
+pub fn epoch_input_to_secs(input: &str) -> Result<i64, String> {
+    const MS_THRESHOLD: i64 = 100_000_000_000; // 1e11: above → milliseconds
+    if let Ok(n) = input.parse::<i64>() {
+        return Ok(if n.abs() >= MS_THRESHOLD { n / 1000 } else { n });
+    }
+    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .map_err(|_| format!("--since must be epoch seconds/millis or YYYY-MM-DD, got {input:?}"))?;
+    Ok(date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always valid")
+        .and_utc()
+        .timestamp())
+}
+
 /// Check if a node is overdue (incomplete + due date < today).
 pub fn is_overdue(node: &WorkflowyNode, today: NaiveDate) -> bool {
     if node.completed_at.is_some() {
@@ -108,6 +135,23 @@ mod tests {
             parse_due_date(text),
             Some(NaiveDate::from_ymd_opt(2026, 2, 2).unwrap())
         );
+    }
+
+    #[test]
+    fn epoch_input_normalises_to_seconds() {
+        // A date resolves to that day's UTC-midnight epoch SECONDS. This is
+        // the case the pre-fix caller broke: it produced milliseconds and
+        // then compared against second-scale stored timestamps, matching
+        // nothing.
+        let secs = epoch_input_to_secs("2026-07-22").unwrap();
+        assert_eq!(secs, 1_784_678_400, "date must yield epoch seconds, not ms");
+        // A second-scale integer passes through unchanged.
+        assert_eq!(epoch_input_to_secs("1784678400").unwrap(), 1_784_678_400);
+        // A millisecond-scale integer is divided down to seconds, so a
+        // caller that still passes ms lands on the same window as a date.
+        assert_eq!(epoch_input_to_secs("1784678400000").unwrap(), 1_784_678_400);
+        // Garbage is a typed error, not a panic.
+        assert!(epoch_input_to_secs("not-a-date").is_err());
     }
 
     #[test]

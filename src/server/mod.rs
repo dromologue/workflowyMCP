@@ -11460,6 +11460,30 @@ mod load_tests {
         );
     }
 
+    /// `wflow-do reindex --full-export` must build the whole index from one
+    /// bulk `export_all()` call, not the per-root walk. Added 2026-07-22 from
+    /// the workflowy-cli comparison: one GET returns the entire tree, so the
+    /// full-export branch must not fall through to `get_subtree_with_controls`.
+    #[test]
+    fn reindex_full_export_uses_export_all_not_the_walk() {
+        let src = include_str!("../bin/wflow_do.rs");
+        let branch = src
+            .split("if full_export {")
+            .nth(1)
+            .and_then(|rest| rest.split("// Walk each root in turn").next())
+            .expect("cmd_reindex full_export branch present");
+        assert!(
+            branch.contains("export_all()"),
+            "the --full-export branch must call client.export_all() (one bulk GET), \
+             not the level-by-level walk",
+        );
+        assert!(
+            branch.contains("save_to_disk"),
+            "the --full-export branch must persist the rebuilt index (exclusion filter \
+             applies at the save boundary)",
+        );
+    }
+
     /// Every observed 429 must drain the local token bucket. Burst
     /// headroom held through a rate-limit window fires up to burst_size
     /// requests back-to-back the moment the window clears, re-tripping

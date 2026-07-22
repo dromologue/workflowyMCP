@@ -713,6 +713,129 @@ impl WorkflowyClient {
         Ok(nodes)
     }
 
+    /// Bulk full-tree export via `GET /nodes-export` — the ENTIRE tree
+    /// (every node, flat, each carrying `parent_id`) in a single call.
+    ///
+    /// This is the fast path for building the name index: one request
+    /// instead of a level-by-level walk that must respect the 20 s subtree
+    /// budget and eats 429 storms on a 100k+ node tree. On the production
+    /// account the full tree is ~80 MB and serialises in ~26 s, so this
+    /// call overrides the shared 30 s client timeout with the dedicated
+    /// `EXPORT_TIMEOUT_SECS` ceiling.
+    ///
+    /// It is a batch/offline primitive, NOT an interactive MCP tool: the
+    /// payload is far too large to hand an LLM, and Workflowy throttles the
+    /// endpoint hard (a 65 s floor between calls — see `EXPORT_MIN_INTERVAL_MS`).
+    /// Bypasses the rate limiter (one shot) and the retry loop, mirroring
+    /// `probe_top_level`'s bespoke-request posture; a failed export is cheap
+    /// for the caller to retry after the floor.
+    pub async fn export_all(&self) -> Result<Vec<WorkflowyNode>> {
+        let url = format!("{}/nodes-export", self.base_url);
+        debug!(url = %url, "Requesting full nodes-export");
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .timeout(Duration::from_secs(defaults::EXPORT_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(WorkflowyError::HttpError)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            if status.as_u16() == 429 {
+                let retry_after_ms = self.parse_retry_after(&error_text);
+                self.stamp_rate_limited(retry_after_ms);
+            }
+            return Err(WorkflowyError::api_error(status.as_u16(), error_text));
+        }
+
+        let parsed: crate::types::WorkflowyApiResponse = response
+            .json()
+            .await
+            .map_err(WorkflowyError::HttpError)?;
+        Ok(parsed.nodes.unwrap_or_default())
+    }
+
+    /// Base URL for BETA-only operations (native mirrors). The native-mirror
+    /// endpoints and the `data.mirror` linkage are only coherent on
+    /// `beta.workflowy.com`; production strips them. We derive the beta host
+    /// from the configured base by swapping `workflowy.com` → `beta.workflowy.com`
+    /// so a wiremock test (whose base is a localhost URL, no host swap) still
+    /// targets its own mock, and an already-beta configuration is left as-is.
+    fn beta_base(&self) -> String {
+        if self.base_url.contains("://workflowy.com") {
+            self.base_url
+                .replacen("://workflowy.com", "://beta.workflowy.com", 1)
+        } else {
+            self.base_url.clone()
+        }
+    }
+
+    /// Create a NATIVE Workflowy mirror via the beta API
+    /// (`POST {beta}/nodes/{node_id}/mirror`). Unlike the convention-based
+    /// `create_mirror` tool (which duplicates a node and writes a `mirror_of:`
+    /// note), this creates a real mirror: editing the shared content updates
+    /// the origin and every other mirror. BETA-ONLY — on the production
+    /// account the resulting node renders with an empty name and no mirror
+    /// metadata until Workflowy ships mirrors to production. Bypasses the
+    /// rate limiter and retry loop (a single deliberate write); the caller
+    /// owns the decision to issue it.
+    pub async fn create_native_mirror(
+        &self,
+        node_id: &str,
+        parent_id: &str,
+        position: &str,
+    ) -> Result<crate::types::CreateMirrorResponse> {
+        // node_id is a UUID / short hash (hex + hyphen) — URL-safe, no encoding needed.
+        let url = format!("{}/nodes/{}/mirror", self.beta_base(), node_id);
+        let body = json!({ "parent_id": parent_id, "position": position });
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(WorkflowyError::HttpError)?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(WorkflowyError::api_error(status.as_u16(), error_text));
+        }
+        response.json().await.map_err(WorkflowyError::HttpError)
+    }
+
+    /// Remove a native mirror via the beta API
+    /// (`DELETE {beta}/nodes/{mirror_id}/mirror`). Removes the mirror root
+    /// only; the canonical and other mirrors are untouched. BETA-ONLY.
+    pub async fn delete_native_mirror(&self, mirror_id: &str) -> Result<()> {
+        let url = format!("{}/nodes/{}/mirror", self.beta_base(), mirror_id);
+        let response = self
+            .http_client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(WorkflowyError::HttpError)?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(WorkflowyError::api_error(status.as_u16(), error_text));
+        }
+        Ok(())
+    }
+
     /// Get a single node by ID
     pub async fn get_node(&self, node_id: &str) -> Result<WorkflowyNode> {
         self.get_node_cancellable(node_id, None, None).await
@@ -3073,6 +3196,129 @@ mod tests {
                 .set_completion("00000000-0000-0000-0000-000000000001", false)
                 .await
                 .expect("uncomplete must reach mock — if this fails, the wire field name regressed");
+        }
+    }
+
+    /// Bulk export (`GET /nodes-export`) and native-mirror (beta) methods,
+    /// added 2026-07-22 from the workflowy-cli comparison. Verified against
+    /// the live account before landing; these pins hold the wire shape.
+    #[cfg(test)]
+    mod export_and_native_mirror {
+        use super::*;
+        use crate::config::{RateLimitConfig, RetryConfig};
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn client(mock: &MockServer) -> WorkflowyClient {
+            let retry = RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                retryable_statuses: defaults::RETRY_STATUSES,
+            };
+            let rate = RateLimitConfig { requests_per_second: 200, burst_size: 100 };
+            WorkflowyClient::new_with_configs(mock.uri(), "test-key".to_string(), retry, rate)
+                .expect("client must build against mock")
+        }
+
+        #[tokio::test]
+        async fn export_all_parses_the_whole_tree_from_the_bulk_endpoint() {
+            let mock = MockServer::start().await;
+            // One GET returns every node flat, each with parent_id and the
+            // API's own field names (note, modifiedAt). expect(1): a single
+            // call, not a per-level walk.
+            Mock::given(method("GET"))
+                .and(path("/nodes-export"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": [
+                    {"id": "a", "name": "Root", "parent_id": null, "note": "root note", "modifiedAt": 1_784_678_400i64},
+                    {"id": "b", "name": "Child", "parent_id": "a", "modifiedAt": 1_784_678_401i64}
+                ]})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let nodes = client(&mock).export_all().await.expect("export must parse");
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].id, "a");
+            // note → description, modifiedAt → last_modified (seconds, verbatim).
+            assert_eq!(nodes[0].description.as_deref(), Some("root note"));
+            assert_eq!(nodes[0].last_modified, Some(1_784_678_400));
+            assert_eq!(nodes[1].parent_id.as_deref(), Some("a"));
+        }
+
+        #[tokio::test]
+        async fn export_all_surfaces_upstream_error_status() {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/nodes-export"))
+                .respond_with(ResponseTemplate::new(429).set_body_string("{\"retry_after\": 65}"))
+                .mount(&mock)
+                .await;
+            let err = client(&mock).export_all().await.expect_err("429 must be an error");
+            assert!(matches!(err, WorkflowyError::ApiError { status: 429, .. }));
+        }
+
+        #[tokio::test]
+        async fn create_native_mirror_posts_body_and_parses_item_and_origin() {
+            let mock = MockServer::start().await;
+            // POST /nodes/{id}/mirror with {parent_id, position}; response
+            // carries the new mirror's item_id + the origin it points at.
+            Mock::given(method("POST"))
+                .and(path("/nodes/canon-1/mirror"))
+                .and(body_partial_json(json!({"parent_id": "parent-1", "position": "top"})))
+                .respond_with(ResponseTemplate::new(200)
+                    .set_body_json(json!({"item_id": "mirror-9", "origin_id": "canon-1"})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let resp = client(&mock)
+                .create_native_mirror("canon-1", "parent-1", "top")
+                .await
+                .expect("native mirror create must parse");
+            assert_eq!(resp.item_id, "mirror-9");
+            assert_eq!(resp.origin_id, "canon-1");
+        }
+
+        #[tokio::test]
+        async fn delete_native_mirror_hits_the_beta_mirror_endpoint() {
+            let mock = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/nodes/mirror-9/mirror"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            client(&mock)
+                .delete_native_mirror("mirror-9")
+                .await
+                .expect("native mirror delete must succeed");
+        }
+
+        #[test]
+        fn beta_base_swaps_production_host_only() {
+            let retry = RetryConfig::default();
+            let rate = RateLimitConfig::default();
+            // Production base → beta host.
+            let prod = WorkflowyClient::new_with_configs(
+                "https://workflowy.com/api/v1".to_string(),
+                "k".to_string(),
+                RetryConfig { ..retry },
+                RateLimitConfig { ..rate },
+            )
+            .unwrap();
+            assert_eq!(prod.beta_base(), "https://beta.workflowy.com/api/v1");
+            // A non-production base (a mock / already-beta) is left as-is, so
+            // wiremock tests hit their own host.
+            let local = WorkflowyClient::new_with_configs(
+                "http://127.0.0.1:8080".to_string(),
+                "k".to_string(),
+                RetryConfig::default(),
+                RateLimitConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(local.beta_base(), "http://127.0.0.1:8080");
         }
     }
 }

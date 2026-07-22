@@ -6,6 +6,37 @@ use std::collections::HashMap;
 pub struct NodeData {
     #[serde(alias = "layoutMode")]
     pub layout_mode: Option<String>,
+    /// Native-mirror linkage. Only populated by the BETA API
+    /// (`beta.workflowy.com`): a mirror node carries `origin_id` (the
+    /// canonical it reflects), a canonical carries `mirror_ids` (every node
+    /// mirroring it). Production reads strip this object entirely, so on the
+    /// production account it is always `None` — distinct from the
+    /// convention-based `mirror_of:`/`canonical_of:` note markers that the
+    /// `create_mirror` tool and `audit_mirrors` use. Added 2026-07-22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorLink>,
+}
+
+/// Native-mirror linkage carried under a node's `data.mirror` on the BETA
+/// API. Confirmed by a live round-trip 2026-07-22: a mirror node exposes
+/// `origin_id`; its canonical exposes `mirror_ids`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MirrorLink {
+    /// Present on a mirror node: the canonical (origin) it reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_id: Option<String>,
+    /// Present on a canonical node: the ids of every node mirroring it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_ids: Option<Vec<String>>,
+}
+
+/// Response from the BETA native-mirror-create endpoint
+/// (`POST /nodes/{id}/mirror`): the new mirror node's id plus the canonical
+/// it points at. Confirmed live 2026-07-22.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMirrorResponse {
+    pub item_id: String,
+    pub origin_id: String,
 }
 
 /// Newtype wrapper for Workflowy node IDs (UUIDs).

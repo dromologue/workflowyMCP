@@ -190,8 +190,27 @@ pub const AUTH_FAILURE_WINDOW_SECS: u64 = 5 * 60;
 // --- API ---
 /// Workflowy API base URL
 pub const WORKFLOWY_BASE_URL: &str = "https://workflowy.com/api/v1";
+/// Workflowy BETA API base URL. Same account, same Bearer token; only the
+/// host differs. The native-mirror endpoints (`POST/DELETE /nodes/{id}/mirror`)
+/// and the `data.mirror` linkage on reads are only coherent here — production
+/// reads strip the mirror metadata and render a mirror node with an empty
+/// name. Confirmed 2026-07-22 by a live create/verify/delete round-trip.
+pub const WORKFLOWY_BETA_BASE_URL: &str = "https://beta.workflowy.com/api/v1";
 /// HTTP client timeout (seconds)
 pub const HTTP_TIMEOUT_SECS: u64 = 30;
+/// Dedicated per-request timeout for the bulk `GET /nodes-export` call.
+/// The whole tree (100k+ nodes, ~80 MB) serialises upstream in ~26 s on the
+/// production account, comfortably over `HTTP_TIMEOUT_SECS` (30 s but shared
+/// with every other call), so export overrides it with a generous ceiling
+/// that still sits under `MCP_TRANSPORT_HARD_TIMEOUT_MS`. Export is a
+/// batch/offline primitive (the reference CLI enforces a 65 s floor between
+/// calls), never an interactive MCP tool.
+pub const EXPORT_TIMEOUT_SECS: u64 = 120;
+/// Minimum interval between full `nodes-export` calls. Workflowy throttles
+/// this endpoint far harder than per-node reads; the reference `workflowy-cli`
+/// enforces the same 65 s floor. `wflow-do reindex` respects it so back-to-back
+/// exports (e.g. an interrupted rerun) do not trip a long upstream cool-off.
+pub const EXPORT_MIN_INTERVAL_MS: u64 = 65_000;
 
 // --- Persistent name index ---
 /// How often the periodic saver checks the dirty flag and rewrites the

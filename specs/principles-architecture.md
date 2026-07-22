@@ -372,7 +372,33 @@ the structural rules for contributors are:
   (floor 1 req/s); success → +0.1 req/s toward the configured ceiling.
 - **Incremental sync is a local diff** (`C-server-020`): the index
   records `last_modified` (schema v3) and `wflow-do changed-since`
-  serves change windows with zero API calls.
+  serves change windows with zero API calls. `last_modified` is stored
+  in the API's native **epoch seconds** (a verbatim `modifiedAt`
+  passthrough); the `changed-since` cutoff normalises to seconds via
+  `date_parser::epoch_input_to_secs` (2026-07-22 fix — a ms cutoff
+  compared against second-scale values matched nothing). Pinned by
+  `epoch_input_normalises_to_seconds`.
+- **Bulk export supersedes the walk for full rebuilds** (`C-server-023`):
+  `WorkflowyClient::export_all()` (`GET /nodes-export`) returns the whole
+  tree flat in one call, and `wflow-do reindex --full-export` rebuilds
+  the entire index from it — no truncation, no dropped branches, no 429
+  storm — replacing the patient-walk machinery for the nightly job. The
+  `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` filter still applies at the
+  `snapshot()` save boundary, so ingesting the whole tree in memory and
+  saving yields a disk index that omits excluded subtrees. Export is a
+  batch/offline primitive (~80 MB payload, ~65 s upstream floor), CLI-only
+  by design — never an MCP tool. Pinned by
+  `reindex_full_export_uses_export_all_not_the_walk` and the
+  `export_and_native_mirror` client tests.
+- **Native mirrors are beta-only and CLI-gated** (`C-server-024`):
+  `create_native_mirror`/`delete_native_mirror` target the beta host via
+  `beta_base()` and are exposed only through `wflow-do native-mirror-create`,
+  never the production-facing MCP `create_mirror` tool. On the production
+  account a native mirror renders as an empty node with no linkage, so the
+  convention-based `mirror_of:` note discipline (which `audit_mirrors`
+  tracks) stays the default. The two mechanisms are distinct and must not
+  be conflated. Shared logic lives once on `WorkflowyClient`; the CLI is a
+  thin facade. Pinned by the `export_and_native_mirror` client tests.
 - **Deliberately rejected:** serving `bulk_tag`'s pre-read from the name
   index. The fetched name is the *base for the mutation* — a stale
   index name would clobber a rename, and a stale already-tagged name

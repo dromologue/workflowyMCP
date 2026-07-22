@@ -46,9 +46,12 @@ pub struct NameIndexEntry {
     /// Available at every ingest site (walks return full `WorkflowyNode`s),
     /// so populating it needs no extra API calls.
     pub description: Option<String>,
-    /// Upstream `modifiedAt` (epoch ms) as of the last ingest. Feeds
-    /// `entries_modified_since` / `wflow-do changed-since` so incremental
-    /// sync is a local index diff, not a repeated live walk.
+    /// Upstream `modifiedAt` as of the last ingest, in the API's native
+    /// unit: **epoch SECONDS** (a verbatim serde passthrough of the wire
+    /// `modifiedAt` — the read path performs no conversion). Feeds
+    /// `entries_modified_since` / `wflow-do changed-since`, which normalise
+    /// their cutoff to seconds to match. Feeds incremental sync so it is a
+    /// local index diff, not a repeated live walk.
     pub last_modified: Option<i64>,
 }
 
@@ -79,10 +82,10 @@ struct PersistedEntry {
     /// keeps the field optional on the wire; absent = `None`.
     #[serde(default)]
     description: Option<String>,
-    /// The node's upstream `modifiedAt` (epoch ms) as of the last ingest
-    /// (2026-07-21, schema v3). Enables local incremental queries —
-    /// `wflow-do changed-since` diffs the index instead of re-walking a
-    /// large subtree on every sync poll.
+    /// The node's upstream `modifiedAt` as of the last ingest, in the API's
+    /// native unit — **epoch SECONDS** (2026-07-21, schema v3). Enables
+    /// local incremental queries — `wflow-do changed-since` diffs the index
+    /// instead of re-walking a large subtree on every sync poll.
     #[serde(default)]
     last_modified: Option<i64>,
 }
@@ -428,15 +431,20 @@ impl NameIndex {
     }
 
     /// Entries whose recorded upstream `modifiedAt` is at or after
-    /// `since_ms` (2026-07-21). The local half of incremental sync:
-    /// `wflow-do changed-since` diffs the index instead of re-walking a
-    /// large subtree on every poll. Entries with no recorded timestamp are
-    /// excluded — absence means "not observed", not "unchanged", and the
-    /// caller's recovery for suspected gaps is a fresh reindex.
-    pub fn entries_modified_since(&self, since_ms: i64) -> Vec<NameIndexEntry> {
+    /// `since_secs` (2026-07-21). `last_modified` is stored in **epoch
+    /// seconds** (the API's native unit), so the cutoff MUST also be in
+    /// seconds — the caller normalises via [`epoch_input_to_secs`]. Pre-
+    /// 2026-07-22 the caller passed a millisecond cutoff (~1.7e12) against
+    /// second-scale stored values (~1.7e9), so a date-based `changed-since`
+    /// matched nothing. The local half of incremental sync: `wflow-do
+    /// changed-since` diffs the index instead of re-walking a large subtree
+    /// on every poll. Entries with no recorded timestamp are excluded —
+    /// absence means "not observed", not "unchanged", and the caller's
+    /// recovery for suspected gaps is a fresh reindex.
+    pub fn entries_modified_since(&self, since_secs: i64) -> Vec<NameIndexEntry> {
         let mut out = Vec::new();
         self.for_each_entry(|e| {
-            if e.last_modified.map(|m| m >= since_ms).unwrap_or(false) {
+            if e.last_modified.map(|m| m >= since_secs).unwrap_or(false) {
                 out.push(e.clone());
             }
         });

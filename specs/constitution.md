@@ -207,7 +207,7 @@ Cache aggressively but transparently. Expose configuration for rate-limit behavi
 - Support authentication methods other than API key for the Workflowy upstream.
 - Implement real-time sync or webhooks.
 - Build a web UI or standalone application.
-- Support Workflowy features not exposed via the public API.
+- Support Workflowy features not exposed via the public API. The **beta** public API (`beta.workflowy.com/api/v1`) is in scope, but a beta-only feature (e.g. native mirrors, 2026-07-22) must be gated as an explicit, experimental, CLI-only opt-in with the beta-only caveat documented — never wired into a production-facing MCP tool by default, because it does not render correctly on the production account.
 - Compromise security for convenience.
 - Inline the same orchestration in both binaries when it can be lifted to `workflows.rs` / `aggregation.rs` / `audit.rs`.
 - Ship a rule that isn't pinned by a test if a pin test is feasible.
