@@ -58,6 +58,12 @@ already been hit, diagnosed, and engineered away:
 - **Repeat reads are nearly free.** Complete children listings are cached
   with write-through invalidation, node payloads serialise sparse, and
   overlapping queries collapse to single API calls.
+- **The whole tree in one call.** The search index rebuilds from Workflowy's
+  bulk `GET /nodes-export` endpoint (added to the public API in November
+  2025) — the entire workspace in a single request, seconds not minutes, with
+  no level-by-level walk, no truncation, and no 429 storm. `wflow-do reindex
+  --full-export` is the nightly path; the coverage-complete `--patient` walk
+  remains for scoped rebuilds.
 
 The same logic serves two surfaces: the MCP server for conversation, and a
 `wflow-do` CLI with full parity for scripts, cron jobs, and the terminal —
@@ -242,14 +248,16 @@ wflow-do changed-since 2026-07-14 --root <uuid>      # local incremental diff
 wflow-do complete <uuid>                             # mark done
 wflow-do bulk-update complete --tag urgent           # bulk-toggle by filter
 wflow-do --dry-run delete <uuid>                     # preview first
-wflow-do reindex --timeout-secs 0 --patient --root <uuid>   # coverage-complete index build
+wflow-do reindex --full-export                       # whole tree in one bulk call
+wflow-do reindex --timeout-secs 0 --patient --root <uuid>   # coverage-complete scoped build
 ```
 
 Forty-two subcommands, `--json` for raw output, `--dry-run` on write verbs.
-The nightly `reindex --patient` job is the convergence mechanism for the
-search index: it waits out rate-limit windows instead of dropping branches,
-and its work is cumulative — every walk any tool performs extends the same
-persistent file.
+The nightly reindex rebuilds the whole index from one bulk `/nodes-export`
+call (`--full-export`); the `--patient` walk is the convergence mechanism for
+*scoped* rebuilds, waiting out rate-limit windows instead of dropping
+branches. Either way the work is cumulative — every walk any tool performs
+extends the same persistent file.
 
 ---
 
