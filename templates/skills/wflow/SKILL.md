@@ -345,7 +345,7 @@ The detailed implementation of each workflow lives in the user's customised copy
 1. **Daily prioritisation** — surface today's todos, overdue items, and recently-modified projects via `daily_review`. Suggest a focus block for the morning.
 2. **Weekly prioritisation** — review last week's completions and unmoved items. Identify what to drop, what to escalate.
 3. **Monthly prioritisation** — set themes; promote/demote pillar work.
-4. **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo. **When capture is incidental** (an action item surfaces mid-chat rather than being the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under `<inferred-domain>` — confirm?", (2) on user yes, the actual write. When the user's *primary* intent is capture ("capture: X"), the offer collapses to a domain confirmation in the first response and the create lands on yes.
+4. **Task capture** — infer domain from content; place under the appropriate Tasks subtree as a Workflowy todo (create with `layout="todo"` to set the type directly). **When capture is incidental** (an action item surfaces mid-chat rather than being the user's primary intent), split into two messages: (1) "I can capture this as `#TODO @<assignee>` under `<inferred-domain>` — confirm?", (2) on user yes, the actual write. When the user's *primary* intent is capture ("capture: X"), the offer collapses to a domain confirmation in the first response and the create lands on yes.
 5. **Project status** — for a named project, return current state (todos open, recent activity, blockers tagged).
 6. **Inbox triage** — walk Inbox children, route each to the right subtree (or delete).
 7. **Reading list management** — surface WIP reading, recent additions, items tagged for distillation.
@@ -416,6 +416,8 @@ Top level item
 ```
 
 Use `-` bullets only when outputting to the user in chat. Do not use `-` bullets or markdown headers in content sent to Workflowy.
+
+**The Workflowy API parses markdown in a node's name on write — silent, no opt-out (2026.01).** `**bold**`, `*italic*`, `` `code` ``, and `[text](url)` become formatting; a `# ` / `## ` / `- [ ] ` / `> ` / ` ``` ` *prefix* sets the node type (h1/h2/h3/todo/quote-block/code-block) and is stripped; `[YYYY-MM-DD]` becomes a date reference. Single `*`, `_`, `#tag`, and `@mention` are preserved. So: don't wrap a name in markdown you don't want rendered; and to set a node *type*, pass the explicit `layout` param — `create_node(..., layout="todo" | "h1" | "h2" | "h3" | "code-block" | "quote-block")` — rather than a prefix. Reads return clean text and search matches the visible text (the server renders the stored HTML for you).
 
 ### Ordered lists must land in their intended order
 
