@@ -221,6 +221,13 @@ Every PR should verify:
 
 ---
 
+## Persistent-Index Privacy: one exclusion set, monitored
+
+The name index is written to disk by more than one process (the long-running MCP server's 30 s checkpoint and out-of-process `wflow-do reindex`). Which subtrees are private is the operator's fact, held in `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` and, since 2026-07-22, a single-source-of-truth file named by `WORKFLOWY_INDEX_EXCLUDE_SUBTREES_FILE` that every local writer points at. Two rules follow from Fail-Secure and Defense-in-Depth:
+
+- **One source, not many copies.** The exclusion set must not be hand-copied into each writer's env. On 2026-07-22 the set lived in five places; the MCP host configs carried one of three required UUIDs, so a running server re-persisted 37 804 nodes the nightly job had excluded — a live leak of private content into a durable, connector-replicated artefact. Point every writer at the one file; the filter is transitive (root + all descendants) and applied at the sole serialisation boundary (`NameIndex::snapshot`). A configured-but-unreadable file fails open (tokens absent) and MUST therefore be loud: ERROR log on every save plus `workflowy_status.name_index.exclusions.warning`. Principle 8 (no machine-specific IDs in the repo) forbids a baked-in floor, so observability is the compensating control.
+- **A stale process is a leak vector.** After the binary or the exclude config changes, a still-running MCP server keeps the OLD image and env and re-leaks every 30 s until restarted. Restarting every MCP host (Claude Desktop, Claude Code) after any such change is mandatory; `pgrep -f workflowy-mcp-server` must show no pre-change process. This is the same class the estate's stale-process check polices; the dromologue-sync `estate-health.sh` name-index-privacy control reads the on-disk index and goes RED (transitive) on any excluded-subtree node, so a recurrence surfaces rather than running silent for hours.
+
 ## Incident Response
 
 If a security issue is discovered:

@@ -250,6 +250,29 @@ pub const RETRY_WINDOW_WAIT_SLACK_MS: u64 = 500;
 /// lives only in memory for the lifetime of the process.
 pub const INDEX_PATH_ENV: &str = "WORKFLOWY_INDEX_PATH";
 
+/// Environment variable carrying an inline, comma-separated list of
+/// excluded-subtree tokens (UUIDs / 12-char short hashes).
+pub const INDEX_EXCLUDE_SUBTREES_ENV: &str = "WORKFLOWY_INDEX_EXCLUDE_SUBTREES";
+
+/// Environment variable naming a FILE whose lines list excluded-subtree
+/// tokens (one per line; `#` comments and blank lines ignored). Its
+/// tokens are UNIONED with the inline [`INDEX_EXCLUDE_SUBTREES_ENV`] list.
+///
+/// WHY a file, not just the inline list: the exclusion set is the single
+/// most safety-critical piece of configuration, and it must be identical
+/// across every writer of the one shared index — the MCP server (under
+/// two different host configs), the `wflow-do` CLI, and the scheduled
+/// reindex. Hand-copying the list into each surface's env drifts
+/// silently: on 2026-07-22 the MCP host configs carried only one of three
+/// required UUIDs, so the server's 30 s checkpoint re-persisted 37 804
+/// nodes the nightly job had excluded. A file that every surface's env
+/// POINTS AT (rather than a list every surface's env REPEATS) collapses
+/// the copies to one, so they cannot disagree. The path is env-driven and
+/// the file lives outside the repo, so constitution principle 8 (no
+/// machine-specific IDs in the repo) still holds. Pinned by
+/// `index_excluded_subtrees_unions_env_and_file`.
+pub const INDEX_EXCLUDE_SUBTREES_FILE_ENV: &str = "WORKFLOWY_INDEX_EXCLUDE_SUBTREES_FILE";
+
 /// Environment variable that sets the on-disk root of the operational
 /// `secondBrain` directory (drafts, session logs, briefs, memory).
 /// Unset or empty disables every feature that reads from it (e.g. the
@@ -448,26 +471,88 @@ pub fn default_review_root() -> Option<String> {
 /// privacy leak rather than a cosmetic bug, such tokens are dropped with a
 /// warning rather than passed through as a never-matching filter.
 pub fn index_excluded_subtrees() -> Vec<String> {
-    let raw = match std::env::var("WORKFLOWY_INDEX_EXCLUDE_SUBTREES") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    raw.split(',')
-        .map(|t| t.trim().to_ascii_lowercase())
-        .filter(|t| !t.is_empty())
-        .filter(|t| {
-            let ok = is_full_uuid(t) || is_short_hash(t);
-            if !ok {
-                tracing::warn!(
-                    token = %t,
-                    "WORKFLOWY_INDEX_EXCLUDE_SUBTREES entry is neither a 36-char UUID nor a \
-                     12-char short hash; ignoring it — the subtree it was meant to exclude \
-                     WILL be persisted"
-                );
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Inline env list (comma-separated) — retained verbatim for backward
+    // compatibility with every deployment that predates the file option.
+    if let Ok(s) = std::env::var(INDEX_EXCLUDE_SUBTREES_ENV) {
+        for tok in s.split(',') {
+            push_exclude_token(tok, INDEX_EXCLUDE_SUBTREES_ENV, &mut out, &mut seen);
+        }
+    }
+
+    // File list (one token per line; `#` comments and blank lines ignored).
+    // A single file every surface POINTS AT is the source of truth the
+    // inline env cannot be — see INDEX_EXCLUDE_SUBTREES_FILE_ENV.
+    if let Ok(path) = std::env::var(INDEX_EXCLUDE_SUBTREES_FILE_ENV) {
+        let path = path.trim();
+        if !path.is_empty() {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        // Strip an inline `#` comment, then split on commas so a
+                        // line may carry one-or-many tokens either way.
+                        let body = line.split('#').next().unwrap_or("");
+                        for tok in body.split(',') {
+                            push_exclude_token(
+                                tok,
+                                INDEX_EXCLUDE_SUBTREES_FILE_ENV,
+                                &mut out,
+                                &mut seen,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fail LOUD: a configured-but-unreadable exclude file is a
+                    // privacy hazard — the subtrees it names would be persisted
+                    // — not a cosmetic miss. Principle 8 forbids a baked-in
+                    // floor, so an error-level log on every save is the loudest
+                    // signal available. `workflowy_status.name_index.exclusions`
+                    // also surfaces the unreadable state for a single probe.
+                    tracing::error!(
+                        path = %path,
+                        error = %e,
+                        env = %INDEX_EXCLUDE_SUBTREES_FILE_ENV,
+                        "exclude-subtrees file is set but could not be read; the subtrees it \
+                         names WILL be persisted to the index — fix the path or contents"
+                    );
+                }
             }
-            ok
-        })
-        .collect()
+        }
+    }
+
+    out
+}
+
+/// Normalise, validate, dedupe and push one exclusion token into `out`.
+/// A token that is neither a 36-char UUID nor a 12-char short hash is
+/// almost certainly a typo; since a silently-ignored exclusion token is a
+/// privacy leak rather than a cosmetic bug, it is dropped with a warning
+/// naming its source rather than passed through as a never-matching filter.
+fn push_exclude_token(
+    raw: &str,
+    source: &str,
+    out: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let t = raw.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return;
+    }
+    if !(is_full_uuid(&t) || is_short_hash(&t)) {
+        tracing::warn!(
+            token = %t,
+            source = %source,
+            "exclude-subtrees entry is neither a 36-char UUID nor a 12-char short hash; \
+             ignoring it — the subtree it was meant to exclude WILL be persisted"
+        );
+        return;
+    }
+    if seen.insert(t.clone()) {
+        out.push(t);
+    }
 }
 
 /// Serialises tests that mutate process-global environment variables.
@@ -645,8 +730,11 @@ mod tests {
     #[test]
     fn index_excluded_subtrees_parses_uuids_and_short_hashes_and_drops_junk() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let key = "WORKFLOWY_INDEX_EXCLUDE_SUBTREES";
+        let key = INDEX_EXCLUDE_SUBTREES_ENV;
         let prev = std::env::var(key).ok();
+        // The file source must be absent for this env-only test.
+        let file_prev = std::env::var(INDEX_EXCLUDE_SUBTREES_FILE_ENV).ok();
+        std::env::remove_var(INDEX_EXCLUDE_SUBTREES_FILE_ENV);
 
         // Unset → exclude nothing, so the shipped behaviour is unchanged for
         // anyone who never sets the var.
@@ -688,6 +776,89 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
+        }
+        match file_prev {
+            Some(v) => std::env::set_var(INDEX_EXCLUDE_SUBTREES_FILE_ENV, v),
+            None => std::env::remove_var(INDEX_EXCLUDE_SUBTREES_FILE_ENV),
+        }
+    }
+
+    // WHY this test: the 2026-07-22 leak was a config-drift bug — the MCP
+    // host configs and the nightly job carried DIFFERENT exclusion lists, so
+    // the server's checkpoint re-persisted subtrees the reindex had dropped.
+    // The file source is the fix: every surface points at one file so their
+    // sets cannot diverge. This proves the file is honoured, unioned with the
+    // env (not shadowed by it), deduped, junk-filtered, and — critically —
+    // that a configured-but-unreadable file fails OPEN (the tokens are simply
+    // absent) rather than silently returning the env-only set with no signal.
+    #[test]
+    fn index_excluded_subtrees_unions_env_and_file() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_key = INDEX_EXCLUDE_SUBTREES_ENV;
+        let file_key = INDEX_EXCLUDE_SUBTREES_FILE_ENV;
+        let env_prev = std::env::var(env_key).ok();
+        let file_prev = std::env::var(file_key).ok();
+
+        let dir = std::env::temp_dir();
+        let file_path = dir.join(format!(
+            "wflow-excludes-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &file_path,
+            "# canonical exclude set — one token per line\n\
+             bbbbbbbb-2222-4222-8222-222222222222   # Archives\n\
+             \n\
+             333333333333\n\
+             not-a-uuid\n\
+             # trailing comment only\n",
+        )
+        .unwrap();
+
+        // Env and file together; the file adds two, the env adds one, one is
+        // shared across both (must appear once).
+        std::env::set_var(env_key, "aaaaaaaa-1111-4111-8111-111111111111, 333333333333");
+        std::env::set_var(file_key, file_path.to_str().unwrap());
+        let got = index_excluded_subtrees();
+        assert_eq!(
+            got,
+            vec![
+                "aaaaaaaa-1111-4111-8111-111111111111".to_string(), // env only
+                "333333333333".to_string(),                         // env AND file — once
+                "bbbbbbbb-2222-4222-8222-222222222222".to_string(), // file only
+            ],
+            "env+file union, deduped, order = env-first then file-only; junk dropped"
+        );
+
+        // File only, env absent → the file is a complete source of truth.
+        std::env::remove_var(env_key);
+        let got = index_excluded_subtrees();
+        assert_eq!(
+            got,
+            vec![
+                "bbbbbbbb-2222-4222-8222-222222222222".to_string(),
+                "333333333333".to_string(),
+            ],
+            "file alone must fully populate the exclude set"
+        );
+
+        // Configured-but-missing file → fails OPEN to the env set (here empty),
+        // never panics. The error-level log is the loud signal; the status
+        // envelope surfaces the unreadable state for a probe.
+        std::fs::remove_file(&file_path).ok();
+        std::env::set_var(file_key, file_path.to_str().unwrap());
+        assert!(
+            index_excluded_subtrees().is_empty(),
+            "an unreadable exclude file must not panic and must not resurrect stale tokens"
+        );
+
+        match env_prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+        match file_prev {
+            Some(v) => std::env::set_var(file_key, v),
+            None => std::env::remove_var(file_key),
         }
     }
 

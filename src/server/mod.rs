@@ -3804,6 +3804,7 @@ impl WorkflowyMcpServer {
                 "size": self.name_index.size(),
                 "populated": self.name_index.is_populated(),
                 "persistence": name_index_persistence_envelope(),
+                "exclusions": name_index_exclusions_envelope(),
             },
             "server_uptime_ms": self.started_at.elapsed().as_millis() as u64,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
@@ -3939,6 +3940,7 @@ impl WorkflowyMcpServer {
                 "size": self.name_index.size(),
                 "populated": self.name_index.is_populated(),
                 "persistence": name_index_persistence_envelope(),
+                "exclusions": name_index_exclusions_envelope(),
             },
             "rate_limit": {
                 "remaining": rate_limit.remaining,
@@ -5433,6 +5435,62 @@ fn name_index_persistence_envelope() -> serde_json::Value {
     })
 }
 
+/// Build the `name_index.exclusions` envelope for `workflowy_status` /
+/// `health_check`. Surfaced 2026-07-22: the exclusion set is per-process
+/// and hand-copied across the MCP host config, the CLI env, and the
+/// scheduled reindex, so it drifts silently — a narrower set on one writer
+/// re-persists subtrees another writer excluded (37 804 nodes leaked that
+/// way). This envelope makes the ACTIVE set and its source answerable from
+/// a single status probe, the same diagnostic move the `persistence`
+/// envelope makes for the index path. It also flags the one unambiguous
+/// misconfiguration: a file source that is configured but unreadable, whose
+/// named subtrees would then reach disk. An empty set is NOT warned on — a
+/// generic user legitimately excludes nothing (constitution principle 8).
+fn name_index_exclusions_envelope() -> serde_json::Value {
+    let env_raw = std::env::var(defaults::INDEX_EXCLUDE_SUBTREES_ENV).ok();
+    let env_configured = env_raw
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    let file_raw = std::env::var(defaults::INDEX_EXCLUDE_SUBTREES_FILE_ENV).ok();
+    let file_path: Option<String> = file_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let file_configured = file_path.is_some();
+    // Only meaningful when a file is configured; None otherwise.
+    let file_readable = file_path
+        .as_deref()
+        .map(|p| std::fs::metadata(p).is_ok());
+
+    // The single authoritative count — whatever every writer actually applies.
+    let active_count = defaults::index_excluded_subtrees().len();
+
+    let warning = if file_configured && file_readable == Some(false) {
+        Some(format!(
+            "{} points at '{}', which cannot be read — the subtrees it names WILL be \
+             persisted to the index. Fix the path or its contents.",
+            defaults::INDEX_EXCLUDE_SUBTREES_FILE_ENV,
+            file_path.clone().unwrap_or_default(),
+        ))
+    } else {
+        None
+    };
+
+    json!({
+        "active_count": active_count,
+        "env_var": defaults::INDEX_EXCLUDE_SUBTREES_ENV,
+        "env_configured": env_configured,
+        "file_env_var": defaults::INDEX_EXCLUDE_SUBTREES_FILE_ENV,
+        "file_configured": file_configured,
+        "file_path": file_path,
+        "file_readable": file_readable,
+        "warning": warning,
+    })
+}
+
 /// Spawn a background task that flushes the dirty name index to disk
 /// every [`defaults::INDEX_SAVE_INTERVAL_SECS`] seconds. The task lives
 /// for as long as the process — there is no graceful shutdown over MCP
@@ -6310,6 +6368,61 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
+        }
+    }
+
+    /// The exclusions envelope answers "what is actually excluded, and from
+    /// where" in one probe. WHY it exists: the 2026-07-22 leak was invisible
+    /// because no surface reported its active exclude set — a narrower set on
+    /// one writer silently re-persisted another's excluded subtrees. This
+    /// pins the two states that matter: a readable file source reports its
+    /// count with no warning, and a configured-but-unreadable file source
+    /// warns (its named subtrees would otherwise reach disk). Uses the shared
+    /// `ENV_TEST_LOCK` because the exclude env vars are mutated from three
+    /// modules' tests.
+    #[test]
+    fn name_index_exclusions_envelope_reports_source_and_warns_on_unreadable_file() {
+        let _env = crate::defaults::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let env_key = defaults::INDEX_EXCLUDE_SUBTREES_ENV;
+        let file_key = defaults::INDEX_EXCLUDE_SUBTREES_FILE_ENV;
+        let env_prev = std::env::var(env_key).ok();
+        let file_prev = std::env::var(file_key).ok();
+
+        // Readable file source, no inline env → count reflects the file, and
+        // the source is reported as file-configured with no warning.
+        let path = std::env::temp_dir().join(format!(
+            "wflow-excl-status-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "cccccccc-3333-4333-8333-333333333333\n444444444444\n").unwrap();
+        std::env::remove_var(env_key);
+        std::env::set_var(file_key, path.to_str().unwrap());
+        let env = name_index_exclusions_envelope();
+        assert_eq!(env["active_count"], serde_json::json!(2));
+        assert_eq!(env["env_configured"], serde_json::Value::Bool(false));
+        assert_eq!(env["file_configured"], serde_json::Value::Bool(true));
+        assert_eq!(env["file_readable"], serde_json::Value::Bool(true));
+        assert_eq!(env["warning"], serde_json::Value::Null);
+
+        // Configured-but-unreadable file → warning names the env var and path.
+        std::fs::remove_file(&path).ok();
+        let env = name_index_exclusions_envelope();
+        assert_eq!(env["file_readable"], serde_json::Value::Bool(false));
+        let warn = env["warning"]
+            .as_str()
+            .expect("warning string when file unreadable");
+        assert!(warn.contains(file_key), "warning must name the file env var: {warn}");
+        assert!(warn.contains("WILL be persisted"), "warning must name the hazard: {warn}");
+
+        match env_prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+        match file_prev {
+            Some(v) => std::env::set_var(file_key, v),
+            None => std::env::remove_var(file_key),
         }
     }
 
