@@ -35,5 +35,11 @@
   // documentation, not HTML.
   "MD033": false,
   // Both _underscore_ and *asterisk* emphasis appear in long-lived docs.
-  "MD049": false
+  "MD049": false,
+  // Bare URLs are intentional: API endpoints (https://workflowy.com/api/v1)
+  // and Workflowy canonical URLs are cited inline as identifiers, not links.
+  "MD034": false,
+  // Repeated headings are allowed under different parents (e.g. per-tool
+  // sections that each carry a "Known Limitations" heading).
+  "MD024": { "siblings_only": true }
 }
