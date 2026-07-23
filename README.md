@@ -71,6 +71,12 @@ enforced at build time, so the two can never drift apart.
 
 ---
 
+## Alongside WorkFlowy's official desktop MCP
+
+WorkFlowy now ships its own local MCP inside the desktop app (`workflowy-desktop`). It is a **complement to this server, not a competitor** — the two sit at different layers. The desktop MCP drives the running app: it reads the already-synced local tree (so no REST rate limit), it can attach and pull **file attachments**, navigate your client, and live-watch the tree. This server talks to the REST API, so it works **headless** — the `wflow-do` CLI, cron jobs, CI, and a remote connector for mobile/web — and it carries the persistent name index, mirror discipline, structured error/truncation contracts, and (via a skill) a second-brain workflow layer. It also lets you withhold private subtrees from the on-disk index; the desktop MCP exposes the whole tree.
+
+The sensible topology is all three: the desktop MCP for attachments and rate-limit-free interactive work at the machine, this server for anything headless (scheduled reindex, scripts) or remote (a connector for mobile), and — because they read the same account — you can route by what the task needs. This repo ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`) so you can measure which surface actually carries your work over time.
+
 ## Quick install (five minutes)
 
 You need Rust 1.75+ (`rustup install stable`), a Workflowy API key
@@ -135,6 +141,7 @@ profile (`~/.zshrc` or `~/.bashrc`).
 | `WORKFLOWY_API_KEY` | Yes | Bearer token for the Workflowy API. |
 | `SECONDBRAIN_DIR` | Optional | Absolute path to your operational secondBrain directory (drafts, session logs, briefs, memory). When set, the `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip). |
 | `WORKFLOWY_INDEX_PATH` | Optional | Absolute path to the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Unset or empty disables persistence — the index then lives only in memory for the lifetime of each process. |
+| `WORKFLOWY_USAGE_LOG_DIR` | Optional | Directory for a durable per-call usage log (`{ts, surface, tool, ok, ms, cause}` JSONL, one file per day). Lets you measure this server's load — e.g. against WorkFlowy's official desktop MCP. Unset disables it. |
 | `WORKFLOWY_REVIEW_ROOT` | Optional | Default root node for the `review` and `audit_mirrors` tools when `root_id` is omitted (your review-anchor / "Distillations" node). No hardcoded fallback — if unset, those two tools require an explicit `root_id`. |
 | `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` | Optional | Comma-separated full UUIDs and/or 12-char short hashes whose subtrees must never be **written to the persistent index file**. Walks may still traverse them in memory (a live session still needs answers), but the on-disk index — a durable artefact other tools read — never carries them. Exclusion is transitive (root + all descendants); malformed tokens are dropped with a warning. Set this for any subtree holding material you don't want in a local file. |
 

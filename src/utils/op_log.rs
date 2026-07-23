@@ -236,6 +236,22 @@ impl OpLogRecorder {
             .duration_since(self.started)
             .unwrap_or(Duration::ZERO)
             .as_millis() as u64;
+        // Durable cross-surface usage log (best-effort, no-op unless
+        // WORKFLOWY_USAGE_LOG_DIR is set). This is the single funnel every MCP
+        // op passes through, so it captures the whole server surface with one
+        // hook. Cause is the proximate-cause slug on failure so the report can
+        // count rate-limit incidence, not just error totals.
+        let ok = matches!(status, OpStatus::Ok);
+        let cause_owned = if ok {
+            None
+        } else {
+            error.as_deref().map(|e| {
+                crate::utils::error_class::ProximateCause::from_error_message(e)
+                    .as_str()
+                    .to_string()
+            })
+        };
+        crate::utils::usage_log::record("mcp", &self.tool, ok, duration_ms, cause_owned.as_deref());
         let entry = OpLogEntry {
             tool: self.tool,
             params_hash: self.params_hash,

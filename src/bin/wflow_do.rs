@@ -622,10 +622,21 @@ async fn main() -> ExitCode {
         }
     };
 
-    match dispatch(&cli, client).await {
-        Ok(()) => ExitCode::SUCCESS,
+    // Time the dispatch and append a durable usage record (surface "cli";
+    // no-op unless WORKFLOWY_USAGE_LOG_DIR is set) so the CLI's load shows up
+    // in the same cross-surface comparison as the MCP server's.
+    let started = std::time::Instant::now();
+    let result = dispatch(&cli, client).await;
+    let ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(()) => {
+            workflowy_mcp_server::utils::usage_log::record("cli", op, true, ms, None);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            eprintln!("{}: {} [{}]", op, e, classify(&e.to_string()));
+            let cause = classify(&e.to_string());
+            workflowy_mcp_server::utils::usage_log::record("cli", op, false, ms, Some(&cause));
+            eprintln!("{}: {} [{}]", op, e, cause);
             ExitCode::from(1)
         }
     }

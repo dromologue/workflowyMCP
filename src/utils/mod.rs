@@ -16,6 +16,7 @@ pub mod rate_limiter;
 pub mod subtree;
 pub mod tag_parser;
 pub mod truncation_envelope;
+pub mod usage_log;
 
 pub use cache::get_cache;
 pub use cancel::{CancelGuard, CancelRegistry};
