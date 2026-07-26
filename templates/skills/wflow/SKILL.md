@@ -20,6 +20,8 @@ It is invoked **conversationally** — the user does not need to type slash comm
 
 **If the official WorkFlowy desktop MCP is also connected** (`mcp__workflowy-desktop__*`, exposed by the WorkFlowy desktop app), treat it as a complement, not a replacement. Prefer it for the two things this server cannot do: **attachments** (`attachments_attach` / `attachments_pull` — this server has no attachment support) and **navigating the user's client** (`tree_zoom`); it also reads the local synced tree with no REST rate limit, so it is a good choice for heavy interactive reads/writes during a live desktop session. Keep using this server (`mcp__workflowy__*`) for everything that needs the filesystem/second-brain (`$SECONDBRAIN_DIR` drafts, session logs, memory), the persistent name index, mirror discipline, or headless/CLI/scheduled work — the desktop MCP has none of that. Its endpoint is a stable localhost port (durably wireable, not a per-session pairing). On mobile/web you have neither; use the remote connector.
 
+**The desktop MCP going away is never a reason to fail a task.** It only exists while the WorkFlowy desktop app is running, so its absence (missing from the tool list, or a call erroring/timing out) is expected, not exceptional. For anything except attachments and `tree_zoom` — i.e. everything this server can also do — fall back to this server automatically rather than aborting or reporting failure; note the fallback briefly so the caller knows a slower, rate-limited surface was used. Only the attachment/navigation-specific step (which has no substitute here) should ever come back as genuinely blocked.
+
 ## How the skill is invoked
 
 | User intent | Workflow |
