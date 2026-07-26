@@ -1,9 +1,16 @@
 node_modules/
-dist/
+# dist/* (not dist/) so a file can be re-included below — gitignore never
+# looks inside a directory that's itself excluded.
+dist/*
 # Dispatch prompt for the scheduled second-brain workflow — carries personal
 # node IDs and Drive paths; never tracked (explicit even though dist/ already
 # ignores it, so it stays out even if dist/ artefacts are ever force-added).
 dist/daily-second-brain-workflow.dispatch.md
+# The public wflow template zip is the one dist/ artefact that DOES ship —
+# generic content only (templates/skills/wflow/), rebuilt deterministically
+# by bin/build-template-zips.py on every commit. Everything else in dist/
+# stays ignored, including the personal file named explicitly above.
+!dist/wflow.skill.zip
 .env
 *.log
 .DS_Store

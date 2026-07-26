@@ -1,0 +1,11 @@
+#!/bin/sh
+# Keep the public wflow template's claude.ai zip current on every commit by
+# rebuilding it from templates/skills/wflow/ (generic content only — no
+# personal node IDs ever belong here, see BOOTSTRAP.md), then staging it.
+# Tracked, not gitignored (dist/wflow.skill.zip is explicitly un-ignored in
+# .gitignore) — a clone of this repo should ship with something to upload,
+# not require a build step first.
+set -e
+root=$(git rev-parse --show-toplevel)
+python3 "$root/bin/build-template-zips.py"
+git -C "$root" add dist/wflow.skill.zip
