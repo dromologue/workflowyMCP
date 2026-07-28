@@ -1119,6 +1119,41 @@ impl WorkflowyClient {
         self.get_subtree_recursive(None, defaults::MAX_TREE_DEPTH).await
     }
 
+    /// Restore document order to a freshly-fetched BFS level.
+    ///
+    /// WHY (2026-07-28): each parent's children arrive already sorted into
+    /// display order by [`Self::sort_children_by_priority`], but a level is
+    /// assembled from a `buffer_unordered` stream, so the sibling *blocks*
+    /// land in completion order — whichever parent's fetch returned first.
+    /// The per-listing sort was therefore invisible in the one place callers
+    /// actually read a tree: the flat `nodes` array of `get_subtree`, whose
+    /// order was non-deterministic across runs of the identical walk. That is
+    /// the "the local server does not sort reliably" symptom, and it cost two
+    /// round-trips diagnosing a phantom inversion before anyone checked
+    /// priorities. Re-sorting each level by its parent's position in the
+    /// previous level restores true BFS document order; the sort is stable, so
+    /// the within-parent priority order established by the funnel survives
+    /// untouched. Nodes whose parent is not in the previous level (only
+    /// possible on a malformed response) sort to the tail rather than being
+    /// dropped.
+    fn order_level_by_parent(level: &mut [WorkflowyNode], parents: &[WorkflowyNode]) {
+        if level.is_empty() || parents.len() < 2 {
+            return;
+        }
+        let rank: std::collections::HashMap<&str, usize> = parents
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+        level.sort_by_key(|n| {
+            n.parent_id
+                .as_deref()
+                .and_then(|p| rank.get(p))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     /// Fetch descendants level-by-level, parallelising per-level child fetches
     /// up to [`FetchControls::concurrency`] (which picks the interactive or
     /// the patient width). The rate-limiter serialises each HTTP call
@@ -1216,6 +1251,10 @@ impl WorkflowyClient {
 
             if let Some(reason) = stop {
                 let remaining = node_limit.saturating_sub(out.len());
+                // Even a truncated level is emitted in document order, so a
+                // partial read is a prefix of the full one rather than a
+                // differently-ordered sample of it.
+                Self::order_level_by_parent(&mut next_level, &current_level);
                 out.extend(next_level.into_iter().take(remaining));
                 if reason == TruncationReason::NodeLimit {
                     warn!(limit = node_limit, "Node cap reached during level fetch, subtree truncated");
@@ -1238,6 +1277,11 @@ impl WorkflowyClient {
                 skipped_branches.extend(still_failed);
             }
 
+            // Completion order is not document order: re-key this level to the
+            // parents' order before it becomes `out`'s next block. Runs after
+            // recovery so a recovered branch slots into its parent's position
+            // rather than landing at the tail.
+            Self::order_level_by_parent(&mut next_level, &current_level);
             current_level = next_level;
             depth += 1;
         }
@@ -2159,6 +2203,81 @@ mod tests {
         // None entries first (head), preserving their relative upstream order;
         // then ascending priority; ties (b, dup1 both 6100) keep upstream order.
         assert_eq!(order, vec!["none1", "none2", "a", "b", "dup1", "c"]);
+    }
+
+    fn child_of(id: &str, parent: &str) -> WorkflowyNode {
+        WorkflowyNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn order_level_by_parent_restores_document_order_from_completion_order() {
+        // The parents are in document order (the previous level was itself
+        // ordered). Their children came back through buffer_unordered, so
+        // p3's block completed first and p1's last — the exact inversion that
+        // made a sorted `list_children` disagree with `get_subtree`'s flat
+        // node array.
+        let parents = vec![
+            node_with_priority("p1", Some(100)),
+            node_with_priority("p2", Some(200)),
+            node_with_priority("p3", Some(300)),
+        ];
+        let mut level = vec![
+            child_of("p3a", "p3"),
+            child_of("p3b", "p3"),
+            child_of("p2a", "p2"),
+            child_of("p1a", "p1"),
+            child_of("p1b", "p1"),
+        ];
+        WorkflowyClient::order_level_by_parent(&mut level, &parents);
+        let order: Vec<&str> = level.iter().map(|n| n.id.as_str()).collect();
+        // Blocks follow the parents' order; within a block the funnel's
+        // priority order survives because the sort is stable.
+        assert_eq!(order, vec!["p1a", "p1b", "p2a", "p3a", "p3b"]);
+    }
+
+    #[test]
+    fn order_level_by_parent_is_stable_and_keeps_unknown_parents() {
+        // A node whose parent is absent from the previous level cannot be
+        // placed; it must sort to the tail, never be dropped (correctness
+        // beats tidiness — the walk still has to report every node it read).
+        let parents = vec![
+            node_with_priority("p1", Some(100)),
+            node_with_priority("p2", Some(200)),
+        ];
+        let mut level = vec![
+            child_of("orphan", "gone"),
+            child_of("p2a", "p2"),
+            child_of("p1a", "p1"),
+            child_of("p1b", "p1"),
+        ];
+        WorkflowyClient::order_level_by_parent(&mut level, &parents);
+        let order: Vec<&str> = level.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(order, vec!["p1a", "p1b", "p2a", "orphan"]);
+        assert_eq!(level.len(), 4, "no node may be dropped by the reorder");
+    }
+
+    #[test]
+    fn subtree_walk_orders_every_level_before_it_becomes_output() {
+        // Pin (2026-07-28): both sites where a fetched level reaches `out` —
+        // the mid-level truncation path and the normal descend — must route
+        // through `order_level_by_parent` first. Without this, the per-listing
+        // display-order sort is invisible in the flat `nodes` array and the
+        // ordering contract silently regresses to completion order.
+        let src = include_str!("client.rs");
+        let body = src
+            .split("async fn fetch_descendants")
+            .nth(1)
+            .expect("fetch_descendants is defined");
+        let calls = body.matches("Self::order_level_by_parent(&mut next_level").count();
+        assert_eq!(
+            calls, 2,
+            "expected both level-emission sites in fetch_descendants to order the level; found {calls}"
+        );
     }
 
     #[test]
