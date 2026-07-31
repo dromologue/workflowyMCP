@@ -132,13 +132,52 @@ or, for Claude Desktop, in `claude_desktop_config.json`:
 `wf mcp --tools read,search,add` narrows the exposed set if a full 30-tool
 surface is more than a given host needs.
 
-### Choosing between them
+### When to use this server, and when to use the native tools
 
-Route by what the task needs, not by what appears first in the tool list. Use
-the CLI for search, read and routine writes; the desktop MCP for attachments;
-this server for scheduled jobs, for the mirror-discipline and review workflows
-it uniquely implements, and for reaching your tree from a phone through a remote
-connector. They share one account and therefore **one rate limit**, so running
+Be honest about the split, because it saves you a wasted afternoon.
+
+**Use the native tools when** you want to read, search, or make ordinary edits.
+The `wf` CLI is faster than this server at all three and costs no API quota: it
+answers from a local cache, ranks full-text matches, and hands back each hit's
+ancestor path. If your whole use case is "let Claude look things up in my
+outline and add the odd node", install the CLI, wire in `wf mcp`, and stop
+there — you do not need this server at all. Likewise, if you need
+**attachments** or want Claude to **move your actual client** to a node, only
+WorkFlowy's desktop MCP can do it, and no amount of REST will change that.
+
+**Use this server when** one of these is true:
+
+- **You want the second-brain method, not just the tools.** The
+  [wflow skill](templates/skills/wflow/SKILL.md) turns the tool surface into
+  workflows — capture, triage, distillation into atomic notes, weekly review,
+  a reading queue — with a private data directory the server knows how to read
+  and write. That layer is the reason this repo exists; nothing else here has it.
+- **You need mirror discipline.** `create_mirror` and `audit_mirrors` implement
+  a convention (`mirror_of:` / `canonical_of:` notes) for holding the same claim
+  in several places and auditing when the copies drift apart. This is a method,
+  not an API feature, and no other tool implements it.
+- **It has to run headless.** Cron jobs, CI, a scheduled reindex, a script with
+  no cache to depend on: `wflow-do` has full parity with the MCP surface,
+  enforced at build time, and the server talks to the REST API directly rather
+  than to a local database that something else has to keep fresh.
+- **You need it from a phone or the web.** The same binary runs behind an HTTP
+  shim as a remote connector for claude.ai. A local CLI cache cannot help you
+  there.
+- **You must withhold part of your tree.** This server's on-disk index takes an
+  exclusion list (`WORKFLOWY_INDEX_EXCLUDE_SUBTREES`). The CLI cache and the
+  desktop MCP both hold everything, with no way to hold back a private subtree.
+  That matters when the index is replicated somewhere; it matters less when it
+  never leaves your laptop.
+- **You want failures to be legible.** Typed error causes with retry-ability and
+  `retry_after`, honest truncation envelopes with recovery hints, a name-echo
+  guard on deletes, an operation log. That is what the 500+ tests are for.
+
+**The honest summary:** the native CLI has won the *index and lookup* half. This
+server keeps the *method* half — the workflows, the mirror discipline, the
+headless and remote paths, and the failure contracts. Most people running both
+should use the CLI for reads and this server for everything it uniquely does.
+
+They share one account and therefore **one rate limit**, so running
 several live clients at once divides a single budget — the reason this repo
 ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`), so the
 question of which surface actually carries your work is answered by measurement
