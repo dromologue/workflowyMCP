@@ -71,11 +71,86 @@ enforced at build time, so the two can never drift apart.
 
 ---
 
-## Alongside WorkFlowy's official desktop MCP
+## Where this sits among the other WorkFlowy tools
 
-WorkFlowy now ships its own local MCP inside the desktop app (`workflowy-desktop`). It is a **complement to this server, not a competitor** — the two sit at different layers. The desktop MCP drives the running app: it reads the already-synced local tree (so no REST rate limit), it can attach and pull **file attachments**, navigate your client, and live-watch the tree. This server talks to the REST API, so it works **headless** — the `wflow-do` CLI, cron jobs, CI, and a remote connector for mobile/web — and it carries the persistent name index, mirror discipline, structured error/truncation contracts, and (via a skill) a second-brain workflow layer. It also lets you withhold private subtrees from the on-disk index; the desktop MCP exposes the whole tree.
+There is now more than one way to put Claude in front of a WorkFlowy tree, and
+they are complements at different layers rather than competitors. WorkFlowy's
+own help pages point at two of them
+([the CLI](https://workflowy.com/help/workflowy-cli),
+[the Claude Desktop extension](https://workflowy.com/help/claude-desktop/)),
+both maintained by [rodolfo-terriquez](https://github.com/rodolfo-terriquez)
+under MIT licence — third-party code that WorkFlowy endorses, which is worth
+knowing before you hand any of them an API key.
 
-The sensible topology is all three: the desktop MCP for attachments and rate-limit-free interactive work at the machine, this server for anything headless (scheduled reindex, scripts) or remote (a connector for mobile), and — because they read the same account — you can route by what the task needs. This repo ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`) so you can measure which surface actually carries your work over time.
+| Surface | What it is | Reach for it when |
+|---|---|---|
+| **`wf` CLI** (`workflowy-cli`) | A single Go/Node binary with a local SQLite+FTS cache of the entire tree, and an MCP server built in (`wf mcp`). | Day-to-day reading, searching, and ordinary writes — it is the fastest of the four and the best general-purpose index. |
+| **WorkFlowy desktop MCP** | The MCP embedded in the desktop app, driving the already-synced client on `127.0.0.1`. | Attachments (pull and attach) and zooming your actual client — neither has any substitute. |
+| **This server** | Rust, REST-backed, headless-capable, with a persistent name index you can withhold subtrees from. | Anything headless or remote, and the workflow layer: mirror discipline, drift auditing, the second-brain review, a connector for mobile. |
+| **Claude Desktop `.mcpb` extension** | A one-click bundle of an *older*, smaller server (8 tools) with its own separate cache and its own copy of your API key. | Only if you want a GUI install and nothing else. See the note below. |
+
+**On the `.mcpb`:** it packages
+[`workflowy-local-mcp`](https://github.com/rodolfo-terriquez/workflowy-local-mcp),
+not the CLI, and at the time of writing it lags — v1.2.4 against the CLI's
+v3.3.1, 8 tools against 30, a second SQLite cache under
+`com.workflowy.local-mcp` rather than the CLI's `~/.workflowy`, and a second
+place your API key is stored. If you already have the CLI, `wf mcp` gives you a
+strictly larger tool set (structured nested writes, batch operations, native
+beta mirrors, todos, tags, context) off one cache and one credential. Install
+the extension only if you want the double-click install and no terminal; do not
+run both.
+
+### Installing the CLI, and using it as an MCP surface
+
+```bash
+curl -fsSL https://github.com/rodolfo-terriquez/workflowy-cli/releases/latest/download/install.sh | bash
+wf login            # or: WORKFLOWY_API_KEY=... wf login
+wf cache:sync       # whole tree into ~/.workflowy/db
+wf doctor
+```
+
+The install script verifies a SHA-256 checksum from the release before it moves
+anything into place, which is the reason it is safe to pipe. On a
+235,000-node workspace the first sync took **16.5 seconds** and full-text search
+answers in **under 100 ms** with the ancestor path attached — materially better
+than this server's own name index, which stores names and descriptions but not
+paths and has no ranking. Subsequent syncs re-export the whole tree, so they hit
+WorkFlowy's ~65 s floor on `/nodes-export`; sync on a schedule, not in a loop.
+
+Wire the same binary in as an MCP server:
+
+```bash
+claude mcp add workflowy-cli -s user -- "$HOME/.local/bin/wf" mcp
+```
+
+or, for Claude Desktop, in `claude_desktop_config.json`:
+
+```json
+"workflowy-cli": { "command": "/Users/you/.local/bin/wf", "args": ["mcp"] }
+```
+
+`wf mcp --tools read,search,add` narrows the exposed set if a full 30-tool
+surface is more than a given host needs.
+
+### Choosing between them
+
+Route by what the task needs, not by what appears first in the tool list. Use
+the CLI for search, read and routine writes; the desktop MCP for attachments;
+this server for scheduled jobs, for the mirror-discipline and review workflows
+it uniquely implements, and for reaching your tree from a phone through a remote
+connector. They share one account and therefore **one rate limit**, so running
+several live clients at once divides a single budget — the reason this repo
+ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`), so the
+question of which surface actually carries your work is answered by measurement
+rather than by preference.
+
+One privacy consequence is worth stating plainly. The CLI's cache and the
+desktop MCP both hold your *entire* tree locally, with no way to withhold a
+subtree. This server's on-disk index is the only one of the four that can be
+told to exclude subtrees (`WORKFLOWY_INDEX_EXCLUDE_SUBTREES`), which matters
+when that index is replicated somewhere — to a hosted connector, say. A
+local-only cache and a replicated index deserve different postures; keep the
+exclusion on whatever leaves the machine.
 
 ## Quick install (five minutes)
 
