@@ -72,6 +72,61 @@ The two are connected by design. The daily loop feeds the slow one; the slow one
 
 Session logs live on the filesystem rather than in the outline, and this is deliberate. The log records what was checked, what was written and what was decided; it is an audit trail rather than knowledge, and mixing the two pollutes the regions with process. It also gives the next session somewhere to pick up from.
 
+## What using it looks like
+
+Five things you do. The examples are illustrative, but their shape is taken from a second brain that has run this way daily for months: about 1,500 claims across nine regions, three levels deep, roughly a tenth of them mirrored.
+
+**Distilling a source.** You have read something worth keeping, and you say so. What comes back first is not a note; it is a routing table. The claims the source supports, the region each would land in, which should mirror elsewhere, and which existing notes already cover the ground. You correct that, because routing is where your judgement is needed and drafting is not. On your confirmation it writes a cluster: a head carrying the source's lead claim, the atoms beneath it, the mirrors, and a log to disk.
+
+The result looks like this, and the head is the source's argument in one sentence rather than its title:
+
+```text
+Delegating a judgement to a system never delegates responsibility for it
+(Author, Work) #decide #ethics
+  ⌙ Source: https://example.org/the-paper
+    canonical_of: decide
+  ├── An accountable decision needs a person who can be asked why, so any
+  │   automation that removes that person removes the accountability #decide
+  ├── Speed of decision and reviewability trade against each other, and most
+  │   deployments choose speed without recording the choice #decide
+  └── The audit question is not "was the model correct" but "could a human
+      have overturned it in time" #decide #ethics
+```
+
+Nothing in that tree is a heading. Read any line alone and it asserts something.
+
+**Asking across regions.** *"What do I have on how teams absorb new tools?"* Retrieval crosses regions by design, because a question rarely respects your filing. The answer comes back as your own claims with links to them, which is the point: you are reading your conclusions, not re-reading your sources. Where two claims conflict, you see both, and that is usually the most valuable output of the whole exercise.
+
+**Capturing an action mid-conversation.** Something surfaces that someone has to do. The system offers before it writes: *"I can capture this as a todo under Client work, owner you, due before the November board. Confirm?"* Offer-then-confirm exists because an inferred region is right most of the time and silently wrong the rest, and silent misfiling compounds. When capture is your explicit intent the offer collapses to confirming the region.
+
+**The weekly pass.** One session a week does the work that makes the daily loop worth running: read what came in, turn it into claims and actions, route them, mirror what belongs in several regions, tidy anything orphaned, and write a log. An hour on a Saturday is enough. This cadence matters more than any individual session, because a second brain is a compounding asset and compounding needs regularity more than it needs intensity.
+
+**Auditing drift.** Ask for a mirror audit and you get every mirror whose name no longer matches its canonical, and every mirror whose canonical has been deleted. Both accumulate quietly, and neither is visible by reading the tree. Run it monthly.
+
+## Rules earned in operation
+
+These rules are not deductions from the method. They are what the change record of a working second brain shows, and most were adopted only after their absence caused a mess.
+
+**Sharpening a rule means paying to retrofit it.** Six convention sweeps ran inside a single month: a tag backfill across 326 nodes, a deprecated-tag strip across 78, a jargon removal across 87, a claim-led reframing across 225. Each was a rule arriving after the material it governs. The alternative to retrofitting is two layers in one tree, each obeying a different vintage of the standard, and no way to tell which you are reading. Do the sweep as one deterministic pass: build the plan as data, apply it verbatim, verify a sample by reading back. Never retype a claim by hand.
+
+**Delete navigation that a query can compute.** Four hand-curated "cross-pillar reference" nodes were retired once it was clear that a backlink search answered the same question dynamically and could not go stale. The session-log subtree, 185 nodes, was deleted from the outline entirely and moved to the filesystem. Anything you maintain that a tool can derive is debt with an upkeep cost.
+
+**Never leave placeholder scaffolding.** Five stubs reading "(Mirror syntheses about leadership go here)" sat untouched from the day the structure was created until the day they were swept as clutter. Empty structure does not invite filling; it makes an empty tree look populated, which is worse than an obviously empty one.
+
+**A claim that promises a list must deliver it.** An audit of 1,316 nodes looked for one pattern: notes titled "three forces converge" or "the four conditions" that never enumerate them. The promise-without-payload note is the most seductive thing you can write, because it feels like a conclusion while deferring the work.
+
+**Themes get promoted or they die.** One theme accumulated for months, earned a full conceptual region, and had its material moved across in a single deliberate migration. That is the lifecycle working. The failure mode is a theme that keeps growing without ever being promoted, until it holds more than the regions it was supposed to cut across.
+
+**Mark staleness rather than living with it.** When a cluster was found to contradict current thinking on four points, it was tagged for revisit with a dated note saying exactly where it had gone stale. A second brain is a record of what you concluded, and some of it will be wrong later. Flagging is cheap; silently trusting a stale cluster is not.
+
+**Mirror sparingly.** Roughly one node in ten carries a mirror. Mirroring everything that touches a region reproduces the duplication the canonical rule exists to prevent, only with markers on it. Mirror when a claim is a substantive contribution to the second region, not when it merely brushes it.
+
+**Verify that the write landed.** Every write session in the record ends with a live re-read confirming the nodes persisted. An API acknowledgement is not evidence, and a batch that half-applied looks identical to one that succeeded until you look.
+
+**Keep it shallow.** Region, source cluster, atoms. Three levels carries almost everything; the fourth is occasionally justified and the fifth almost never is. Depth is where material goes to be forgotten.
+
+**Measure whether you are meeting your own standard.** Because claims are sentences and labels are not, you can count. In the tree these rules came from, about 95% of nodes at claim depth are sentence-shaped, and the residue that is not is exactly where the last convention sweep did not reach. That is a number you can check on your own tree in a single query, and a falling one tells you the discipline is slipping before the structure visibly rots.
+
 ## What the software is for
 
 Read in order, the method needs very little from a tool. It needs to read and write an outline reliably, to resolve a reference to a node without ambiguity, to make a batch of related writes without leaving half of them applied, and to tell you plainly when it could not do what you asked.
