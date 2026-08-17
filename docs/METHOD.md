@@ -1,6 +1,8 @@
-# The second-brain method
+# The claim-based second brain
 
-WorkFlowy is adding AI features, and so is every other tool that holds your notes. Asking your outline a question in plain language is becoming a commodity; the part of this repository that wires a model to an API will matter less every month. What will still matter is the method: the regions you divide your thinking into, and the discipline that everything you file in them is either a claim or an action. It is worth reading even if you never install the server.
+WorkFlowy now ships AI features, and so does every other tool that holds your notes. Asking your outline a question in plain language has become a commodity; the part of this repository that wires a model to an API matters less every month. What still matters is the method: the regions you divide your thinking into, and the discipline that everything you file in them is either a claim or an action. It is worth reading even if you never install the server.
+
+The name is doing work. This is not a general method for organising notes, and it is not a filing system with claims as one of its node types. It is a system whose only substantive unit is a claim: a sentence someone could contradict. Actions are the one other thing permitted, because a system that cannot hold what you have to do is a system you will keep alongside a second one. Everything else is raw material, and raw material lives in an inbox until it becomes a claim or an action or is dropped.
 
 ## Accumulating is not compounding
 
@@ -133,7 +135,19 @@ Read in order, the method needs very little from a tool. It needs to read and wr
 
 That is roughly what this repository provides, along with the mirror-drift audit, an index that answers questions about a large tree without walking it, and a skill file that carries the method itself as instructions a model follows. The [wflow skill](../templates/skills/wflow/SKILL.md) is the method in executable form; the server is what it stands on.
 
-If WorkFlowy's own AI eventually does all of that natively, the right response is to move the method onto it and retire the plumbing here. The method was never the plumbing.
+## What the native tools have already taken, and what they have not
+
+That prediction has started to come true, sooner than expected, and the honest thing is to say which parts have gone.
+
+Retrieval has gone. WorkFlowy Pro answers questions against your notes inside the client. Its CLI holds the whole tree in a local full-text index and answers in under a tenth of a second with each hit's ancestor path attached, which is better than anything here. Its desktop integration traverses the synced tree with filters on patterns and dates, and applies batches of nested writes under advisory locks, without touching the API quota at all. If your interest in a second brain is being able to find things in it, that problem is solved and none of it needs this repository. The routing consequences are set out in [`SURFACES.md`](SURFACES.md).
+
+Live mirrors have arrived too, on the beta API: one node genuinely appearing in several places rather than copied into them, which is what the `mirror_of:` convention here approximates. When they reach production the right move is to migrate onto them.
+
+What has not gone is the part that was never a retrieval problem. No tool decides what your regions are. No tool refuses a container in place of a claim, because refusing things is the opposite of what a capture feature is built to do. No tool tells you that a claim you filed under two regions is a substantive contribution to one and a passing mention in the other, which is the judgement that keeps mirroring from reproducing the duplication it exists to prevent. And no tool notices that a cluster you wrote eighteen months ago now contradicts what you think, because it has no view on what you think.
+
+Those are the questions the method is made of, and they are questions about writing rather than about search. A model that can find any sentence in your outline in fifty milliseconds is not much use if the sentences are headlines. The better the retrieval gets, in fact, the more the quality of what you wrote down becomes the only variable left.
+
+So the position this repository takes is narrower than it used to be, and deliberately so. Use the native tools for reading and searching and ordinary writing, because they are better at it. Keep this one for the discipline: the claim standard, the canonical-and-mirror rule with an audit behind it, the review that asks whether the tree still meets its own standard, and the surfaces that a phone or an unattended cloud run can reach when nothing native can be installed there.
 
 ## Adopting it
 

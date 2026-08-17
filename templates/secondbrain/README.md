@@ -1,6 +1,12 @@
-# Your Second Brain (operational outside)
+# Your claim-based second brain (the operational outside)
 
-This directory holds the part of your second brain that lives *outside* Workflowy — the cached node IDs, in-flight drafts, session logs, and briefs intended for collaborators or future Claude sessions. The second brain proper (your knowledge graph of atomic notes, distillations, and structural nodes) lives in Workflowy.
+This directory holds the part of your second brain that lives *outside* Workflowy — the cached node IDs, in-flight drafts, session logs, and briefs intended for collaborators or future Claude sessions. The second brain proper lives in Workflowy: a small set of durable **regions**, and under them nothing that is not a **claim** you could argue with or an **action** someone will take.
+
+Read [`docs/METHOD.md`](../../docs/METHOD.md) before you populate any of this, and write your regions down before you capture anything. The files here are the method's working memory; they do not supply the method. In particular `memory/distillation_taxonomy.md` is where your region list actually lives, and routing from a written list rather than from the mood of the moment is the whole point of having one.
+
+Two decisions govern everything filed below. **Divide the space before you fill it**, into conceptual regions named as activities ("how we build", "how we decide"), theme regions for what cuts across them, and life regions for what is not the practice at all. **Admit only claims and actions**: a claim states something a reader could contradict, an action names an owner and a date, and everything else is raw material that belongs in an inbox until someone turns it into one of the two or drops it. A claim that bears on several regions lives canonically in one and appears in the others as a mirror pointing back, which is what `create_mirror` writes and `audit_mirrors` checks.
+
+**On tooling.** Reading and searching your tree is now done better by Workflowy's own tools than by this server; see [`docs/SURFACES.md`](../../docs/SURFACES.md) for which surface to use for what. This server, and this directory, carry the method rather than the retrieval.
 
 The MCP server reads this directory through the `$SECONDBRAIN_DIR` env var (set in your MCP host config, e.g. Claude Code's `~/.claude.json` or Claude Desktop's `claude_desktop_config.json`). The persistent name index lives at `$WORKFLOWY_INDEX_PATH`, conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Both env vars are optional — leave them unset and the dependent features (the persistent index, the `review` tool's bucket-d session-log scan) simply skip. The wflow skill at `~/.claude/skills/wflow/SKILL.md` reads `$SECONDBRAIN_DIR/memory/workflowy_node_links.md` on every bootstrap.
 
@@ -27,9 +33,9 @@ secondBrain/
 
 A markdown file with tables of structural node IDs. The wflow skill creates this file on first use (schema in the skill template) and reads it on every bootstrap so it doesn't have to re-walk the tree to find Tasks, Inbox, Journal, etc. Update it whenever a structural node moves or is renamed. Old entries (>7 days) are flagged for re-verification by the skill.
 
-### `memory/distillation_taxonomy.md` (optional)
+### `memory/distillation_taxonomy.md` (optional in name only)
 
-The semantic layer of the second brain — pillars, themes, key thinkers, inbound routing. You author this once before the synthesise workflows can run. Schema in the skill template.
+Your regions, written down: the conceptual ones (called pillars in the skill), the themes that cut across them, the key thinkers, and the inbound routing rules. You author this once, before the synthesise workflows can run. It is nominally optional because the server runs without it, but the method does not: without a written region list you route by mood and file inconsistently, which is the failure this file exists to prevent. Keep it short enough to recite. Schema in the skill template.
 
 ### `memory/services.md` (optional)
 
@@ -53,6 +59,10 @@ Documents intended for somebody other than you — Claude Code, an external coll
 
 ## Discipline
 
+- **Every node you file is a claim or an action.** If you cannot turn a source into one of the two, you have not finished reading it. A node that only names a topic is a container, and containers are where material goes to be forgotten.
+- **Mirror sparingly.** Mirror a claim into a second region when it is a substantive contribution there, not when it merely brushes it. Roughly one node in ten is about right; mirroring everything reproduces the duplication the canonical rule exists to prevent, with markers on it.
 - **Update `memory/workflowy_node_links.md` when structural nodes change.** The wflow skill validates entries older than 7 days but only when invoked.
 - **Draft before write.** Any distillation involving more than three or four Workflowy mutations should produce a file in `drafts/` first. This protects against MCP wedges and gives you a chance to veto the routing before the graph mutates.
 - **One session log per session that touched the graph.** Both the Workflowy node and the local file should agree.
+- **Verify that the write landed.** An API acknowledgement is not evidence. A batch that half-applied looks identical to one that succeeded until you read it back.
+- **Keep it shallow.** Region, source cluster, atoms. Three levels carries almost everything; the fifth almost never earns itself.

@@ -125,21 +125,47 @@ This is an operational deployment policy, not server behaviour — the binary
 cannot know which device called it, so it is enforced by convention and by the
 operator's health monitoring, not by a code path in this repo.
 
-### A third surface, if the WorkFlowy desktop app is running
+### The other surfaces, and why they do not reduce what a connector must carry
 
-WorkFlowy's own desktop app exposes an MCP server on a stable localhost port
-(`mcp__workflowy-desktop__*`). It drives the running client against the
-already-synced local tree, so it has no REST rate limit and can traverse the
-whole tree instantly — but it has no filesystem, no persistent name index, no
-mirror discipline, no privacy exclusions (it exposes the entire tree), and its
-ids are 12-char handles rather than full UUIDs. It is a **complement, not a
-replacement**: reach for it only for what this server cannot do — attachments,
-navigating the user's client, live-watch, and rate-limit-free whole-tree reads
-— and return to this server for everything else.
+WorkFlowy now ships tooling of its own, and on a laptop most of it is better
+than this server at the jobs it covers. The `wf` CLI answers reads from a local
+full-text cache with ancestor paths attached, and writes nested outlines in one
+call. The desktop MCP traverses the synced client with filters on patterns and
+date windows, applies batched nested writes under advisory leases, and draws on
+no REST quota at all. The full accounting is in
+[`SURFACES.md`](SURFACES.md), and the routing conclusion there is that reads,
+searches and ordinary writes should go native on any machine that can reach
+them.
 
-Its absence is routine, not exceptional: the app simply may not be running.
-Any skill or scheduled task that reaches for it must fall back to this server
-automatically rather than aborting, and report only the specific step that has
-no substitute here. Falling the other way — from this server outward to a
-remote connector on a machine that can reach local — is not a fallback but an
-incident; restart the local host instead.
+**None of that reduces what a connector deployment has to carry, and this is
+the point of the section.** A connector exists precisely to serve the surfaces
+where none of those tools can be installed: claude.ai on a phone, and a
+scheduled run inside a cloud sandbox. Neither has a desktop app, a shell, or a
+filesystem shared with the machine those tools live on. The reasoning "a native
+tool now does this better, so the connector need not expose it" is therefore
+invalid by construction: better, but not reachable from where the connector
+runs.
+
+Two rules follow, and they bind regardless of how good the native tools get.
+
+1. **Do not narrow a connector's tool surface because a native equivalent
+   exists.** Retiring a connector tool on those grounds removes the only
+   implementation available to the surface that has no alternative. If a
+   connector tool is to be retired, the test is whether the *connector's own
+   callers* still need it, never whether a laptop has something better.
+2. **Do not reroute a scheduled cloud routine to a native surface.** It will
+   fail silently, unattended, and a failure that produces nothing looks exactly
+   like a quiet day. Where a cloud run needs a structural decision made
+   reliably, the right answer is a deterministic connector tool that makes it in
+   code rather than a prompt asking a model to make it well. A production
+   example is a daily journal write: date-node resolution, missing-level
+   creation and the indented insert all live in one tool for exactly that
+   reason, after a run of failures in which a model made those decisions itself.
+
+Its absence is routine, not exceptional: the desktop app simply may not be
+running, and a `wf` binary may not be installed. Any skill or scheduled task
+that reaches for a native surface must fall back to this server automatically
+rather than aborting, and report only the specific step that has no substitute
+here (attachments, client navigation, screen capture). Falling the other way —
+from this server outward to a remote connector on a machine that can reach
+local — is not a fallback but an incident; restart the local host instead.

@@ -1,18 +1,25 @@
-# Workflowy MCP Server
+# The claim-based second brain
 
-**A second-brain method, and the tooling that runs it on WorkFlowy.**
+**A method for building a note system out of claims rather than clippings, and
+the tooling that runs it on WorkFlowy.**
 
 Most note systems accumulate. This one is built to compound: you divide your
 thinking into a small set of durable **regions**, and you allow nothing into
 them that is not a **claim** you could argue with or an **action** someone will
-take. Everything else here exists to make that discipline cheap enough to keep.
+take. A claim is a sentence you could contradict. "Team structure constrains
+architecture more reliably than the reverse" is a claim; "Conway's Law and team
+topologies" is a container you have to open before it tells you anything.
+Everything else here exists to make that one distinction cheap enough to hold
+to.
 
 **[Read the method first](docs/METHOD.md).** It is the part worth your time,
-and it applies to any outliner, with or without this software. WorkFlowy is
-adding AI features and so is everyone else; asking your notes a question in
-plain language is becoming a commodity, and the plumbing in this repository
+and it applies to any outliner, with or without this software. WorkFlowy now
+ships its own AI, and so does everyone else; asking your notes a question in
+plain language has become a commodity, and the plumbing in this repository
 matters less every month. What you wrote down, and where it lives, is the part
-no model can fix for you afterwards.
+no model can fix for you afterwards. That is the bet this repository is
+increasingly made of: the retrieval half is being won by the native tools, and
+should be, while the claim discipline is not a feature anyone will ship you.
 
 If you want it running rather than only understood, the rest of this README is
 the software: a Rust MCP server connecting Claude (Desktop, Code, or claude.ai)
@@ -34,6 +41,11 @@ Two ways in:
    let it run the install: build, wire the host, seed your private data
    directory, cache your structural node IDs, install the wflow skill that
    drives every later session. About ten minutes.
+
+Before you install anything, it is worth reading
+[`docs/SURFACES.md`](docs/SURFACES.md), which says candidly what WorkFlowy's own
+tools now do better than this one and what is left that only this repository
+provides. Several people should read it and then install the `wf` CLI instead.
 
 Your data stays yours. The repo ships only generic templates; everything
 personal (your regions, node IDs, drafts, session logs, the search index) lives
@@ -106,34 +118,55 @@ two can never drift apart.
 
 ---
 
-## Where this sits among the other WorkFlowy tools
+## Where this sits among WorkFlowy's own tools
 
-There is now more than one way to put Claude in front of a WorkFlowy tree, and
-they are complements at different layers rather than competitors. WorkFlowy's
-own help pages point at two of them
-([the CLI](https://workflowy.com/help/workflowy-cli),
-[the Claude Desktop extension](https://workflowy.com/help/claude-desktop/)),
-both maintained by [rodolfo-terriquez](https://github.com/rodolfo-terriquez)
-under MIT licence: third-party code that WorkFlowy endorses, which is worth
-knowing before you hand any of them an API key.
+WorkFlowy has been building fast, and several things this server was once the
+only way to do are now native. As of August 2026 there are five ways to put a
+model in front of a WorkFlowy tree: WorkFlowy Pro's own AI inside the client,
+the [`wf` CLI](https://workflowy.com/help/workflowy-cli), the
+[MCP embedded in the desktop app](https://workflowy.com/help/claude-desktop/),
+this server, and a remote connector for anywhere the first four cannot be
+installed.
 
-| Surface | What it is | Reach for it when |
-|---|---|---|
-| **`wf` CLI** (`workflowy-cli`) | A single Go/Node binary with a local SQLite+FTS cache of the entire tree, and an MCP server built in (`wf mcp`). | Day-to-day reading, searching, and ordinary writes; it is the fastest of the four and the best general-purpose index. |
-| **WorkFlowy desktop MCP** | The MCP embedded in the desktop app, driving the already-synced client on `127.0.0.1`. | Attachments (pull and attach) and zooming your actual client; neither has any substitute. |
-| **This server** | Rust, REST-backed, headless-capable, with a persistent name index you can withhold subtrees from. | Anything headless or remote, and the workflow layer: mirror discipline, drift auditing, the second-brain review, a connector for mobile. |
-| **Claude Desktop `.mcpb` extension** | A one-click bundle of an *older*, smaller server (8 tools) with its own separate cache and its own copy of your API key. | Only if you want a GUI install and nothing else. See the note below. |
+**[`docs/SURFACES.md`](docs/SURFACES.md) is the full accounting**, kept current
+because it decides real routing. The short version:
 
-**On the `.mcpb`:** it packages
-[`workflowy-local-mcp`](https://github.com/rodolfo-terriquez/workflowy-local-mcp),
-not the CLI, and at the time of writing it lags: v1.2.4 against the CLI's
-v3.3.1, 8 tools against 30, a second SQLite cache under
-`com.workflowy.local-mcp` rather than the CLI's `~/.workflowy`, and a second
-place your API key is stored. If you already have the CLI, `wf mcp` gives you a
-strictly larger tool set (structured nested writes, batch operations, native
-beta mirrors, todos, tags, context) off one cache and one credential. Install
-the extension only if you want the double-click install and no terminal; do not
-run both.
+**Use the native tools for reading, searching, and ordinary writing.** The `wf`
+CLI answers from a local full-text cache in under 100 ms with each hit's
+ancestor path attached, costs no API quota, and now also does nested writes,
+todos, tags, change streams and webhooks. The desktop MCP traverses the
+already-synced client with filters on regular expressions and date windows,
+applies batched nested writes under advisory leases, and draws on no REST quota
+at all. Both are better than this server at those jobs. If that is your whole
+use case, install the CLI, wire in `wf mcp`, and stop there.
+
+**Use this server for the method, and for where the others cannot go.** The
+claim-based discipline and the skill that executes it, mirror creation and
+drift auditing, the second-brain review, the `$SECONDBRAIN_DIR` layer, a
+scheduled reindex, an index you can withhold private subtrees from, and typed
+failures that make an unattended run diagnosable the next morning. None of that
+is a tool WorkFlowy is likely to ship, because none of it is a feature.
+
+**And use it for anything that runs where WorkFlowy's tools cannot be
+installed.** A cloud sandbox and a phone have no desktop app and no shell. The
+same binary behind an HTTP shim serves both as a custom connector, which is why
+that surface has to keep a complete tool set even as the native tools absorb
+more of the daily work. See
+[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md).
+
+One thing has genuinely arrived and is worth flagging if you are weighing the
+method. WorkFlowy's beta API now has **real live mirrors**, which do what this
+repository's `mirror_of:` convention approximates. They are beta-only today,
+and the drift audit answers wider questions than a live mirror makes redundant,
+so the convention stays the production-safe path for now. The migration, when
+it comes, is described in `docs/SURFACES.md`.
+
+All of these share one WorkFlowy account and therefore **one API rate limit**
+(the desktop MCP excepted, since it reads the synced client rather than the
+API). Running several live clients divides a single budget, which is why this
+repo ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`) so the
+question of which surface actually carries your work is answered by counting
+rather than by preference.
 
 ### Installing the CLI, and using it as an MCP surface
 
@@ -167,64 +200,23 @@ or, for Claude Desktop, in `claude_desktop_config.json`:
 `wf mcp --tools read,search,add` narrows the exposed set if a full 30-tool
 surface is more than a given host needs.
 
-### When to use this server, and when to use the native tools
-
-Be honest about the split, because it saves you a wasted afternoon.
-
-**Use the native tools when** you want to read, search, or make ordinary edits.
-The `wf` CLI is faster than this server at all three and costs no API quota: it
-answers from a local cache, ranks full-text matches, and hands back each hit's
-ancestor path. If your whole use case is "let Claude look things up in my
-outline and add the odd node", install the CLI, wire in `wf mcp`, and stop
-there; you do not need this server at all. Likewise, if you need
-**attachments** or want Claude to **move your actual client** to a node, only
-WorkFlowy's desktop MCP can do it, and no amount of REST will change that.
-
-**Use this server when** one of these is true:
-
-- **You want the second-brain method, not just the tools.** The
-  [wflow skill](templates/skills/wflow/SKILL.md) turns the tool surface into
-  workflows (capture, triage, distillation into atomic notes, weekly review,
-  a reading queue) with a private data directory the server knows how to read
-  and write. That layer is the reason this repo exists; nothing else here has it.
-- **You need mirror discipline.** `create_mirror` and `audit_mirrors` implement
-  a convention (`mirror_of:` / `canonical_of:` notes) for holding the same claim
-  in several places and auditing when the copies drift apart. This is a method,
-  not an API feature, and no other tool implements it.
-- **It has to run headless.** Cron jobs, CI, a scheduled reindex, a script with
-  no cache to depend on: `wflow-do` has full parity with the MCP surface,
-  enforced at build time, and the server talks to the REST API directly rather
-  than to a local database that something else has to keep fresh.
-- **You need it from a phone or the web.** The same binary runs behind an HTTP
-  shim as a remote connector for claude.ai. A local CLI cache cannot help you
-  there.
-- **You must withhold part of your tree.** This server's on-disk index takes an
-  exclusion list (`WORKFLOWY_INDEX_EXCLUDE_SUBTREES`). The CLI cache and the
-  desktop MCP both hold everything, with no way to hold back a private subtree.
-  That matters when the index is replicated somewhere; it matters less when it
-  never leaves your laptop.
-- **You want failures to be legible.** Typed error causes with retry-ability and
-  `retry_after`, honest truncation envelopes with recovery hints, a name-echo
-  guard on deletes, an operation log. That is what the 500+ tests are for.
-
-**The honest summary:** the native CLI has won the *index and lookup* half. This
-server keeps the *method* half: the workflows, the mirror discipline, the
-headless and remote paths, and the failure contracts. Most people running both
-should use the CLI for reads and this server for everything it uniquely does.
-
-They share one account and therefore **one rate limit**, so running
-several live clients at once divides a single budget, which is why this repo
-ships an optional per-call usage log (`WORKFLOWY_USAGE_LOG_DIR`), so the
-question of which surface actually carries your work is answered by measurement
-rather than by preference.
+**On the Claude Desktop `.mcpb` extension:** it packages
+[`workflowy-local-mcp`](https://github.com/rodolfo-terriquez/workflowy-local-mcp),
+not the CLI, and at the time of writing it lags: v1.2.4 against the CLI's
+v3.3.1, 8 tools against 30, a second SQLite cache under
+`com.workflowy.local-mcp` rather than the CLI's `~/.workflowy`, and a second
+place your API key is stored. If you already have the CLI, `wf mcp` gives you a
+strictly larger tool set off one cache and one credential. Install the
+extension only if you want the double-click install and no terminal; do not run
+both.
 
 One privacy consequence is worth stating plainly. The CLI's cache and the
 desktop MCP both hold your *entire* tree locally, with no way to withhold a
-subtree. This server's on-disk index is the only one of the four that can be
-told to exclude subtrees (`WORKFLOWY_INDEX_EXCLUDE_SUBTREES`), which matters
-when that index is replicated somewhere, to a hosted connector say. A
-local-only cache and a replicated index deserve different postures; keep the
-exclusion on whatever leaves the machine.
+subtree. This server's on-disk index is the only one that can be told to
+exclude subtrees (`WORKFLOWY_INDEX_EXCLUDE_SUBTREES`), which matters when that
+index is replicated somewhere, to a hosted connector say. A local-only cache
+and a replicated index deserve different postures; keep the exclusion on
+whatever leaves the machine.
 
 ## Quick install (five minutes)
 
@@ -327,6 +319,13 @@ only to your interactive shell silently disables the features it drives.
 45 tools. `node_id` accepts a full UUID (with or without hyphens), the
 12-char short hash from any Workflowy URL, or the 8-char doc prefix; paste
 whatever you have.
+
+Read this table alongside [`docs/SURFACES.md`](docs/SURFACES.md) rather than as
+a shopping list. On a machine that can reach WorkFlowy's own tools, most of the
+search-and-navigate row and much of the create-and-edit row is better served
+natively, at no API cost. The rows that have no native equivalent are mirror
+discipline, `review`, and the diagnostics; those, plus headless and remote
+operation, are the reason to run this at all.
 
 | Category | Tools |
 |----------|-------|
@@ -431,6 +430,7 @@ extends the same persistent file.
 ```text
 workflowyMCP/
 ├── docs/METHOD.md            ← the method: regions, claims, actions
+├── docs/SURFACES.md          ← native vs this server: which surface, and why
 ├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
 ├── README.md                 ← this file
 ├── docs/SETUP.md             ← long-form setup walkthrough
