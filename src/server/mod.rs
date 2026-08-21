@@ -346,6 +346,13 @@ fn classify_operational_error(err_str: &str) -> ErrorClassification {
             ErrorCode::INTERNAL_ERROR,
             "auth failure — check WORKFLOWY_API_KEY",
         ),
+        ProximateCause::UpstreamBlocked => (
+            ErrorCode::INTERNAL_ERROR,
+            "Workflowy's edge refused the request before it reached the API (block code WFB) — \
+             the credential is fine; do NOT rotate the key. Verify with a read: if reads still \
+             succeed, the block is upstream and method-scoped. Wait and re-issue; if it persists, \
+             report to help@workflowy.com naming the HTTP method and that it precedes auth",
+        ),
         ProximateCause::LockContention => (
             ErrorCode::INTERNAL_ERROR,
             "internal lock contention — retry shortly",

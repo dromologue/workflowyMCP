@@ -39,7 +39,38 @@ pub enum ProximateCause {
     /// (`classify_degraded_kind`) already classified the same 429 as
     /// `rate_limited`. The two envelopes now agree.
     RateLimited,
+    /// Workflowy's edge refused the request before it reached the API — a 403
+    /// whose body carries their `WFB(n)` block code and the "reach out to our
+    /// support team" text. **Not an auth failure**, and telling the two apart
+    /// is the whole point of this variant.
+    ///
+    /// WHY (2026-08-21 incident): every write from the connector began
+    /// returning `403 ... code WFB(3)` while reads kept working. The 401/403
+    /// branch classified it `auth_failure`, so the envelope hint said "check
+    /// WORKFLOWY_API_KEY" and `workflowy_status.authenticated` flipped to
+    /// false — both pointing at a credential that was in fact fine. The
+    /// diagnosis that actually held: Workflowy was rejecting *every* POST to
+    /// `workflowy.com`, before authentication, from unrelated IPs and any
+    /// User-Agent, on every path including the site root, while GET and DELETE
+    /// reached the application normally. A GET carrying a deliberately invalid
+    /// token still returned 401, which is what proves the block sits in front
+    /// of auth rather than inside it.
+    ///
+    /// Retryable: the block is upstream and time-bounded, so the correct
+    /// response is to wait and re-issue, never to rotate a key.
+    UpstreamBlocked,
     Unknown,
+}
+
+/// Whether an upstream error body carries Workflowy's edge-block signature.
+///
+/// One predicate so [`ProximateCause::from_error_message`] and the API
+/// client's auth-failure stamping cannot disagree about what counts as a
+/// block: a body that classifies as `upstream_blocked` must also be a body
+/// that does NOT stamp an auth failure. Matches the `WFB(` code prefix, which
+/// is Workflowy's own marker and appears in no other error we emit.
+pub fn is_upstream_block_body(body: &str) -> bool {
+    body.to_lowercase().contains("wfb(")
 }
 
 impl ProximateCause {
@@ -56,6 +87,7 @@ impl ProximateCause {
             ProximateCause::AuthFailure => "auth_failure",
             ProximateCause::InvalidParams => "invalid_params",
             ProximateCause::RateLimited => "rate_limited",
+            ProximateCause::UpstreamBlocked => "upstream_blocked",
             ProximateCause::Unknown => "unknown",
         }
     }
@@ -64,10 +96,17 @@ impl ProximateCause {
     /// 429/rate-limit branch is FIRST so it cannot be shadowed by a later
     /// string match (pre-2026-06-17 a 429 fell through to `Unknown`, burying
     /// the `retry_after`). Single source for both the MCP server and the CLI.
+    ///
+    /// The edge-block branch sits ahead of the 401/403 branch for the same
+    /// reason: a `WFB(` body carries the literal "403", so leaving it later
+    /// would let the auth branch shadow it and reinstate the misdiagnosis
+    /// [`ProximateCause::UpstreamBlocked`] exists to prevent.
     pub fn from_error_message(err_str: &str) -> ProximateCause {
         let lower = err_str.to_lowercase();
         if lower.contains("429") || lower.contains("rate limit") {
             ProximateCause::RateLimited
+        } else if is_upstream_block_body(&lower) {
+            ProximateCause::UpstreamBlocked
         } else if lower.contains("404") || lower.contains("not found") {
             ProximateCause::NotFound
         } else if lower.contains("cancelled") {
@@ -104,6 +143,7 @@ impl ProximateCause {
                 | ProximateCause::CacheMiss
                 | ProximateCause::NotFound
                 | ProximateCause::Cancelled
+                | ProximateCause::UpstreamBlocked
         )
     }
 }
@@ -138,6 +178,10 @@ mod tests {
             ("401 unauthorized", ProximateCause::AuthFailure),
             ("403 forbidden", ProximateCause::AuthFailure),
             ("unauthorized", ProximateCause::AuthFailure),
+            (
+                "API error 403: Access denied. code WFB(3)",
+                ProximateCause::UpstreamBlocked,
+            ),
             ("internal lock contention", ProximateCause::LockContention),
             ("stale cache entry", ProximateCause::CacheMiss),
             ("something we have never seen", ProximateCause::Unknown),
@@ -145,6 +189,40 @@ mod tests {
         for (msg, want) in cases {
             assert_eq!(ProximateCause::from_error_message(msg), want, "msg: {msg}");
         }
+    }
+
+    /// The 2026-08-21 incident in one test: the real body Workflowy returned
+    /// on every blocked write must classify as an upstream block and never as
+    /// an auth failure, even though it contains the literal "403".
+    #[test]
+    fn workflowy_edge_block_outranks_the_auth_branch() {
+        let real_body = "Retry failed after 1 attempts: API error 403: Access denied. \
+             Please reach out to our support team at help@workflowy.com and include \
+             your IP address (45.76.131.165) and code WFB(3) so we can help resolve this.";
+        assert_eq!(
+            ProximateCause::from_error_message(real_body),
+            ProximateCause::UpstreamBlocked
+        );
+        assert_eq!(
+            ProximateCause::UpstreamBlocked.as_str(),
+            "upstream_blocked"
+        );
+        // Waiting is the recovery; rotating a key is not.
+        assert!(ProximateCause::UpstreamBlocked.is_retryable());
+        assert!(!ProximateCause::AuthFailure.is_retryable());
+        // A 403 with no block code is still an auth failure.
+        assert_eq!(
+            ProximateCause::from_error_message("API error 403: forbidden"),
+            ProximateCause::AuthFailure
+        );
+    }
+
+    #[test]
+    fn is_upstream_block_body_matches_only_the_block_code() {
+        assert!(is_upstream_block_body("code WFB(3)"));
+        assert!(is_upstream_block_body("lowercase wfb(1) marker"));
+        assert!(!is_upstream_block_body("403 forbidden"));
+        assert!(!is_upstream_block_body("invalid credentials, try again"));
     }
 
     #[test]
@@ -157,6 +235,7 @@ mod tests {
             ProximateCause::CacheMiss,
             ProximateCause::NotFound,
             ProximateCause::Cancelled,
+            ProximateCause::UpstreamBlocked,
         ] {
             assert!(c.is_retryable(), "{} should be retryable", c.as_str());
         }

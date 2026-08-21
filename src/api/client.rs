@@ -2050,15 +2050,6 @@ impl WorkflowyClient {
                 .await
                 .map_err(WorkflowyError::HttpError)
         } else {
-            // Auth failures are special: they prove the API key is wrong
-            // (or revoked), independent of network/upstream health. Track
-            // them on a separate axis so probes can answer
-            // "authenticated?" without conflating it with "reachable?".
-            if matches!(status.as_u16(), 401 | 403) {
-                self.last_auth_failure_unix_ms
-                    .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
-            }
-
             let error_text = response
                 .text()
                 .await
@@ -2075,7 +2066,22 @@ impl WorkflowyClient {
                 self.stamp_rate_limited(retry_after_ms);
             }
 
-            if matches!(status.as_u16(), 401 | 403) {
+            // Auth failures are special: they prove the API key is wrong
+            // (or revoked), independent of network/upstream health. Track
+            // them on a separate axis so probes can answer
+            // "authenticated?" without conflating it with "reachable?".
+            //
+            // WHY the block exclusion (2026-08-21): Workflowy's edge answers
+            // a blocked request with 403 + a `WFB(n)` code BEFORE evaluating
+            // the token, so stamping it here made `workflowy_status` and
+            // `health_check` report `authenticated: false` on a credential
+            // that was still authenticating reads perfectly well. Stamping an
+            // auth failure for a request that was never authenticated is the
+            // misdiagnosis; the body test is shared with the classifier so
+            // the two can never disagree.
+            if matches!(status.as_u16(), 401 | 403)
+                && !crate::utils::error_class::is_upstream_block_body(&error_text)
+            {
                 self.last_auth_failure_unix_ms
                     .store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
             }
