@@ -6,6 +6,13 @@ this page is the honest accounting of it: what each surface can do as of
 **August 2026**, what is left that only this repository provides, and the one
 routing rule that is not a preference but a constraint.
 
+> **Open proposal (2026-09-05).** A re-survey and a measured proposal on what
+> should remain in this repository now that the native tools carry most daily
+> work lives in
+> [`proposals/2026-09-05-what-stays-local.md`](proposals/2026-09-05-what-stays-local.md).
+> It is not yet decided; this page stays canonical for current routing until it
+> is.
+
 If you read only one paragraph, read this one. **On a laptop, reach for the
 native tools first for reading, searching, and ordinary writing; reach for this
 server for the claim-based method, for anything scheduled, and for anything
