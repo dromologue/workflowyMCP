@@ -58,6 +58,7 @@ When the intent is ambiguous, ask one clarifying question rather than guessing.
 
 ---
 
+<!-- BEGIN SHARED METHOD BLOCK — identical in every wflow skill; see scripts/check-method-sync.sh -->
 ## The method this skill exists to execute
 
 The user's second brain is not a store of notes. It is a small set of durable **regions**, containing nothing that is not a **claim** or an **action**. Everything below serves that, and where a tool convenience and this section conflict, this section wins.
@@ -81,6 +82,8 @@ The user's second brain is not a store of notes. It is a small set of durable **
 **9. Mark staleness rather than living with it.** Some of what the user concluded will later be wrong. When you find a cluster that contradicts current thinking, tag it for revisit with a dated note saying exactly where it went stale. Flagging is cheap; silently trusting a stale cluster is not.
 
 **10. A write is not done until it has been read back.** An API acknowledgement is not evidence. A batch that half-applied looks identical to one that succeeded until you look. This is where the operating detail below starts earning its length.
+
+<!-- END SHARED METHOD BLOCK -->
 
 ---
 

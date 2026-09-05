@@ -9,3 +9,8 @@ set -e
 root=$(git rev-parse --show-toplevel)
 python3 "$root/bin/build-template-zips.py"
 git -C "$root" add dist/wflow.skill.zip
+
+# The wflow skills must state the same method. A model follows whichever copy
+# it loaded, so two copies with different rules is worse than one with none.
+# Skips any target that is not checked out; --self-test proves it goes red.
+sh "$root/scripts/check-method-sync.sh"
