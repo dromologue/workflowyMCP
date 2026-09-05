@@ -21,10 +21,12 @@ no model can fix for you afterwards. That is the bet this repository is
 increasingly made of: the retrieval half is being won by the native tools, and
 should be, while the claim discipline is not a feature anyone will ship you.
 
-If you want it running rather than only understood, the rest of this README is
-the software: a Rust MCP server connecting Claude (Desktop, Code, or claude.ai)
-to your workspace, a `wflow-do` CLI with the same surface for scripts and cron,
-and a skill file that carries the method as instructions a model follows.
+If you want it running rather than only understood, there is software here to
+run it: a Rust MCP server connecting Claude (Desktop, Code, or claude.ai) to
+your workspace, a `wflow-do` CLI with the same surface for scripts and cron,
+and a skill file that carries the method as instructions a model follows. It is
+one section of this page and one document behind it, which is the proportion it
+deserves.
 
 In practice that means you say *"capture this as a task under Projects"*
 mid-conversation and it lands in the right region, tagged and dated. You ask
@@ -77,44 +79,131 @@ in one and appears in the others as a mirror pointing back. Copies drift;
 
 ---
 
-## Why this implementation
+## What building one actually looks like
 
-Most Workflowy integrations are demos. This one has been hardened in daily
-production use against a 250,000-node workspace, and every hard-won lesson is
-encoded in the code and pinned by a test: over 500 of them, including
-build-time invariant tests that make the design rules unbreakable by future
-contributors.
+The rules above are short enough to memorise and that makes them sound easy.
+They are not, and the honest account of the work is the most useful thing this
+page can give you.
 
-Concretely, the problems you would otherwise hit in week two have already been
-hit, diagnosed, and engineered away:
+**The first act is writing your regions down, and it happens before you capture
+anything.** Most people skip it, because capture feels productive and
+classification feels like admin. The cost of skipping it is not disorder; it is
+that you file by mood, so the same idea lands in three places over a year and
+none of them is where you look for it. Six to nine conceptual regions, a
+handful of themes, the life regions you would otherwise keep in a second system
+you abandon. If you cannot recite the list, it is a list of topics rather than
+regions.
 
-- **Rate limits don't ruin your session.** The client fails fast inside a
-  429 window instead of hanging for four minutes, adapts its request rate
-  when the API pushes back (halve on 429, creep back on success), and never
-  fires a burst into a freshly-reset quota. Bulk writes that stop early
-  always tell you exactly what landed and how to resume.
-- **Big trees don't time out your questions.** A persistent name index turns
-  names, tags, backlinks, and Workflowy URLs into answers in O(1) from a
-  local file, with no tree walk and no API calls. Searches fall back to live,
-  scoped walks only when the index can't answer, and every truncated result
-  says so honestly, with a recovery hint.
-- **Nothing fails silently.** Every walk reports its coverage, every error
-  carries a typed cause (`rate_limited`, `timeout`, `auth`, …) with a
-  retry-ability flag, every write is auditable in an operation log, and
-  deletes support a name-echo guard so a coerced ID can't take out the wrong
-  node.
-- **Repeat reads are nearly free.** Complete children listings are cached
-  with write-through invalidation, node payloads serialise sparse, and
-  overlapping queries collapse to single API calls.
-- **The whole tree in one call.** The search index rebuilds from Workflowy's
-  bulk `GET /nodes-export` endpoint: the entire workspace in a single request,
-  seconds not minutes, with no level-by-level walk, no truncation, and no 429
-  storm. `wflow-do reindex --full-export` is the nightly path; the
-  coverage-complete `--patient` walk remains for scoped rebuilds.
+**Then the discipline is refusal.** Almost everything that arrives is neither a
+claim nor an action, and the work is turning it into one or dropping it. A
+source you cannot reduce to a claim is a source you have not finished reading,
+which is uncomfortable and usually true. This is the part no tool does for you,
+and it is the reason a second brain compounds rather than merely accumulating:
+what makes the existing material more useful is a new claim that argues with it,
+not a new clipping that sits beside it.
 
-The same logic serves both surfaces, the MCP server for conversation and the
-`wflow-do` CLI for scripts and cron, with parity enforced at build time so the
-two can never drift apart.
+**The structure stays shallow and the mirrors stay rare.** Region, source
+cluster, atoms. Three levels carry almost everything; depth is where material
+goes to be forgotten. Roughly one node in ten earns a mirror, and mirroring
+everything that merely touches a second region reproduces the duplication the
+canonical rule exists to prevent, with markers on it.
+
+**And it is maintained, not merely written.** Conventions sharpen, which means
+retrofitting the material they now govern: in the tree these rules came from,
+six sweeps ran inside a single month, one of them reframing 225 nodes into
+claim-led form. Some of what you concluded will later be wrong, and marking a
+cluster stale with a dated note is cheap where silently trusting it is not.
+Because claims are sentences and labels are not, you can measure whether you are
+meeting your own standard: count the share of nodes at claim depth that are
+sentence-shaped, watch it, and a falling number tells you the discipline is
+slipping before the structure visibly rots.
+
+[`docs/METHOD.md`](docs/METHOD.md) is the full account, with worked examples and
+the rules a real change record supports. It is the document this repository
+exists to serve.
+
+---
+
+## Getting the method running
+
+Have your regions written down before you start; the install asks for them,
+and [`docs/METHOD.md`](docs/METHOD.md) explains how to arrive at a set worth
+keeping. Then hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. It walks the
+seven steps: build, wire the host, seed your private `$SECONDBRAIN_DIR`, cache
+your structural node IDs (Inbox, Tasks, Journal…), install the wflow skill,
+pre-warm the search index for large trees, and verify the whole chain
+end-to-end. After that, every session opens with your workflows available
+conversationally: daily and weekly reviews, task capture, inbox triage,
+reading-list management, distillation of sources into atomic notes, mirror
+discipline with drift auditing, and cross-note research.
+
+The long-form walkthrough (multi-surface setups, large-tree convergence,
+troubleshooting) is in [`docs/SETUP.md`](docs/SETUP.md). Running behind a
+remote connector for claude.ai web/mobile is covered in
+[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md).
+
+---
+
+### If you only want the bare server
+
+Skip the method entirely and wire the binary in by hand:
+
+You need Rust 1.75+ (`rustup install stable`), a Workflowy API key
+(Workflowy → Settings → API), and an MCP host (Claude Code or Claude
+Desktop).
+
+```bash
+git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
+cd ~/code/workflowy-mcp-server
+cargo build --release
+echo "WORKFLOWY_API_KEY=<your-token>" > .env
+```
+
+Wire `target/release/workflowy-mcp-server` into your host:
+
+- **Claude Code:** `claude mcp add workflowy -- $(pwd)/target/release/workflowy-mcp-server`
+- **Claude Desktop:** edit
+  `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+  or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). See
+  [BOOTSTRAP.md](BOOTSTRAP.md) for the JSON shape.
+
+Verify by asking Claude to call `workflowy_status`; you want
+`status: "ok"`, `api_reachable: true`, `authenticated: true`. Then try it:
+
+> "List the children of my workspace root."
+> "Create a node called *Read later* under my Inbox."
+> "What did I change in the last two days?"
+
+That's the bare server working. The `.env` file covers a binary launched from
+the repo directory; putting the same key in the host's `env` block (next
+section) works from anywhere and is the recommended form.
+
+---
+
+## The software, in one section
+
+Everything below this line is a tool for building the thing above it, and it is
+deliberately the smaller half of this page.
+
+A second brain built this way needs very little from software. It needs to read
+and write an outline reliably, resolve a reference to a node without ambiguity,
+make a batch of related writes without leaving half of them applied, and say
+plainly when it could not do what was asked. WorkFlowy's own tooling now does
+most of that better than this server does, and you should use it: see
+[`docs/SURFACES.md`](docs/SURFACES.md) for which surface to reach for and why.
+
+What is left here is what carries the method rather than the outline. Mirror
+creation and the drift audit that tells you when copies have diverged. The
+second-brain review. The private data directory holding your regions, your
+routing rules, your drafts and session logs. Scheduled and headless operation.
+And a remote connector for a phone or an unattended cloud run, where none of
+WorkFlowy's own tools can be installed.
+
+The engineering detail, the tool reference, the environment variables, the
+`wflow-do` CLI and the reliability contracts all live in
+[`docs/SERVER.md`](docs/SERVER.md). If WorkFlowy's own AI eventually does all of
+it natively, the right response is to move the method onto that and retire the
+plumbing here. The method was never the plumbing.
 
 ---
 
@@ -218,227 +307,27 @@ index is replicated somewhere, to a hosted connector say. A local-only cache
 and a replicated index deserve different postures; keep the exclusion on
 whatever leaves the machine.
 
-## Quick install (five minutes)
-
-You need Rust 1.75+ (`rustup install stable`), a Workflowy API key
-(Workflowy → Settings → API), and an MCP host (Claude Code or Claude
-Desktop).
-
-```bash
-git clone https://github.com/dromologue/workflowyMCP.git ~/code/workflowy-mcp-server
-cd ~/code/workflowy-mcp-server
-cargo build --release
-echo "WORKFLOWY_API_KEY=<your-token>" > .env
-```
-
-Wire `target/release/workflowy-mcp-server` into your host:
-
-- **Claude Code:** `claude mcp add workflowy -- $(pwd)/target/release/workflowy-mcp-server`
-- **Claude Desktop:** edit
-  `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
-  or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). See
-  [BOOTSTRAP.md](BOOTSTRAP.md) for the JSON shape.
-
-Verify by asking Claude to call `workflowy_status`; you want
-`status: "ok"`, `api_reachable: true`, `authenticated: true`. Then try it:
-
-> "List the children of my workspace root."
-> "Create a node called *Read later* under my Inbox."
-> "What did I change in the last two days?"
-
-That's the bare server working. The `.env` file covers a binary launched from
-the repo directory; putting the same key in the host's `env` block (next
-section) works from anywhere and is the recommended form.
-
-## Make it a second brain (recommended)
-
-Have your regions written down before you start; the install asks for them,
-and [`docs/METHOD.md`](docs/METHOD.md) explains how to arrive at a set worth
-keeping. Then hand [`BOOTSTRAP.md`](BOOTSTRAP.md) to Claude. It walks the
-seven steps: build, wire the host, seed your private `$SECONDBRAIN_DIR`, cache
-your structural node IDs (Inbox, Tasks, Journal…), install the wflow skill,
-pre-warm the search index for large trees, and verify the whole chain
-end-to-end. After that, every session opens with your workflows available
-conversationally: daily and weekly reviews, task capture, inbox triage,
-reading-list management, distillation of sources into atomic notes, mirror
-discipline with drift auditing, and cross-note research.
-
-The long-form walkthrough (multi-surface setups, large-tree convergence,
-troubleshooting) is in [`docs/SETUP.md`](docs/SETUP.md). Running behind a
-remote connector for claude.ai web/mobile is covered in
-[`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md).
-
----
-
-## Environment variables
-
-The server reads five env vars at runtime. The repository ships no
-machine-specific defaults: a path or node ID you don't set is a feature you
-don't use. Set them in the `env` block of your MCP host config (Claude Code:
-`~/.claude.json`; Claude Desktop: `claude_desktop_config.json`) and,
-when you also use the `wflow-do` CLI from a shell, in your shell
-profile (`~/.zshrc` or `~/.bashrc`).
-
-| Variable | Required? | What it controls |
-|----------|-----------|------------------|
-| `WORKFLOWY_API_KEY` | Yes | Bearer token for the Workflowy API. |
-| `SECONDBRAIN_DIR` | Optional | Absolute path to your operational secondBrain directory (drafts, session logs, briefs, memory). When set, the `review` tool's bucket-d session-log scan and the `wflow-do index` default output path read from `$SECONDBRAIN_DIR/session-logs/`. Unset or empty disables those features (graceful skip). |
-| `WORKFLOWY_INDEX_PATH` | Optional | Absolute path to the persistent name-index JSON. Conventionally `$SECONDBRAIN_DIR/memory/name_index.json`. Unset or empty disables persistence, so the index lives only in memory for the lifetime of each process. |
-| `WORKFLOWY_USAGE_LOG_DIR` | Optional | Directory for a durable per-call usage log (`{ts, surface, tool, ok, ms, cause}` JSONL, one file per day). Lets you measure this server's load, for instance against WorkFlowy's official desktop MCP. Unset disables it. |
-| `WORKFLOWY_REVIEW_ROOT` | Optional | Default root node for the `review` and `audit_mirrors` tools when `root_id` is omitted (your review-anchor / "Distillations" node). No hardcoded fallback: if unset, those two tools require an explicit `root_id`. |
-| `WORKFLOWY_INDEX_EXCLUDE_SUBTREES` | Optional | Comma-separated full UUIDs and/or 12-char short hashes whose subtrees must never be **written to the persistent index file**. Walks may still traverse them in memory (a live session still needs answers), but the on-disk index, a durable artefact other tools read, never carries them. Exclusion is transitive (root + all descendants); malformed tokens are dropped with a warning. Set this for any subtree holding material you don't want in a local file. |
-
-Example MCP host `env` block (Claude Code or Desktop):
-
-```json
-"env": {
-  "WORKFLOWY_API_KEY": "<your token>",
-  "SECONDBRAIN_DIR": "/absolute/path/to/secondBrain",
-  "WORKFLOWY_INDEX_PATH": "/absolute/path/to/secondBrain/memory/name_index.json",
-  "WORKFLOWY_REVIEW_ROOT": "<your review-anchor node id, optional>"
-}
-```
-
-Example shell profile (so the CLI agrees with the MCP server):
-
-```bash
-export SECONDBRAIN_DIR="/absolute/path/to/secondBrain"
-export WORKFLOWY_INDEX_PATH="$SECONDBRAIN_DIR/memory/name_index.json"
-```
-
-Neither path needs to be inside your home directory; a Dropbox / iCloud /
-Google Drive folder works as long as the host process can read and write it.
-**Set the vars in the host config, not only your shell profile**, because the server
-process inherits its environment from the host's launch, and a var visible
-only to your interactive shell silently disables the features it drives.
-
----
-
-## The tool surface
-
-45 tools. `node_id` accepts a full UUID (with or without hyphens), the
-12-char short hash from any Workflowy URL, or the 8-char doc prefix; paste
-whatever you have.
-
-Read this table alongside [`docs/SURFACES.md`](docs/SURFACES.md) rather than as
-a shopping list. On a machine that can reach WorkFlowy's own tools, most of the
-search-and-navigate row and much of the create-and-edit row is better served
-natively, at no API cost. The rows that have no native equivalent are mirror
-discipline, `review`, and the diagnostics; those, plus headless and remote
-operation, are the reason to run this at all.
-
-| Category | Tools |
-|----------|-------|
-| Search & navigate | `node_at_path`, `resolve_link`, `search_nodes`, `find_node`, `get_node`, `list_children`, `tag_search`, `get_subtree`, `find_backlinks`, `path_of`, `find_by_tag_and_path`, `read_batch` |
-| Create & edit | `create_node`, `batch_create_nodes`, `insert_content`, `smart_insert`, `convert_markdown`, `edit_node`, `move_node`, `reorder_nodes`, `delete_node`, `complete_node`, `duplicate_node`, `create_from_template`, `bulk_update`, `bulk_tag`, `transaction`, `export_subtree` |
-| Mirror discipline | `create_mirror` (convention-based `mirror_of:` linking), `audit_mirrors` (finds broken and drifted mirrors) |
-| Todos & scheduling | `list_todos`, `list_upcoming`, `list_overdue`, `daily_review`, `since` |
-| Project management | `get_project_summary`, `get_recent_changes` |
-| Diagnostics & ops | `workflowy_status`, `health_check`, `cancel_all`, `build_name_index`, `review`, `get_recent_tool_calls` |
-
-Highlights worth knowing before you need them:
-
-- **Index-first retrieval.** `search_nodes` and `find_node` take
-  `prefer_index=true`: answer from the local index when it can, fall back
-  to a live scoped walk when it can't, one call either way. `tag_search`
-  and `find_backlinks` take `use_index=true` for zero-API-call sweeps.
-  The index matches names *and* descriptions, token-AND, any order.
-- **Reads that survive awkward hosts.** `read_batch` runs many reads in one
-  call with bounded concurrency and per-operation status, the reliable
-  shape on hosts that mangle single-ID parameters.
-- **Writes that can't land in the wrong place.** The write tools require an
-  explicit `parent_id` (empty string means workspace root), every scoped
-  response echoes `scope_resolved` so you can verify the target, and
-  `delete_node` accepts an `expect_name` guard that refuses a delete when
-  the resolved node's name doesn't match.
-- **Batches that resume.** `insert_content` reports a committed-count
-  cursor on *every* failure, so a rate-limited batch resumes exactly where
-  it stopped, with no double-writes. `transaction` rolls back on failure.
-- **Ordering that matches the app.** Listings sort into Workflowy display
-  order; `insert_content` writes explicit ascending priorities;
-  `reorder_nodes` is the deterministic reorder primitive.
-- **Clean text in, rich nodes out.** Since the 2026.01 API parses markdown
-  in a node's name on write (so stored names carry `<b>`/`<a>`/`<time>`
-  markup), reads render back to clean display text (links keep their URL,
-  dates unwrap to their label) and search matches the visible text, not the
-  tags. `create_node` also takes an explicit `layout` (`todo`/`h1`/`h2`/`h3`/
-  `code-block`/`quote-block`) so you can build headers and checklists
-  directly.
-
-Conventions parsed from node text: tags (`#project`), assignees (`@alice`),
-due dates (`due:2026-03-15`, `#due-2026-03-15`, or a bare date).
-
----
-
-## Reliability, in numbers
-
-Every API-touching handler runs inside a uniform wrapper with a
-kind-appropriate wall-clock budget, cancellation support, and an op-log
-entry: a call can time out, but it cannot vanish:
-
-| Tool kind | Budget | Examples |
-|-----------|--------|----------|
-| Read | 30 s | `get_node`, `list_children` |
-| Write | 15 s | `create_node`, `delete_node`, `edit_node` |
-| Bulk | 180 s | `insert_content`, `transaction`, `bulk_update` |
-| Walk | 20 s (internal) | `search_nodes`, `get_subtree`, `find_node` |
-
-`cancel_all` interrupts anything in flight within ~50 ms. Every walk-shaped
-response carries a four-field truncation envelope (`truncated`,
-`truncation_limit`, `truncation_reason`, `truncation_recovery_hint`) so a
-partial answer is never mistaken for a complete one. Every error carries a
-typed envelope: `proximate_cause`, `retryable`, `retry_after_secs`, a
-hint, so the right recovery is explicit rather than guessed. The full
-behavioural contract, including 21 wiremock-driven failure-mode tests and
-the build-time invariant suite, lives in
-[`specs/specification.md`](specs/specification.md) with a machine-checked
-[traceability matrix](specs/traceability.md) mapping every contract to the
-test that pins it.
-
----
-
-## The CLI: `wflow-do`
-
-Everything the MCP server does, as a shell command, with full surface parity
-enforced at build time. Use it for scheduled jobs, shell pipelines, and as a
-fallback when you'd rather not open a chat window.
-
-```bash
-wflow-do status                                      # liveness
-wflow-do search --query "concept maps" --use-index   # zero-API-call search
-wflow-do find "Tasks" --use-index                    # O(1) name lookup
-wflow-do backlinks <uuid> --use-index                # who links here?
-wflow-do changed-since 2026-07-14 --root <uuid>      # local incremental diff
-wflow-do complete <uuid>                             # mark done
-wflow-do bulk-update complete --tag urgent           # bulk-toggle by filter
-wflow-do --dry-run delete <uuid>                     # preview first
-wflow-do reindex --full-export                       # whole tree in one bulk call
-wflow-do reindex --timeout-secs 0 --patient --root <uuid>   # coverage-complete scoped build
-```
-
-Forty-two subcommands, `--json` for raw output, `--dry-run` on write verbs.
-The nightly reindex rebuilds the whole index from one bulk `/nodes-export`
-call (`--full-export`); the `--patient` walk is the convergence mechanism for
-*scoped* rebuilds, waiting out rate-limit windows instead of dropping
-branches. Either way the work is cumulative: every walk any tool performs
-extends the same persistent file.
-
----
-
 ## What ships in this repo
 
 ```text
 workflowyMCP/
-├── docs/METHOD.md            ← the method: regions, claims, actions
-├── docs/SURFACES.md          ← native vs this server: which surface, and why
-├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
+│
+│  THE METHOD  (read in this order)
+├── docs/METHOD.md            ← the method: regions, claims, actions, mirrors
+├── templates/skills/wflow/   ← the method as instructions a model follows
+├── templates/secondbrain/    ← skeleton copied to $SECONDBRAIN_DIR
 ├── README.md                 ← this file
+│
+│  RUNNING IT
+├── BOOTSTRAP.md              ← LLM-facing install script (hand to Claude)
 ├── docs/SETUP.md             ← long-form setup walkthrough
+├── docs/SURFACES.md          ← which surface to use, and why
+├── docs/proposals/           ← dated proposals, not yet decided
+│
+│  THE SOFTWARE
+├── docs/SERVER.md            ← tool reference, env vars, CLI, reliability
 ├── docs/REMOTE-CONNECTOR.md  ← claude.ai custom-connector notes
 ├── specs/                    ← behavioural spec, principles, traceability
-├── templates/
-│   ├── secondbrain/          ← skeleton copied to $SECONDBRAIN_DIR
-│   └── skills/wflow/SKILL.md ← the operating manual the assistant follows
 ├── dist/wflow.skill.zip      ← ready-to-upload skill bundle for claude.ai
 └── src/                      ← Rust MCP server + wflow-do CLI
 ```
@@ -456,21 +345,6 @@ starting point; so does the next person.
 | `drafts/`, `session-logs/`, `briefs/` | `$SECONDBRAIN_DIR/` | In-flight work, per-session audit trails, handoff documents. |
 
 ---
-
-## Development
-
-```bash
-cargo build --release    # optimised build (server + CLI)
-cargo test --lib         # 500+ unit tests, no live API calls
-cargo test               # full suite: lib + portability + traceability + eval coverage
-```
-
-The architecture guide is [CLAUDE.md](CLAUDE.md); the law of the project,
-eight core principles, a definition of done, and a conflict-resolution
-hierarchy, is [`specs/constitution.md`](specs/constitution.md). Every
-consistency rule worth stating is pinned by a test that fails the build when
-violated. Contributions are held to the same standard, which is precisely
-why you can build on this without reading the whole source first.
 
 ## Licence
 

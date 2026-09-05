@@ -195,6 +195,14 @@ removes the only implementation available to the surface that has no laptop.
 silently, at 04:15, with nobody watching, and the failure will look exactly
 like a quiet day.
 
+## Where the engineering detail lives
+
+This page is about choosing a surface. What this server's own tools do, the
+environment variables, the `wflow-do` CLI and the reliability contracts are in
+[`SERVER.md`](SERVER.md), kept separate so that
+[`../README.md`](../README.md) and [`METHOD.md`](METHOD.md) can stay about the
+method rather than the machinery.
+
 ## Measuring it rather than guessing
 
 Because the surfaces share one budget and it is easy to lose track of which one

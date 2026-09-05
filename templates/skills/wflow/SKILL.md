@@ -1,6 +1,6 @@
 ---
 name: wflow
-description: Integrated second-brain skill built on Workflowy plus any additional services the user has configured (declared in $SECONDBRAIN_DIR/memory/services.md). Capture, triage, distillation, retrieval, and synthesis. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
+description: Second-brain skill for a claim-based knowledge graph in Workflowy, plus any additional services the user has configured (declared in $SECONDBRAIN_DIR/memory/services.md). Governs what may enter the graph (claims and actions, one claim one home, mirrors audited for drift) as well as how: capture, triage, prioritisation, distillation, retrieval, synthesis, review. Triggered conversationally. Use when the user wants to plan their day, capture a task, triage their inbox, distil a source into atomic notes, journal, research a topic across their notes, or run a periodic review.
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, mcp__workflowy__workflowy_status, mcp__workflowy__health_check, mcp__workflowy__get_node, mcp__workflowy__find_node, mcp__workflowy__search_nodes, mcp__workflowy__list_children, mcp__workflowy__get_subtree, mcp__workflowy__read_batch, mcp__workflowy__create_node, mcp__workflowy__edit_node, mcp__workflowy__delete_node, mcp__workflowy__move_node, mcp__workflowy__reorder_nodes, mcp__workflowy__insert_content, mcp__workflowy__smart_insert, mcp__workflowy__complete_node, mcp__workflowy__duplicate_node, mcp__workflowy__create_from_template, mcp__workflowy__batch_create_nodes, mcp__workflowy__transaction, mcp__workflowy__bulk_update, mcp__workflowy__bulk_tag, mcp__workflowy__create_mirror, mcp__workflowy__audit_mirrors, mcp__workflowy__daily_review, mcp__workflowy__get_recent_changes, mcp__workflowy__list_overdue, mcp__workflowy__list_upcoming, mcp__workflowy__list_todos, mcp__workflowy__get_project_summary, mcp__workflowy__tag_search, mcp__workflowy__find_backlinks, mcp__workflowy__find_by_tag_and_path, mcp__workflowy__node_at_path, mcp__workflowy__path_of, mcp__workflowy__resolve_link, mcp__workflowy__since, mcp__workflowy__convert_markdown, mcp__workflowy__export_subtree, mcp__workflowy__review, mcp__workflowy__build_name_index
 # Additional service tool namespaces (e.g. mcp__SERVICENAME__*) are listed in $SECONDBRAIN_DIR/memory/services.md and must be added to allowed-tools when configured.
 ---
@@ -8,6 +8,8 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, AskUserQuestion, WebFetch, m
 # wflow — second-brain skill (template)
 
 This is the generic skill template shipped by the workflowy-mcp-server repo. It deliberately contains **no user-specific node IDs** — those live in `$SECONDBRAIN_DIR/memory/workflowy_node_links.md`. On first use, walk the user through populating that file (see Bootstrap below).
+
+**Read the next section before anything else.** Most of this file is operating detail: hazards, contracts, failure modes, tool routing. That detail exists to serve one method, and a session that executes the plumbing correctly while breaking the method has failed. The method is short; the plumbing is long because it was expensive to learn, not because it matters more.
 
 The skill spans the full second-brain loop:
 
@@ -53,6 +55,32 @@ Up to four MCP surfaces can reach the same Workflowy account: **this server** ov
 | "What do I have on X" / "trace my thinking on X" | Cross-system research |
 
 When the intent is ambiguous, ask one clarifying question rather than guessing.
+
+---
+
+## The method this skill exists to execute
+
+The user's second brain is not a store of notes. It is a small set of durable **regions**, containing nothing that is not a **claim** or an **action**. Everything below serves that, and where a tool convenience and this section conflict, this section wins.
+
+**1. Regions are decided in advance and written down.** The user's set lives in `$SECONDBRAIN_DIR/memory/distillation_taxonomy.md` (conceptual regions, called pillars; themes that cut across them; the inbound routing table). Route from that written list, never from the mood of the conversation or from what a node happens to be "about". If a destination is genuinely ambiguous, ask one question rather than inventing a region; if the taxonomy is missing, say so and offer to build it, and do not proceed to file things in the meantime.
+
+**2. Every node you write is a claim or an action.** A claim is a sentence the reader could contradict: "Team structure constrains architecture more reliably than the reverse". A label is not: "Conway's Law and team topologies". A node that names a topic instead of stating something is a container, and containers are where material goes to be forgotten. This applies to the head of a source's cluster as much as to its atoms — the head is the source's **lead claim**, never its title or its author. An action names an owner and a date. Anything that is neither belongs in the inbox until someone makes it one or drops it.
+
+**3. If it cannot be reduced to a claim, the reading is not finished.** When asked to distil something you cannot state as claims, say that plainly rather than producing a summary with bullet points. A summary that restates a source is not distillation, and shipping one silently is the most damaging thing this skill can do, because it looks like the work.
+
+**4. One claim, one home.** A claim lives canonically in exactly one region and appears elsewhere as a mirror pointing back (`create_mirror`; the mirror carries `mirror_of:` and the canonical carries `canonical_of:`). Mirror only when the claim is a **substantive contribution** to the second region, not when it merely touches it — about one node in ten. Mirroring everything reproduces the duplication the canonical rule exists to prevent, with markers on it.
+
+**5. Keep it shallow.** Region, source cluster, atoms. Three levels carry almost everything; a fourth is occasionally justified and a fifth almost never. Do not build hierarchy to express nuance — state the nuance in the claim.
+
+**6. Delete navigation a query can compute.** Do not create index nodes, cross-reference nodes, or "map of content" scaffolding. A backlink search answers the same question dynamically and cannot go stale. Never leave placeholder scaffolding ("(syntheses go here)") behind: empty structure makes an empty tree look populated, which is worse than an obviously empty one.
+
+**7. Descriptions carry graph plumbing, not content.** A `Source:` line plus `canonical_of:` / `mirror_of:` markers. Substance lives in the claim and in child atoms. The judgement exception is a description that *argues* something; one that only records where the note came from goes.
+
+**8. A promise must be paid.** A claim that says "three forces converge" and never enumerates them is the most seductive thing you can write, because it feels like a conclusion while deferring the work. Do not write one, and flag one when you see it.
+
+**9. Mark staleness rather than living with it.** Some of what the user concluded will later be wrong. When you find a cluster that contradicts current thinking, tag it for revisit with a dated note saying exactly where it went stale. Flagging is cheap; silently trusting a stale cluster is not.
+
+**10. A write is not done until it has been read back.** An API acknowledgement is not evidence. A batch that half-applied looks identical to one that succeeded until you look. This is where the operating detail below starts earning its length.
 
 ---
 
@@ -168,7 +196,7 @@ When a workflow performs 2+ writes that share a logical batch — moves with a c
 
 ## The Distillation Standard (read before any synthesis write)
 
-Every node in your Distillations layer — heading or atom, canonical or mirror — should meet one standard. It is both the bar a fresh distillation clears at creation and the bar a cleanup pass enforces.
+Every node in your Distillations layer — heading or atom, canonical or mirror — should meet one standard. It is both the bar a fresh distillation clears at creation and the bar a cleanup pass enforces. This is the write-time form of rules 2, 4 and 7 in *The method this skill exists to execute*; if the two ever appear to disagree, that section governs.
 
 1. **Every node is a self-standing claim.** Read on its own, stripped of any thinker parenthetical, it still states something. The thinker is a trailing `(Name)` attribution only — never the head of the name, never the organising axis. Structure on claims and topics, not on people. No bare-label or headline-led heads ("DDD in the AI Era — Author"); the head of a source's cluster is that source's **lead claim**, with supporting atoms beneath it.
 

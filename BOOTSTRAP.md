@@ -1,11 +1,21 @@
 # Bootstrap — for Claude
 
-> Hand this file to Claude (Code, Desktop, or claude.ai) when you want to install
-> the Workflowy MCP server **and** wire up a working second-brain workflow.
+> Hand this file to Claude (Code, Desktop, or claude.ai) when you want a working
+> claim-based second brain. Installing the Workflowy MCP server is one step of
+> that, not the point of it.
 
 This file is a script for the assistant. It assumes the user has cloned this
 repo and wants the assistant to do the rest. The assistant should follow each
 step in order, run the listed checks, and stop on first failure.
+
+**Before step 1, check the user has read [`docs/METHOD.md`](docs/METHOD.md) and
+can name their regions.** A second brain is a small set of durable regions
+containing nothing that is not a claim or an action, and the regions are decided
+before anything is captured, not discovered afterwards. If the user cannot name
+theirs, stop and work through that first: an install that completes without them
+produces a well-plumbed empty tree that will be filled by mood. This is the one
+step whose absence the software cannot compensate for, and it is the reason the
+taxonomy file is created early rather than last.
 
 The contract:
 

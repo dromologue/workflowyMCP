@@ -2,8 +2,11 @@
 
 This guide is written for an LLM (Claude, GPT, etc.) bootstrapping a fresh user onto the workflowy-mcp-server stack. Read it linearly. Each step has a check that determines whether you should proceed; do not skip checks.
 
-The goal is a working installation in which:
+The goal is a working **second brain**, not a working installation. The software below is how it gets operated; what makes it a second brain is the method in [`METHOD.md`](METHOD.md) — a small set of durable regions containing nothing that is not a claim or an action.
 
+Done means:
+
+0. **The user's regions are written down**, in `$SECONDBRAIN_DIR/memory/distillation_taxonomy.md`, before anything is captured. This step is numbered zero because the rest is worthless without it: an outline with no decided regions gets filed by mood, and no amount of retrieval quality fixes that afterwards. If the user cannot name their regions, stop here and work through METHOD.md with them.
 1. The MCP server resolves Workflowy URLs and short-hash node IDs without manual setup.
 2. The user has a `secondBrain` directory at a path of their choice (exposed via `$SECONDBRAIN_DIR`) holding their cached node IDs, drafts, session logs, and any briefs that don't belong inside Workflowy itself.
 3. The wflow skill (or equivalent) is installed at `~/.claude/skills/wflow/` and reads from `$SECONDBRAIN_DIR`.
