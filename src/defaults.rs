@@ -669,6 +669,11 @@ mod tests {
 
     #[test]
     fn secondbrain_dir_returns_env_value_when_set() {
+        // These four tests mutate the same process-global env var, and
+        // cargo runs tests in parallel threads: without this lock one
+        // test's restore races another's set_var. Observed as an
+        // intermittent CI failure on 2026-09-05.
+        let _env = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = SECONDBRAIN_DIR_ENV;
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "/tmp/wflow-secondbrain-test");
@@ -682,6 +687,7 @@ mod tests {
 
     #[test]
     fn secondbrain_dir_returns_none_when_env_empty_or_unset() {
+        let _env = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Pin the no-fallback contract: no machine-specific default
         // path lives in the source. An unset or empty env var must
         // yield None so callers treat the feature as disabled rather
@@ -699,6 +705,11 @@ mod tests {
 
     #[test]
     fn session_logs_dir_appends_session_logs_subdir() {
+        // These four tests mutate the same process-global env var, and
+        // cargo runs tests in parallel threads: without this lock one
+        // test's restore races another's set_var. Observed as an
+        // intermittent CI failure on 2026-09-05.
+        let _env = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = SECONDBRAIN_DIR_ENV;
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "/tmp/wflow-secondbrain-test");
@@ -712,6 +723,11 @@ mod tests {
 
     #[test]
     fn secondbrain_dir_checked_distinguishes_unset_missing_and_present() {
+        // These four tests mutate the same process-global env var, and
+        // cargo runs tests in parallel threads: without this lock one
+        // test's restore races another's set_var. Observed as an
+        // intermittent CI failure on 2026-09-05.
+        let _env = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = SECONDBRAIN_DIR_ENV;
         let prev = std::env::var(key).ok();
 
