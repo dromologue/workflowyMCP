@@ -3,7 +3,7 @@
 WorkFlowy has been building its own tooling quickly, and several things this
 server was once the only way to do are now native. That is a good outcome and
 this page is the honest accounting of it: what each surface can do as of
-**August 2026**, what is left that only this repository provides, and the one
+**September 2026**, what is left that only this repository provides, and the one
 routing rule that is not a preference but a constraint.
 
 > **Open proposal (2026-09-05).** A re-survey and a measured proposal on what
@@ -58,13 +58,24 @@ LLM-authored diff before it lands. On a 235,000-node workspace the first sync
 took under twenty seconds and searches answer in under 100 ms with the ancestor
 path attached, which this server's index does not store.
 
-**Native live mirrors exist, on the beta API.** `wf mirror:create`,
-`mirror:info` and `mirror:remove` drive WorkFlowy's real mirror primitive:
-one node, several places, genuinely synchronised rather than copied. Verified
-on 2026-08-17, they remain **beta-only**: the same call against production
-returns `beta_api_required`, and the production API reference documents no
-mirror endpoint. See the mirror section below, because this is the piece of the
-method most affected.
+**Native live mirrors are half-shipped, and the previous reading of this was
+wrong.** WorkFlowy's real mirror primitive is one node in several places,
+genuinely synchronised rather than copied. On 2026-09-12 the production API
+reference documents `POST /nodes/:id/mirror` with no beta labelling, and a live
+round-trip confirms the write endpoint works **on production**. What does not
+work there is reading the mirror back. See the mirror section below, because
+this is the piece of the method most affected.
+
+**Calendar targets, which nothing in this repository anticipated.** Production
+now serves `GET /api/v1/targets` and accepts a target key wherever a `parent_id`
+is expected: `inbox`, `today`, `tomorrow`, `next_week`, and literal `YYYY`,
+`YYYY-MM` and `YYYY-MM-DD` keys. On a create, WorkFlowy materialises whatever is
+missing. A probe on 2026-09-12 that created one node under `2027-03-09` produced
+the entire chain — `Journal → 2027 → March → <time …>Mar 9, 2027</time>` — all
+three containers stamped with that minute's creation time, under the account's
+own Journal. A read resolves an existing calendar node but creates nothing, and
+404s where the node has not been materialised yet. See the calendar section
+below, because this is the piece of the method's *plumbing* most affected.
 
 The consequence is stated plainly rather than defended. The native tools have
 won the index-and-lookup half outright, and are now competitive on the
@@ -116,13 +127,38 @@ not: a native mirror is one node rendered twice, so it cannot drift at all.
 When they reach production, the honest thing is to move onto them, and this
 repository should follow the method rather than defend its own plumbing.
 
-Three things are worth knowing before that happens.
+Four things are worth knowing before that happens, and the first was
+misdescribed here until 2026-09-12.
 
-They are beta-only today. Production returns `beta_api_required` and mirrors
-created against beta are not coherently visible on production, so a second
-brain built on them is not portable back.
+**The write works on production; the read does not.** `POST /nodes/{id}/mirror`
+against `workflowy.com` returns `{item_id, origin_id}` and creates a real
+mirror. (That the route exists rather than 404ing generically is provable: an
+unrouted path returns WorkFlowy's HTML 404 page, while the mirror route returns
+a JSON envelope and validates the parent separately.) But read the same mirror
+back through the two APIs and they disagree:
 
-The audit does not become redundant when they ship. A native mirror cannot
+| | production | beta |
+|---|---|---|
+| mirror node `name` | `""` | the origin's name |
+| mirror node `data.mirror` | absent | `{origin_id: …}` |
+| origin `data.mirror` | absent | `{mirror_ids: [...]}` |
+
+So the accurate statement is not "mirrors are beta-only". It is that the mirror
+write endpoint is live on production, the linkage that identifies a node as a
+mirror is readable only on beta, and **on a production read a native mirror
+comes back as an empty-named node**. `wf mirror:info` still refuses production
+with `beta_api_required`, but that is `wf`'s own client-side gate rather than
+the API's.
+
+That is what blocks the migration, and it blocks it harder than beta-only did.
+A second brain built on native mirrors would be invisible to every surface that
+reads the production API — this server, `audit_mirrors`, the remote connector,
+and the unattended cloud run. There is a sharper edge too, worth naming because
+a sweep could act on it: on a production read a native mirror is
+indistinguishable from the empty-named mobile-capture artefact that inbox
+triage offers to delete.
+
+**The audit does not become redundant when they ship.** A native mirror cannot
 drift in wording, but the questions `audit_mirrors` actually answers are wider
 than that: is this claim mirrored into a region where it is a substantive
 contribution or one it merely brushes, is the canonical marked, has the
@@ -137,6 +173,36 @@ migration will have to answer it rather than assume it away.
 
 Until then, `create_mirror` and `audit_mirrors` remain the production-safe
 path, and `wf --beta mirror:create` is available if you want to experiment.
+
+The condition to watch for is narrow and testable: `data.mirror` appearing on a
+**production** read, and a mirror returning its origin's name rather than an
+empty string. When both hold, the migration is on.
+
+## Calendar targets: the one place the plumbing is simply beaten
+
+A create may name a target key instead of a UUID as its `parent_id` — `inbox`,
+`today`, `tomorrow`, `next_week`, or a literal `2027-03-09`, `2027-03` or
+`2027` — and WorkFlowy will materialise whatever part of its own calendar is
+missing and put the node underneath. Verified on production, 2026-09-12.
+
+This matters more than it sounds, because it dissolves a problem this estate
+spent months on. A journal writer used to resolve the year, then the month, then
+the day, creating each missing level itself, and the date node it created was
+its own node carrying `<time>` markup rather than WorkFlowy's. The client keys
+adoption on metadata the REST API cannot set, so that node was never adopted: it
+surfaced beside the native one as a Found Date, and converging the two was a
+manual drag. Under a calendar target the node you are given **is** the native
+one, so the twin cannot arise.
+
+Two asymmetries to hold. A **read** resolves an existing calendar node and
+creates nothing — `GET /nodes/today` returns the real date node, while
+`GET /nodes?parent_id=<date key>` 404s until something has materialised it. And
+**this server cannot reach any of it**: `check_node_id` accepts a UUID or a hex
+short hash and rejects everything else, so a target key is refused at the
+handler boundary before a request is built. `wf` can address them (`@inbox`,
+`@today`); the desktop MCP, which works in 12-character handles, cannot. Adding
+target support here is the clearest single improvement available to this
+repository, and `docs/proposals/` is where that argument belongs.
 
 ## The routing rule that is not a preference
 

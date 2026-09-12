@@ -210,7 +210,7 @@ plumbing here. The method was never the plumbing.
 ## Where this sits among WorkFlowy's own tools
 
 WorkFlowy has been building fast, and several things this server was once the
-only way to do are now native. As of August 2026 there are five ways to put a
+only way to do are now native. As of September 2026 there are five ways to put a
 model in front of a WorkFlowy tree: WorkFlowy Pro's own AI inside the client,
 the [`wf` CLI](https://workflowy.com/help/workflowy-cli), the
 [MCP embedded in the desktop app](https://workflowy.com/help/claude-desktop/),
@@ -243,12 +243,28 @@ that surface has to keep a complete tool set even as the native tools absorb
 more of the daily work. See
 [`docs/REMOTE-CONNECTOR.md`](docs/REMOTE-CONNECTOR.md).
 
-One thing has genuinely arrived and is worth flagging if you are weighing the
-method. WorkFlowy's beta API now has **real live mirrors**, which do what this
-repository's `mirror_of:` convention approximates. They are beta-only today,
-and the drift audit answers wider questions than a live mirror makes redundant,
-so the convention stays the production-safe path for now. The migration, when
-it comes, is described in `docs/SURFACES.md`.
+Two things have genuinely arrived since, both verified against the production
+API on 12 September 2026, and both worth knowing if you are weighing the method.
+
+**Calendar targets.** A create can now name `today`, `tomorrow`, `next_week`, or
+a literal `2027-03-09` as its `parent_id`, and WorkFlowy materialises the whole
+missing year/month/day chain in its own calendar and puts your node under it.
+That replaces every line of date-node arithmetic a journal writer used to carry,
+and it removes the duplicate-date-node problem at the root, because the node you
+get back is WorkFlowy's own rather than a lookalike sitting beside it. This
+server cannot reach it yet: its id validator accepts a UUID or a short hash and
+rejects everything else, target keys included.
+
+**Native mirrors, half-arrived.** The write endpoint is live on production:
+`POST /nodes/{id}/mirror` creates a real mirror, one node genuinely rendered in
+two places, which is what this repository's `mirror_of:` convention only
+approximates. The linkage that tells you it *is* a mirror is still beta-only,
+and on a production read a native mirror comes back with an empty name and no
+mirror metadata at all. So the convention stays the production-safe path, not
+because mirrors are unavailable but because a second brain built on them would
+be invisible to every tool that reads the production API — this server, the
+connector, and the unattended cloud run included. `docs/SURFACES.md` carries the
+evidence and the migration conditions.
 
 All of these share one WorkFlowy account and therefore **one API rate limit**
 (the desktop MCP excepted, since it reads the synced client rather than the
