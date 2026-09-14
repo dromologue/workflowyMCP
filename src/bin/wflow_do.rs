@@ -103,7 +103,8 @@ enum Cmd {
     },
     /// Toggle a node's native Workflowy completion state. Default is to mark
     /// complete; pass `--uncomplete` to revert. Mirrors the MCP `complete_node`
-    /// tool — same `client.set_completion` code path.
+    /// tool — same verified code path: dedicated endpoint, then read-back;
+    /// exits non-zero if the read-back disagrees.
     Complete {
         node_id: String,
         /// Mark uncomplete instead of complete.
@@ -971,17 +972,27 @@ async fn dispatch(cli: &Cli, client: Arc<WorkflowyClient>) -> Result<(), Box<dyn
         }
         Cmd::Complete { node_id, uncomplete } => {
             let target_state = !*uncomplete;
-            client
+            // Verified path (2026-09-14): the success line is printed only
+            // when the node was observed in the requested state.
+            let outcome = client
                 .set_completion_with_propagation_retry(node_id, target_state)
                 .await?;
             if cli.json {
                 println!(
                     "{}",
-                    json!({ "ok": true, "node_id": node_id, "completed": target_state }),
+                    json!({
+                        "ok": true, "node_id": node_id,
+                        "completed": outcome.completed, "completed_at": outcome.completed_at,
+                        "verified": "read_back",
+                    }),
                 );
             } else {
                 let verb = if target_state { "Completed" } else { "Uncompleted" };
-                println!("{} {}", verb, node_id);
+                println!(
+                    "{} {} (verified by read-back: completed={}, completed_at={})",
+                    verb, node_id, outcome.completed,
+                    outcome.completed_at.map(|t| t.to_string()).unwrap_or_else(|| "null".into())
+                );
             }
         }
         Cmd::Search { query, parent, depth, limit, use_index } => {

@@ -1158,8 +1158,10 @@ async fn apply_txn_step(
                 reason: format!("{} requires `node_id`", kind.as_str()),
             })?;
             let prev = client.get_node(&node_id).await.ok();
-            let prev_completed = prev.as_ref().map(|n| n.completed_at.is_some());
-            client.set_completion(&node_id, target_state).await?;
+            let prev_completed = prev.as_ref().map(|n| n.completed);
+            // Verified (2026-09-14): an accepted write whose read-back
+            // disagrees fails the step and rolls the transaction back.
+            client.set_completion_verified(&node_id, target_state).await?;
             footprint.invalidate_node(&node_id);
             let summary = json!({ "op": kind.as_str(), "id": node_id.clone() });
             let inverse = prev_completed.map(|p| TxnInverse::RestoreCompletion {
@@ -1227,7 +1229,7 @@ async fn run_txn_inverse(
             node_id,
             prev_completed,
         } => {
-            client.set_completion(&node_id, prev_completed).await?;
+            client.set_completion_verified(&node_id, prev_completed).await?;
             footprint.invalidate_node(&node_id);
             Ok((
                 json!({
@@ -1339,8 +1341,10 @@ pub async fn apply_bulk_op(
     for node in nodes {
         let success = match op {
             BulkOp::Delete => client.delete_node(&node.id).await.is_ok(),
-            BulkOp::Complete => client.set_completion(&node.id, true).await.is_ok(),
-            BulkOp::Uncomplete => client.set_completion(&node.id, false).await.is_ok(),
+            // Verified (2026-09-14): a node whose read-back still shows the
+            // old state counts as a FAILURE in `affected`.
+            BulkOp::Complete => client.set_completion_verified(&node.id, true).await.is_ok(),
+            BulkOp::Uncomplete => client.set_completion_verified(&node.id, false).await.is_ok(),
             BulkOp::AddTag => {
                 let tag = operation_tag.expect("validated by requires_tag check above");
                 // Whole-tag idempotency via the shared helper: `None` means

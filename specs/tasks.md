@@ -861,6 +861,23 @@
 
 ---
 
+- [x] **T-171**: `complete_node` reported success and persisted nothing
+  (2026-09-14; ported from the connector twin's fix the same day).
+  - `set_completion` posted `{"completed": <bool>}` to the generic
+    `POST /nodes/{id}`, which the API accepts and ignores. Now
+    `POST /nodes/{id}/complete` | `/uncomplete`, path-pinned. New
+    `set_completion_verified` reads the node back and returns
+    `CompletionOutcome` or `WorkflowyError::EffectNotObserved` (cause
+    `effect_not_observed`); `complete_node`, `bulk_update`, `transaction`
+    and `wflow-do complete` route through it; a pin test forbids the raw
+    call outside the client. `per_tool_health` rows gain `ok_means`.
+  - **Tests**: `set_completion_true_posts_complete_endpoint`,
+    `set_completion_false_posts_uncomplete_endpoint`,
+    `set_completion_verified_fails_when_read_back_disagrees`,
+    `set_completion_verified_returns_read_back_completed_at`,
+    `complete_node_reports_effect_not_observed_when_read_back_disagrees`,
+    `completion_writers_route_through_verified_path`. 542 unit tests pass.
+
 ## Phase 4: Quality & Documentation
 
 - [ ] **T-140**: Add integration tests with mock HTTP server

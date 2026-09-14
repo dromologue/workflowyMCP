@@ -59,6 +59,12 @@ pub enum ProximateCause {
     /// Retryable: the block is upstream and time-bounded, so the correct
     /// response is to wait and re-issue, never to rotate a key.
     UpstreamBlocked,
+    /// The upstream accepted the write (2xx) and a read-back showed the
+    /// intended state did not change. Nothing failed on the wire; the
+    /// *effect* is missing. Added 2026-09-14 when `complete_node` was found
+    /// reporting success against a generic update the API silently ignored.
+    /// Retryable: a read-back can lag an accepted write.
+    EffectNotObserved,
     Unknown,
 }
 
@@ -88,6 +94,7 @@ impl ProximateCause {
             ProximateCause::InvalidParams => "invalid_params",
             ProximateCause::RateLimited => "rate_limited",
             ProximateCause::UpstreamBlocked => "upstream_blocked",
+            ProximateCause::EffectNotObserved => "effect_not_observed",
             ProximateCause::Unknown => "unknown",
         }
     }
@@ -107,6 +114,10 @@ impl ProximateCause {
             ProximateCause::RateLimited
         } else if is_upstream_block_body(&lower) {
             ProximateCause::UpstreamBlocked
+        } else if lower.contains("effect not observed") {
+            // Ahead of the 404 / timeout branches: the detail text quotes
+            // what the read-back returned and may carry those words.
+            ProximateCause::EffectNotObserved
         } else if lower.contains("404") || lower.contains("not found") {
             ProximateCause::NotFound
         } else if lower.contains("cancelled") {
@@ -144,6 +155,7 @@ impl ProximateCause {
                 | ProximateCause::NotFound
                 | ProximateCause::Cancelled
                 | ProximateCause::UpstreamBlocked
+                | ProximateCause::EffectNotObserved
         )
     }
 }

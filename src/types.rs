@@ -562,3 +562,14 @@ mod tests {
         assert!(back.children.is_empty());
     }
 }
+
+/// What a *verified* completion write observed on read-back. Returned by
+/// `WorkflowyClient::set_completion_verified` so a caller can report the
+/// server-derived `completedAt` rather than a bare success string — the
+/// string was the whole defect on 2026-09-14.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionOutcome {
+    pub node_id: String,
+    pub completed: bool,
+    pub completed_at: Option<i64>,
+}

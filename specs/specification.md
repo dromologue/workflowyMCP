@@ -198,9 +198,15 @@ re-implementing them:
    explicitly at the `client.rs` boundary. `create_node` and
    `edit_node` set `body["note"]` (not `description` — the read-side
    alias `note` ↔ `description` masked the wire mismatch as the
-   "P2.4 field loss" symptom on 2026-05-02). `set_completion` posts
-   `body["completed"]` (the read-side `WorkflowyNode::completed` boolean
-   has no alias, so the wire field is literally `completed`). Every
+   "P2.4 field loss" symptom on 2026-05-02). **Completion is not a
+   field of the generic update at all** (corrected 2026-09-14): the API
+   accepts only `name`, `note`, `layoutMode`, `parent_id` and `position`
+   on `POST /nodes/{id}`, and a `completed` key there is accepted with
+   200, bumps `modifiedAt`, and is ignored — a worse shape than P2.4,
+   because a body matcher on the wrong path pins the defect rather than
+   catching it. `set_completion` now calls the dedicated
+   `POST /nodes/{id}/complete` / `/uncomplete` endpoints, pinned by PATH
+   (`set_completion_true_posts_complete_endpoint`). Every
    write field is pinned by a wiremock body-matcher test in
    `src/api/client.rs::tests::write_field_names`; if a wire field
    name shifts, the test fails locally without needing a live API.
@@ -1375,10 +1381,16 @@ Toggle a node's native Workflowy completion state. Replaces the tag-based `#done
 | `node_id` | string | yes | Full UUID or 12-char short hash of the target node |
 | `completed` | boolean | no | Target state. Default `true` (mark complete); pass `false` to uncomplete a previously-completed node |
 
-**Wire shape**: `POST /nodes/{id}` with `{"completed": true}` or `{"completed": false}`. The read-side `WorkflowyNode::completed` boolean has no serde alias, so the wire field is literally `completed`. Pinned by `tests::write_field_names::set_completion_*` so any wire-field surprise (the description→note bug from 2026-05-02 was the precedent) fails the unit suite locally without needing a live API.
+**Wire shape (corrected 2026-09-14)**: `POST /nodes/{id}/complete` or `POST /nodes/{id}/uncomplete`, no body. The previous shape — `POST /nodes/{id}` with `{"completed": <bool>}` — returned 200 on production and changed nothing: `completed` is not a settable field of the generic update. Measured against the connector twin: three "Completed node" successes, three read-backs at `completed: false`. Pinned by PATH in `tests::write_field_names::set_completion_true_posts_complete_endpoint` / `set_completion_false_posts_uncomplete_endpoint`, which the old shape cannot satisfy.
+
+**Verified by read-back**: after the write the client reads the node back (`set_completion_verified`, one 300 ms retry for propagation lag) and compares `completed` to the request. Agreement is the success and the response carries the observed `completed_at`; disagreement is `WorkflowyError::EffectNotObserved`, rendered with `proximate_cause: "effect_not_observed"` and `retryable: true`, and recorded as `Err` in the op log — so `per_tool_health.complete_node.ok` counts observed effects, never HTTP acceptance. The same verified path serves `bulk_update`, `transaction` and `wflow-do complete`.
+
+- **[C-server-023] Completion success means the read-back agreed.** An accepted write whose read-back disagrees is an error carrying `effect_not_observed` and an `Err` op-log entry; no completion writer outside the client may call the raw unverified `set_completion`. Pinned by `complete_node_reports_effect_not_observed_when_read_back_disagrees`, `set_completion_verified_fails_when_read_back_disagrees`, `completion_writers_route_through_verified_path`.
+- **[C-server-024] Completion writes the dedicated endpoints.** Pinned by `set_completion_true_posts_complete_endpoint`, `set_completion_false_posts_uncomplete_endpoint`.
+- **[C-server-025] `per_tool_health` rows carry `ok_means`** (`read_back_verified` | `returned_id` | `http_accepted` | `response_read`), so a healthy row states what an `ok` is evidence of. Pinned by `workflowy_status_includes_per_tool_health`.
 
 **Behaviour**:
-- The `completedAt` timestamp is server-derived: a successful `complete_node(_, completed=true)` causes the next read to surface a non-null `completed_at`. Uncompleting clears it back to `None`. Callers that need the timestamp re-read the node via `get_node`.
+- The `completedAt` timestamp is server-derived and is returned in the success message (`verified by read-back: completed=true, completed_at=<epoch>`); uncompleting clears it to `null`.
 - Cache + name-index entries for the node are invalidated on success so subsequent reads (`get_node`, `list_todos`, `daily_review`) reflect the new state without a TTL wait.
 - Bounded by `WRITE_NODE_TIMEOUT_MS` (15 s) end-to-end via the `tool_handler!(ToolKind::Write)` wrapper. Propagation-lag retries (3 attempts at 200/400/800 ms) on 404, same as `edit_node` / `delete_node`.
 
@@ -1399,7 +1411,7 @@ Apply an operation to all nodes matching a filter. Supports dry-run mode for pre
 | `limit` | number | no | Max nodes to modify (default: 50, safety limit) |
 
 **Operations**:
-- `complete` / `uncomplete`: Toggle completion status. Routes through `client.set_completion`, the same code path the single-node `complete_node` tool uses; same wire shape (`POST /nodes/{id}` with `{"completed": <bool>}`).
+- `complete` / `uncomplete`: Toggle completion status. Routes through `client.set_completion_verified`, the same verified code path the single-node `complete_node` tool uses (dedicated `/complete` | `/uncomplete` endpoint, then a read-back). A node whose read-back still shows the old state counts as a failure in `affected`.
 - `delete`: Permanently remove matching nodes
 - `add_tag`: Append `#tag` to node names
 - `remove_tag`: Remove `#tag` from names and notes

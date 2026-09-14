@@ -46,6 +46,19 @@ pub enum WorkflowyError {
     #[error("HTTP error: {0}")]
     HttpError(#[from] reqwest::Error),
 
+    /// A write was accepted upstream (2xx) but a read-back showed the
+    /// intended state change did not land. Added 2026-09-14 after
+    /// `complete_node` reported success while every read-back returned
+    /// `completed: false`: the API accepted a field it does not model
+    /// and bumped `modifiedAt`, so HTTP success was evidence of a write,
+    /// not of the effect.
+    #[error("Effect not observed after {operation} on {node_id}: {detail}")]
+    EffectNotObserved {
+        operation: String,
+        node_id: String,
+        detail: String,
+    },
+
     #[error("Timeout")]
     Timeout,
 

@@ -4,7 +4,7 @@
 use crate::config::{RetryConfig, RateLimitConfig};
 use crate::defaults;
 use crate::error::{Result, WorkflowyError};
-use crate::types::{WorkflowyNode, CreatedNode};
+use crate::types::{CompletionOutcome, CreatedNode, WorkflowyNode};
 use crate::utils::{CancelGuard, RateLimiter};
 use futures::stream::StreamExt;
 use reqwest::Client;
@@ -1610,49 +1610,83 @@ impl WorkflowyClient {
         Ok(())
     }
 
-    /// Toggle a node's completion state.
+    /// Toggle a node's completion state — the raw write, unverified.
     ///
-    /// **Wire shape.** Workflowy's read side returns `completed: bool`
-    /// (no serde alias on `WorkflowyNode::completed`, so the wire field
-    /// is literally `completed`) and `completedAt: i64?` (camelCase).
-    /// The write payload mirrors the boolean: `POST /nodes/{id}` with
-    /// `{"completed": true}` to mark complete and `{"completed": false}`
-    /// to uncomplete. Pinned by `tests::write_field_names::
-    /// set_completion_*` — if the wire field name shifts (the
-    /// description → note bug from 2026-05-02 was the precedent), the
-    /// tests fail locally without needing a live API.
+    /// **Wire shape (corrected 2026-09-14).** Completion is NOT a field of
+    /// the generic update. `POST /nodes/{id}` accepts only `name`, `note`,
+    /// `layoutMode`, `parent_id` and `position`; a `completed` key in that
+    /// body is accepted with 200, bumps `modifiedAt`, and is otherwise
+    /// ignored — measured against the connector twin on 2026-09-14: three
+    /// "Completed node" successes, three read-backs at `completed: false`.
+    /// The API has dedicated endpoints — `POST /nodes/{id}/complete` and
+    /// `POST /nodes/{id}/uncomplete` — and this method now calls them.
+    /// Pinned by PATH in `tests::write_field_names::
+    /// set_completion_true_posts_complete_endpoint` /
+    /// `set_completion_false_posts_uncomplete_endpoint`.
     ///
-    /// Bounded by [`defaults::WRITE_NODE_TIMEOUT_MS`] end-to-end. The
-    /// `completedAt` timestamp is server-derived: a successful
-    /// `set_completion(_, true)` causes the next read to surface a
-    /// non-null `completed_at`; uncompleting clears it back to
-    /// `None`. Callers that need the timestamp re-read the node via
-    /// `get_node`.
+    /// Prefer [`Self::set_completion_verified`]: an accepted write is not
+    /// evidence of the effect.
     pub async fn set_completion(&self, node_id: &str, completed: bool) -> Result<()> {
-        let endpoint = format!("/nodes/{}", node_id);
+        let verb = if completed { "complete" } else { "uncomplete" };
+        let endpoint = format!("/nodes/{}/{}", node_id, verb);
         let deadline = Instant::now() + Duration::from_millis(defaults::WRITE_NODE_TIMEOUT_MS);
-        let body = json!({ "completed": completed });
         let _: serde_json::Value = self
-            .request_cancellable("POST", &endpoint, Some(body), None, Some(deadline))
+            .request_cancellable("POST", &endpoint, Some(json!({})), None, Some(deadline))
             .await?;
         Ok(())
     }
 
+    /// Set completion AND prove it landed: the dedicated endpoint write,
+    /// then a read-back compared to the requested state (one 300 ms retry
+    /// for propagation lag). A disagreement is
+    /// [`WorkflowyError::EffectNotObserved`], never `Ok`. Every completion
+    /// caller — the tool, `bulk_update`, `transaction`, `wflow-do complete`
+    /// — routes through this so `Ok` means "observed on read-back". Pinned
+    /// by `set_completion_verified_fails_when_read_back_disagrees` and
+    /// `completion_writers_route_through_verified_path`.
+    pub async fn set_completion_verified(
+        &self,
+        node_id: &str,
+        completed: bool,
+    ) -> Result<CompletionOutcome> {
+        self.set_completion(node_id, completed).await?;
+        let mut observed = self.get_node(node_id).await?;
+        if observed.completed != completed {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            observed = self.get_node(node_id).await?;
+        }
+        if observed.completed != completed {
+            return Err(WorkflowyError::EffectNotObserved {
+                operation: if completed { "complete" } else { "uncomplete" }.to_string(),
+                node_id: node_id.to_string(),
+                detail: format!(
+                    "write accepted upstream but read-back shows completed={} completed_at={:?}; \
+                     expected completed={}",
+                    observed.completed, observed.completed_at, completed
+                ),
+            });
+        }
+        Ok(CompletionOutcome {
+            node_id: node_id.to_string(),
+            completed: observed.completed,
+            completed_at: observed.completed_at,
+        })
+    }
+
     /// Completion-toggle counterpart to
-    /// [`Self::edit_node_with_propagation_retry`]. Same policy: 3
-    /// attempts with 200/400/800 ms backoff on 404 only, because a
-    /// freshly-created node may surface in a parent's children listing
-    /// before it is mutable directly.
+    /// [`Self::edit_node_with_propagation_retry`]: 3 attempts with
+    /// 200/400/800 ms backoff on 404 only. Routes through
+    /// [`Self::set_completion_verified`], so `Ok` carries the read-back.
     pub async fn set_completion_with_propagation_retry(
         &self,
         node_id: &str,
         completed: bool,
-    ) -> Result<()> {
+    ) -> Result<CompletionOutcome> {
         const MAX_PROP_RETRIES: u32 = 3;
         let mut attempt: u32 = 0;
         loop {
-            match self.set_completion(node_id, completed).await {
-                Ok(()) => return Ok(()),
+            match self.set_completion_verified(node_id, completed).await {
+                Ok(outcome) => return Ok(outcome),
                 Err(e) if is_404_like(&e) && attempt + 1 < MAX_PROP_RETRIES => {
                     let delay_ms = 200u64 * (1u64 << attempt);
                     tracing::info!(
@@ -3310,48 +3344,105 @@ mod tests {
                 .expect("split edit must reach both mocks — if this fails, the wire field name regressed");
         }
 
-        /// `set_completion(_, true)` must POST `{"completed": true}` to
-        /// `/nodes/{id}`. Pins the wire shape so the description → note
-        /// failure mode (200 OK with the field silently dropped) cannot
-        /// recur on the completion path.
+        /// `set_completion(_, true)` must POST to the DEDICATED endpoint
+        /// `/nodes/{id}/complete`. The PATH matcher is the pin: the
+        /// pre-2026-09-14 generic-update shape does not match it. That
+        /// shape returned 200 on production and changed nothing, which is
+        /// why a body matcher on the old path never pinned the real defect.
         #[tokio::test]
-        async fn set_completion_true_sends_completed_true() {
+        async fn set_completion_true_posts_complete_endpoint() {
             let mock = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path_regex(r"^/nodes/[^/]+$"))
-                .and(body_partial_json(json!({"completed": true})))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .and(path_regex(r"^/nodes/[^/]+/complete$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
                 .expect(1)
                 .mount(&mock)
                 .await;
-
             let client = mock_client(&mock).await;
             client
                 .set_completion("00000000-0000-0000-0000-000000000001", true)
                 .await
-                .expect("complete must reach mock — if this fails, the wire field name regressed");
+                .expect("complete must reach /complete — if this fails, the endpoint regressed");
         }
 
-        /// `set_completion(_, false)` is the symmetric uncomplete path.
-        /// The mock requires the literal `false` value so a
-        /// `{"completed": true}` regression on the uncomplete branch
-        /// would also fail this test.
+        /// Symmetric path: `POST /nodes/{id}/uncomplete`.
         #[tokio::test]
-        async fn set_completion_false_sends_completed_false() {
+        async fn set_completion_false_posts_uncomplete_endpoint() {
             let mock = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path_regex(r"^/nodes/[^/]+$"))
-                .and(body_partial_json(json!({"completed": false})))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .and(path_regex(r"^/nodes/[^/]+/uncomplete$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
                 .expect(1)
                 .mount(&mock)
                 .await;
-
             let client = mock_client(&mock).await;
             client
                 .set_completion("00000000-0000-0000-0000-000000000001", false)
                 .await
-                .expect("uncomplete must reach mock — if this fails, the wire field name regressed");
+                .expect("uncomplete must reach /uncomplete — if this fails, the endpoint regressed");
+        }
+
+        /// THE 2026-09-14 DEFECT: the write is accepted and every read-back
+        /// still says `completed: false`. The verified path must return
+        /// `EffectNotObserved`, never `Ok`.
+        #[tokio::test]
+        async fn set_completion_verified_fails_when_read_back_disagrees() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+/complete$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "name": "still pending",
+                    "completed": false,
+                    "completedAt": null
+                })))
+                .expect(2)
+                .mount(&mock)
+                .await;
+            let client = mock_client(&mock).await;
+            let err = client
+                .set_completion_verified("00000000-0000-0000-0000-000000000001", true)
+                .await
+                .expect_err("an accepted write whose read-back shows no effect must be an error");
+            assert!(matches!(err, WorkflowyError::EffectNotObserved { .. }), "got {err:?}");
+            assert!(err.to_string().to_lowercase().contains("effect not observed"), "{err}");
+        }
+
+        /// The verified path returns the server-derived `completedAt` when
+        /// the read-back agrees.
+        #[tokio::test]
+        async fn set_completion_verified_returns_read_back_completed_at() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/nodes/[^/]+/complete$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/nodes/[^/]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "name": "done",
+                    "completed": true,
+                    "completedAt": 1789377638
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            let client = mock_client(&mock).await;
+            let outcome = client
+                .set_completion_verified("00000000-0000-0000-0000-000000000001", true)
+                .await
+                .expect("agreeing read-back is a success");
+            assert!(outcome.completed);
+            assert_eq!(outcome.completed_at, Some(1789377638));
         }
     }
 

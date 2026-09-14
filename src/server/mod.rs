@@ -57,6 +57,7 @@ fn per_tool_health(log: &OpLog) -> serde_json::Value {
     }
     let mut out = serde_json::Map::new();
     for (tool, (ok, err)) in by_tool {
+        let ok_means = ok_semantics(&tool);
         let total = ok + err;
         let ok_rate = if total == 0 { 1.0 } else { ok as f64 / total as f64 };
         let status = if ok_rate >= 0.75 {
@@ -74,10 +75,33 @@ fn per_tool_health(log: &OpLog) -> serde_json::Value {
                 "err": err,
                 "ok_rate": (ok_rate * 100.0).round() / 100.0,
                 "status": status,
+                "ok_means": ok_means,
             }),
         );
     }
     serde_json::Value::Object(out)
+}
+
+/// What an `ok` in `per_tool_health` is evidence OF, per tool — stated in
+/// the payload so a healthy row cannot be read as more than it is.
+///
+/// WHY (2026-09-14): `complete_node` sat at `ok_rate 1.0, healthy` while
+/// completing nothing, because `ok` counted HTTP acceptance. That tool now
+/// reads back (`read_back_verified`); the create family's returned
+/// `item_id` is the effect (`returned_id`); edit/move/delete/reorder/tag
+/// record acceptance only (`http_accepted`) — a declared blind spot, kept
+/// rather than doubling every write's quota with a read.
+fn ok_semantics(tool: &str) -> &'static str {
+    match tool {
+        "complete_node" => "read_back_verified",
+        "create_node" | "batch_create_nodes" | "insert_content" | "smart_insert"
+        | "journal_insert_today" | "duplicate_node" | "create_from_template" | "create_mirror" => {
+            "returned_id"
+        }
+        "edit_node" | "move_node" | "delete_node" | "reorder_nodes" | "bulk_update" | "bulk_tag"
+        | "transaction" => "http_accepted",
+        _ => "response_read",
+    }
 }
 
 // `ProximateCause` (the cause taxonomy + the string→cause classifier
@@ -352,6 +376,12 @@ fn classify_operational_error(err_str: &str) -> ErrorClassification {
              the credential is fine; do NOT rotate the key. Verify with a read: if reads still \
              succeed, the block is upstream and method-scoped. Wait and re-issue; if it persists, \
              report to help@workflowy.com naming the HTTP method and that it precedes auth",
+        ),
+        ProximateCause::EffectNotObserved => (
+            ErrorCode::INTERNAL_ERROR,
+            "the write was accepted upstream but a read-back shows the state did not change — \
+             the node was NOT modified as requested. Re-read the node, then re-issue; if it \
+             recurs the API is ignoring the field and the wire shape needs fixing",
         ),
         ProximateCause::LockContention => (
             ErrorCode::INTERNAL_ERROR,
@@ -2274,12 +2304,22 @@ impl WorkflowyMcpServer {
             .set_completion_with_propagation_retry(&resolved, target_state)
             .await
         {
-            Ok(_) => {
+            Ok(outcome) => {
+                // `outcome` is the READ-BACK: the verified path returns Err
+                // when the observed state disagrees with the request, so
+                // this arm — and the op-log Ok it produces — means the
+                // effect was observed (2026-09-14).
                 let verb = if target_state { "Completed" } else { "Uncompleted" };
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "scope_resolved: {}\n\n{} node `{}`",
+                    "scope_resolved: {}\n\n{} node `{}` (verified by read-back: completed={}, completed_at={})",
                     scope_resolved_label(Some(&resolved)),
-                    verb, resolved
+                    verb,
+                    resolved,
+                    outcome.completed,
+                    outcome
+                        .completed_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "null".to_string()),
                 ))]))
             }
             Err(e) => Err(tool_error("complete_node", Some(&resolved), e)),
@@ -5864,6 +5904,7 @@ mod tests {
             "create_from_template",
             "bulk_update",
             "convert_markdown",
+            "complete_node",
         ];
 
         for tool_name in &expected_tools {
@@ -6658,6 +6699,8 @@ mod tests {
         // show up as failing (1.0 err_rate).
         assert_eq!(get_node_health["status"], "failing");
         assert_eq!(get_node_health["err"], 1);
+        // Every row says what an `ok` is evidence of (2026-09-14).
+        assert_eq!(workflowy_status_health["ok_means"], "response_read");
     }
 
     #[tokio::test]
@@ -6873,6 +6916,10 @@ mod tests {
             ("internal lock contention on cache", "lock_contention"),
             ("stale cache entry detected", "cache_miss"),
             ("some completely unknown failure mode", "unknown"),
+            (
+                "Effect not observed after complete on 1111: write accepted upstream but read-back shows completed=false",
+                "effect_not_observed",
+            ),
             // 429 must classify as rate_limited, not fall through to
             // `unknown` — the write-path report's core gap. Both the
             // synthetic in-window shape and the retry-exhausted Display form.
@@ -10900,22 +10947,33 @@ mod load_tests {
         );
     }
 
-    /// `complete_node` end-to-end against a wiremock — pins both the
-    /// handler-level dispatch and the wire shape (`POST /nodes/{id}`
-    /// with `{"completed": true}`). The body matcher rejects any
-    /// regression to a different field name; the success message
-    /// proves the handler applied the right verb.
+    /// Mounts the read-back a verified completion needs.
+    async fn mount_completion_read_back(mock: &MockServer, id: &str, completed: bool) {
+        Mock::given(method("GET"))
+            .and(path(format!("/nodes/{}", id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id,
+                "name": "task",
+                "completed": completed,
+                "completedAt": if completed { json!(1789377638) } else { json!(null) }
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    /// `complete_node` end-to-end: the dedicated `POST /nodes/{id}/complete`
+    /// endpoint (PATH-pinned; the pre-2026-09-14 generic update cannot
+    /// match), then a read-back whose agreement the success message reports.
     #[tokio::test]
     async fn complete_node_dispatches_completed_true_on_default() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex(r"^/nodes/[^/]+$"))
-            .and(body_partial_json(json!({"completed": true})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path(format!("/nodes/{}/complete", id_a())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
             .expect(1)
             .mount(&mock)
             .await;
-
+        mount_completion_read_back(&mock, id_a(), true).await;
         let server = server_against(&mock).await;
         let result = server
             .complete_node(Parameters(CompleteNodeParams {
@@ -10923,32 +10981,27 @@ mod load_tests {
                 completed: None,
             }))
             .await
-            .expect("complete_node must succeed against the body-matcher mock");
+            .expect("complete_node must succeed against the endpoint mock with an agreeing read-back");
         let body = body_text(&result);
+        assert!(body.starts_with("scope_resolved: "), "{body}");
+        assert!(body.contains("Completed node"), "{body}");
         assert!(
-            body.starts_with("scope_resolved: "),
-            "completion response carries the scope_resolved audit prefix: {body}"
-        );
-        assert!(
-            body.contains("Completed node"),
-            "default `completed: None` must mean 'mark complete': {body}"
+            body.contains("verified by read-back: completed=true, completed_at=1789377638"),
+            "success must report the READ-BACK, not the write's status: {body}"
         );
     }
 
-    /// Symmetric uncomplete path. With `completed: Some(false)` the
-    /// handler must POST `{"completed": false}` and report
-    /// "Uncompleted node …".
+    /// Symmetric uncomplete path: `POST /nodes/{id}/uncomplete`.
     #[tokio::test]
     async fn complete_node_dispatches_completed_false_when_explicit() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex(r"^/nodes/[^/]+$"))
-            .and(body_partial_json(json!({"completed": false})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path(format!("/nodes/{}/uncomplete", id_a())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
             .expect(1)
             .mount(&mock)
             .await;
-
+        mount_completion_read_back(&mock, id_a(), false).await;
         let server = server_against(&mock).await;
         let result = server
             .complete_node(Parameters(CompleteNodeParams {
@@ -10956,16 +11009,64 @@ mod load_tests {
                 completed: Some(false),
             }))
             .await
-            .expect("complete_node must succeed against the body-matcher mock");
+            .expect("complete_node must succeed against the endpoint mock");
         let body = body_text(&result);
-        assert!(
-            body.starts_with("scope_resolved: "),
-            "uncompletion response carries the scope_resolved audit prefix: {body}"
-        );
-        assert!(
-            body.contains("Uncompleted node"),
-            "explicit `completed: Some(false)` must mean 'uncomplete': {body}"
-        );
+        assert!(body.contains("Uncompleted node"), "{body}");
+        assert!(body.contains("completed=false, completed_at=null"), "{body}");
+    }
+
+    /// THE 2026-09-14 DEFECT, reproduced: write accepted, read-back never
+    /// agrees. The handler must error with `effect_not_observed` and the op
+    /// log must record Err, so `per_tool_health` cannot call the tool
+    /// healthy while it completes nothing.
+    #[tokio::test]
+    async fn complete_node_reports_effect_not_observed_when_read_back_disagrees() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/nodes/{}/complete", id_a())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+            .mount(&mock)
+            .await;
+        mount_completion_read_back(&mock, id_a(), false).await;
+        let server = server_against(&mock).await;
+        let err = server
+            .complete_node(Parameters(CompleteNodeParams {
+                node_id: NodeId::from(id_a()),
+                completed: Some(true),
+            }))
+            .await
+            .expect_err("an accepted write with no observed effect must NOT be a success");
+        let json = serde_json::to_value(&err).expect("McpError serialises");
+        assert_eq!(json["data"]["proximate_cause"], "effect_not_observed", "{json}");
+        assert_eq!(json["data"]["retryable"], true, "{json}");
+        let status = server
+            .workflowy_status(Parameters(WorkflowyStatusParams::default()))
+            .await
+            .expect("status");
+        let v: serde_json::Value = serde_json::from_str(&body_text(&status)).expect("json");
+        let row = &v["per_tool_health"]["complete_node"];
+        assert_eq!(row["ok"], 0, "{row}");
+        assert_eq!(row["err"], 1, "{row}");
+        assert_eq!(row["ok_means"], "read_back_verified", "{row}");
+    }
+
+    /// PIN: no completion writer outside the client may call the raw,
+    /// unverified `set_completion`.
+    #[test]
+    fn completion_writers_route_through_verified_path() {
+        let sources: &[(&str, &str)] = &[
+            ("src/server/mod.rs", include_str!("mod.rs")),
+            ("src/workflows.rs", include_str!("../workflows.rs")),
+            ("src/bin/wflow_do.rs", include_str!("../bin/wflow_do.rs")),
+        ];
+        for (name, src) in sources {
+            let body = src.split("#[cfg(test)]").next().unwrap_or("");
+            assert!(
+                !body.contains(".set_completion("),
+                "{name} calls the raw, unverified `set_completion` — route through \
+                 `set_completion_verified` so success means the effect was observed (2026-09-14)"
+            );
+        }
     }
 
     /// `bulk_update` with `operation: "complete"` must filter the walk
@@ -11000,14 +11101,15 @@ mod load_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nodes": []})))
             .mount(&mock)
             .await;
-        // Set-completion: POST /nodes/{id} with {"completed": true}.
+        // Set-completion: the dedicated endpoint, then the verified
+        // read-back (2026-09-14).
         Mock::given(method("POST"))
-            .and(path_regex(r"^/nodes/[^/]+$"))
-            .and(body_partial_json(json!({"completed": true})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path(format!("/nodes/{}/complete", id_a())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
             .expect(1)
             .mount(&mock)
             .await;
+        mount_completion_read_back(&mock, id_a(), true).await;
 
         let server = server_against(&mock).await;
         let result = server

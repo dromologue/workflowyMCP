@@ -4,7 +4,7 @@
 
 Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md`](specification.md). Each contract carries one or more `` Pinned by `<test_fn>` `` claims naming a real `fn <test_fn>` under `src/` or `tests/`. The traceability test fails if (a) any contract has no pin, (b) any pin names a non-existent function, or (c) the matrix file disagrees with the spec — running `cargo test --test traceability` regenerates this file from the spec.
 
-**Coverage:** 58 contracts, 57 unique pinning tests.
+**Coverage:** 61 contracts, 63 unique pinning tests.
 
 ## Skill template — leak rules (`C-skill-*`)
 
@@ -61,6 +61,9 @@ Source of contracts: every `[C-<area>-<NNN>]` marker in [`specs/specification.md
 | `C-server-020` | The persisted index records `last_modified` (schema v3) and serves local incremental queries | `last_modified_roundtrips_and_changed_since_filters` | `src/utils/name_index.rs` |
 | `C-server-021` | `insert_content` creates lines strictly sequentially | `insert_content_remains_sequential_by_design` | `src/server/mod.rs` |
 | `C-server-022` | Index schema changes migrate forward and never downgrade (2026-07-21 incident) | `older_schema_snapshot_migrates_forward_instead_of_discarding`<br>`reindex_checkpoints_after_every_root`<br>`save_refuses_to_downgrade_a_newer_schema_file` | `src/utils/name_index.rs`<br>`src/server/mod.rs`<br>`src/utils/name_index.rs` |
+| `C-server-023` | Completion success means the read-back agreed | `complete_node_reports_effect_not_observed_when_read_back_disagrees`<br>`completion_writers_route_through_verified_path`<br>`set_completion_verified_fails_when_read_back_disagrees` | `src/server/mod.rs`<br>`src/server/mod.rs`<br>`src/api/client.rs` |
+| `C-server-024` | Completion writes the dedicated endpoints | `set_completion_false_posts_uncomplete_endpoint`<br>`set_completion_true_posts_complete_endpoint` | `src/api/client.rs`<br>`src/api/client.rs` |
+| `C-server-025` | `per_tool_health` rows carry `ok_means` | `workflowy_status_includes_per_tool_health` | `src/server/mod.rs` |
 
 ## Workflow orchestration (`C-wf-*`)
 
